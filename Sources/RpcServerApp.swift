@@ -45,6 +45,8 @@ struct ContentView: View {
     @State private var log = ""
     @State private var devices = ""
     @State private var availMB = 0
+    // 開いたら自動で受け手を始める（Tailscale の住所が見えたとき）
+    @AppStorage("autoStart") private var autoStart = true
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -62,6 +64,7 @@ struct ContentView: View {
                     }
                     TextField("番号", text: $port).keyboardType(.numberPad)
                     Toggle("GPU（Metal）で計算する", isOn: $useGPU)
+                    Toggle("開いたら自動で始める", isOn: $autoStart)
                 } header: { Text("待ち受け") }
                 Section {
                     Button(running ? "動いている（止めるときはアプリを閉じる）" : "受け手を始める") { start() }
@@ -83,6 +86,14 @@ struct ContentView: View {
         .onReceive(tick) { _ in
             log = readBridge { rpc_bridge_log($0, $1) }
             availMB = Int(os_proc_available_memory() / 1_048_576)
+            // Tailscale がつながるのを待って、自動で始める
+            if autoStart && !running {
+                addrs = listAddresses()
+                if let ts = addrs.first(where: { $0.ip.hasPrefix("100.") }) {
+                    host = ts.ip
+                    start()
+                }
+            }
         }
     }
 
