@@ -1,3 +1,4 @@
+import AVFoundation
 import SwiftUI
 import os
 
@@ -5,6 +6,54 @@ import os
 struct RpcServerApp: App {
     init() { rpc_bridge_init() }
     var body: some Scene { WindowGroup { ContentView() } }
+}
+
+// 後ろに回っても止められないように、音の出ない再生を流し続ける
+final class Keeper {
+    static let shared = Keeper()
+    private var player: AVAudioPlayer?
+    private var watching = false
+
+    func start() {
+        if player?.isPlaying == true { return }
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, options: [.mixWithOthers])
+        try? session.setActive(true)
+        if player == nil {
+            player = try? AVAudioPlayer(data: Keeper.silentWav())
+            player?.numberOfLoops = -1
+            player?.volume = 0
+        }
+        player?.play()
+        if watching { return }
+        watching = true
+        // 電話などで止まったら、終わったときにまた流す
+        NotificationCenter.default.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] n in
+            let raw = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            if raw == AVAudioSession.InterruptionType.ended.rawValue {
+                try? AVAudioSession.sharedInstance().setActive(true)
+                self?.player?.play()
+            }
+        }
+    }
+
+    func stop() {
+        player?.stop()
+        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+    }
+
+    // 1 秒ぶんの無音（16bit・8000Hz・モノラル）の WAV
+    private static func silentWav() -> Data {
+        let rate: UInt32 = 8000, samples = rate
+        var d = Data()
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        d.append(contentsOf: Array("RIFF".utf8)); u32(36 + samples * 2)
+        d.append(contentsOf: Array("WAVEfmt ".utf8)); u32(16); u16(1); u16(1); u32(rate); u32(rate * 2); u16(2); u16(16)
+        d.append(contentsOf: Array("data".utf8)); u32(samples * 2)
+        d.append(Data(count: Int(samples * 2)))
+        return d
+    }
 }
 
 struct Addr: Hashable { let name: String; let ip: String }
@@ -49,6 +98,10 @@ struct ContentView: View {
     @AppStorage("autoStart") private var autoStart = true
     // USB の通り道は iPhone の中の 127.0.0.1 に届く（PC 側は usb_forward.py）
     @AppStorage("usb") private var usb = true
+    // 後ろに回っても続ける（その間は CPU で計算する）
+    @AppStorage("keepAlive") private var keepAlive = true
+    @State private var onCPU = false
+    @Environment(\.scenePhase) private var scenePhase
     private let usbHost = "127.0.0.1"
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
     private var running: Bool { !started.isEmpty }
@@ -59,6 +112,7 @@ struct ContentView: View {
                 Section("この iPhone") {
                     Text(devices.isEmpty ? "読み込み中" : devices).font(.footnote.monospaced())
                     Text("アプリが使えるメモリの残り：\(availMB) MB").font(.footnote)
+                    Text(onCPU ? "いまの計算：CPU" : "いまの計算：GPU").font(.footnote)
                 }
                 Section {
                     Picker("待ち受ける住所", selection: $host) {
@@ -69,6 +123,8 @@ struct ContentView: View {
                     TextField("番号", text: $port).keyboardType(.numberPad)
                     Toggle("GPU（Metal）で計算する", isOn: $useGPU)
                     Toggle("USB でも待ち受ける", isOn: $usb)
+                    Toggle("後ろに回っても続ける", isOn: $keepAlive)
+                        .onChange(of: keepAlive) { _, on in if running { on ? Keeper.shared.start() : Keeper.shared.stop() } }
                     Toggle("開いたら自動で始める", isOn: $autoStart)
                 } header: { Text("待ち受け") }
                 Section {
@@ -94,9 +150,14 @@ struct ContentView: View {
             devices = readBridge { rpc_bridge_devices($0, $1) }
             host = addrs.first(where: { $0.ip.hasPrefix("100.") })?.ip ?? addrs.first(where: { $0.name == "en0" })?.ip ?? addrs.first?.ip ?? ""
         }
+        .onChange(of: scenePhase) { _, phase in
+            // 後ろに回ると GPU が使えない。前に戻ったら GPU に戻す
+            rpc_bridge_set_background(phase == .background ? 1 : 0)
+        }
         .onReceive(tick) { _ in
             log = readBridge { rpc_bridge_log($0, $1) }
             availMB = Int(os_proc_available_memory() / 1_048_576)
+            onCPU = rpc_bridge_last_on_cpu() != 0
             // USB はすぐ、Tailscale はつながるのを待って、自動で始める
             if autoStart {
                 if usb { start(usbHost) }
@@ -114,7 +175,8 @@ struct ContentView: View {
     private func start(_ h: String) {
         guard let p = Int32(port), !h.isEmpty, !started.contains(h) else { return }
         started.insert(h)
-        UIApplication.shared.isIdleTimerDisabled = true // 画面が消えると止まるので、つけたままにする
+        UIApplication.shared.isIdleTimerDisabled = true // GPU を使えるのは前にいる間だけなので、画面はつけたままにする
+        if keepAlive { Keeper.shared.start() }
         let gpu: Int32 = useGPU ? 1 : 0
         let threads = Int32(max(1, ProcessInfo.processInfo.activeProcessorCount - 1))
         let t = Thread { h.withCString { rpc_bridge_serve($0, p, threads, gpu) } }

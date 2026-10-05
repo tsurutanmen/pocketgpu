@@ -49,6 +49,19 @@ extern "C" int rpc_bridge_devices(char * buf, int len) {
     return copy_out(s, buf, len);
 }
 
+// patches/rpc_no_abort.py が ggml-rpc.cpp に足す
+extern "C" void ggml_rpc_set_force_cpu(int on);
+extern "C" int ggml_rpc_last_on_cpu(void);
+
+extern "C" void rpc_bridge_set_background(int on) {
+    ggml_rpc_set_force_cpu(on);
+    on_log(GGML_LOG_LEVEL_INFO, on ? "後ろに回った：CPU で計算する\n" : "前に戻った：GPU で計算する\n", nullptr);
+}
+
+extern "C" int rpc_bridge_last_on_cpu(void) {
+    return ggml_rpc_last_on_cpu();
+}
+
 extern "C" void rpc_bridge_serve(const char * host, int port, int n_threads, int use_gpu) {
     std::vector<ggml_backend_dev_t> devices;
     if (use_gpu) {

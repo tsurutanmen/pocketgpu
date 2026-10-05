@@ -13,11 +13,12 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: 計算の受け手
-        CFBundleShortVersionString: "0.5.1"
-        CFBundleVersion: "6"
+        CFBundleShortVersionString: "0.6.0"
+        CFBundleVersion: "7"
         UILaunchScreen: {}
         NSLocalNetworkUsageDescription: PC からの計算の依頼を受け取るために使います
         UIRequiredDeviceCapabilities: [metal]
+        UIBackgroundModes: [audio]
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
     settings:
       base:
@@ -37,3 +38,4 @@ targets:
       - sdk: Metal.framework
       - sdk: Accelerate.framework
       - sdk: Foundation.framework
+      - sdk: AVFoundation.framework
