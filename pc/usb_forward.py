@@ -82,17 +82,17 @@ def pump(src, dst):
 
 
 def serve(local, remote):
-    device_id = usb_device_id()
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", local))
     srv.listen(8)
-    print(f"127.0.0.1:{local} → USB の iPhone（{device_id}）の {remote} 番", flush=True)
+    print(f"127.0.0.1:{local} → USB の iPhone の {remote} 番", flush=True)
     while True:
         client, _ = srv.accept()
         try:
-            phone = connect_device(device_id, remote)
-        except ConnectionError as e:
+            # 挿し直すと番号が変わるので、つなぐたびに引き直す
+            phone = connect_device(usb_device_id(), remote)
+        except (ConnectionError, SystemExit) as e:
             print(e, flush=True)
             client.close()
             continue
