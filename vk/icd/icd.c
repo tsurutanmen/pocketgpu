@@ -521,6 +521,26 @@ static void mask_ext_features(VkBaseOutStructure *s) {
     }
 }
 
+// 受け手の GPU とは別の装置として名乗る。同じ UUID だと、llama.cpp などは同じ GPU が 2 つ見えたと思って片方を捨てる。
+// Windows のアダプター番号（LUID）は、この PC の物ではないので「無し」にする
+static void fix_ids(VkBaseOutStructure *s) {
+    uint8_t *uuid = NULL;
+    VkBool32 *luid_valid = NULL;
+    if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES) {
+        VkPhysicalDeviceIDProperties *p = (void *) s;
+        uuid = p->deviceUUID;
+        luid_valid = &p->deviceLUIDValid;
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES) {
+        VkPhysicalDeviceVulkan11Properties *p = (void *) s;
+        uuid = p->deviceUUID;
+        luid_valid = &p->deviceLUIDValid;
+    }
+    if (!uuid) return;
+    static const uint8_t mark[4] = { 'i', 'P', 'h', 'n' };
+    for (int i = 0; i < 4; i++) uuid[12 + i] ^= mark[i];
+    *luid_valid = VK_FALSE;
+}
+
 // pNext の鎖のうち、知っている構造体だけを受け手に尋ねて埋める
 static void query_chain(uint32_t op, void *pnext, const stinfo *t, size_t nt, void *base, size_t base_size) {
     vr_buf b = { 0 }, out = { 0 };
@@ -537,6 +557,7 @@ static void query_chain(uint32_t op, void *pnext, const stinfo *t, size_t nt, vo
             uint32_t sz = st_size(t, nt, items[i]->sType);
             vr_rcopy(&rd, BODY(items[i]), sz - sizeof(VkBaseOutStructure));
             if (op == VR_GET_FEATURES2) mask_ext_features(items[i]);
+            else fix_ids(items[i]);
         }
     }
     (void) base;
