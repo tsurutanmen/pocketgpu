@@ -41,13 +41,17 @@ struct ContentView: View {
     @State private var host = ""
     @State private var port = "50052"
     @State private var useGPU = true
-    @State private var running = false
+    @State private var started: Set<String> = [] // 待ち受けを始めた住所
     @State private var log = ""
     @State private var devices = ""
     @State private var availMB = 0
     // 開いたら自動で受け手を始める（Tailscale の住所が見えたとき）
     @AppStorage("autoStart") private var autoStart = true
+    // USB の通り道は iPhone の中の 127.0.0.1 に届く（PC 側は usb_forward.py）
+    @AppStorage("usb") private var usb = true
+    private let usbHost = "127.0.0.1"
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    private var running: Bool { !started.isEmpty }
 
     var body: some View {
         NavigationStack {
@@ -64,13 +68,20 @@ struct ContentView: View {
                     }
                     TextField("番号", text: $port).keyboardType(.numberPad)
                     Toggle("GPU（Metal）で計算する", isOn: $useGPU)
+                    Toggle("USB でも待ち受ける", isOn: $usb)
                     Toggle("開いたら自動で始める", isOn: $autoStart)
                 } header: { Text("待ち受け") }
                 Section {
-                    Button(running ? "動いている（止めるときはアプリを閉じる）" : "受け手を始める") { start() }
-                        .disabled(running || host.isEmpty)
-                    if running {
+                    Button(running ? "動いている（止めるときはアプリを閉じる）" : "受け手を始める") {
+                        if !host.isEmpty { start(host) }
+                        if usb { start(usbHost) }
+                    }
+                    .disabled(running || (host.isEmpty && !usb))
+                    if started.contains(host) {
                         Text("PC で：llama-cli … --rpc \(host):\(port)").font(.footnote.monospaced()).textSelection(.enabled)
+                    }
+                    if started.contains(usbHost) {
+                        Text("USB：usb_forward.py のあと --rpc 127.0.0.1:50053").font(.footnote.monospaced()).textSelection(.enabled)
                     }
                 }
                 Section("記録") {
@@ -86,22 +97,25 @@ struct ContentView: View {
         .onReceive(tick) { _ in
             log = readBridge { rpc_bridge_log($0, $1) }
             availMB = Int(os_proc_available_memory() / 1_048_576)
-            // Tailscale がつながるのを待って、自動で始める
-            if autoStart && !running {
-                addrs = listAddresses()
-                if let ts = addrs.first(where: { $0.ip.hasPrefix("100.") }) {
-                    host = ts.ip
-                    start()
+            // USB はすぐ、Tailscale はつながるのを待って、自動で始める
+            if autoStart {
+                if usb { start(usbHost) }
+                if started.allSatisfy({ $0 == usbHost }) {
+                    addrs = listAddresses()
+                    if let ts = addrs.first(where: { $0.ip.hasPrefix("100.") }) {
+                        host = ts.ip
+                        start(ts.ip)
+                    }
                 }
             }
         }
     }
 
-    private func start() {
-        guard let p = Int32(port), !host.isEmpty else { return }
-        running = true
+    private func start(_ h: String) {
+        guard let p = Int32(port), !h.isEmpty, !started.contains(h) else { return }
+        started.insert(h)
         UIApplication.shared.isIdleTimerDisabled = true // 画面が消えると止まるので、つけたままにする
-        let h = host, gpu: Int32 = useGPU ? 1 : 0
+        let gpu: Int32 = useGPU ? 1 : 0
         let threads = Int32(max(1, ProcessInfo.processInfo.activeProcessorCount - 1))
         let t = Thread { h.withCString { rpc_bridge_serve($0, p, threads, gpu) } }
         t.stackSize = 8 << 20
