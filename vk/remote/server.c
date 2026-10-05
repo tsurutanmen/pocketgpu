@@ -11,6 +11,26 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#ifdef __APPLE__
+#include <os/log.h>
+#endif
+#include <stdarg.h>
+
+// 記録。iPhone ではアプリの中の printf が見えないので os_log に出す（PC から USB で読める）
+static void vlog(const char *fmt, ...) {
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+#ifdef __APPLE__
+    os_log(OS_LOG_DEFAULT, "vk: %{public}s", line);
+#else
+    fputs(line, stdout);
+    fputc('\n', stdout);
+    fflush(stdout);
+#endif
+}
 
 // ---- 本物の Vulkan ----
 static PFN_vkGetInstanceProcAddr gipa;
@@ -40,7 +60,7 @@ VKFUNCS(DECL)
 #undef DECL
 
 // ---- PC が振った番号 → ここの本物の Vulkan の物 ----
-typedef struct { uint64_t id, h; uint32_t kind; void *map; } ent;
+typedef struct { uint64_t id, h; uint32_t kind; void *map; uint64_t size; } ent;
 static ent *g_tab;
 static size_t g_cap, g_cnt;
 
@@ -69,7 +89,7 @@ static void put(uint64_t id, uint64_t h, uint32_t kind) {
     size_t s = slot(id);
     while (g_tab[s].id && g_tab[s].id != id) s = (s + 1) & (g_cap - 1);
     if (!g_tab[s].id) g_cnt++;
-    g_tab[s] = (ent) { id, h, kind, NULL };
+    g_tab[s] = (ent) { id, h, kind, NULL, 0 };
 }
 
 static ent *find(uint64_t id) {
@@ -142,7 +162,7 @@ static int vk_init(void) {
     free(ep);
     VkPhysicalDeviceProperties p;
     vkGetPhysicalDeviceProperties(g_pd, &p);
-    printf("受け手の GPU: %s\n", p.deviceName);
+    vlog("受け手の GPU: %s", p.deviceName);
     return 1;
 }
 
@@ -210,7 +230,8 @@ static void replay(VkCommandBuffer cb, vr_rd *r) {
         switch (op) {
         case VR_CMD_BIND_PIPELINE: {
             uint32_t bp = vr_ru32(r);
-            vkCmdBindPipeline(cb, (VkPipelineBindPoint) bp, OBJ(VkPipeline, vr_ru64(r)));
+            VkPipeline pl = OBJ(VkPipeline, vr_ru64(r));
+            if (pl) vkCmdBindPipeline(cb, (VkPipelineBindPoint) bp, pl);
         } break;
         case VR_CMD_BIND_DESCRIPTOR_SETS: {
             uint32_t bp = vr_ru32(r);
@@ -281,7 +302,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r) {
             free(bb);
         } break;
         default:
-            fprintf(stderr, "知らない記録の命令 %u\n", op);
+            vlog("知らない記録の命令 %u", op);
             r->bad = 1;
         }
     }
@@ -439,6 +460,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkResult res = vkAllocateMemory(d, &mai, NULL, &m);
         if (res == VK_SUCCESS) {
             put(id, (uint64_t) m, K_MEMORY);
+            find(id)->size = mai.allocationSize;
             VkPhysicalDeviceMemoryProperties mp;
             vkGetPhysicalDeviceMemoryProperties(g_pd, &mp);
             if (mp.memoryTypes[mai.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
@@ -467,13 +489,14 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t off = vr_ru64(r);
         uint32_t n;
         const void *d = vr_rbytes(r, &n);
-        if (e && e->map && d) memcpy((uint8_t *) e->map + off, d, n);
+        if (e && e->map && d && off <= e->size && n <= e->size - off) memcpy((uint8_t *) e->map + off, d, n);
+        else vlog("範囲の外への書き込みを捨てた（%llu + %u）", (unsigned long long) off, n);
         return 1;
     }
     case VR_MEM_READ: {
         ent *e = find(vr_ru64(r));
         uint64_t off = vr_ru64(r), n = vr_ru64(r);
-        if (!e || !e->map) return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
+        if (!e || !e->map || off > e->size || n > e->size - off) return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
         vr_put(&g_out, (uint8_t *) e->map + off, (size_t) n);
         return reply(s, 0);
     }
@@ -564,8 +587,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkPipeline p;
         VkResult res = vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &ci, NULL, &p);
         if (res == VK_SUCCESS) put(id, (uint64_t) p, K_PIPELINE);
-        else fprintf(stderr, "compute pipeline を作れない (%d)\n", res);
-        return 1;
+        else vlog("compute pipeline を作れない (%d)", res);
+        return reply(s, res);
     }
     case VR_DESTROY_PIPELINE: {
         VkDevice d = DEV(vr_ru64(r));
@@ -611,7 +634,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             VkDescriptorSet ds;
             VkResult res = vkAllocateDescriptorSets(d, &ai, &ds);
             if (res == VK_SUCCESS) put(id, (uint64_t) ds, K_DSET);
-            else fprintf(stderr, "descriptor set を取れない (%d)\n", res);
+            else vlog("descriptor set を取れない (%d)", res);
         }
         return 1;
     }
@@ -776,13 +799,13 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         }
         VkFence f = OBJ(VkFence, vr_ru64(r));
         VkResult res = vkQueueSubmit(q, ns, si, f);
-        if (res != VK_SUCCESS) fprintf(stderr, "vkQueueSubmit 失敗 (%d)\n", res);
+        if (res != VK_SUCCESS) vlog("vkQueueSubmit 失敗 (%d)", res);
         return 1;
     }
     case VR_QUEUE_WAIT_IDLE: return reply(s, vkQueueWaitIdle((VkQueue) (uintptr_t) H(vr_ru64(r))));
     case VR_DEVICE_WAIT_IDLE: return reply(s, vkDeviceWaitIdle(DEV(vr_ru64(r))));
     }
-    fprintf(stderr, "知らない命令 %u\n", op);
+    vlog("知らない命令 %u", op);
     return 0;
 }
 
@@ -804,7 +827,7 @@ static void serve_client(vr_sock c) {
 
 // iPhone のアプリから呼ぶ入口。戻ってこない
 int vkr_serve(const char *host, int port) {
-    if (!vk_init()) { fprintf(stderr, "Vulkan を起動できない\n"); return 1; }
+    if (!vk_init()) { vlog("Vulkan を起動できない"); return 1; }
 #ifdef _WIN32
     WSADATA w;
     WSAStartup(MAKEWORD(2, 2), &w);
@@ -816,22 +839,19 @@ int vkr_serve(const char *host, int port) {
     a.sin_family = AF_INET;
     a.sin_port = htons((uint16_t) port);
     inet_pton(AF_INET, host, &a.sin_addr);
-    if (bind(ls, (struct sockaddr *) &a, sizeof a) != 0 || listen(ls, 4) != 0) { fprintf(stderr, "%s:%d で待てない\n", host, port); return 1; }
-    printf("Vulkan の受け手：%s:%d で待っている\n", host, port);
-    fflush(stdout);
+    if (bind(ls, (struct sockaddr *) &a, sizeof a) != 0 || listen(ls, 4) != 0) { vlog("%s:%d で待てない", host, port); return 1; }
+    vlog("Vulkan の受け手：%s:%d で待っている", host, port);
     for (;;) {
         vr_sock c = accept(ls, NULL, NULL);
         if (c == VR_BAD_SOCK) continue;
-        printf("つながった\n");
-        fflush(stdout);
+        vlog("つながった");
         serve_client(c);
 #ifdef _WIN32
         closesocket(c);
 #else
         close(c);
 #endif
-        printf("切れた\n");
-        fflush(stdout);
+        vlog("切れた");
     }
 }
 
