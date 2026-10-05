@@ -21,6 +21,7 @@ jobs:
       - name: patch (iOS のメモリの上限に合わせて空きを答える)
         run: python3 patches/ios_memory.py llama.cpp
 
+      # GGML_MAX_NAME=160：stable-diffusion.cpp と同じ長さ。PC 側も pc-tools.yml で 160 にそろえる
       - name: build ggml for iOS (Metal + RPC)
         run: |
           cmake -S llama.cpp -B build-ios -G Xcode \
@@ -33,7 +34,8 @@ jobs:
             -DGGML_RPC=ON -DGGML_RPC_RDMA=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_BLAS=OFF \
             -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_MTMD=OFF \
-            -DLLAMA_OPENSSL=OFF -DMTMD_VIDEO=OFF
+            -DLLAMA_OPENSSL=OFF -DMTMD_VIDEO=OFF \
+            -DCMAKE_C_FLAGS=-DGGML_MAX_NAME=160 -DCMAKE_CXX_FLAGS=-DGGML_MAX_NAME=160
           cmake --build build-ios --config Release --target ggml ggml-rpc -- -quiet
           mkdir -p libs
           find build-ios -name "*.a" -path "*Release-iphoneos*" -exec cp {} libs/ \;

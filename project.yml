@@ -13,8 +13,8 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: 計算の受け手
-        CFBundleShortVersionString: "0.4.0"
-        CFBundleVersion: "4"
+        CFBundleShortVersionString: "0.5.0"
+        CFBundleVersion: "5"
         UILaunchScreen: {}
         NSLocalNetworkUsageDescription: PC からの計算の依頼を受け取るために使います
         UIRequiredDeviceCapabilities: [metal]
@@ -28,6 +28,7 @@ targets:
         LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/libs
         OTHER_LDFLAGS: "-lggml -lggml-base -lggml-cpu -lggml-metal -lggml-rpc -lc++"
         CLANG_CXX_LANGUAGE_STANDARD: c++17
+        GCC_PREPROCESSOR_DEFINITIONS: $(inherited) GGML_MAX_NAME=160
         TARGETED_DEVICE_FAMILY: "1,2"
         CODE_SIGNING_ALLOWED: "NO"
         CODE_SIGNING_REQUIRED: "NO"

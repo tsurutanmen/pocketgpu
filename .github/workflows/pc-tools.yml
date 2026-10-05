@@ -1,0 +1,79 @@
+name: build-pc-tools
+# PC（Windows）側の道具を、iPhone の受け手と同じ取り決め（RPC 7.0.0・GGML_MAX_NAME=160）でそろえて作る
+# 160 は stable-diffusion.cpp が使う長さ。llama.cpp と whisper.cpp もこれに合わせる
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - patches/whisper_rpc.py
+      - .github/workflows/pc-tools.yml
+env:
+  CFLAGS: -DGGML_MAX_NAME=160
+  CXXFLAGS: -DGGML_MAX_NAME=160
+  CPUFLAGS: -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+jobs:
+  llama:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    env:
+      VULKAN_VERSION: 1.4.357.0
+    steps:
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+      - name: llama.cpp b11412
+        run: git clone --depth 1 --branch b11412 https://github.com/ggml-org/llama.cpp.git llama.cpp
+      - name: build (Vulkan + RPC)
+        run: |
+          cmake -S llama.cpp -B build -T ClangCL -DBUILD_SHARED_LIBS=OFF -DGGML_VULKAN=ON -DGGML_RPC=ON -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF $env:CPUFLAGS.Split(' ')
+          cmake --build build --config Release -j 4 --target llama-bench llama-cli llama-completion llama-server rpc-server
+          dir build\bin\Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-win
+          path: build/bin/Release/*.exe
+
+  whisper:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: whisper.cpp
+        shell: bash
+        run: |
+          git clone https://github.com/ggml-org/whisper.cpp.git whisper.cpp
+          git -C whisper.cpp checkout 60c0be6ac8fa71b1a2ae2dd938a31a34a508e774
+      - name: patch (WHISPER_RPC で計算の受け手を GPU として足す)
+        run: python patches/whisper_rpc.py whisper.cpp
+      - name: build whisper-cli (CPU + RPC)
+        run: |
+          cmake -S whisper.cpp -B build -T ClangCL -DBUILD_SHARED_LIBS=OFF -DGGML_RPC=ON -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF -DWHISPER_SDL2=OFF $env:CPUFLAGS.Split(' ')
+          cmake --build build --config Release -j 4 --target whisper-cli
+          dir build\bin\Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-win-160
+          path: build/bin/Release/*.exe
+
+  sd:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - name: stable-diffusion.cpp
+        shell: bash
+        run: |
+          git clone https://github.com/leejet/stable-diffusion.cpp.git sd
+          git -C sd checkout 3f8527a46c54ecf4cb4ed6003da8e8982283c73c
+          git -C sd submodule update --init --recursive --depth 1
+      - name: build sd-cli (CPU + RPC)
+        run: |
+          cmake -S sd -B build -T ClangCL -DSD_RPC=ON -DSD_BUILD_SHARED_LIBS=OFF $env:CPUFLAGS.Split(' ')
+          cmake --build build --config Release -j 4
+          dir build\bin\Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sd-win
+          path: build/bin/Release/*.exe
