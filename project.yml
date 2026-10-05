@@ -9,12 +9,15 @@ targets:
     platform: iOS
     sources:
       - path: Sources
+      # Vulkan の命令の受け手（PC 側のドライバは vk/icd）
+      - path: vk/remote
+        includes: ["server.c", "proto.h", "wire.h"]
     info:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: 計算の受け手
-        CFBundleShortVersionString: "0.6.0"
-        CFBundleVersion: "7"
+        CFBundleShortVersionString: "0.7.0"
+        CFBundleVersion: "8"
         UILaunchScreen: {}
         NSLocalNetworkUsageDescription: PC からの計算の依頼を受け取るために使います
         UIRequiredDeviceCapabilities: [metal]
@@ -25,9 +28,9 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.tsurutanmen.iphonerpc
         SWIFT_VERSION: "5.0"
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridging-Header.h
-        HEADER_SEARCH_PATHS: $(PROJECT_DIR)/llama.cpp/ggml/include
-        LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/libs
-        OTHER_LDFLAGS: "-lggml -lggml-base -lggml-cpu -lggml-metal -lggml-rpc -lc++"
+        HEADER_SEARCH_PATHS: "$(PROJECT_DIR)/llama.cpp/ggml/include $(PROJECT_DIR)/MoltenVK/MoltenVK/include"
+        LIBRARY_SEARCH_PATHS: "$(PROJECT_DIR)/libs $(PROJECT_DIR)/MoltenVK/MoltenVK/static/MoltenVK.xcframework/ios-arm64"
+        OTHER_LDFLAGS: "-lggml -lggml-base -lggml-cpu -lggml-metal -lggml-rpc -lMoltenVK -lc++"
         CLANG_CXX_LANGUAGE_STANDARD: c++17
         GCC_PREPROCESSOR_DEFINITIONS: $(inherited) GGML_MAX_NAME=160
         TARGETED_DEVICE_FAMILY: "1,2"
@@ -39,3 +42,8 @@ targets:
       - sdk: Accelerate.framework
       - sdk: Foundation.framework
       - sdk: AVFoundation.framework
+      # MoltenVK が使う
+      - sdk: IOSurface.framework
+      - sdk: QuartzCore.framework
+      - sdk: UIKit.framework
+      - sdk: CoreGraphics.framework

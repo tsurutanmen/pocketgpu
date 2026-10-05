@@ -6,6 +6,7 @@ on:
       - project.yml
       - patches/ios_memory.py
       - patches/rpc_no_abort.py
+      - vk/remote/**
       - .github/workflows/ios.yml
   workflow_dispatch:
 jobs:
@@ -44,6 +45,13 @@ jobs:
           mkdir -p libs
           find build-ios -name "*.a" -path "*Release-iphoneos*" -exec cp {} libs/ \;
           ls -la libs
+
+      # Vulkan の受け手は MoltenVK（Vulkan を Metal の上で動かす部品）を使う。iOS 用の静的ライブラリとヘッダーが入っている
+      - name: MoltenVK v1.4.2
+        run: |
+          curl -sSL -o mvk.tar https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar
+          tar xf mvk.tar
+          ls -la MoltenVK/MoltenVK/static/MoltenVK.xcframework/ios-arm64
 
       - name: generate Xcode project
         run: brew install xcodegen && xcodegen generate

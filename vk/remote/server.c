@@ -844,6 +844,10 @@ int vkr_serve(const char *host, int port) {
     for (;;) {
         vr_sock c = accept(ls, NULL, NULL);
         if (c == VR_BAD_SOCK) continue;
+#ifdef SO_NOSIGPIPE
+        // PC が先に切ったときに書き込むと SIGPIPE でアプリごと落ちるので、止める
+        setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
         vlog("つながった");
         serve_client(c);
 #ifdef _WIN32

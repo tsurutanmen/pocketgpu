@@ -5,3 +5,5 @@ dd/
 Payload/
 *.ipa
 *.xcodeproj/
+MoltenVK/
+mvk.tar

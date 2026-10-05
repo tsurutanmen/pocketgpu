@@ -101,6 +101,7 @@ struct ContentView: View {
     // 後ろに回っても続ける（その間は CPU で計算する）
     @AppStorage("keepAlive") private var keepAlive = true
     @State private var onCPU = false
+    @State private var vkStarted = false
     @Environment(\.scenePhase) private var scenePhase
     private let usbHost = "127.0.0.1"
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -138,6 +139,9 @@ struct ContentView: View {
                     }
                     if started.contains(usbHost) {
                         Text("USB：usb_forward.py のあと --rpc 127.0.0.1:50053").font(.footnote.monospaced()).textSelection(.enabled)
+                    }
+                    if vkStarted {
+                        Text("Vulkan：USB の 50060 番（PC は usb_forward.py --local 50061 --remote 50060）").font(.footnote.monospaced()).textSelection(.enabled)
                     }
                 }
                 Section("記録") {
@@ -182,5 +186,12 @@ struct ContentView: View {
         let t = Thread { h.withCString { rpc_bridge_serve($0, p, threads, gpu) } }
         t.stackSize = 8 << 20
         t.start()
+        // Vulkan の受け手は USB（iPhone の中の 127.0.0.1）だけで待つ。命令をそのまま GPU に流すので、Wi-Fi には出さない
+        if h == usbHost && !vkStarted {
+            vkStarted = true
+            let v = Thread { _ = vkr_serve("127.0.0.1", 50060) }
+            v.stackSize = 8 << 20
+            v.start()
+        }
     }
 }

@@ -5,6 +5,8 @@
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
 
+#include <os/log.h>
+
 #include <algorithm>
 #include <cstring>
 #include <mutex>
@@ -15,6 +17,8 @@ static std::mutex g_mu;
 static std::string g_log;
 
 static void on_log(enum ggml_log_level, const char * text, void *) {
+    // PC から USB で読めるように os_log にも出す（app/pc/iphone_syslog.py）
+    os_log(OS_LOG_DEFAULT, "ggml: %{public}s", text);
     std::lock_guard<std::mutex> lk(g_mu);
     g_log += text;
     if (g_log.size() > 24000) g_log.erase(0, g_log.size() - 16000);
