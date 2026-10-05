@@ -29,7 +29,7 @@ jobs:
       - name: build (Vulkan + RPC)
         run: |
           cmake -S llama.cpp -B build -T ClangCL -DBUILD_SHARED_LIBS=OFF -DGGML_VULKAN=ON -DGGML_RPC=ON -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF $env:CPUFLAGS.Split(' ')
-          cmake --build build --config Release -j 4 --target llama-bench llama-cli llama-completion llama-server rpc-server
+          cmake --build build --config Release -j 4 --target llama-bench llama-cli llama-completion llama-server ggml-rpc-server
           dir build\bin\Release
       - uses: actions/upload-artifact@v4
         with:
@@ -68,12 +68,14 @@ jobs:
           git clone https://github.com/leejet/stable-diffusion.cpp.git sd
           git -C sd checkout 3f8527a46c54ecf4cb4ed6003da8e8982283c73c
           git -C sd submodule update --init --recursive --depth 1
+      - uses: ilammy/msvc-dev-cmd@v1
+      # 本家の Windows の作り方（共有ライブラリ・Ninja・cl）に RPC を足す。GGML_MAX_NAME=160 は sd 自身が付ける
       - name: build sd-cli (CPU + RPC)
         run: |
-          cmake -S sd -B build -T ClangCL -DSD_RPC=ON -DSD_BUILD_SHARED_LIBS=OFF $env:CPUFLAGS.Split(' ')
-          cmake --build build --config Release -j 4
-          dir build\bin\Release
+          cmake -S sd -B build -G Ninja -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS='/bigobj /EHsc' -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DSD_RPC=ON
+          cmake --build build
+          dir buildin
       - uses: actions/upload-artifact@v4
         with:
           name: sd-win
-          path: build/bin/Release/*.exe
+          path: build/bin/
