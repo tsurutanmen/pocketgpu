@@ -5,6 +5,7 @@ on:
       - Sources/**
       - project.yml
       - patches/ios_memory.py
+      - patches/rpc_no_abort.py
       - .github/workflows/ios.yml
   workflow_dispatch:
 jobs:
@@ -20,6 +21,9 @@ jobs:
 
       - name: patch (iOS のメモリの上限に合わせて空きを答える)
         run: python3 patches/ios_memory.py llama.cpp
+
+      - name: patch (GPU の計算が失敗しても落ちない)
+        run: python3 patches/rpc_no_abort.py llama.cpp
 
       # GGML_MAX_NAME=160：stable-diffusion.cpp と同じ長さ。PC 側も pc-tools.yml で 160 にそろえる
       - name: build ggml for iOS (Metal + RPC)
