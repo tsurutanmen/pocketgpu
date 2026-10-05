@@ -53,7 +53,8 @@ static int g_portability; // MoltenVK のときは portability_subset を有効�
     X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdDispatchBase) \
     X(vkCmdDispatchIndirect) X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCmdPipelineBarrier) \
     X(vkCreateFence) X(vkDestroyFence) X(vkResetFences) X(vkWaitForFences) X(vkGetFenceStatus) \
-    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkQueueSubmit)
+    X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkQueueSubmit) \
+    X(vkWaitSemaphores) X(vkGetSemaphoreCounterValue) X(vkSignalSemaphore)
 
 #define DECL(n) static PFN_##n n;
 VKFUNCS(DECL)
@@ -765,7 +766,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_CREATE_SEMAPHORE: {
         VkDevice d = DEV(vr_ru64(r));
         uint64_t id = vr_ru64(r);
-        VkSemaphoreCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        // timeline semaphore（番号つきの待ち合わせ）。llama.cpp の Vulkan 版が使う
+        VkSemaphoreTypeCreateInfo ti = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+        ti.semaphoreType = (VkSemaphoreType) vr_ru32(r);
+        ti.initialValue = vr_ru64(r);
+        VkSemaphoreCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ti };
         VkSemaphore sm;
         if (vkCreateSemaphore(d, &ci, NULL, &sm) == VK_SUCCESS) put(id, (uint64_t) sm, K_SEM);
         return 1;
@@ -780,26 +785,67 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_QUEUE_SUBMIT: {
         VkQueue q = (VkQueue) (uintptr_t) H(vr_ru64(r));
         uint32_t ns = vr_ru32(r);
+        if (ns > 8) ns = 8; // ドライバが 8 ずつに分けて送ってくる
         VkSubmitInfo si[8];
+        VkTimelineSemaphoreSubmitInfo tl[8];
         VkSemaphore ws[8][8], ss[8][8];
+        uint64_t wv[8][8], sv[8][8];
         VkPipelineStageFlags wst[8][8];
         VkCommandBuffer cbs[8][64];
-        for (uint32_t i = 0; i < ns && i < 8; i++) {
-            si[i] = (VkSubmitInfo) { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            si[i].waitSemaphoreCount = vr_ru32(r);
-            for (uint32_t k = 0; k < si[i].waitSemaphoreCount && k < 8; k++) { ws[i][k] = OBJ(VkSemaphore, vr_ru64(r)); wst[i][k] = vr_ru32(r); }
+        for (uint32_t i = 0; i < ns; i++) {
+            si[i] = (VkSubmitInfo) { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &tl[i] };
+            tl[i] = (VkTimelineSemaphoreSubmitInfo) { .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+            uint32_t nw = vr_ru32(r);
+            if (nw > 8) nw = 8;
+            for (uint32_t k = 0; k < nw; k++) { ws[i][k] = OBJ(VkSemaphore, vr_ru64(r)); wst[i][k] = vr_ru32(r); wv[i][k] = vr_ru64(r); }
+            si[i].waitSemaphoreCount = tl[i].waitSemaphoreValueCount = nw;
             si[i].pWaitSemaphores = ws[i];
             si[i].pWaitDstStageMask = wst[i];
-            si[i].commandBufferCount = vr_ru32(r);
-            for (uint32_t k = 0; k < si[i].commandBufferCount && k < 64; k++) cbs[i][k] = (VkCommandBuffer) (uintptr_t) H(vr_ru64(r));
+            tl[i].pWaitSemaphoreValues = wv[i];
+            uint32_t nc = vr_ru32(r);
+            if (nc > 64) nc = 64;
+            for (uint32_t k = 0; k < nc; k++) cbs[i][k] = (VkCommandBuffer) (uintptr_t) H(vr_ru64(r));
+            si[i].commandBufferCount = nc;
             si[i].pCommandBuffers = cbs[i];
-            si[i].signalSemaphoreCount = vr_ru32(r);
-            for (uint32_t k = 0; k < si[i].signalSemaphoreCount && k < 8; k++) ss[i][k] = OBJ(VkSemaphore, vr_ru64(r));
+            uint32_t nsg = vr_ru32(r);
+            if (nsg > 8) nsg = 8;
+            for (uint32_t k = 0; k < nsg; k++) { ss[i][k] = OBJ(VkSemaphore, vr_ru64(r)); sv[i][k] = vr_ru64(r); }
+            si[i].signalSemaphoreCount = tl[i].signalSemaphoreValueCount = nsg;
             si[i].pSignalSemaphores = ss[i];
+            tl[i].pSignalSemaphoreValues = sv[i];
         }
         VkFence f = OBJ(VkFence, vr_ru64(r));
         VkResult res = vkQueueSubmit(q, ns, si, f);
         if (res != VK_SUCCESS) vlog("vkQueueSubmit 失敗 (%d)", res);
+        return 1;
+    }
+    case VR_WAIT_SEMAPHORES: {
+        VkDevice d = DEV(vr_ru64(r));
+        VkSemaphoreWaitInfo wi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+        wi.flags = vr_ru32(r);
+        uint32_t n = vr_ru32(r);
+        if (n > 64) n = 64;
+        VkSemaphore sm[64];
+        uint64_t v[64];
+        for (uint32_t i = 0; i < n; i++) { sm[i] = OBJ(VkSemaphore, vr_ru64(r)); v[i] = vr_ru64(r); }
+        wi.semaphoreCount = n;
+        wi.pSemaphores = sm;
+        wi.pValues = v;
+        return reply(s, vkWaitSemaphores(d, &wi, vr_ru64(r)));
+    }
+    case VR_GET_SEMAPHORE_COUNTER: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t v = 0;
+        VkResult res = vkGetSemaphoreCounterValue(d, OBJ(VkSemaphore, vr_ru64(r)), &v);
+        vr_u64(&g_out, v);
+        return reply(s, res);
+    }
+    case VR_SIGNAL_SEMAPHORE: {
+        VkDevice d = DEV(vr_ru64(r));
+        VkSemaphoreSignalInfo si = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO };
+        si.semaphore = OBJ(VkSemaphore, vr_ru64(r));
+        si.value = vr_ru64(r);
+        vkSignalSemaphore(d, &si);
         return 1;
     }
     case VR_QUEUE_WAIT_IDLE: return reply(s, vkQueueWaitIdle((VkQueue) (uintptr_t) H(vr_ru64(r))));

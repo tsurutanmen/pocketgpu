@@ -167,7 +167,7 @@ static const char *const ALLOWED_EXT[] = {
     "VK_KHR_variable_pointers", "VK_KHR_uniform_buffer_standard_layout", "VK_EXT_scalar_block_layout",
     "VK_KHR_vulkan_memory_model", "VK_KHR_shader_atomic_int64", "VK_KHR_dedicated_allocation",
     "VK_KHR_get_memory_requirements2", "VK_KHR_bind_memory2", "VK_KHR_maintenance1", "VK_KHR_maintenance3",
-    "VK_KHR_relaxed_block_layout", "VK_KHR_shader_draw_parameters",
+    "VK_KHR_relaxed_block_layout", "VK_KHR_shader_draw_parameters", "VK_KHR_timeline_semaphore",
 };
 
 static int allowed_ext(const char *name) {
@@ -219,6 +219,13 @@ static int hello(void) {
                 if (g_hw.props.apiVersion > VK_API_VERSION_1_2)
                     g_hw.props.apiVersion = VK_MAKE_API_VERSION(0, 1, 2, VK_API_VERSION_PATCH(g_hw.props.apiVersion));
                 mask_features(&g_hw.feats);
+                // PC から見ると iPhone のメモリは USB の先にあるので、「別のメモリを持つ GPU」と名乗る。
+                // 共有メモリの GPU（integrated）と名乗ると、llama.cpp などはデータを CPU から直接書ける所に置こうとして、
+                // 写しの送り返しが毎回モデル全部になってしまう
+                g_hw.props.deviceType = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+                for (uint32_t i = 0; i < g_hw.mem.memoryTypeCount; i++)
+                    if (g_hw.mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+                        g_hw.mem.memoryTypes[i].propertyFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
                 for (uint32_t i = 0; i < g_hw.nq; i++) {
                     g_hw.q[i].queueFlags &= VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
                 }
@@ -255,7 +262,7 @@ struct mem {
 
 struct buf { uint64_t size; VkMemoryRequirements req; struct mem *m; uint64_t memoff; };
 
-typedef struct { struct mem *m; uint64_t off, len, serial; } rng;
+typedef struct { struct mem *m; uint64_t off, len, serial; struct queue *q; } rng;
 
 struct dev {
     VK_LOADER_DATA loader;
@@ -286,7 +293,11 @@ struct cb {
     size_t nr, capr;
 };
 
-struct fence { uint64_t serial; };
+struct fence { uint64_t serial; struct queue *q; };
+
+// timeline semaphore は、どの値をどのキューの何番目の submit が知らせるかを覚える（待ちが済んだら引き取りに使う）
+typedef struct { uint64_t value, serial; struct queue *q; } sigrec;
+struct sem { int timeline; sigrec *sig; size_t n, cap; };
 
 // ---- 範囲の並び ----
 static void rng_add(rng **a, size_t *n, size_t *cap, struct mem *m, uint64_t off, uint64_t len, uint64_t serial) {
@@ -297,7 +308,7 @@ static void rng_add(rng **a, size_t *n, size_t *cap, struct mem *m, uint64_t off
         *cap = *cap ? *cap * 2 : 16;
         *a = realloc(*a, *cap * sizeof **a);
     }
-    (*a)[(*n)++] = (rng) { m, off, len, serial };
+    (*a)[(*n)++] = (rng) { m, off, len, serial, NULL };
 }
 
 static int rng_cmp(const void *x, const void *y) {
@@ -375,13 +386,13 @@ static void read_back(struct mem *m, uint64_t off, uint64_t len) {
     ResetWriteWatch(m->shadow + p0, (SIZE_T) (p1 - p0));
 }
 
-// serial までの submit が終わった：GPU が書いた範囲を引き取る
-static void complete(struct dev *d, uint64_t upto) {
+// キュー q（NULL なら全部）の serial までの submit が終わった：GPU が書いた範囲を引き取る
+static void complete(struct dev *d, struct queue *q, uint64_t upto) {
     AcquireSRWLockExclusive(&d->lock);
     rng *take = NULL;
     size_t nt = 0, ct = 0, k = 0;
     for (size_t i = 0; i < d->npend; i++) {
-        if (d->pend[i].serial <= upto) rng_add(&take, &nt, &ct, d->pend[i].m, d->pend[i].off, d->pend[i].len, d->pend[i].serial);
+        if (d->pend[i].serial <= upto && (!q || d->pend[i].q == q)) rng_add(&take, &nt, &ct, d->pend[i].m, d->pend[i].off, d->pend[i].len, d->pend[i].serial);
         else d->pend[k++] = d->pend[i];
     }
     d->npend = k;
@@ -460,6 +471,7 @@ static const stinfo FEAT_ST[] = {
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_MEMORY_MODEL_FEATURES, sizeof(VkPhysicalDeviceVulkanMemoryModelFeatures) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_INT64_FEATURES, sizeof(VkPhysicalDeviceShaderAtomicInt64Features) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, sizeof(VkPhysicalDeviceShaderDrawParametersFeatures) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES, sizeof(VkPhysicalDeviceTimelineSemaphoreFeatures) },
 };
 
 static const stinfo PROP_ST[] = {
@@ -472,6 +484,7 @@ static const stinfo PROP_ST[] = {
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES, sizeof(VkPhysicalDeviceFloatControlsProperties) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_PROPERTIES, sizeof(VkPhysicalDeviceShaderIntegerDotProductProperties) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES, sizeof(VkPhysicalDeviceIDProperties) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_PROPERTIES, sizeof(VkPhysicalDeviceTimelineSemaphoreProperties) },
 };
 
 static uint32_t st_size(const stinfo *t, size_t n, VkStructureType st) {
@@ -504,6 +517,7 @@ static void mask_ext_features(VkBaseOutStructure *s) {
         f->vulkanMemoryModelDeviceScope = k.vulkanMemoryModelDeviceScope;
         f->vulkanMemoryModelAvailabilityVisibilityChains = k.vulkanMemoryModelAvailabilityVisibilityChains;
         f->subgroupBroadcastDynamicId = k.subgroupBroadcastDynamicId;
+        f->timelineSemaphore = k.timelineSemaphore;
     }
 }
 
@@ -903,7 +917,6 @@ DESTROY_SIMPLE(destroy_shader, VkShaderModule, VR_DESTROY_SHADER_MODULE)
 DESTROY_SIMPLE(destroy_dsl, VkDescriptorSetLayout, VR_DESTROY_DSL)
 DESTROY_SIMPLE(destroy_playout, VkPipelineLayout, VR_DESTROY_PIPELINE_LAYOUT)
 DESTROY_SIMPLE(destroy_pipeline, VkPipeline, VR_DESTROY_PIPELINE)
-DESTROY_SIMPLE(destroy_semaphore, VkSemaphore, VR_DESTROY_SEMAPHORE)
 
 static VkResult VKAPI_CALL create_dsl(VkDevice dv, const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorSetLayout *out) {
     (void) a;
@@ -1418,14 +1431,22 @@ static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *f
     vr_u64(&b, timeout);
     VkResult r = rpc_call(VR_WAIT_FOR_FENCES, &b, NULL);
     free(b.p);
-    if (r == VK_SUCCESS && n) {
-        // 1 本のキューでは、後に出した submit ほど後に終わる
-        uint64_t upto = ((struct fence *) fs[0])->serial;
-        for (uint32_t i = 1; i < n; i++) {
-            uint64_t s = ((struct fence *) fs[i])->serial;
-            if (all ? s > upto : s < upto) upto = s;
+    if (r == VK_SUCCESS) {
+        // fence が知らせたら、そのキューでそれより前に出した submit も終わっている
+        for (uint32_t i = 0; i < n; i++) {
+            struct fence *f = (struct fence *) fs[i];
+            if (!f->q) continue;
+            if (all) complete((struct dev *) dv, f->q, f->serial);
+            else if (n == 1) complete((struct dev *) dv, f->q, f->serial);
+            else {
+                // どれが知らせたか分からないので 1 つずつ尋ねる
+                vr_buf q = { 0 };
+                vr_u64(&q, ID(dv));
+                vr_u64(&q, ID(f));
+                if (rpc_call(VR_GET_FENCE_STATUS, &q, NULL) == VK_SUCCESS) complete((struct dev *) dv, f->q, f->serial);
+                free(q.p);
+            }
         }
-        complete((struct dev *) dv, upto);
     }
     return r;
 }
@@ -1436,19 +1457,110 @@ static VkResult VKAPI_CALL fence_status(VkDevice dv, VkFence f) {
     vr_u64(&b, ID(f));
     VkResult r = rpc_call(VR_GET_FENCE_STATUS, &b, NULL);
     free(b.p);
-    if (r == VK_SUCCESS) complete((struct dev *) dv, ((struct fence *) f)->serial);
+    if (r == VK_SUCCESS && ((struct fence *) f)->q) complete((struct dev *) dv, ((struct fence *) f)->q, ((struct fence *) f)->serial);
     return r;
 }
 
 static VkResult VKAPI_CALL create_semaphore(VkDevice dv, const VkSemaphoreCreateInfo *ci, const VkAllocationCallbacks *a, VkSemaphore *out) {
-    (void) ci; (void) a;
-    uint64_t id = new_id();
+    (void) a;
+    struct sem *sm = calloc(1, sizeof *sm);
+    if (!sm) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    uint32_t type = VK_SEMAPHORE_TYPE_BINARY;
+    uint64_t initial = 0;
+    for (const VkBaseInStructure *s = ci->pNext; s; s = s->pNext)
+        if (s->sType == VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO) {
+            type = ((const VkSemaphoreTypeCreateInfo *) s)->semaphoreType;
+            initial = ((const VkSemaphoreTypeCreateInfo *) s)->initialValue;
+        }
+    sm->timeline = type == VK_SEMAPHORE_TYPE_TIMELINE;
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
-    vr_u64(&b, id);
+    vr_u64(&b, ID(sm));
+    vr_u32(&b, type);
+    vr_u64(&b, initial);
     rpc_send(VR_CREATE_SEMAPHORE, &b);
     free(b.p);
-    *out = (VkSemaphore) (uintptr_t) id;
+    *out = (VkSemaphore) sm;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL destroy_semaphore(VkDevice dv, VkSemaphore h, const VkAllocationCallbacks *a) {
+    (void) a;
+    if (!h) return;
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, ID(h));
+    rpc_send(VR_DESTROY_SEMAPHORE, &b);
+    free(b.p);
+    struct sem *sm = (struct sem *) h;
+    free(sm->sig);
+    free(sm);
+}
+
+// semaphore が値 v に届いた：その値までを知らせる submit は終わっている
+static void sem_reached(struct dev *d, struct sem *sm, uint64_t v) {
+    if (!sm || !sm->timeline) return;
+    struct { struct queue *q; uint64_t serial; } done[16];
+    int nd = 0;
+    AcquireSRWLockExclusive(&d->lock);
+    size_t k = 0;
+    for (size_t i = 0; i < sm->n; i++) {
+        if (sm->sig[i].value <= v) {
+            int j = 0;
+            while (j < nd && done[j].q != sm->sig[i].q) j++;
+            if (j == nd && nd < 16) { done[nd].q = sm->sig[i].q; done[nd].serial = 0; nd++; }
+            if (j < nd && sm->sig[i].serial > done[j].serial) done[j].serial = sm->sig[i].serial;
+        } else {
+            sm->sig[k++] = sm->sig[i];
+        }
+    }
+    sm->n = k;
+    ReleaseSRWLockExclusive(&d->lock);
+    for (int j = 0; j < nd; j++) complete(d, done[j].q, done[j].serial);
+}
+
+static VkResult VKAPI_CALL get_sem_counter(VkDevice dv, VkSemaphore h, uint64_t *v) {
+    vr_buf b = { 0 }, out = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, ID(h));
+    VkResult r = rpc_call(VR_GET_SEMAPHORE_COUNTER, &b, &out);
+    *v = 0;
+    if (out.n >= 8) memcpy(v, out.p, 8);
+    free(b.p);
+    free(out.p);
+    if (r == VK_SUCCESS) sem_reached((struct dev *) dv, (struct sem *) h, *v);
+    return r;
+}
+
+static VkResult VKAPI_CALL wait_sems(VkDevice dv, const VkSemaphoreWaitInfo *wi, uint64_t timeout) {
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u32(&b, wi->flags);
+    vr_u32(&b, wi->semaphoreCount);
+    for (uint32_t i = 0; i < wi->semaphoreCount; i++) { vr_u64(&b, ID(wi->pSemaphores[i])); vr_u64(&b, wi->pValues[i]); }
+    vr_u64(&b, timeout);
+    VkResult r = rpc_call(VR_WAIT_SEMAPHORES, &b, NULL);
+    free(b.p);
+    if (r != VK_SUCCESS) return r;
+    if (wi->flags & VK_SEMAPHORE_WAIT_ANY_BIT) {
+        // どれが届いたか分からないので、いまの値を尋ねる
+        for (uint32_t i = 0; i < wi->semaphoreCount; i++) {
+            uint64_t v;
+            get_sem_counter(dv, wi->pSemaphores[i], &v);
+        }
+    } else {
+        for (uint32_t i = 0; i < wi->semaphoreCount; i++) sem_reached((struct dev *) dv, (struct sem *) wi->pSemaphores[i], wi->pValues[i]);
+    }
+    return r;
+}
+
+static VkResult VKAPI_CALL signal_sem(VkDevice dv, const VkSemaphoreSignalInfo *si) {
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, ID(si->semaphore));
+    vr_u64(&b, si->value);
+    rpc_send(VR_SIGNAL_SEMAPHORE, &b);
+    free(b.p);
     return VK_SUCCESS;
 }
 
@@ -1466,12 +1578,22 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
         vr_u64(&b, ID(q));
         vr_u32(&b, k);
         for (uint32_t i = at; i < at + k; i++) {
+            const VkTimelineSemaphoreSubmitInfo *tl = NULL;
+            for (const VkBaseInStructure *s = si[i].pNext; s; s = s->pNext)
+                if (s->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) tl = (const VkTimelineSemaphoreSubmitInfo *) s;
             vr_u32(&b, si[i].waitSemaphoreCount);
-            for (uint32_t j = 0; j < si[i].waitSemaphoreCount; j++) { vr_u64(&b, ID(si[i].pWaitSemaphores[j])); vr_u32(&b, si[i].pWaitDstStageMask[j]); }
+            for (uint32_t j = 0; j < si[i].waitSemaphoreCount; j++) {
+                vr_u64(&b, ID(si[i].pWaitSemaphores[j]));
+                vr_u32(&b, si[i].pWaitDstStageMask[j]);
+                vr_u64(&b, tl && j < tl->waitSemaphoreValueCount ? tl->pWaitSemaphoreValues[j] : 0);
+            }
             vr_u32(&b, si[i].commandBufferCount);
             for (uint32_t j = 0; j < si[i].commandBufferCount; j++) vr_u64(&b, ID(si[i].pCommandBuffers[j]));
             vr_u32(&b, si[i].signalSemaphoreCount);
-            for (uint32_t j = 0; j < si[i].signalSemaphoreCount; j++) vr_u64(&b, ID(si[i].pSignalSemaphores[j]));
+            for (uint32_t j = 0; j < si[i].signalSemaphoreCount; j++) {
+                vr_u64(&b, ID(si[i].pSignalSemaphores[j]));
+                vr_u64(&b, tl && j < tl->signalSemaphoreValueCount ? tl->pSignalSemaphoreValues[j] : 0);
+            }
         }
         vr_u64(&b, at + 8 >= n ? ID(f) : 0);
         rpc_send(VR_QUEUE_SUBMIT, &b);
@@ -1481,13 +1603,27 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
     rpc_flush();
     AcquireSRWLockExclusive(&d->lock);
     uint64_t serial = ++d->serial;
-    for (uint32_t i = 0; i < n; i++)
+    for (uint32_t i = 0; i < n; i++) {
         for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
             struct cb *c = (struct cb *) si[i].pCommandBuffers[j];
-            for (size_t k = 0; k < c->nr; k++) rng_add(&d->pend, &d->npend, &d->cappend, c->r[k].m, c->r[k].off, c->r[k].len, serial);
+            for (size_t k = 0; k < c->nr; k++) {
+                size_t before = d->npend;
+                rng_add(&d->pend, &d->npend, &d->cappend, c->r[k].m, c->r[k].off, c->r[k].len, serial);
+                if (d->npend > before) d->pend[before].q = q;
+            }
         }
+        const VkTimelineSemaphoreSubmitInfo *tl = NULL;
+        for (const VkBaseInStructure *s = si[i].pNext; s; s = s->pNext)
+            if (s->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) tl = (const VkTimelineSemaphoreSubmitInfo *) s;
+        for (uint32_t j = 0; tl && j < si[i].signalSemaphoreCount && j < tl->signalSemaphoreValueCount; j++) {
+            struct sem *sm = (struct sem *) si[i].pSignalSemaphores[j];
+            if (!sm->timeline) continue;
+            if (sm->n == sm->cap) { sm->cap = sm->cap ? sm->cap * 2 : 8; sm->sig = realloc(sm->sig, sm->cap * sizeof *sm->sig); }
+            sm->sig[sm->n++] = (sigrec) { tl->pSignalSemaphoreValues[j], serial, q };
+        }
+    }
     ReleaseSRWLockExclusive(&d->lock);
-    if (f) ((struct fence *) f)->serial = serial;
+    if (f) { ((struct fence *) f)->serial = serial; ((struct fence *) f)->q = q; }
     return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
@@ -1497,7 +1633,7 @@ static VkResult VKAPI_CALL queue_wait_idle(VkQueue qh) {
     vr_u64(&b, ID(q));
     VkResult r = rpc_call(VR_QUEUE_WAIT_IDLE, &b, NULL);
     free(b.p);
-    if (r == VK_SUCCESS) complete(q->d, q->d->serial);
+    if (r == VK_SUCCESS) complete(q->d, q, q->d->serial);
     return r;
 }
 
@@ -1507,7 +1643,7 @@ static VkResult VKAPI_CALL device_wait_idle(VkDevice dv) {
     vr_u64(&b, ID(d));
     VkResult r = rpc_call(VR_DEVICE_WAIT_IDLE, &b, NULL);
     free(b.p);
-    if (r == VK_SUCCESS) complete(d, d->serial);
+    if (r == VK_SUCCESS) complete(d, NULL, d->serial);
     return r;
 }
 
@@ -1540,8 +1676,7 @@ static const char *const NOT_YET[] = {
     "vkCreateDescriptorUpdateTemplate", "vkDestroyDescriptorUpdateTemplate", "vkUpdateDescriptorSetWithTemplate",
     // 1.2
     "vkCmdDrawIndirectCount", "vkCmdDrawIndexedIndirectCount", "vkCreateRenderPass2", "vkCmdBeginRenderPass2",
-    "vkCmdNextSubpass2", "vkCmdEndRenderPass2", "vkResetQueryPool", "vkGetSemaphoreCounterValue", "vkWaitSemaphores",
-    "vkSignalSemaphore", "vkGetBufferDeviceAddress", "vkGetBufferOpaqueCaptureAddress", "vkGetDeviceMemoryOpaqueCaptureAddress",
+    "vkCmdNextSubpass2", "vkCmdEndRenderPass2", "vkResetQueryPool", "vkGetBufferDeviceAddress", "vkGetBufferOpaqueCaptureAddress", "vkGetDeviceMemoryOpaqueCaptureAddress",
 };
 
 // ---- 入口の表 ----
@@ -1619,6 +1754,12 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkGetFenceStatus", fence_status);
     F("vkCreateSemaphore", create_semaphore);
     F("vkDestroySemaphore", destroy_semaphore);
+    F("vkGetSemaphoreCounterValue", get_sem_counter);
+    F("vkGetSemaphoreCounterValueKHR", get_sem_counter);
+    F("vkWaitSemaphores", wait_sems);
+    F("vkWaitSemaphoresKHR", wait_sems);
+    F("vkSignalSemaphore", signal_sem);
+    F("vkSignalSemaphoreKHR", signal_sem);
     for (size_t i = 0; i < sizeof NOT_YET / sizeof *NOT_YET; i++) F(NOT_YET[i], not_yet);
     return NULL;
 }

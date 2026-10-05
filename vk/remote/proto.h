@@ -2,7 +2,7 @@
 #pragma once
 #include <stdint.h>
 
-#define VR_PROTO_VERSION 1
+#define VR_PROTO_VERSION 2
 #define VR_DEFAULT_PORT 50060
 
 // 返事のある命令（往復が 1 回かかる）には [同期] と書く。ほかは送りっぱなし
@@ -47,12 +47,15 @@ enum vr_op {
     VR_RESET_FENCES,
     VR_WAIT_FOR_FENCES,       // [同期]
     VR_GET_FENCE_STATUS,      // [同期]
-    VR_CREATE_SEMAPHORE,
+    VR_CREATE_SEMAPHORE,      // device・id・種類（binary か timeline）・はじめの値
     VR_DESTROY_SEMAPHORE,
-    VR_QUEUE_SUBMIT,
+    VR_QUEUE_SUBMIT,          // 待つ（semaphore・stage・値）・command buffer・知らせる（semaphore・値）・fence
     VR_QUEUE_WAIT_IDLE,       // [同期]
     VR_DEVICE_WAIT_IDLE,      // [同期]
     VR_PING,                  // [同期] 往復の時間を測る
+    VR_WAIT_SEMAPHORES,       // [同期] device・flags・(semaphore・値)の並び・待つ時間
+    VR_GET_SEMAPHORE_COUNTER, // [同期] device・semaphore → いまの値
+    VR_SIGNAL_SEMAPHORE,      // device・semaphore・値
     VR_OP_COUNT
 };
 
