@@ -1,6 +1,11 @@
 name: build-ios
 on:
   push:
+    paths:
+      - Sources/**
+      - project.yml
+      - patches/ios_memory.py
+      - .github/workflows/ios.yml
   workflow_dispatch:
 jobs:
   build:

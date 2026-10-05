@@ -1,0 +1,35 @@
+name: build-whisper-win
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - patches/whisper_rpc.py
+      - .github/workflows/whisper-win.yml
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # iPhone のアプリと同じ RPC の取り決め（7.0.0・命令 101 個）の版
+      - name: whisper.cpp
+        shell: bash
+        run: |
+          git clone https://github.com/ggml-org/whisper.cpp.git whisper.cpp
+          git -C whisper.cpp checkout 60c0be6ac8fa71b1a2ae2dd938a31a34a508e774
+          grep -E "RPC_PROTO_(MAJOR|MINOR|PATCH)_VERSION|GGML_OP_COUNT" whisper.cpp/ggml/include/ggml-rpc.h
+
+      - name: patch (WHISPER_RPC で計算の受け手を GPU として足す)
+        run: python patches/whisper_rpc.py whisper.cpp
+
+      - name: build whisper-cli (CPU + RPC)
+        run: |
+          cmake -S whisper.cpp -B build -T ClangCL -DBUILD_SHARED_LIBS=OFF -DGGML_RPC=ON -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF -DWHISPER_SDL2=OFF
+          cmake --build build --config Release -j 4 --target whisper-cli
+          dir build\bin\Release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-win
+          path: build/bin/Release/
