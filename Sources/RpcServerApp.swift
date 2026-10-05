@@ -62,9 +62,7 @@ struct ContentView: View {
                     }
                     TextField("番号", text: $port).keyboardType(.numberPad)
                     Toggle("GPU（Metal）で計算する", isOn: $useGPU)
-                } header: { Text("待ち受け") } footer: {
-                    Text("鍵のない仕組みなので、Tailscale の住所（100. で始まる）で待ち受けるのが安全。家の Wi-Fi の住所にすると、同じ Wi-Fi の誰からでも届く。")
-                }
+                } header: { Text("待ち受け") }
                 Section {
                     Button(running ? "動いている（止めるときはアプリを閉じる）" : "受け手を始める") { start() }
                         .disabled(running || host.isEmpty)

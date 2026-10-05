@@ -13,6 +13,9 @@ jobs:
       - name: llama.cpp b11412
         run: git clone --depth 1 --branch b11412 https://github.com/ggml-org/llama.cpp.git llama.cpp
 
+      - name: patch (iOS のメモリの上限に合わせて空きを答える)
+        run: python3 patches/ios_memory.py llama.cpp
+
       - name: build ggml for iOS (Metal + RPC)
         run: |
           cmake -S llama.cpp -B build-ios -G Xcode \
@@ -41,6 +44,9 @@ jobs:
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath dd \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build | tail -60
           mkdir -p Payload && cp -R dd/Build/Products/Release-iphoneos/RpcServer.app Payload/
+          # メモリの上限を上げる許可を付けて仮の署名をしておく（Sideloadly が署名し直すときに引き継ぐ）
+          codesign -f -s - --entitlements Sources/RpcServer.entitlements Payload/RpcServer.app
+          codesign -d --entitlements - Payload/RpcServer.app
           zip -qry RpcServer.ipa Payload
           ls -la RpcServer.ipa
 
