@@ -1,0 +1,7 @@
+llama.cpp/
+build-ios/
+libs/
+dd/
+Payload/
+*.ipa
+*.xcodeproj/

@@ -1,0 +1,38 @@
+name: RpcServer
+options:
+  bundleIdPrefix: com.tsurutanmen
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  RpcServer:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: 計算の受け手
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        NSLocalNetworkUsageDescription: PC からの計算の依頼を受け取るために使います
+        UIRequiredDeviceCapabilities: [metal]
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tsurutanmen.iphonerpc
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridging-Header.h
+        HEADER_SEARCH_PATHS: $(PROJECT_DIR)/llama.cpp/ggml/include
+        LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/libs
+        OTHER_LDFLAGS: "-lggml -lggml-base -lggml-cpu -lggml-metal -lggml-rpc -lc++"
+        CLANG_CXX_LANGUAGE_STANDARD: c++17
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: Accelerate.framework
+      - sdk: Foundation.framework

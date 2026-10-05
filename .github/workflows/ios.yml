@@ -1,0 +1,50 @@
+name: build-ios
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # Windows 側の llama.cpp と同じ版にそろえる（RPC の取り決めの版が合わないとつながらない）
+      - name: llama.cpp b11412
+        run: git clone --depth 1 --branch b11412 https://github.com/ggml-org/llama.cpp.git llama.cpp
+
+      - name: build ggml for iOS (Metal + RPC)
+        run: |
+          cmake -S llama.cpp -B build-ios -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=17.0 -DGGML_METAL_TARGET_OS=ios \
+            -DCMAKE_XCODE_ATTRIBUTE_SUPPORTED_PLATFORMS=iphoneos \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED=NO \
+            -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY="" \
+            -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DGGML_RPC=ON -DGGML_RPC_RDMA=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_BLAS=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_MTMD=OFF \
+            -DLLAMA_OPENSSL=OFF -DMTMD_VIDEO=OFF
+          cmake --build build-ios --config Release --target ggml ggml-rpc -- -quiet
+          mkdir -p libs
+          find build-ios -name "*.a" -path "*Release-iphoneos*" -exec cp {} libs/ \;
+          ls -la libs
+
+      - name: generate Xcode project
+        run: brew install xcodegen && xcodegen generate
+
+      - name: build app (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild -project RpcServer.xcodeproj -scheme RpcServer -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build | tail -60
+          mkdir -p Payload && cp -R dd/Build/Products/Release-iphoneos/RpcServer.app Payload/
+          zip -qry RpcServer.ipa Payload
+          ls -la RpcServer.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RpcServer-ipa
+          path: RpcServer.ipa
