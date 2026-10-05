@@ -74,7 +74,7 @@ jobs:
         run: |
           cmake -S sd -B build -G Ninja -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS='/bigobj /EHsc' -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DSD_RPC=ON
           cmake --build build
-          dir buildin
+          dir build\bin
       - uses: actions/upload-artifact@v4
         with:
           name: sd-win
