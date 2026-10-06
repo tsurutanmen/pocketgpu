@@ -68,7 +68,8 @@ jobs:
           set -o pipefail
           cd pumpkin
           # 直した nix は手元の部品として扱われ、nix 自身の厳しい lint（使われない物は失敗）がかかる。警告に落とす
-          RUSTFLAGS="--cap-lints warn" cargo build -p pumpkin-ios --release --target aarch64-apple-ios 2>&1 | grep -E "^error|^\s+-->|Finished" | head -60
+          # アプリと同じ iOS 17 から動くように組む（指定しないと、C とアセンブラの部品が Xcode の最新の iOS 向けになる）
+          IPHONEOS_DEPLOYMENT_TARGET=17.0 RUSTFLAGS="--cap-lints warn" cargo build -p pumpkin-ios --release --target aarch64-apple-ios 2>&1 | grep -E "^error|^\s+-->|Finished" | head -60
           ls -la target/aarch64-apple-ios/release/
       - name: collect
         run: |

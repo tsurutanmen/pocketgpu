@@ -130,6 +130,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_DESTROY_QUERY_POOL] = "DESTROY_QUERY_POOL", [VR_GET_QUERY_POOL_RESULTS] = "GET_QUERY_POOL_RESULTS",
     [VR_RESET_QUERY_POOL] = "RESET_QUERY_POOL", [VR_CREATE_BUFFER_VIEW] = "CREATE_BUFFER_VIEW",
     [VR_DESTROY_BUFFER_VIEW] = "DESTROY_BUFFER_VIEW", [VR_GET_IMAGE_SUBRESOURCE_LAYOUT] = "GET_IMAGE_SUBRESOURCE_LAYOUT",
+    [VR_READ_JPEG_PIPE] = "READ_JPEG_PIPE",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -2038,8 +2039,11 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
         if ((r = create_buffer(dv, &bc, NULL, &sc->rb[i])) != VK_SUCCESS) break;
         VkMemoryRequirements req;
         buffer_reqs(dv, sc->rb[i], &req);
-        VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
-            .memoryTypeIndex = pick_mem(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
+        // 受け手の CPU が毎コマ読むので、キャッシュの効くメモリを先に探す（効かないと 640 x 480 を写すだけで 8 ms かかった）
+        const VkMemoryPropertyFlags vis = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        uint32_t mt = pick_mem(req.memoryTypeBits, vis | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if ((g_hw.mem.memoryTypes[mt].propertyFlags & vis) != vis) mt = pick_mem(req.memoryTypeBits, vis);
+        VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = mt };
         if ((r = alloc_memory(dv, &mai, NULL, &sc->rbmem[i])) != VK_SUCCESS) break;
         // 受け手が JPEG に縮められるなら、引き取らずに JPEG で受け取る（IPHONE_VK_JPEG=0 で止める）。無理なら違いだけ受け取る
         if (sc->use_jpeg) ((struct mem *) sc->rbmem[i])->jpeg = 1;
@@ -2115,8 +2119,10 @@ static int jpeg_fetch(struct swapchain *sc, uint32_t j) {
         CoInitializeEx(NULL, COINIT_MULTITHREADED);
         if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **) &fac))) return 0;
     }
-    static int q = -1;
+    static int q = -1, pipe = -1;
     if (q < 0) { const char *e = getenv("IPHONE_VK_JPEG_Q"); q = e && atoi(e) > 0 ? atoi(e) : 80; }
+    // 先送り：受け手は今のコマを後ろで縮め、ひとつ前のコマの JPEG を返す（窓に出るのは 1 コマ遅れる）
+    if (pipe < 0) { const char *e = getenv("IPHONE_VK_JPEG_PIPE"); pipe = (g_hw.caps & VR_CAP_JPEG_PIPE) && !(e && *e == '0'); }
     vr_buf b = { 0 }, out = { 0 };
     vr_u64(&b, ID(sc->rbmem[j]));
     vr_u64(&b, 0);
@@ -2125,19 +2131,24 @@ static int jpeg_fetch(struct swapchain *sc, uint32_t j) {
     vr_u32(&b, sc->w * 4);
     vr_u32(&b, sc->fmt == VK_FORMAT_B8G8R8A8_UNORM || sc->fmt == VK_FORMAT_B8G8R8A8_SRGB ? 1 : 0);
     vr_u32(&b, (uint32_t) q);
-    VkResult r = rpc_call(VR_READ_JPEG, &b, &out);
+    VkResult r = rpc_call(pipe ? VR_READ_JPEG_PIPE : VR_READ_JPEG, &b, &out);
     free(b.p);
     int ok = 0;
+    UINT jw = 0, jh = 0;
     IWICStream *st = NULL;
     IWICBitmapDecoder *dec = NULL;
     IWICBitmapFrameDecode *fr = NULL;
     IWICFormatConverter *cv = NULL;
+    if (r == VK_SUCCESS && !out.n && pipe) { ok = -1; goto done; } // 先送りの最初のコマ：まだ出す物が無い
     if (r != VK_SUCCESS || !out.n) goto done;
     sc->jpeg_bytes += out.n;
     if (FAILED(IWICImagingFactory_CreateStream(fac, &st))) goto done;
     if (FAILED(IWICStream_InitializeFromMemory(st, out.p, (DWORD) out.n))) goto done;
     if (FAILED(IWICImagingFactory_CreateDecoderFromStream(fac, (IStream *) st, NULL, WICDecodeMetadataCacheOnDemand, &dec))) goto done;
     if (FAILED(IWICBitmapDecoder_GetFrame(dec, 0, &fr))) goto done;
+    // 先送りでは、窓の大きさが変わる前のコマが届くことがある。大きさが違えば出さない
+    if (FAILED(IWICBitmapFrameDecode_GetSize(fr, &jw, &jh))) goto done;
+    if (jw != sc->w || jh != sc->h) { ok = -1; goto done; }
     if (FAILED(IWICImagingFactory_CreateFormatConverter(fac, &cv))) goto done;
     if (FAILED(IWICFormatConverter_Initialize(cv, (IWICBitmapSource *) fr, &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom))) goto done;
     if (FAILED(IWICFormatConverter_CopyPixels(cv, NULL, sc->w * 4, sc->w * 4 * sc->h, sc->px[j]))) goto done;
@@ -2155,7 +2166,12 @@ static VkResult blit(struct swapchain *sc, uint32_t j) {
     if (!sc->hwnd) return VK_SUCCESS;
     uint8_t *px = sc->px[j];
     // JPEG で受け取ったときは、もう B・G・R・A の並びになっている
-    int is_bgra = sc->use_jpeg && jpeg_fetch(sc, j);
+    int is_bgra = 0;
+    if (sc->use_jpeg) {
+        int k = jpeg_fetch(sc, j);
+        if (k < 0) return VK_SUCCESS; // 出す物がまだ無い
+        is_bgra = k;
+    }
     BITMAPINFO bmi = { 0 };
     bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
     bmi.bmiHeader.biWidth = (LONG) sc->w;
@@ -3391,7 +3407,8 @@ static VkResult VKAPI_CALL reset_fences(VkDevice dv, uint32_t n, const VkFence *
 static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *fs, VkBool32 all, uint64_t timeout) {
     // どれも submit に付けた fence で、終わるまで待つ呼び方なら、往復しない。
     // 持ち帰る物があれば引き取る（その MEM_READ の前に受け手が仕事の終わりを待つ）
-    int known = timeout == UINT64_MAX;
+    // DXVK は「1 秒の期限で待つ」を繰り返す。0.1 秒以上の期限は、期限なしと同じに扱う
+    int known = timeout >= 100000000ull;
     for (uint32_t i = 0; i < n && known; i++) known = ((struct fence *) fs[i])->q != NULL;
     if (known) {
         for (uint32_t i = 0; i < n; i++) complete((struct dev *) dv, ((struct fence *) fs[i])->q, ((struct fence *) fs[i])->serial);

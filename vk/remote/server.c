@@ -26,6 +26,7 @@
 #include <stddef.h>
 #include <time.h>
 #ifndef _WIN32
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
@@ -278,7 +279,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     g_fmt3 = (v13 || has_ext(ep, ne, "VK_KHR_format_feature_flags2")) && vkGetPhysicalDeviceFormatProperties2;
     caps |= VR_CAP_D3D; // buffer view と画像の並び方は 1.0 の入口なので、どの GPU でも使える
 #if defined(__APPLE__) || defined(_WIN32)
-    caps |= VR_CAP_JPEG; // 窓に出すコマを JPEG に縮められる（iPhone は ImageIO、PC の代役は WIC）
+    caps |= VR_CAP_JPEG | VR_CAP_JPEG_PIPE; // 窓に出すコマを JPEG に縮められる（iPhone は ImageIO、PC の代役は WIC）
 #endif
     // 調べ用：VKR_CAPS=数 で名乗る印を絞る（古い受け手のふりをする）
     const char *mask = getenv("VKR_CAPS");
@@ -562,8 +563,10 @@ static int chain_ready(void) {
 }
 
 // ---- 1 つの接続の間に作った物を、切れたときに片づける ----
+static void jp_reset(void);
 static void cleanup(void) {
     drain();
+    jp_reset();
     for (size_t i = 0; i < g_ncbi; i++) { free(g_cbi[i].sets); idlist_free(&g_cbi[i].mems); }
     g_ncbi = 0;
     if (g_err == VK_ERROR_DEVICE_LOST) g_lost = 1;
@@ -1237,6 +1240,87 @@ done:
 }
 #endif
 
+// ---- 先送りの JPEG（VR_READ_JPEG_PIPE） ----
+// 今のコマを写して別の糸で縮め始め、返事にはひとつ前のコマの JPEG を入れる。
+// 縮めている間に、受け手は次のコマの仕事を進められる（窓に出るのは 1 コマ遅れる）
+#if defined(__APPLE__) || defined(_WIN32)
+static struct {
+    uint8_t *px;
+    size_t cap;
+    uint32_t w, h, stride;
+    int bgra, q, ok, busy;
+    double ms;
+    vr_buf out;
+#ifdef _WIN32
+    HANDLE thr;
+#else
+    pthread_t thr;
+#endif
+} g_jp;
+
+static void jp_encode(void) {
+    double t0 = t_ms();
+    g_jp.out.n = 0;
+    g_jp.ok = jpeg_encode(g_jp.px, g_jp.w, g_jp.h, g_jp.stride, g_jp.bgra, g_jp.q, &g_jp.out);
+    g_jp.ms = t_ms() - t0;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI jp_thread(LPVOID a) {
+    (void) a;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    jp_encode();
+    return 0;
+}
+#else
+static void *jp_thread(void *a) {
+    (void) a;
+    jp_encode();
+    return NULL;
+}
+#endif
+
+// 縮めている途中なら、終わるまで待つ
+static void jp_join(void) {
+    if (!g_jp.busy) return;
+#ifdef _WIN32
+    WaitForSingleObject(g_jp.thr, INFINITE);
+    CloseHandle(g_jp.thr);
+#else
+    pthread_join(g_jp.thr, NULL);
+#endif
+    g_jp.busy = 0;
+}
+
+// 接続が切れたとき：縮めている途中なら待ち、次につないだ人に前の人のコマを見せない
+static void jp_reset(void) {
+    jp_join();
+    g_jp.ok = 0;
+}
+
+static int jp_start(const uint8_t *src) {
+    size_t need = (size_t) g_jp.stride * g_jp.h;
+    if (g_jp.cap < need) {
+        free(g_jp.px);
+        g_jp.px = malloc(need);
+        g_jp.cap = g_jp.px ? need : 0;
+        if (!g_jp.px) return 0;
+    }
+    memcpy(g_jp.px, src, need); // GPU のメモリから、まとめて写す
+    g_jp.ok = 0;
+#ifdef _WIN32
+    g_jp.thr = CreateThread(NULL, 0, jp_thread, NULL, 0, NULL);
+    g_jp.busy = g_jp.thr != NULL;
+#else
+    g_jp.busy = pthread_create(&g_jp.thr, NULL, jp_thread, NULL) == 0;
+#endif
+    if (!g_jp.busy) jp_encode(); // 糸を作れなければ、その場で縮める
+    return 1;
+}
+#else
+static void jp_reset(void) {}
+#endif
+
 // ---- 1 つの命令を実行する。返事が要るものは reply する ----
 static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     g_cur_op = op;
@@ -1275,7 +1359,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     // GPU を失っていたら、返事のある命令でそれを伝える（黙って間違った答えを返さない）
     if (g_err != VK_SUCCESS) {
         switch (op) {
-        case VR_MEM_READ: case VR_MEM_READ_DELTA: case VR_READ_JPEG: case VR_WAIT_FOR_FENCES: case VR_GET_FENCE_STATUS: case VR_WAIT_SEMAPHORES:
+        case VR_MEM_READ: case VR_MEM_READ_DELTA: case VR_READ_JPEG: case VR_READ_JPEG_PIPE: case VR_WAIT_FOR_FENCES: case VR_GET_FENCE_STATUS: case VR_WAIT_SEMAPHORES:
         case VR_GET_SEMAPHORE_COUNTER: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE: case VR_GET_QUERY_POOL_RESULTS:
             return reply(s, g_err);
         default:
@@ -1536,6 +1620,42 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (++jn % 100 == 0)
             vlog("JPEG：%llu コマ・GPU を待つ %.1f ms・縮める %.1f ms・平均 %.1f KB（1 コマあたり）", (unsigned long long) jn,
                  jt_wait / 100, jt_enc / 100, jbytes / 1024.0 / 100), jt_wait = jt_enc = 0, jbytes = 0;
+        return reply(s, 0);
+#else
+        (void) bgra; (void) q;
+        return reply(s, VK_ERROR_FEATURE_NOT_PRESENT);
+#endif
+    }
+    case VR_READ_JPEG_PIPE: {
+        static double jp_wait, jp_join_ms, jp_enc;
+        static uint64_t jpn, jpbytes;
+        double t0 = t_ms();
+        uint64_t mid = vr_ru64(r);
+        drain_upto(last_with_mem(mid));
+        jp_wait += t_ms() - t0;
+        if (g_err != VK_SUCCESS) return reply(s, g_err);
+        ent *e = find(mid);
+        uint64_t off = vr_ru64(r);
+        uint32_t w = vr_ru32(r), h = vr_ru32(r), stride = vr_ru32(r), bgra = vr_ru32(r), q = vr_ru32(r);
+        if (!e || !e->map || w == 0 || h == 0 || stride < w * 4 || off > e->size || (uint64_t) stride * h > e->size - off)
+            return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
+#if defined(__APPLE__) || defined(_WIN32)
+        // ひとつ前のコマの JPEG ができあがるのを待って、返事に入れる
+        double t1 = t_ms();
+        jp_join();
+        jp_join_ms += t_ms() - t1;
+        if (g_jp.ok) {
+            vr_put(&g_out, g_jp.out.p, g_jp.out.n);
+            jp_enc += g_jp.ms;
+            jpbytes += g_jp.out.n;
+        }
+        // 今のコマを写して、後ろで縮め始める
+        g_jp.w = w, g_jp.h = h, g_jp.stride = stride, g_jp.bgra = (int) bgra, g_jp.q = (int) (q ? q : 80);
+        if (!jp_start((const uint8_t *) e->map + off)) return reply(s, VK_ERROR_OUT_OF_HOST_MEMORY);
+        if (++jpn % 100 == 0)
+            vlog("JPEG（先送り）：%llu コマ・GPU を待つ %.1f ms・前のコマを待つ %.1f ms・縮める %.1f ms（後ろで）・平均 %.1f KB（1 コマあたり）",
+                 (unsigned long long) jpn, jp_wait / 100, jp_join_ms / 100, jp_enc / 100, jpbytes / 1024.0 / 100),
+                jp_wait = jp_join_ms = jp_enc = 0, jpbytes = 0;
         return reply(s, 0);
 #else
         (void) bgra; (void) q;
