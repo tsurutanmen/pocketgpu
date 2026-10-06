@@ -82,7 +82,8 @@ static int g_portability; // MoltenVK のときは portability_subset を有効�
     X(vkCmdSetLineWidth) X(vkCmdSetDepthBias) X(vkCmdSetBlendConstants) X(vkCmdSetDepthBounds) X(vkCmdSetStencilCompareMask) \
     X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdClearAttachments) X(vkCmdClearDepthStencilImage) \
     X(vkCmdResolveImage) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkGetQueryPoolResults) X(vkCmdResetQueryPool) \
-    X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp) X(vkCmdCopyQueryPoolResults) X(vkGetPhysicalDeviceFormatProperties2)
+    X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp) X(vkCmdCopyQueryPoolResults) X(vkGetPhysicalDeviceFormatProperties2) \
+    X(vkCreateBufferView) X(vkDestroyBufferView) X(vkGetImageSubresourceLayout)
 
 // 1.2・1.3 の入口。本体の名前か拡張の名前で読む。GPU が持っていなければ NULL のまま（そのときは caps で名乗らない）
 #define VKFUNCS_OPT(X) \
@@ -121,7 +122,7 @@ static ent *g_tab;
 static size_t g_cap, g_cnt;
 
 enum { K_DEVICE = 1, K_QUEUE, K_BUFFER, K_MEMORY, K_SHADER, K_DSL, K_PLAYOUT, K_PIPELINE, K_DPOOL, K_DSET, K_CPOOL, K_CB, K_FENCE, K_SEM,
-       K_IMAGE, K_VIEW, K_RPASS, K_FB, K_SAMPLER, K_QPOOL };
+       K_IMAGE, K_VIEW, K_RPASS, K_FB, K_SAMPLER, K_QPOOL, K_BVIEW };
 
 static size_t slot(uint64_t id) { return (size_t) ((id * 0x9E3779B97F4A7C15ull) >> 20) & (g_cap - 1); }
 
@@ -275,6 +276,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     const uint32_t need13 = VR_CAP_DYNAMIC_RENDERING | VR_CAP_SYNC2 | VR_CAP_RENDER_PASS2 | VR_CAP_EXT_DYNAMIC_STATE;
     if (v13 && (caps & need13) == need13) caps |= VR_CAP_VK13;
     g_fmt3 = (v13 || has_ext(ep, ne, "VK_KHR_format_feature_flags2")) && vkGetPhysicalDeviceFormatProperties2;
+    caps |= VR_CAP_D3D; // buffer view と画像の並び方は 1.0 の入口なので、どの GPU でも使える
 #if defined(__APPLE__) || defined(_WIN32)
     caps |= VR_CAP_JPEG; // 窓に出すコマを JPEG に縮められる（iPhone は ImageIO、PC の代役は WIC）
 #endif
@@ -580,7 +582,7 @@ static void cleanup(void) {
     if (dev) {
         vkDeviceWaitIdle(dev);
         static const int order[] = { K_PIPELINE, K_FB, K_RPASS, K_PLAYOUT, K_SHADER, K_DPOOL, K_DSL, K_SAMPLER, K_CPOOL, K_FENCE, K_SEM,
-                                     K_QPOOL, K_VIEW, K_IMAGE, K_BUFFER, K_MEMORY };
+                                     K_QPOOL, K_VIEW, K_BVIEW, K_IMAGE, K_BUFFER, K_MEMORY };
         for (size_t o = 0; o < sizeof order / sizeof *order; o++)
             for (size_t i = 0; i < g_cap; i++) {
                 ent *e = &g_tab[i];
@@ -602,6 +604,7 @@ static void cleanup(void) {
                 case K_IMAGE: vkDestroyImage(dev, (VkImage) e->h, NULL); break;
                 case K_SAMPLER: vkDestroySampler(dev, (VkSampler) e->h, NULL); break;
                 case K_QPOOL: vkDestroyQueryPool(dev, (VkQueryPool) e->h, NULL); break;
+                case K_BVIEW: vkDestroyBufferView(dev, (VkBufferView) e->h, NULL); break;
                 }
             }
         vkDestroyDevice(dev, NULL);
@@ -1261,7 +1264,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_DESTROY_PIPELINE_LAYOUT: case VR_DESTROY_SHADER_MODULE: case VR_DESTROY_DSL: case VR_DESTROY_FENCE:
     case VR_DESTROY_SEMAPHORE: case VR_DESTROY_DEVICE: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE:
     case VR_DESTROY_IMAGE: case VR_DESTROY_IMAGE_VIEW: case VR_DESTROY_RENDER_PASS: case VR_DESTROY_FRAMEBUFFER:
-    case VR_DESTROY_SAMPLER:
+    case VR_DESTROY_SAMPLER: case VR_DESTROY_BUFFER_VIEW:
     // query の結果は、出した仕事が全部終わってから読む（ドライバは fence を待たずに「終わった」と答えているので）
     case VR_DESTROY_QUERY_POOL: case VR_GET_QUERY_POOL_RESULTS: case VR_RESET_QUERY_POOL:
         drain();
@@ -1768,6 +1771,19 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             int image = w.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || w.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
                         w.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
                         w.descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+            if (w.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+                VkBufferView *tv = calloc(w.descriptorCount ? w.descriptorCount : 1, sizeof *tv);
+                for (uint32_t k = 0; k < w.descriptorCount; k++) {
+                    uint64_t vid = vr_ru64(r);
+                    tv[k] = OBJ(VkBufferView, vid);
+                    ent *ve = find(vid);
+                    if (se && ve && ve->aux) idlist_add(&se->list, ve->aux); // 見え方の aux はもとの buffer
+                }
+                w.pTexelBufferView = tv;
+                if (!r->bad) vkUpdateDescriptorSets(d, 1, &w, 0, NULL);
+                free(tv);
+                continue;
+            }
             if (image) {
                 VkDescriptorImageInfo *ii = calloc(w.descriptorCount ? w.descriptorCount : 1, sizeof *ii);
                 for (uint32_t k = 0; k < w.descriptorCount; k++) {
@@ -2598,6 +2614,47 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t first = vr_ru32(r), n = vr_ru32(r);
         if (qp && vkResetQueryPool) vkResetQueryPool(d, qp, first, n);
         return 1;
+    }
+    case VR_CREATE_BUFFER_VIEW: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r), bid = vr_ru64(r);
+        VkBufferViewCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = OBJ(VkBuffer, bid) };
+        ci.format = (VkFormat) vr_ru32(r);
+        ci.offset = vr_ru64(r);
+        ci.range = vr_ru64(r);
+        VkBufferView v;
+        VkResult res = r->bad ? VK_ERROR_INITIALIZATION_FAILED : vkCreateBufferView(d, &ci, NULL, &v);
+        if (res == VK_SUCCESS) {
+            put(id, (uint64_t) v, K_BVIEW);
+            ent *ve = find(id);
+            if (ve) ve->aux = bid; // descriptor に入ったとき、もとの buffer を使っていると分かるように
+        } else {
+            vlog("buffer view を作れない (%d)", res);
+        }
+        return 1;
+    }
+    case VR_DESTROY_BUFFER_VIEW: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r);
+        ent *e = find(id);
+        if (e) {
+            vkDestroyBufferView(d, (VkBufferView) e->h, NULL);
+            del(id);
+        }
+        return 1;
+    }
+    case VR_GET_IMAGE_SUBRESOURCE_LAYOUT: {
+        VkDevice d = DEV(vr_ru64(r));
+        VkImage im = OBJ(VkImage, vr_ru64(r));
+        VkImageSubresource sr;
+        sr.aspectMask = vr_ru32(r);
+        sr.mipLevel = vr_ru32(r);
+        sr.arrayLayer = vr_ru32(r);
+        VkSubresourceLayout l = { 0 };
+        if (!im || r->bad) return reply(s, VK_ERROR_INITIALIZATION_FAILED);
+        vkGetImageSubresourceLayout(d, im, &sr, &l);
+        vr_put(&g_out, &l, sizeof l);
+        return reply(s, 0);
     }
     }
     vlog("知らない命令 %u", op);

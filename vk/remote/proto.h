@@ -20,6 +20,7 @@
 #define VR_CAP_EXT_DYNAMIC_STATE 64u // VR_CMD_SET_DYNAMIC の extended dynamic state（1.3 で本体入り）の値と VR_CMD_BIND_VERTEX_BUFFERS2
 #define VR_CAP_QUERY 128u            // query pool（タイムスタンプ・occlusion）。VR_CREATE_QUERY_POOL など
 #define VR_CAP_JPEG 256u             // VR_READ_JPEG：窓に出すコマを受け手が JPEG に縮めて返す
+#define VR_CAP_D3D 512u              // DirectX（DXVK）の土台：VR_CREATE_BUFFER_VIEW・texel buffer の descriptor・VR_GET_IMAGE_SUBRESOURCE_LAYOUT
 #define VR_CAP_NEW_MASK (VR_CAP_VK13 | VR_CAP_DYNAMIC_RENDERING | VR_CAP_SYNC2 | VR_CAP_RENDER_PASS2 | VR_CAP_CMD10 | VR_CAP_EXT_DYNAMIC_STATE | VR_CAP_QUERY)
 // 1.3 の受け手は、VR_GET_FORMAT_PROPS の返事の後ろに VkFormatProperties3 の 3 つの値（u64）を付ける。古いドライバは読まない
 
@@ -96,6 +97,9 @@ enum vr_op {
     VR_GET_QUERY_POOL_RESULTS,   // [同期] device・pool・最初・数・大きさ・間隔・flags → 結果・中身。受け手は出した仕事を全部待ってから読む
     VR_RESET_QUERY_POOL,         // device・pool・最初・数（CPU からの reset）
     VR_READ_JPEG,                // [同期] memory・offset・幅・高さ・行の長さ・BGRA か・質（0〜100）→ JPEG のバイト（VR_CAP_JPEG）
+    VR_CREATE_BUFFER_VIEW,       // device・id・buffer・形式・offset・大きさ（VR_CAP_D3D）
+    VR_DESTROY_BUFFER_VIEW,
+    VR_GET_IMAGE_SUBRESOURCE_LAYOUT, // [同期] device・image・aspect・mip・layer → VkSubresourceLayout（VR_CAP_D3D）
     VR_OP_COUNT
 };
 

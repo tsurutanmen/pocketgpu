@@ -128,7 +128,8 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_READ_JPEG] = "READ_JPEG",
     [VR_CREATE_RENDER_PASS2] = "CREATE_RENDER_PASS2", [VR_CREATE_QUERY_POOL] = "CREATE_QUERY_POOL",
     [VR_DESTROY_QUERY_POOL] = "DESTROY_QUERY_POOL", [VR_GET_QUERY_POOL_RESULTS] = "GET_QUERY_POOL_RESULTS",
-    [VR_RESET_QUERY_POOL] = "RESET_QUERY_POOL",
+    [VR_RESET_QUERY_POOL] = "RESET_QUERY_POOL", [VR_CREATE_BUFFER_VIEW] = "CREATE_BUFFER_VIEW",
+    [VR_DESTROY_BUFFER_VIEW] = "DESTROY_BUFFER_VIEW", [VR_GET_IMAGE_SUBRESOURCE_LAYOUT] = "GET_IMAGE_SUBRESOURCE_LAYOUT",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -387,6 +388,9 @@ static const char *const ALLOWED_EXT[] = {
     "VK_KHR_vulkan_memory_model", "VK_KHR_shader_atomic_int64", "VK_KHR_dedicated_allocation",
     "VK_KHR_get_memory_requirements2", "VK_KHR_bind_memory2", "VK_KHR_maintenance1", "VK_KHR_maintenance3",
     "VK_KHR_relaxed_block_layout", "VK_KHR_shader_draw_parameters", "VK_KHR_timeline_semaphore",
+    // DXVK が使う物。中身はシェーダーと値だけなので、受け手の装置で有効にすれば通る
+    "VK_KHR_image_format_list", "VK_KHR_sampler_mirror_clamp_to_edge",
+    "VK_EXT_shader_stencil_export", "VK_EXT_shader_viewport_index_layer",
 };
 
 // 受け手が caps で名乗ったときだけ見せる拡張（受け手の装置でも有効にする）
@@ -411,7 +415,8 @@ static void mask_features(VkPhysicalDeviceFeatures *f) {
     // 中継していない機能は「無い」と答える
     f->sparseBinding = f->sparseResidencyBuffer = f->sparseResidencyImage2D = f->sparseResidencyImage3D = VK_FALSE;
     f->sparseResidency2Samples = f->sparseResidency4Samples = f->sparseResidency8Samples = f->sparseResidency16Samples = VK_FALSE;
-    f->sparseResidencyAliased = f->pipelineStatisticsQuery = f->inheritedQueries = f->occlusionQueryPrecise = VK_FALSE;
+    f->sparseResidencyAliased = f->pipelineStatisticsQuery = f->inheritedQueries = VK_FALSE;
+    if (!(g_hw.caps & VR_CAP_QUERY)) f->occlusionQueryPrecise = VK_FALSE;
 }
 
 static int hello(void) {
@@ -1467,6 +1472,54 @@ static VkResult VKAPI_CALL create_view(VkDevice dv, const VkImageViewCreateInfo 
 
 static void VKAPI_CALL destroy_view(VkDevice dv, VkImageView h, const VkAllocationCallbacks *a) { (void) a; if (h) send_destroy(VR_DESTROY_IMAGE_VIEW, dv, ID(h)); }
 
+// ---- buffer の見え方（texel buffer。DirectX の型付きの buffer はこれになる） ----
+// どの buffer のどこを見ているかを覚えておく（descriptor に入ったとき、GPU が書く範囲として使う）
+struct bview { struct buf *b; uint64_t off, range; };
+static int need_cap(uint32_t cap, const char *what);
+
+static VkResult VKAPI_CALL create_bview(VkDevice dv, const VkBufferViewCreateInfo *ci, const VkAllocationCallbacks *a, VkBufferView *out) {
+    (void) a;
+    if (!need_cap(VR_CAP_D3D, "vkCreateBufferView")) return VK_ERROR_FEATURE_NOT_PRESENT;
+    struct bview *v = calloc(1, sizeof *v);
+    if (!v) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    v->b = (struct buf *) ci->buffer;
+    v->off = ci->offset;
+    v->range = ci->range == VK_WHOLE_SIZE && v->b ? v->b->size - ci->offset : ci->range;
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, ID(v));
+    vr_u64(&b, ID(ci->buffer));
+    vr_u32(&b, ci->format);
+    vr_u64(&b, ci->offset);
+    vr_u64(&b, ci->range);
+    rpc_send(VR_CREATE_BUFFER_VIEW, &b);
+    free(b.p);
+    *out = (VkBufferView) v;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL destroy_bview(VkDevice dv, VkBufferView h, const VkAllocationCallbacks *a) {
+    (void) a;
+    if (!h) return;
+    send_destroy(VR_DESTROY_BUFFER_VIEW, dv, ID(h));
+    free((struct bview *) h);
+}
+
+// 画像の中で、ある mip・layer の画素がどこから並ぶか（CPU から直接読み書きする linear の画像で使う）
+static void VKAPI_CALL get_subres_layout(VkDevice dv, VkImage im, const VkImageSubresource *sr, VkSubresourceLayout *l) {
+    memset(l, 0, sizeof *l);
+    if (!need_cap(VR_CAP_D3D, "vkGetImageSubresourceLayout")) return;
+    vr_buf b = { 0 }, o = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, ID(im));
+    vr_u32(&b, sr->aspectMask);
+    vr_u32(&b, sr->mipLevel);
+    vr_u32(&b, sr->arrayLayer);
+    if (rpc_call(VR_GET_IMAGE_SUBRESOURCE_LAYOUT, &b, &o) == VK_SUCCESS && o.n >= sizeof *l) memcpy(l, o.p, sizeof *l);
+    free(b.p);
+    free(o.p);
+}
+
 // ---- 描く手順（render pass）と描く先（framebuffer） ----
 static void put_refs(vr_buf *b, const VkAttachmentReference *r, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) {
@@ -2412,6 +2465,10 @@ static int is_buffer_desc(VkDescriptorType t) {
            t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC || t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
 }
 
+static int is_texel_desc(VkDescriptorType t) {
+    return t == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || t == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+}
+
 static void dset_put(struct dset *s, uint32_t binding, uint32_t elem, uint32_t type, struct buf *bf, uint64_t off, uint64_t range) {
     for (uint32_t i = 0; i < s->n; i++)
         if (s->e[i].binding == binding && s->e[i].elem == elem) { s->e[i] = (struct dent) { binding, elem, type, bf, off, range }; return; }
@@ -2425,10 +2482,11 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     uint32_t real = 0;
-    for (uint32_t i = 0; i < nw; i++) if (is_buffer_desc(w[i].descriptorType) || is_image_desc(w[i].descriptorType)) real++;
+#define KNOWN_DESC(t) (is_buffer_desc(t) || is_image_desc(t) || (is_texel_desc(t) && (g_hw.caps & VR_CAP_D3D)))
+    for (uint32_t i = 0; i < nw; i++) if (KNOWN_DESC(w[i].descriptorType)) real++;
     vr_u32(&b, real);
     for (uint32_t i = 0; i < nw; i++) {
-        if (!is_buffer_desc(w[i].descriptorType) && !is_image_desc(w[i].descriptorType)) { say("この種類の descriptor（%d）はまだ扱わない", w[i].descriptorType); continue; }
+        if (!KNOWN_DESC(w[i].descriptorType)) { say("この種類の descriptor（%d）はまだ扱わない", w[i].descriptorType); continue; }
         struct dset *s = (struct dset *) w[i].dstSet;
         vr_u64(&b, ID(s));
         vr_u32(&b, w[i].dstBinding);
@@ -2444,6 +2502,14 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
             }
             continue;
         }
+        if (is_texel_desc(w[i].descriptorType)) {
+            for (uint32_t k = 0; k < w[i].descriptorCount; k++) {
+                struct bview *v = (struct bview *) w[i].pTexelBufferView[k];
+                vr_u64(&b, ID(v));
+                if (v) dset_put(s, w[i].dstBinding, w[i].dstArrayElement + k, w[i].descriptorType, v->b, v->off, v->range);
+            }
+            continue;
+        }
         for (uint32_t k = 0; k < w[i].descriptorCount; k++) {
             const VkDescriptorBufferInfo *bi = &w[i].pBufferInfo[k];
             struct buf *bf = (struct buf *) bi->buffer;
@@ -2456,6 +2522,65 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
     }
     rpc_send(VR_UPDATE_DESCRIPTOR_SETS, &b);
     free(b.p);
+}
+
+// ---- descriptor の書き込みの型紙（update template） ----
+// 受け手には送らない。使うたびに、型紙と中身から普通の書き込み（update_dsets）を組み立てる
+struct dtmpl { uint32_t n; VkDescriptorUpdateTemplateEntry *e; };
+
+static VkResult VKAPI_CALL create_dtmpl(VkDevice dv, const VkDescriptorUpdateTemplateCreateInfo *ci, const VkAllocationCallbacks *a,
+                                        VkDescriptorUpdateTemplate *out) {
+    (void) dv; (void) a;
+    if (ci->templateType != VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET) { say("push descriptor の型紙はまだ扱わない"); return VK_ERROR_FEATURE_NOT_PRESENT; }
+    struct dtmpl *t = calloc(1, sizeof *t);
+    if (!t) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    t->n = ci->descriptorUpdateEntryCount;
+    t->e = malloc((t->n ? t->n : 1) * sizeof *t->e);
+    if (t->n) memcpy(t->e, ci->pDescriptorUpdateEntries, t->n * sizeof *t->e);
+    *out = (VkDescriptorUpdateTemplate) t;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL destroy_dtmpl(VkDevice dv, VkDescriptorUpdateTemplate h, const VkAllocationCallbacks *a) {
+    (void) dv; (void) a;
+    struct dtmpl *t = (struct dtmpl *) h;
+    if (!t) return;
+    free(t->e);
+    free(t);
+}
+
+static void VKAPI_CALL update_dset_tmpl(VkDevice dv, VkDescriptorSet set, VkDescriptorUpdateTemplate h, const void *data) {
+    struct dtmpl *t = (struct dtmpl *) h;
+    if (!t || !t->n) return;
+    VkWriteDescriptorSet *w = calloc(t->n, sizeof *w);
+    void **keep = calloc(t->n, sizeof *keep);
+    for (uint32_t i = 0; i < t->n; i++) {
+        const VkDescriptorUpdateTemplateEntry *e = &t->e[i];
+        const char *p = (const char *) data + e->offset;
+        uint32_t cnt = e->descriptorCount;
+        w[i] = (VkWriteDescriptorSet) { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = e->dstBinding,
+                                        .dstArrayElement = e->dstArrayElement, .descriptorCount = cnt, .descriptorType = e->descriptorType };
+        if (is_image_desc(e->descriptorType)) {
+            VkDescriptorImageInfo *ii = calloc(cnt ? cnt : 1, sizeof *ii);
+            for (uint32_t k = 0; k < cnt; k++) memcpy(&ii[k], p + k * e->stride, sizeof *ii);
+            w[i].pImageInfo = ii;
+            keep[i] = ii;
+        } else if (is_buffer_desc(e->descriptorType)) {
+            VkDescriptorBufferInfo *bi = calloc(cnt ? cnt : 1, sizeof *bi);
+            for (uint32_t k = 0; k < cnt; k++) memcpy(&bi[k], p + k * e->stride, sizeof *bi);
+            w[i].pBufferInfo = bi;
+            keep[i] = bi;
+        } else if (is_texel_desc(e->descriptorType)) {
+            VkBufferView *tv = calloc(cnt ? cnt : 1, sizeof *tv);
+            for (uint32_t k = 0; k < cnt; k++) memcpy(&tv[k], p + k * e->stride, sizeof *tv);
+            w[i].pTexelBufferView = tv;
+            keep[i] = tv;
+        }
+    }
+    update_dsets(dv, t->n, w, 0, NULL);
+    for (uint32_t i = 0; i < t->n; i++) free(keep[i]);
+    free(keep);
+    free(w);
 }
 
 // ---- command buffer ----
@@ -2619,7 +2744,7 @@ static void VKAPI_CALL cmd_bind_sets(VkCommandBuffer cbh, VkPipelineBindPoint bp
         if (!s) continue;
         for (uint32_t k = 0; k < s->n; k++) {
             struct dent *e = &s->e[k];
-            if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) cb_writes(c, e->b, e->off, e->range);
+            if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) cb_writes(c, e->b, e->off, e->range);
             else if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && e->b) cb_writes(c, e->b, 0, e->b->size);
             if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) cb_reads(c, e->b, e->off, e->range);
             else if (e->b) cb_reads(c, e->b, 0, e->b->size);
@@ -3592,6 +3717,114 @@ static void VKAPI_CALL cmd_wait_events(VkCommandBuffer cbh, uint32_t n, const Vk
     cmd_barrier(cbh, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, dst ? dst : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, k, all, nb, bb, ni, ib);
 }
 
+// ---- query（GPU に数えさせる：遮蔽・時刻） ----
+// 受け手の VR_CREATE_QUERY_POOL などに送る。結果は受け手が出した仕事を全部待ってから読む
+static VkResult VKAPI_CALL create_qpool(VkDevice dv, const VkQueryPoolCreateInfo *ci, const VkAllocationCallbacks *a, VkQueryPool *out) {
+    (void) a;
+    if (!(g_hw.caps & VR_CAP_QUERY)) return VK_ERROR_FEATURE_NOT_PRESENT;
+    uint64_t id = new_id();
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, id);
+    vr_u32(&b, ci->queryType);
+    vr_u32(&b, ci->queryCount);
+    vr_u32(&b, ci->pipelineStatistics);
+    rpc_send(VR_CREATE_QUERY_POOL, &b);
+    free(b.p);
+    *out = (VkQueryPool) (uintptr_t) id;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL destroy_qpool(VkDevice dv, VkQueryPool qp, const VkAllocationCallbacks *a) {
+    (void) a;
+    if (!qp) return;
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, ID(qp));
+    rpc_send(VR_DESTROY_QUERY_POOL, &b);
+    free(b.p);
+}
+
+static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32_t first, uint32_t n, size_t size, void *data,
+                                             VkDeviceSize stride, VkQueryResultFlags flags) {
+    vr_buf b = { 0 }, out = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, ID(qp));
+    vr_u32(&b, first);
+    vr_u32(&b, n);
+    vr_u64(&b, size);
+    vr_u64(&b, stride);
+    vr_u32(&b, flags);
+    VkResult r = rpc_call(VR_GET_QUERY_POOL_RESULTS, &b, &out);
+    free(b.p);
+    if (r >= 0 && out.p) memcpy(data, out.p, out.n < size ? out.n : size);
+    free(out.p);
+    return r;
+}
+
+static void VKAPI_CALL reset_qpool(VkDevice dv, VkQueryPool qp, uint32_t first, uint32_t n) {
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, ID(qp));
+    vr_u32(&b, first);
+    vr_u32(&b, n);
+    rpc_send(VR_RESET_QUERY_POOL, &b);
+    free(b.p);
+}
+
+static void VKAPI_CALL cmd_reset_qpool(VkCommandBuffer cbh, VkQueryPool qp, uint32_t first, uint32_t n) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_RESET_QUERY_POOL);
+    vr_u64(&c->s, ID(qp));
+    vr_u32(&c->s, first);
+    vr_u32(&c->s, n);
+}
+
+static void VKAPI_CALL cmd_begin_query(VkCommandBuffer cbh, VkQueryPool qp, uint32_t q, VkQueryControlFlags flags) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_BEGIN_QUERY);
+    vr_u64(&c->s, ID(qp));
+    vr_u32(&c->s, q);
+    vr_u32(&c->s, flags);
+}
+
+static void VKAPI_CALL cmd_end_query(VkCommandBuffer cbh, VkQueryPool qp, uint32_t q) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_END_QUERY);
+    vr_u64(&c->s, ID(qp));
+    vr_u32(&c->s, q);
+}
+
+static void VKAPI_CALL cmd_write_timestamp(VkCommandBuffer cbh, VkPipelineStageFlagBits st, VkQueryPool qp, uint32_t q) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_WRITE_TIMESTAMP);
+    vr_u32(&c->s, st);
+    vr_u64(&c->s, ID(qp));
+    vr_u32(&c->s, q);
+}
+
+static void VKAPI_CALL cmd_write_timestamp2(VkCommandBuffer cbh, VkPipelineStageFlags2 st, VkQueryPool qp, uint32_t q) {
+    // 2 の stage は、1 の形のいちばん後ろの段にまとめる
+    VkPipelineStageFlagBits s1 = (st >> 32) ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : (VkPipelineStageFlagBits) (st ? st : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    if (st & (st - 1)) s1 = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT; // 複数の段なら一番後ろ
+    cmd_write_timestamp(cbh, s1, qp, q);
+}
+
+static void VKAPI_CALL cmd_copy_qpool_results(VkCommandBuffer cbh, VkQueryPool qp, uint32_t first, uint32_t n, VkBuffer dst,
+                                              VkDeviceSize off, VkDeviceSize stride, VkQueryResultFlags flags) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_COPY_QUERY_RESULTS);
+    vr_u64(&c->s, ID(qp));
+    vr_u32(&c->s, first);
+    vr_u32(&c->s, n);
+    vr_u64(&c->s, ID(dst));
+    vr_u64(&c->s, off);
+    vr_u64(&c->s, stride);
+    vr_u32(&c->s, flags);
+    // GPU が書く範囲として覚える（CPU から見えるメモリなら、待ちのあとに引き取る）
+    cb_writes(c, (struct buf *) dst, off, n ? stride * (n - 1) + ((flags & VK_QUERY_RESULT_64_BIT) ? 16 : 8) : 0);
+}
+
 // ---- Vulkan 1.3 の必須の残り ----
 // vkQueueSubmit2：VkSubmitInfo2 を今までの VkSubmitInfo に直して出す。stage は stage1 で 1 の形に直す
 
@@ -3713,33 +3946,19 @@ static void VKAPI_CALL get_pdata(VkDevice dv, VkObjectType t, uint64_t obj, VkPr
     ReleaseSRWLockShared(&g_pdata_lock);
 }
 
-static VkResult VKAPI_CALL not_yet(void) {
-    say("まだ中継していない入口が呼ばれた");
-    return VK_ERROR_FEATURE_NOT_PRESENT;
-}
-
-static const char *const NOT_YET[] = {
-    "vkQueueBindSparse", "vkGetImageSparseMemoryRequirements",
-    "vkCreateQueryPool", "vkDestroyQueryPool", "vkGetQueryPoolResults", "vkCreateBufferView", "vkDestroyBufferView",
-    "vkGetImageSubresourceLayout", 
-    
-    
-    "vkCmdSetLineWidth", "vkCmdSetDepthBias", "vkCmdSetBlendConstants",
-    "vkCmdSetDepthBounds", "vkCmdSetStencilCompareMask", "vkCmdSetStencilWriteMask", "vkCmdSetStencilReference",
-    
-    
-    "vkCmdClearDepthStencilImage", "vkCmdClearAttachments", "vkCmdResolveImage",
-    "vkCmdBeginQuery", "vkCmdEndQuery", "vkCmdResetQueryPool",
-    "vkCmdWriteTimestamp", "vkCmdCopyQueryPoolResults", 
-    "vkCmdExecuteCommands",
-    // 1.1
-    "vkGetDeviceGroupPeerMemoryFeatures", "vkCmdSetDeviceMask", 
-    "vkGetImageSparseMemoryRequirements2", "vkCreateSamplerYcbcrConversion", "vkDestroySamplerYcbcrConversion",
-    "vkCreateDescriptorUpdateTemplate", "vkDestroyDescriptorUpdateTemplate", "vkUpdateDescriptorSetWithTemplate",
-    // 1.2
-    "vkCmdDrawIndirectCount", "vkCmdDrawIndexedIndirectCount", "vkCreateRenderPass2", "vkCmdBeginRenderPass2",
-    "vkCmdNextSubpass2", "vkCmdEndRenderPass2", "vkResetQueryPool", "vkGetBufferDeviceAddress", "vkGetBufferOpaqueCaptureAddress", "vkGetDeviceMemoryOpaqueCaptureAddress",
-};
+// まだ中継していない入口。呼ばれたら名前を出す（入口ごとに別の関数）
+#define NOT_YET(X) \
+    X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements) X(vkGetImageSparseMemoryRequirements2) \
+    X(vkGetDeviceGroupPeerMemoryFeatures) X(vkCmdSetDeviceMask) X(vkCreateSamplerYcbcrConversion) X(vkDestroySamplerYcbcrConversion) \
+    X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount) X(vkGetBufferDeviceAddress) X(vkGetBufferOpaqueCaptureAddress) \
+    X(vkGetDeviceMemoryOpaqueCaptureAddress) X(vkCmdExecuteCommands)
+#define NY_FN(n) \
+    static VkResult VKAPI_CALL ny_##n(void) { \
+        say("まだ中継していない入口が呼ばれた：%s", #n); \
+        return VK_ERROR_FEATURE_NOT_PRESENT; \
+    }
+NOT_YET(NY_FN)
+#undef NY_FN
 
 // ---- 入口の表 ----
 static PFN_vkVoidFunction VKAPI_CALL get_device_proc(VkDevice d, const char *pName);
@@ -3951,6 +4170,18 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkGetDeviceImageMemoryRequirementsKHR", dev_image_reqs);
     F("vkGetDeviceImageSparseMemoryRequirements", dev_image_sparse_reqs);
     F("vkGetDeviceImageSparseMemoryRequirementsKHR", dev_image_sparse_reqs);
+    F("vkCreateQueryPool", create_qpool);
+    F("vkDestroyQueryPool", destroy_qpool);
+    F("vkGetQueryPoolResults", get_qpool_results);
+    F("vkResetQueryPool", reset_qpool);
+    F("vkResetQueryPoolEXT", reset_qpool);
+    F("vkCmdResetQueryPool", cmd_reset_qpool);
+    F("vkCmdBeginQuery", cmd_begin_query);
+    F("vkCmdEndQuery", cmd_end_query);
+    F("vkCmdWriteTimestamp", cmd_write_timestamp);
+    F("vkCmdWriteTimestamp2", cmd_write_timestamp2);
+    F("vkCmdWriteTimestamp2KHR", cmd_write_timestamp2);
+    F("vkCmdCopyQueryPoolResults", cmd_copy_qpool_results);
     F("vkCreatePrivateDataSlot", create_pdslot);
     F("vkCreatePrivateDataSlotEXT", create_pdslot);
     F("vkDestroyPrivateDataSlot", destroy_pdslot);
@@ -3959,7 +4190,18 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkSetPrivateDataEXT", set_pdata);
     F("vkGetPrivateData", get_pdata);
     F("vkGetPrivateDataEXT", get_pdata);
-    for (size_t i = 0; i < sizeof NOT_YET / sizeof *NOT_YET; i++) F(NOT_YET[i], not_yet);
+    F("vkCreateBufferView", create_bview);
+    F("vkDestroyBufferView", destroy_bview);
+    F("vkGetImageSubresourceLayout", get_subres_layout);
+    F("vkCreateDescriptorUpdateTemplate", create_dtmpl);
+    F("vkCreateDescriptorUpdateTemplateKHR", create_dtmpl);
+    F("vkDestroyDescriptorUpdateTemplate", destroy_dtmpl);
+    F("vkDestroyDescriptorUpdateTemplateKHR", destroy_dtmpl);
+    F("vkUpdateDescriptorSetWithTemplate", update_dset_tmpl);
+    F("vkUpdateDescriptorSetWithTemplateKHR", update_dset_tmpl);
+#define NY_F(n) F(#n, ny_##n);
+    NOT_YET(NY_F)
+#undef NY_F
     return NULL;
 }
 
