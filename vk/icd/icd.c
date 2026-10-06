@@ -4,11 +4,18 @@
 //
 // つなぎ先は環境変数 IPHONE_VK（既定 127.0.0.1:50061。usb_forward.py --local 50061 --remote 50060 で iPhone へ）。
 // IPHONE_VK_LOG=1 で何をしているかを stderr に出す。
+// IPHONE_VK_STATS=1 で、終わりに「どの命令を何回送り、何回返事を待ち、何バイト運んだか」を stderr に出す。
 //
 // メモリの同期
 //   PC 側に写しを持ち、アプリにはその写しを map させる。写しは Windows の書き込み監視つきで確保して、
-//   vkQueueSubmit の前に、アプリが書いたページだけを受け手へ送る。
+//   vkQueueSubmit の前に、その submit で GPU が読む範囲（コピー元・つないだバッファ）のうち、アプリが書いたページだけを受け手へ送る。
 //   GPU が書いたかもしれない範囲（storage buffer・コピー先）は、fence などで終わりを待ったときに引き取る。
+//
+// 待ち方（取り決めの版 3）
+//   持ち帰る物が無い待ち（fence・timeline semaphore・idle）には、往復せずにその場で「終わった」と答える。
+//   受け手は、出した仕事が使っているかもしれない物を変える命令の前に、自分の中で仕事の終わりを待つ（drain）。
+//   持ち帰る物があるときは、MEM_READ の返事が終わりの知らせを兼ねる（受け手は読む前に drain する）。
+//   往復は「GPU の答えを持ち帰る」ときだけになる
 #include "../remote/proto.h"
 #include "../remote/wire.h"
 #include <stdarg.h>
@@ -36,6 +43,63 @@ static void say(const char *fmt, ...) {
     va_end(ap);
 }
 
+// ---- 数える（IPHONE_VK_STATS=1） ----
+static const char *const OP_NAME[VR_OP_COUNT] = {
+    [VR_HELLO] = "HELLO", [VR_GET_FEATURES2] = "GET_FEATURES2", [VR_GET_PROPERTIES2] = "GET_PROPERTIES2",
+    [VR_GET_FORMAT_PROPS] = "GET_FORMAT_PROPS", [VR_CREATE_DEVICE] = "CREATE_DEVICE", [VR_DESTROY_DEVICE] = "DESTROY_DEVICE",
+    [VR_GET_QUEUE] = "GET_QUEUE", [VR_CREATE_BUFFER] = "CREATE_BUFFER", [VR_DESTROY_BUFFER] = "DESTROY_BUFFER",
+    [VR_ALLOC_MEMORY] = "ALLOC_MEMORY", [VR_FREE_MEMORY] = "FREE_MEMORY", [VR_BIND_BUFFER_MEMORY] = "BIND_BUFFER_MEMORY",
+    [VR_MEM_WRITE] = "MEM_WRITE", [VR_MEM_READ] = "MEM_READ", [VR_CREATE_SHADER_MODULE] = "CREATE_SHADER_MODULE",
+    [VR_DESTROY_SHADER_MODULE] = "DESTROY_SHADER_MODULE", [VR_CREATE_DSL] = "CREATE_DSL", [VR_DESTROY_DSL] = "DESTROY_DSL",
+    [VR_CREATE_PIPELINE_LAYOUT] = "CREATE_PIPELINE_LAYOUT", [VR_DESTROY_PIPELINE_LAYOUT] = "DESTROY_PIPELINE_LAYOUT",
+    [VR_CREATE_COMPUTE_PIPELINE] = "CREATE_COMPUTE_PIPELINE", [VR_DESTROY_PIPELINE] = "DESTROY_PIPELINE",
+    [VR_CREATE_DESCRIPTOR_POOL] = "CREATE_DESCRIPTOR_POOL", [VR_DESTROY_DESCRIPTOR_POOL] = "DESTROY_DESCRIPTOR_POOL",
+    [VR_RESET_DESCRIPTOR_POOL] = "RESET_DESCRIPTOR_POOL", [VR_ALLOC_DESCRIPTOR_SETS] = "ALLOC_DESCRIPTOR_SETS",
+    [VR_FREE_DESCRIPTOR_SETS] = "FREE_DESCRIPTOR_SETS", [VR_UPDATE_DESCRIPTOR_SETS] = "UPDATE_DESCRIPTOR_SETS",
+    [VR_CREATE_COMMAND_POOL] = "CREATE_COMMAND_POOL", [VR_DESTROY_COMMAND_POOL] = "DESTROY_COMMAND_POOL",
+    [VR_RESET_COMMAND_POOL] = "RESET_COMMAND_POOL", [VR_ALLOC_COMMAND_BUFFERS] = "ALLOC_COMMAND_BUFFERS",
+    [VR_FREE_COMMAND_BUFFERS] = "FREE_COMMAND_BUFFERS", [VR_RECORD_COMMAND_BUFFER] = "RECORD_COMMAND_BUFFER",
+    [VR_RESET_COMMAND_BUFFER] = "RESET_COMMAND_BUFFER", [VR_CREATE_FENCE] = "CREATE_FENCE", [VR_DESTROY_FENCE] = "DESTROY_FENCE",
+    [VR_RESET_FENCES] = "RESET_FENCES", [VR_WAIT_FOR_FENCES] = "WAIT_FOR_FENCES", [VR_GET_FENCE_STATUS] = "GET_FENCE_STATUS",
+    [VR_CREATE_SEMAPHORE] = "CREATE_SEMAPHORE", [VR_DESTROY_SEMAPHORE] = "DESTROY_SEMAPHORE", [VR_QUEUE_SUBMIT] = "QUEUE_SUBMIT",
+    [VR_QUEUE_WAIT_IDLE] = "QUEUE_WAIT_IDLE", [VR_DEVICE_WAIT_IDLE] = "DEVICE_WAIT_IDLE", [VR_PING] = "PING",
+    [VR_WAIT_SEMAPHORES] = "WAIT_SEMAPHORES", [VR_GET_SEMAPHORE_COUNTER] = "GET_SEMAPHORE_COUNTER",
+    [VR_SIGNAL_SEMAPHORE] = "SIGNAL_SEMAPHORE",
+};
+static struct {
+    uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
+    double wait_ms[VR_OP_COUNT];
+    uint64_t bytes_in, flushes;
+    uint64_t ww_calls, ww_pages;   // 書き込み監視を見た回数・見つかった書いたページ
+    uint64_t skipped;              // 往復せずに済ませた待ち
+    double ww_ms, rb_ms;           // 書き込み監視にかかった時間・引き取りにかかった時間
+} g_stat;
+static int g_stats = -1;
+
+static double now_ms(void) {
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double) c.QuadPart * 1000.0 / (double) f.QuadPart;
+}
+
+static void print_stats(void) {
+    uint64_t ts = 0, tc = 0, tb = 0;
+    double tw = 0;
+    fprintf(stderr, "\n[iphone-vk] 命令の数（送りっぱなし / 返事を待った / 送ったバイト / 待った ms）\n");
+    for (int i = 1; i < VR_OP_COUNT; i++) {
+        if (!g_stat.sends[i] && !g_stat.calls[i]) continue;
+        fprintf(stderr, "  %-24s %9llu %9llu %13llu %10.1f\n", OP_NAME[i] ? OP_NAME[i] : "?", (unsigned long long) g_stat.sends[i],
+                (unsigned long long) g_stat.calls[i], (unsigned long long) g_stat.bytes[i], g_stat.wait_ms[i]);
+        ts += g_stat.sends[i]; tc += g_stat.calls[i]; tb += g_stat.bytes[i]; tw += g_stat.wait_ms[i];
+    }
+    fprintf(stderr, "  %-24s %9llu %9llu %13llu %10.1f\n", "合計", (unsigned long long) ts, (unsigned long long) tc, (unsigned long long) tb, tw);
+    fprintf(stderr, "  受け取ったバイト %llu・まとめて送った回数 %llu\n", (unsigned long long) g_stat.bytes_in, (unsigned long long) g_stat.flushes);
+    fprintf(stderr, "  書き込み監視 %llu 回 %.1f ms 書いたページ %llu / 引き取り %.1f ms\n", (unsigned long long) g_stat.ww_calls, g_stat.ww_ms,
+            (unsigned long long) g_stat.ww_pages, g_stat.rb_ms);
+    fprintf(stderr, "  往復せずに済ませた待ち %llu\n", (unsigned long long) g_stat.skipped);
+}
+
 // ---- 受け手との通り道 ----
 static SRWLOCK g_lock = SRWLOCK_INIT;
 static vr_sock g_sock = VR_BAD_SOCK;
@@ -48,6 +112,7 @@ static uint64_t new_id(void) { return (1ull << 62) | (uint64_t) InterlockedIncre
 
 static int flush_locked(void) {
     if (g_dead || g_sock == VR_BAD_SOCK) { g_q.n = 0; return 0; }
+    if (g_q.n) g_stat.flushes++;
     if (g_q.n && !vr_send_all(g_sock, g_q.p, g_q.n)) { g_dead = 1; say("送れない：切れた"); }
     g_q.n = 0;
     return !g_dead;
@@ -55,6 +120,7 @@ static int flush_locked(void) {
 
 static void put_msg_locked(uint32_t op, const vr_buf *b) {
     uint32_t h[2] = { op, (uint32_t) b->n };
+    if (op < VR_OP_COUNT) g_stat.bytes[op] += 8 + b->n;
     vr_put(&g_q, h, 8);
     vr_put(&g_q, b->p, b->n);
 }
@@ -62,6 +128,7 @@ static void put_msg_locked(uint32_t op, const vr_buf *b) {
 // 送りっぱなし（ためておいて、返事の要る命令や submit のときにまとめて送る）
 static void rpc_send(uint32_t op, vr_buf *b) {
     AcquireSRWLockExclusive(&g_lock);
+    if (op < VR_OP_COUNT) g_stat.sends[op]++;
     put_msg_locked(op, b);
     if (g_q.n > (8u << 20)) flush_locked();
     ReleaseSRWLockExclusive(&g_lock);
@@ -78,6 +145,8 @@ static void rpc_flush(void) {
 static VkResult rpc_call(uint32_t op, vr_buf *b, vr_buf *out) {
     VkResult res = VK_ERROR_DEVICE_LOST;
     AcquireSRWLockExclusive(&g_lock);
+    if (op < VR_OP_COUNT) g_stat.calls[op]++;
+    double t0 = now_ms();
     put_msg_locked(op, b);
     if (flush_locked()) {
         uint32_t h[2];
@@ -88,6 +157,7 @@ static VkResult rpc_call(uint32_t op, vr_buf *b, vr_buf *out) {
             if (h[1] == 0 || vr_recv_all(g_sock, dst->p, h[1])) {
                 dst->n = h[1];
                 res = (VkResult) (int32_t) h[0];
+                g_stat.bytes_in += 8 + h[1];
             } else {
                 g_dead = 1;
             }
@@ -97,6 +167,7 @@ static VkResult rpc_call(uint32_t op, vr_buf *b, vr_buf *out) {
             say("返事が来ない：切れた（命令 %u）", op);
         }
     }
+    if (op < VR_OP_COUNT) g_stat.wait_ms[op] += now_ms() - t0;
     ReleaseSRWLockExclusive(&g_lock);
     b->n = 0;
     return res;
@@ -187,6 +258,11 @@ static int hello(void) {
     AcquireSRWLockExclusive(&g_hw_lock);
     if (g_hw.tried) { ReleaseSRWLockExclusive(&g_hw_lock); return g_hw.ok; }
     g_hw.tried = 1;
+    if (g_stats < 0) {
+        const char *e = getenv("IPHONE_VK_STATS");
+        g_stats = e && *e && *e != '0';
+        if (g_stats) atexit(print_stats);
+    }
     AcquireSRWLockExclusive(&g_lock);
     int c = connect_locked();
     ReleaseSRWLockExclusive(&g_lock);
@@ -291,13 +367,15 @@ struct cb {
     uint32_t flags;
     rng *r;            // この command buffer で GPU が書くかもしれない範囲
     size_t nr, capr;
+    rng *rd;           // GPU が読むかもしれない範囲（submit の前に、ここだけ送る）
+    size_t nrd, caprd;
 };
 
-struct fence { uint64_t serial; struct queue *q; };
+struct fence { uint64_t serial; struct queue *q; double last_poll; };
 
 // timeline semaphore は、どの値をどのキューの何番目の submit が知らせるかを覚える（待ちが済んだら引き取りに使う）
 typedef struct { uint64_t value, serial; struct queue *q; } sigrec;
-struct sem { int timeline; sigrec *sig; size_t n, cap; };
+struct sem { int timeline; sigrec *sig; size_t n, cap; uint64_t reached; };
 
 // ---- 範囲の並び ----
 static void rng_add(rng **a, size_t *n, size_t *cap, struct mem *m, uint64_t off, uint64_t len, uint64_t serial) {
@@ -337,22 +415,34 @@ static void rng_merge(rng *a, size_t *n) {
 }
 
 // ---- メモリの写し ----
-static void collect_dirty(struct mem *m) {
-    ULONG_PTR count = m->npages;
+// ページ p0〜p1 の書き込み監視を見て、書かれたページに印を付ける（監視の印は消える）
+static void collect_dirty(struct mem *m, size_t p0, size_t p1) {
+    if (p1 > m->npages) p1 = m->npages;
+    if (p0 >= p1) return;
+    ULONG_PTR count = p1 - p0;
     DWORD gran = 0;
-    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, m->shadow, m->npages * PAGE, m->addrs, &count, &gran) != 0) return;
+    double t0 = now_ms();
+    UINT r = GetWriteWatch(WRITE_WATCH_FLAG_RESET, m->shadow + p0 * PAGE, (p1 - p0) * PAGE, m->addrs, &count, &gran);
+    g_stat.ww_calls++;
+    g_stat.ww_ms += now_ms() - t0;
+    if (r != 0) return;
+    g_stat.ww_pages += count;
     for (ULONG_PTR i = 0; i < count; i++) m->dirty[(size_t) ((uint8_t *) m->addrs[i] - m->shadow) / PAGE] = 1;
 }
 
-// アプリが書いたページを受け手へ送る
-static void send_dirty(struct mem *m) {
-    collect_dirty(m);
+// off から len バイトのうち、アプリが書いたページを受け手へ送る
+static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
+    if (off >= m->size) return;
+    if (len > m->size - off) len = m->size - off;
+    size_t p0 = (size_t) (off / PAGE), p1 = (size_t) ((off + len + PAGE - 1) / PAGE);
+    if (p1 > m->npages) p1 = m->npages;
+    collect_dirty(m, p0, p1);
     const size_t chunk = (16u << 20) / PAGE;
     vr_buf b = { 0 };
-    for (size_t i = 0; i < m->npages;) {
+    for (size_t i = p0; i < p1;) {
         if (!m->dirty[i]) { i++; continue; }
         size_t j = i;
-        while (j < m->npages && m->dirty[j] && j - i < chunk) m->dirty[j++] = 0;
+        while (j < p1 && m->dirty[j] && j - i < chunk) m->dirty[j++] = 0;
         uint64_t off = (uint64_t) i * PAGE, len = (uint64_t) (j - i) * PAGE;
         if (off + len > m->size) len = m->size - off;
         vr_u64(&b, ID(m));
@@ -364,26 +454,60 @@ static void send_dirty(struct mem *m) {
     free(b.p);
 }
 
-// GPU が書いた範囲を写しへ引き取る
-static void read_back(struct mem *m, uint64_t off, uint64_t len) {
-    if (!m->host || off >= m->size) return;
-    if (len > m->size - off) len = m->size - off;
-    collect_dirty(m); // アプリが書いた印を先に取っておく（引き取りで消えないように）
-    vr_buf b = { 0 }, out = { 0 };
-    for (uint64_t at = off; at < off + len;) {
-        uint64_t n = off + len - at;
-        if (n > (64u << 20)) n = 64u << 20;
-        vr_u64(&b, ID(m));
-        vr_u64(&b, at);
-        vr_u64(&b, n);
-        if (rpc_call(VR_MEM_READ, &b, &out) == VK_SUCCESS && out.n == n) memcpy(m->shadow + at, out.p, (size_t) n);
-        at += n;
+// いくつもの範囲を 1 回の往復で引き取る。頼みを全部送ってから、答えを順に受け取る
+static void read_back_many(rng *r, size_t n) {
+    const uint64_t piece = 64u << 20;
+    vr_buf b = { 0 };
+    size_t nreq = 0;
+    // アプリが書いた印を先に取っておく（引き取りで消えないように）
+    for (size_t i = 0; i < n; i++) {
+        struct mem *m = r[i].m;
+        if (r[i].off >= m->size) { r[i].len = 0; continue; }
+        if (r[i].len > m->size - r[i].off) r[i].len = m->size - r[i].off;
+        collect_dirty(m, (size_t) (r[i].off / PAGE), (size_t) ((r[i].off + r[i].len + PAGE - 1) / PAGE));
     }
+    AcquireSRWLockExclusive(&g_lock);
+    for (size_t i = 0; i < n; i++)
+        for (uint64_t at = r[i].off; at < r[i].off + r[i].len; at += piece) {
+            uint64_t k = r[i].off + r[i].len - at < piece ? r[i].off + r[i].len - at : piece;
+            vr_u64(&b, ID(r[i].m));
+            vr_u64(&b, at);
+            vr_u64(&b, k);
+            g_stat.calls[VR_MEM_READ]++;
+            put_msg_locked(VR_MEM_READ, &b);
+            b.n = 0;
+            nreq++;
+        }
+    double t0 = now_ms();
+    int ok = flush_locked();
+    for (size_t i = 0; i < n && ok; i++)
+        for (uint64_t at = r[i].off; at < r[i].off + r[i].len && ok; at += piece) {
+            uint64_t k = r[i].off + r[i].len - at < piece ? r[i].off + r[i].len - at : piece;
+            uint32_t h[2];
+            if (!vr_recv_all(g_sock, h, 8)) { ok = 0; g_dead = 1; break; }
+            if ((int32_t) h[0] == VK_SUCCESS && h[1] == k) {
+                if (!vr_recv_all(g_sock, r[i].m->shadow + at, k)) { ok = 0; g_dead = 1; break; }
+            } else {
+                // 読めなかった：中身は捨てる
+                uint8_t tmp[4096];
+                for (uint32_t left = h[1]; left;) {
+                    uint32_t c = left < sizeof tmp ? left : (uint32_t) sizeof tmp;
+                    if (!vr_recv_all(g_sock, tmp, c)) { ok = 0; g_dead = 1; break; }
+                    left -= c;
+                }
+            }
+            g_stat.bytes_in += 8 + h[1];
+        }
+    g_stat.wait_ms[VR_MEM_READ] += now_ms() - t0;
+    ReleaseSRWLockExclusive(&g_lock);
     free(b.p);
-    free(out.p);
+    (void) nreq;
     // 自分で書いたところの監視の印は消す
-    uint64_t p0 = off / PAGE * PAGE, p1 = (off + len + PAGE - 1) / PAGE * PAGE;
-    ResetWriteWatch(m->shadow + p0, (SIZE_T) (p1 - p0));
+    for (size_t i = 0; i < n; i++) {
+        if (!r[i].len) continue;
+        uint64_t p0 = r[i].off / PAGE * PAGE, p1 = (r[i].off + r[i].len + PAGE - 1) / PAGE * PAGE;
+        ResetWriteWatch(r[i].m->shadow + p0, (SIZE_T) (p1 - p0));
+    }
 }
 
 // キュー q（NULL なら全部）の serial までの submit が終わった：GPU が書いた範囲を引き取る
@@ -398,8 +522,9 @@ static void complete(struct dev *d, struct queue *q, uint64_t upto) {
     d->npend = k;
     ReleaseSRWLockExclusive(&d->lock);
     rng_merge(take, &nt);
-    for (size_t i = 0; i < nt; i++) read_back(take[i].m, take[i].off, take[i].len);
-    if (nt) say("引き取り %zu か所", nt);
+    double t0 = now_ms();
+    if (nt) read_back_many(take, nt);
+    g_stat.rb_ms += now_ms() - t0;
     free(take);
 }
 
@@ -797,6 +922,7 @@ static VkResult VKAPI_CALL alloc_memory(VkDevice dv, const VkMemoryAllocateInfo 
         free(m);
         return r;
     }
+    say("メモリ %.1f MiB（種類 %u%s）", m->size / 1048576.0, m->type, m->host ? "・CPU から見える" : "");
     if (m->host) {
         AcquireSRWLockExclusive(&d->lock);
         m->next = d->mems;
@@ -1177,9 +1303,9 @@ static VkResult VKAPI_CALL create_cpool(VkDevice dv, const VkCommandPoolCreateIn
     return VK_SUCCESS;
 }
 
-static void cb_clear(struct cb *c) { c->s.n = 0; c->nr = 0; }
+static void cb_clear(struct cb *c) { c->s.n = 0; c->nr = 0; c->nrd = 0; }
 
-static void cb_free(struct cb *c) { free(c->s.p); free(c->r); free(c); }
+static void cb_free(struct cb *c) { free(c->s.p); free(c->r); free(c->rd); free(c); }
 
 static void VKAPI_CALL destroy_cpool(VkDevice dv, VkCommandPool pp, const VkAllocationCallbacks *a) {
     (void) a;
@@ -1260,6 +1386,7 @@ static VkResult VKAPI_CALL begin_cb(VkCommandBuffer cbh, const VkCommandBufferBe
 static VkResult VKAPI_CALL end_cb(VkCommandBuffer cbh) {
     struct cb *c = (struct cb *) cbh;
     rng_merge(c->r, &c->nr);
+    rng_merge(c->rd, &c->nrd);
     vr_buf b = { 0 };
     vr_u64(&b, ID(c));
     vr_u32(&b, c->flags);
@@ -1287,6 +1414,13 @@ static void cb_writes(struct cb *c, struct buf *bf, uint64_t off, uint64_t len) 
     rng_add(&c->r, &c->nr, &c->capr, bf->m, bf->memoff + off, len, 0);
 }
 
+// GPU が読むかもしれない範囲として覚える
+static void cb_reads(struct cb *c, struct buf *bf, uint64_t off, uint64_t len) {
+    if (!bf || !bf->m || !bf->m->host) return;
+    if (len == VK_WHOLE_SIZE) len = off < bf->size ? bf->size - off : 0;
+    rng_add(&c->rd, &c->nrd, &c->caprd, bf->m, bf->memoff + off, len, 0);
+}
+
 static void VKAPI_CALL cmd_bind_pipeline(VkCommandBuffer cbh, VkPipelineBindPoint bp, VkPipeline p) {
     struct cb *c = (struct cb *) cbh;
     vr_u32(&c->s, VR_CMD_BIND_PIPELINE);
@@ -1312,6 +1446,8 @@ static void VKAPI_CALL cmd_bind_sets(VkCommandBuffer cbh, VkPipelineBindPoint bp
             struct dent *e = &s->e[k];
             if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) cb_writes(c, e->b, e->off, e->range);
             else if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && e->b) cb_writes(c, e->b, 0, e->b->size);
+            if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) cb_reads(c, e->b, e->off, e->range);
+            else if (e->b) cb_reads(c, e->b, 0, e->b->size);
         }
     }
 }
@@ -1349,6 +1485,7 @@ static void VKAPI_CALL cmd_dispatch_indirect(VkCommandBuffer cbh, VkBuffer bb, V
     vr_u32(&c->s, VR_CMD_DISPATCH_INDIRECT);
     vr_u64(&c->s, ID(bb));
     vr_u64(&c->s, off);
+    cb_reads(c, (struct buf *) bb, off, sizeof(VkDispatchIndirectCommand));
 }
 
 static void VKAPI_CALL cmd_copy(VkCommandBuffer cbh, VkBuffer src, VkBuffer dst, uint32_t n, const VkBufferCopy *r) {
@@ -1362,6 +1499,7 @@ static void VKAPI_CALL cmd_copy(VkCommandBuffer cbh, VkBuffer src, VkBuffer dst,
         vr_u64(&c->s, r[i].dstOffset);
         vr_u64(&c->s, r[i].size);
         cb_writes(c, (struct buf *) dst, r[i].dstOffset, r[i].size);
+        cb_reads(c, (struct buf *) src, r[i].srcOffset, r[i].size);
     }
 }
 
@@ -1434,6 +1572,7 @@ static void VKAPI_CALL destroy_fence(VkDevice dv, VkFence f, const VkAllocationC
 }
 
 static VkResult VKAPI_CALL reset_fences(VkDevice dv, uint32_t n, const VkFence *fs) {
+    for (uint32_t i = 0; i < n; i++) { ((struct fence *) fs[i])->q = NULL; ((struct fence *) fs[i])->serial = 0; }
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u32(&b, n);
@@ -1444,6 +1583,15 @@ static VkResult VKAPI_CALL reset_fences(VkDevice dv, uint32_t n, const VkFence *
 }
 
 static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *fs, VkBool32 all, uint64_t timeout) {
+    // どれも submit に付けた fence で、終わるまで待つ呼び方なら、往復しない。
+    // 持ち帰る物があれば引き取る（その MEM_READ の前に受け手が仕事の終わりを待つ）
+    int known = timeout == UINT64_MAX;
+    for (uint32_t i = 0; i < n && known; i++) known = ((struct fence *) fs[i])->q != NULL;
+    if (known) {
+        for (uint32_t i = 0; i < n; i++) complete((struct dev *) dv, ((struct fence *) fs[i])->q, ((struct fence *) fs[i])->serial);
+        g_stat.skipped++;
+        return VK_SUCCESS;
+    }
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u32(&b, n);
@@ -1472,12 +1620,36 @@ static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *f
     return r;
 }
 
-static VkResult VKAPI_CALL fence_status(VkDevice dv, VkFence f) {
+// 同じ fence を間を空けずに聞き続けるアプリ（llama.cpp など）は、聞くたびに USB を往復させてしまう。
+// 2 ms 以内に続けて聞かれたら空回りと見なし、受け手の側で最大 20 ms 待ってから答える。
+// 1 コマに 1 回だけ聞くようなアプリには、今まで通りすぐ答える
+static VkResult VKAPI_CALL fence_status(VkDevice dv, VkFence fh) {
+    struct fence *fc = (struct fence *) fh;
+    if (fc->q) {
+        // submit に付けた fence は「終わった」と答える（版 3 の待ち方）
+        complete((struct dev *) dv, fc->q, fc->serial);
+        g_stat.skipped++;
+        return VK_SUCCESS;
+    }
+    double t = now_ms();
+    int spinning = t - fc->last_poll < 2.0;
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
-    vr_u64(&b, ID(f));
-    VkResult r = rpc_call(VR_GET_FENCE_STATUS, &b, NULL);
+    VkResult r;
+    if (spinning) {
+        vr_u32(&b, 1);
+        vr_u64(&b, ID(fh));
+        vr_u32(&b, VK_TRUE);
+        vr_u64(&b, 20000000ull);
+        r = rpc_call(VR_WAIT_FOR_FENCES, &b, NULL);
+        if (r == VK_TIMEOUT) r = VK_NOT_READY;
+    } else {
+        vr_u64(&b, ID(fh));
+        r = rpc_call(VR_GET_FENCE_STATUS, &b, NULL);
+    }
     free(b.p);
+    fc->last_poll = now_ms();
+    VkFence f = fh;
     if (r == VK_SUCCESS && ((struct fence *) f)->q) complete((struct dev *) dv, ((struct fence *) f)->q, ((struct fence *) f)->serial);
     return r;
 }
@@ -1536,6 +1708,7 @@ static void sem_reached(struct dev *d, struct sem *sm, uint64_t v) {
         }
     }
     sm->n = k;
+    if (v > sm->reached) sm->reached = v;
     ReleaseSRWLockExclusive(&d->lock);
     for (int j = 0; j < nd; j++) complete(d, done[j].q, done[j].serial);
 }
@@ -1554,6 +1727,29 @@ static VkResult VKAPI_CALL get_sem_counter(VkDevice dv, VkSemaphore h, uint64_t 
 }
 
 static VkResult VKAPI_CALL wait_sems(VkDevice dv, const VkSemaphoreWaitInfo *wi, uint64_t timeout) {
+    struct dev *d = (struct dev *) dv;
+    if (timeout == UINT64_MAX && !(wi->flags & VK_SEMAPHORE_WAIT_ANY_BIT)) {
+        // それぞれの値を知らせる submit が分かっていれば、往復しない
+        int ok = 1;
+        uint64_t need[64];
+        for (uint32_t i = 0; i < wi->semaphoreCount && ok; i++) {
+            struct sem *sm = (struct sem *) wi->pSemaphores[i];
+            uint64_t v = wi->pValues[i], best = UINT64_MAX;
+            if (i >= 64 || !sm->timeline) { ok = 0; break; }
+            if (v <= sm->reached) { need[i] = 0; continue; }
+            AcquireSRWLockShared(&d->lock);
+            for (size_t k = 0; k < sm->n; k++) if (sm->sig[k].value >= v && sm->sig[k].value < best) best = sm->sig[k].value;
+            ReleaseSRWLockShared(&d->lock);
+            if (best == UINT64_MAX) ok = 0;
+            else need[i] = best;
+        }
+        if (ok) {
+            for (uint32_t i = 0; i < wi->semaphoreCount; i++)
+                if (need[i]) sem_reached(d, (struct sem *) wi->pSemaphores[i], need[i]);
+            g_stat.skipped++;
+            return VK_SUCCESS;
+        }
+    }
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u32(&b, wi->flags);
@@ -1588,10 +1784,19 @@ static VkResult VKAPI_CALL signal_sem(VkDevice dv, const VkSemaphoreSignalInfo *
 static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitInfo *si, VkFence f) {
     struct queue *q = (struct queue *) qh;
     struct dev *d = q->d;
-    // アプリが書いたページを先に送る
-    AcquireSRWLockShared(&d->lock);
-    for (struct mem *m = d->mems; m; m = m->next) send_dirty(m);
-    ReleaseSRWLockShared(&d->lock);
+    // GPU が読む範囲のうち、アプリが書いたページを先に送る
+    {
+        rng *rd = NULL;
+        size_t nrd = 0, crd = 0;
+        for (uint32_t i = 0; i < n; i++)
+            for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
+                struct cb *c = (struct cb *) si[i].pCommandBuffers[j];
+                for (size_t k = 0; k < c->nrd; k++) rng_add(&rd, &nrd, &crd, c->rd[k].m, c->rd[k].off, c->rd[k].len, 0);
+            }
+        rng_merge(rd, &nrd);
+        for (size_t k = 0; k < nrd; k++) send_dirty(rd[k].m, rd[k].off, rd[k].len);
+        free(rd);
+    }
     // 受け手は 1 回に 8 まで受け取るので、分けて送る（fence は最後にだけ付ける）
     for (uint32_t at = 0; at < n || (n == 0 && at == 0); at += 8) {
         uint32_t k = n - at < 8 ? n - at : 8;
@@ -1650,6 +1855,9 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
 
 static VkResult VKAPI_CALL queue_wait_idle(VkQueue qh) {
     struct queue *q = (struct queue *) qh;
+    complete(q->d, q, q->d->serial);
+    g_stat.skipped++;
+    return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
     vr_buf b = { 0 };
     vr_u64(&b, ID(q));
     VkResult r = rpc_call(VR_QUEUE_WAIT_IDLE, &b, NULL);
@@ -1660,6 +1868,9 @@ static VkResult VKAPI_CALL queue_wait_idle(VkQueue qh) {
 
 static VkResult VKAPI_CALL device_wait_idle(VkDevice dv) {
     struct dev *d = (struct dev *) dv;
+    complete(d, NULL, d->serial);
+    g_stat.skipped++;
+    return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
     vr_buf b = { 0 };
     vr_u64(&b, ID(d));
     VkResult r = rpc_call(VR_DEVICE_WAIT_IDLE, &b, NULL);

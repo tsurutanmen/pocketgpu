@@ -167,8 +167,45 @@ static int vk_init(void) {
     return 1;
 }
 
+// ---- 出した仕事が終わるのを受け手の中で待つ（版 3） ----
+static VkDevice g_dev;
+typedef struct { VkFence f; int own; } inflight;
+static inflight g_fl[256];
+static int g_nfl;
+static VkFence g_fpool[64]; // 使い回す自前の fence
+static int g_nfpool;
+
+static VkFence own_fence(void) {
+    if (g_nfpool) return g_fpool[--g_nfpool];
+    VkFenceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence f = VK_NULL_HANDLE;
+    vkCreateFence(g_dev, &ci, NULL, &f);
+    return f;
+}
+
+static void drain(void) {
+    if (!g_nfl || !g_dev) { g_nfl = 0; return; }
+    VkFence fs[256];
+    for (int i = 0; i < g_nfl; i++) fs[i] = g_fl[i].f;
+    VkResult r = vkWaitForFences(g_dev, (uint32_t) g_nfl, fs, VK_TRUE, UINT64_MAX);
+    if (r != VK_SUCCESS) vlog("出した仕事を待てない (%d)", r);
+    for (int i = 0; i < g_nfl; i++) {
+        if (!g_fl[i].own) continue;
+        vkResetFences(g_dev, 1, &g_fl[i].f);
+        if (g_nfpool < 64) g_fpool[g_nfpool++] = g_fl[i].f;
+        else vkDestroyFence(g_dev, g_fl[i].f, NULL);
+    }
+    g_nfl = 0;
+}
+
 // ---- 1 つの接続の間に作った物を、切れたときに片づける ----
 static void cleanup(void) {
+    drain();
+    if (g_dev) {
+        for (int i = 0; i < g_nfpool; i++) vkDestroyFence(g_dev, g_fpool[i], NULL);
+    }
+    g_nfpool = 0;
+    g_dev = VK_NULL_HANDLE;
     for (int kind = K_PIPELINE; kind >= K_DEVICE; kind--) { (void) kind; }
     VkDevice dev = VK_NULL_HANDLE;
     for (size_t i = 0; i < g_cap; i++) if (g_tab[i].id && g_tab[i].kind == K_DEVICE) dev = (VkDevice) (uintptr_t) g_tab[i].h;
@@ -311,6 +348,19 @@ static void replay(VkCommandBuffer cb, vr_rd *r) {
 
 // ---- 1 つの命令を実行する。返事が要るものは reply する ----
 static int handle(vr_sock s, uint32_t op, vr_rd *r) {
+    // 出した仕事が使っているかもしれない物を変える・調べる命令の前に、出した仕事が全部終わるのを待つ
+    switch (op) {
+    case VR_MEM_WRITE: case VR_MEM_READ: case VR_RESET_FENCES: case VR_GET_FENCE_STATUS: case VR_GET_SEMAPHORE_COUNTER:
+    case VR_RECORD_COMMAND_BUFFER: case VR_RESET_COMMAND_BUFFER: case VR_RESET_COMMAND_POOL: case VR_FREE_COMMAND_BUFFERS:
+    case VR_DESTROY_COMMAND_POOL: case VR_UPDATE_DESCRIPTOR_SETS: case VR_RESET_DESCRIPTOR_POOL: case VR_FREE_DESCRIPTOR_SETS:
+    case VR_DESTROY_DESCRIPTOR_POOL: case VR_FREE_MEMORY: case VR_DESTROY_BUFFER: case VR_DESTROY_PIPELINE:
+    case VR_DESTROY_PIPELINE_LAYOUT: case VR_DESTROY_SHADER_MODULE: case VR_DESTROY_DSL: case VR_DESTROY_FENCE:
+    case VR_DESTROY_SEMAPHORE: case VR_DESTROY_DEVICE: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE:
+        drain();
+        break;
+    default:
+        break;
+    }
     switch (op) {
     case VR_PING: return reply(s, 0);
     case VR_HELLO: {
@@ -408,7 +458,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkDevice dev;
         VkResult res = vkCreateDevice(g_pd, &dci, NULL, &dev);
         for (uint32_t i = 0; i < nc && i < 32; i++) free(blocks[i]);
-        if (res == VK_SUCCESS) put(id, (uint64_t) (uintptr_t) dev, K_DEVICE);
+        if (res == VK_SUCCESS) { put(id, (uint64_t) (uintptr_t) dev, K_DEVICE); g_dev = dev; }
         return reply(s, res);
     }
     case VR_DESTROY_DEVICE: {
@@ -815,8 +865,16 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             tl[i].pSignalSemaphoreValues = sv[i];
         }
         VkFence f = OBJ(VkFence, vr_ru64(r));
+        // 出した仕事は必ず fence で追う（アプリが付けていなければ自前の物を付ける）
+        int own = 0;
+        if (!f) { f = own_fence(); own = 1; }
+        if (g_nfl == 256) drain();
         VkResult res = vkQueueSubmit(q, ns, si, f);
-        if (res != VK_SUCCESS) vlog("vkQueueSubmit 失敗 (%d)", res);
+        if (res == VK_SUCCESS) g_fl[g_nfl++] = (inflight) { f, own };
+        else {
+            vlog("vkQueueSubmit 失敗 (%d)", res);
+            if (own && g_nfpool < 64) g_fpool[g_nfpool++] = f;
+        }
         return 1;
     }
     case VR_WAIT_SEMAPHORES: {
