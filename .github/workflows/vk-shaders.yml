@@ -1,0 +1,38 @@
+name: vk-shaders
+# 試験用のシェーダーを SPIR-V にして、C から読める形（*_spv.h）にする。PC に glslang を入れずに済ませる
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - vk/tests/*.vert
+      - vk/tests/*.frag
+      - vk/tests/*.comp
+      - .github/workflows/vk-shaders.yml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: glslang
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq glslang-tools
+      - name: compile
+        run: |
+          mkdir -p out
+          for f in vk/tests/*.vert vk/tests/*.frag vk/tests/*.comp; do
+            [ -f "$f" ] || continue
+            b=$(basename "$f"); n=${b%.*}_${b##*.}
+            glslangValidator -V "$f" -o "out/$n.spv"
+            python3 - "$n" <<'PY'
+          import struct, sys
+          n = sys.argv[1]
+          d = open(f"out/{n}.spv", "rb").read()
+          w = struct.unpack(f"<{len(d)//4}I", d)
+          lines = [", ".join(f"0x{x:08x}" for x in w[i:i+8]) for i in range(0, len(w), 8)]
+          open(f"out/{n}_spv.h", "w").write(f"// glslangValidator -V で作った SPIR-V\nstatic const uint32_t {n}_spv[] = {{\n    " + ",\n    ".join(lines) + "\n};\n")
+          PY
+          done
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vk-shaders
+          path: out/
