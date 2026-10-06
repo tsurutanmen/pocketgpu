@@ -11,7 +11,7 @@ targets:
       - path: Sources
       # Vulkan の命令の受け手（PC 側のドライバは vk/icd）
       - path: vk/remote
-        includes: ["server.c", "proto.h", "wire.h"]
+        includes: ["server.c", "bw.c", "proto.h", "wire.h"]
     info:
       path: Sources/Info.plist
       properties:
