@@ -1918,12 +1918,46 @@ static void VKAPI_CALL destroy_swapchain(VkDevice dv, VkSwapchainKHR h, const Vk
     free(sc);
 }
 
+// IPHONE_VK_MONITOR=sub（主でないモニター）か番号（1 から）なら、アプリの窓をそのモニターの左上へ動かす。大きさは変えない。
+// 同じ窓は 1 回だけ動かす（作り直しのたびに動かすと、手で動かした場所が戻ってしまう）
+static BOOL CALLBACK collect_monitor(HMONITOR m, HDC dc, LPRECT rc, LPARAM lp) {
+    (void) dc; (void) rc;
+    HMONITOR *list = (HMONITOR *) lp;
+    for (int i = 0; i < 8; i++) if (!list[i]) { list[i] = m; break; }
+    return TRUE;
+}
+
+static void move_to_monitor(HWND hwnd) {
+    static HWND moved[16];
+    const char *e = getenv("IPHONE_VK_MONITOR");
+    if (!hwnd || !e || !*e) return;
+    for (int i = 0; i < 16; i++) if (moved[i] == hwnd) return;
+    for (int i = 0; i < 16; i++) if (!moved[i]) { moved[i] = hwnd; break; }
+    HMONITOR list[8] = { 0 };
+    EnumDisplayMonitors(NULL, NULL, collect_monitor, (LPARAM) list);
+    HMONITOR target = NULL;
+    if (!strcmp(e, "sub")) {
+        for (int i = 0; i < 8 && list[i]; i++) {
+            MONITORINFO mi = { .cbSize = sizeof mi };
+            if (GetMonitorInfoA(list[i], &mi) && !(mi.dwFlags & MONITORINFOF_PRIMARY)) { target = list[i]; break; }
+        }
+    } else {
+        int k = atoi(e) - 1;
+        if (k >= 0 && k < 8) target = list[k];
+    }
+    MONITORINFO mi = { .cbSize = sizeof mi };
+    if (!target || !GetMonitorInfoA(target, &mi)) { say("窓を動かす先のモニターが見つからない（%s）", e); return; }
+    SetWindowPos(hwnd, NULL, mi.rcWork.left + 40, mi.rcWork.top + 40, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    say("窓をモニター（%ld, %ld）へ動かした", mi.rcWork.left, mi.rcWork.top);
+}
+
 static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreateInfoKHR *ci, const VkAllocationCallbacks *a, VkSwapchainKHR *out) {
     (void) a;
     struct swapchain *sc = calloc(1, sizeof *sc);
     if (!sc) return VK_ERROR_OUT_OF_HOST_MEMORY;
     sc->d = (struct dev *) dv;
     sc->hwnd = surface_hwnd(ci->surface);
+    move_to_monitor(sc->hwnd);
     sc->w = ci->imageExtent.width;
     sc->h = ci->imageExtent.height;
     sc->fmt = ci->imageFormat;
