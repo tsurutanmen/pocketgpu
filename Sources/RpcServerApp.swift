@@ -5,6 +5,11 @@ import os
 @main
 struct RpcServerApp: App {
     init() {
+        // A19 の GPU の行列計算の部品（Metal 4 の tensor）を使わない設定なら、Metal の装置を作る前に llama.cpp に伝える。
+        // 使う・使わないで速さを比べるため。装置はここで作られるので、切り替えはアプリを開き直すと効く
+        if UserDefaults.standard.object(forKey: "metalTensor") as? Bool == false {
+            setenv("GGML_METAL_TENSOR_DISABLE", "1", 1)
+        }
         rpc_bridge_init()
         // 記録を PC から読めるようにする（USB の 50059 番。PC は app/pc/iphone_applog.py）
         let t = Thread { rpc_bridge_serve_log(50059) }
@@ -108,6 +113,7 @@ struct ContentView: View {
     @AppStorage("usb") private var usb = true
     // 後ろに回っても続ける（その間は CPU で計算する）
     @AppStorage("keepAlive") private var keepAlive = true
+    @AppStorage("metalTensor") private var metalTensor = true
     @State private var onCPU = false
     @State private var vkStarted = false
     @State private var vkFailed = false
@@ -136,6 +142,7 @@ struct ContentView: View {
                     Toggle("後ろに回っても続ける", isOn: $keepAlive)
                         .onChange(of: keepAlive) { _, on in if running { on ? Keeper.shared.start() : Keeper.shared.stop() } }
                     Toggle("開いたら自動で始める", isOn: $autoStart)
+                    Toggle("Metal 4 の tensor を使う・開き直すと効く", isOn: $metalTensor)
                 } header: { Text("待ち受け") }
                 Section {
                     Button(running ? "動いている（止めるときはアプリを閉じる）" : "受け手を始める") {
