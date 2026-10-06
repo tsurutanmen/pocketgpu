@@ -60,6 +60,18 @@ enum vr_op {
     VR_WAIT_SEMAPHORES,       // [同期] device・flags・(semaphore・値)の並び・待つ時間
     VR_GET_SEMAPHORE_COUNTER, // [同期] device・semaphore → いまの値
     VR_SIGNAL_SEMAPHORE,      // device・semaphore・値
+    // ---- 描画（後から足した。版は 3 のまま。古い受け手は描画を知らないだけ） ----
+    VR_CREATE_IMAGE,          // [同期] device・id・VkImageCreateInfo の要点 → VkMemoryRequirements
+    VR_DESTROY_IMAGE,
+    VR_BIND_IMAGE_MEMORY,     // device・image・memory・offset
+    VR_CREATE_IMAGE_VIEW,
+    VR_DESTROY_IMAGE_VIEW,
+    VR_CREATE_RENDER_PASS,
+    VR_DESTROY_RENDER_PASS,
+    VR_CREATE_FRAMEBUFFER,
+    VR_DESTROY_FRAMEBUFFER,
+    VR_CREATE_GRAPHICS_PIPELINE, // [同期] 作れたかを返す
+    VR_GET_IMAGE_FORMAT_PROPS,   // [同期] → 結果・VkImageFormatProperties
     VR_OP_COUNT
 };
 
@@ -76,4 +88,22 @@ enum vr_cmd {
     VR_CMD_PIPELINE_BARRIER,      // src/dst stage・dependency・memory barriers[]・buffer barriers[]
     VR_CMD_DISPATCH_INDIRECT,     // buffer・offset
     VR_CMD_RESET_QUERY_POOL,      // （まだ使わない）
+    // ---- 描画 ----
+    VR_CMD_BEGIN_RENDER_PASS,     // render pass・framebuffer・範囲・消す色の並び・contents
+    VR_CMD_END_RENDER_PASS,
+    VR_CMD_NEXT_SUBPASS,          // contents
+    VR_CMD_DRAW,                  // 頂点の数・インスタンスの数・最初の頂点・最初のインスタンス
+    VR_CMD_DRAW_INDEXED,          // 番号の数・インスタンスの数・最初の番号・頂点のずらし・最初のインスタンス
+    VR_CMD_BIND_VERTEX_BUFFERS,   // 最初・(buffer・offset) の並び
+    VR_CMD_BIND_INDEX_BUFFER,     // buffer・offset・型
+    VR_CMD_SET_VIEWPORT,          // 最初・VkViewport の並び
+    VR_CMD_SET_SCISSOR,           // 最初・VkRect2D の並び
+    VR_CMD_COPY_IMAGE_TO_BUFFER,  // image・layout・buffer・VkBufferImageCopy の並び
+    VR_CMD_COPY_BUFFER_TO_IMAGE,  // buffer・image・layout・VkBufferImageCopy の並び
+    VR_CMD_PIPELINE_BARRIER2,     // VR_CMD_PIPELINE_BARRIER ＋ 画像の barrier の並び
+    VR_CMD_CLEAR_COLOR_IMAGE,     // image・layout・色・範囲の並び
+    VR_CMD_DRAW_INDIRECT,         // buffer・offset・数・間隔
+    VR_CMD_DRAW_INDEXED_INDIRECT, // buffer・offset・数・間隔
+    VR_CMD_COPY_IMAGE,            // src・layout・dst・layout・VkImageCopy の並び
+    VR_CMD_BLIT_IMAGE,            // src・layout・dst・layout・VkImageBlit の並び・filter
 };

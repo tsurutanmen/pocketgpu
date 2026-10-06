@@ -1,6 +1,6 @@
 // iPhone を Windows の Vulkan の GPU として見せるドライバ（ICD）。
 // アプリが呼んだ Vulkan の命令を、USB の先の受け手（vk/remote/server.c）に送って、そこの本物の Vulkan で実行させる。
-// いまは計算（compute）だけ。画面に描くこと（graphics）と画像（VkImage）はまだ。
+// 計算（compute）と、窓を使わない描画（画像・render pass・graphics pipeline）。窓に出す仕組み（swapchain）はまだ。
 //
 // つなぎ先は環境変数 IPHONE_VK（既定 127.0.0.1:50061。usb_forward.py --local 50061 --remote 50060 で iPhone へ）。
 // IPHONE_VK_LOG=1 で何をしているかを stderr に出す。
@@ -64,7 +64,11 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_CREATE_SEMAPHORE] = "CREATE_SEMAPHORE", [VR_DESTROY_SEMAPHORE] = "DESTROY_SEMAPHORE", [VR_QUEUE_SUBMIT] = "QUEUE_SUBMIT",
     [VR_QUEUE_WAIT_IDLE] = "QUEUE_WAIT_IDLE", [VR_DEVICE_WAIT_IDLE] = "DEVICE_WAIT_IDLE", [VR_PING] = "PING",
     [VR_WAIT_SEMAPHORES] = "WAIT_SEMAPHORES", [VR_GET_SEMAPHORE_COUNTER] = "GET_SEMAPHORE_COUNTER",
-    [VR_SIGNAL_SEMAPHORE] = "SIGNAL_SEMAPHORE",
+    [VR_SIGNAL_SEMAPHORE] = "SIGNAL_SEMAPHORE", [VR_CREATE_IMAGE] = "CREATE_IMAGE", [VR_DESTROY_IMAGE] = "DESTROY_IMAGE",
+    [VR_BIND_IMAGE_MEMORY] = "BIND_IMAGE_MEMORY", [VR_CREATE_IMAGE_VIEW] = "CREATE_IMAGE_VIEW", [VR_DESTROY_IMAGE_VIEW] = "DESTROY_IMAGE_VIEW",
+    [VR_CREATE_RENDER_PASS] = "CREATE_RENDER_PASS", [VR_DESTROY_RENDER_PASS] = "DESTROY_RENDER_PASS",
+    [VR_CREATE_FRAMEBUFFER] = "CREATE_FRAMEBUFFER", [VR_DESTROY_FRAMEBUFFER] = "DESTROY_FRAMEBUFFER",
+    [VR_CREATE_GRAPHICS_PIPELINE] = "CREATE_GRAPHICS_PIPELINE", [VR_GET_IMAGE_FORMAT_PROPS] = "GET_IMAGE_FORMAT_PROPS",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -303,7 +307,7 @@ static int hello(void) {
                     if (g_hw.mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
                         g_hw.mem.memoryTypes[i].propertyFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
                 for (uint32_t i = 0; i < g_hw.nq; i++) {
-                    g_hw.q[i].queueFlags &= VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+                    g_hw.q[i].queueFlags &= VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
                 }
                 g_hw.ok = 1;
                 say("受け手の GPU：%s", g_hw.props.deviceName);
@@ -734,8 +738,6 @@ static void VKAPI_CALL get_format(VkPhysicalDevice pd, VkFormat f, VkFormatPrope
     vr_u32(&b, (uint32_t) f);
     memset(p, 0, sizeof *p);
     if (rpc_call(VR_GET_FORMAT_PROPS, &b, &out) == VK_SUCCESS && out.n >= sizeof *p) memcpy(p, out.p, sizeof *p);
-    // 画像はまだ扱わないので、バッファとしての性質だけ見せる
-    p->linearTilingFeatures = p->optimalTilingFeatures = 0;
     free(b.p);
     free(out.p);
 }
@@ -760,17 +762,24 @@ static VkResult VKAPI_CALL enum_device_layers(VkPhysicalDevice pd, uint32_t *n, 
     return VK_SUCCESS;
 }
 
-// 画像はまだ扱わない
 static VkResult VKAPI_CALL get_image_format(VkPhysicalDevice pd, VkFormat f, VkImageType t, VkImageTiling ti, VkImageUsageFlags u, VkImageCreateFlags fl, VkImageFormatProperties *p) {
-    (void) pd; (void) f; (void) t; (void) ti; (void) u; (void) fl;
+    (void) pd;
+    vr_buf b = { 0 }, out = { 0 };
+    vr_u32(&b, f);
+    vr_u32(&b, t);
+    vr_u32(&b, ti);
+    vr_u32(&b, u);
+    vr_u32(&b, fl);
     memset(p, 0, sizeof *p);
-    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    VkResult r = rpc_call(VR_GET_IMAGE_FORMAT_PROPS, &b, &out);
+    if (out.n >= sizeof *p) memcpy(p, out.p, sizeof *p);
+    free(b.p);
+    free(out.p);
+    return r;
 }
 
 static VkResult VKAPI_CALL get_image_format2(VkPhysicalDevice pd, const VkPhysicalDeviceImageFormatInfo2 *i, VkImageFormatProperties2 *p) {
-    (void) pd; (void) i;
-    memset(&p->imageFormatProperties, 0, sizeof p->imageFormatProperties);
-    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    return get_image_format(pd, i->format, i->type, i->tiling, i->usage, i->flags, &p->imageFormatProperties);
 }
 
 static void VKAPI_CALL get_sparse_format(VkPhysicalDevice pd, VkFormat f, VkImageType t, VkSampleCountFlagBits s, VkImageUsageFlags u, VkImageTiling ti, uint32_t *n, VkSparseImageFormatProperties *p) {
@@ -1038,6 +1047,272 @@ static VkResult VKAPI_CALL bind_buffer(VkDevice dv, VkBuffer bb, VkDeviceMemory 
 static VkResult VKAPI_CALL bind_buffer2(VkDevice dv, uint32_t n, const VkBindBufferMemoryInfo *i) {
     for (uint32_t k = 0; k < n; k++) bind_buffer(dv, i[k].buffer, i[k].memory, i[k].memoryOffset);
     return VK_SUCCESS;
+}
+
+// ---- 画像 ----
+struct img { VkMemoryRequirements req; struct mem *m; uint64_t memoff; };
+
+static VkResult VKAPI_CALL create_image(VkDevice dv, const VkImageCreateInfo *ci, const VkAllocationCallbacks *a, VkImage *out) {
+    (void) a;
+    struct img *im = calloc(1, sizeof *im);
+    if (!im) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    vr_buf b = { 0 }, o = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, ID(im));
+    vr_u32(&b, ci->flags);
+    vr_u32(&b, ci->imageType);
+    vr_u32(&b, ci->format);
+    vr_u32(&b, ci->extent.width);
+    vr_u32(&b, ci->extent.height);
+    vr_u32(&b, ci->extent.depth);
+    vr_u32(&b, ci->mipLevels);
+    vr_u32(&b, ci->arrayLayers);
+    vr_u32(&b, ci->samples);
+    vr_u32(&b, ci->tiling);
+    vr_u32(&b, ci->usage);
+    vr_u32(&b, ci->initialLayout);
+    VkResult r = rpc_call(VR_CREATE_IMAGE, &b, &o);
+    if (r == VK_SUCCESS && o.n >= sizeof im->req) memcpy(&im->req, o.p, sizeof im->req);
+    free(b.p);
+    free(o.p);
+    if (r != VK_SUCCESS) { free(im); return r; }
+    *out = (VkImage) im;
+    return VK_SUCCESS;
+}
+
+static void send_destroy(uint32_t op, VkDevice dv, uint64_t id) {
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, id);
+    rpc_send(op, &b);
+    free(b.p);
+}
+
+static void VKAPI_CALL destroy_image(VkDevice dv, VkImage h, const VkAllocationCallbacks *a) {
+    (void) a;
+    if (!h) return;
+    send_destroy(VR_DESTROY_IMAGE, dv, ID(h));
+    free((struct img *) h);
+}
+
+static void VKAPI_CALL image_reqs(VkDevice dv, VkImage h, VkMemoryRequirements *r) { (void) dv; *r = ((struct img *) h)->req; }
+
+static void VKAPI_CALL image_reqs2(VkDevice dv, const VkImageMemoryRequirementsInfo2 *i, VkMemoryRequirements2 *r) {
+    image_reqs(dv, i->image, &r->memoryRequirements);
+    for (VkBaseOutStructure *s = r->pNext; s; s = s->pNext)
+        if (s->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
+            VkMemoryDedicatedRequirements *dr = (void *) s;
+            dr->prefersDedicatedAllocation = dr->requiresDedicatedAllocation = VK_FALSE;
+        }
+}
+
+static VkResult VKAPI_CALL bind_image(VkDevice dv, VkImage h, VkDeviceMemory mm, VkDeviceSize off) {
+    struct img *im = (struct img *) h;
+    im->m = (struct mem *) mm;
+    im->memoff = off;
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, ID(h));
+    vr_u64(&b, ID(mm));
+    vr_u64(&b, off);
+    rpc_send(VR_BIND_IMAGE_MEMORY, &b);
+    free(b.p);
+    return VK_SUCCESS;
+}
+
+static VkResult VKAPI_CALL bind_image2(VkDevice dv, uint32_t n, const VkBindImageMemoryInfo *i) {
+    for (uint32_t k = 0; k < n; k++) bind_image(dv, i[k].image, i[k].memory, i[k].memoryOffset);
+    return VK_SUCCESS;
+}
+
+static VkResult VKAPI_CALL create_view(VkDevice dv, const VkImageViewCreateInfo *ci, const VkAllocationCallbacks *a, VkImageView *out) {
+    (void) a;
+    uint64_t id = new_id();
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, id);
+    vr_u32(&b, ci->flags);
+    vr_u64(&b, ID(ci->image));
+    vr_u32(&b, ci->viewType);
+    vr_u32(&b, ci->format);
+    vr_put(&b, &ci->components, sizeof ci->components);
+    vr_put(&b, &ci->subresourceRange, sizeof ci->subresourceRange);
+    rpc_send(VR_CREATE_IMAGE_VIEW, &b);
+    free(b.p);
+    *out = (VkImageView) (uintptr_t) id;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL destroy_view(VkDevice dv, VkImageView h, const VkAllocationCallbacks *a) { (void) a; if (h) send_destroy(VR_DESTROY_IMAGE_VIEW, dv, ID(h)); }
+
+// ---- 描く手順（render pass）と描く先（framebuffer） ----
+static VkResult VKAPI_CALL create_rpass(VkDevice dv, const VkRenderPassCreateInfo *ci, const VkAllocationCallbacks *a, VkRenderPass *out) {
+    (void) a;
+    uint64_t id = new_id();
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, id);
+    vr_u32(&b, ci->flags);
+    vr_u32(&b, ci->attachmentCount);
+    vr_put(&b, ci->pAttachments, ci->attachmentCount * sizeof *ci->pAttachments);
+    vr_u32(&b, ci->subpassCount);
+    for (uint32_t i = 0; i < ci->subpassCount; i++) {
+        const VkSubpassDescription *sp = &ci->pSubpasses[i];
+        vr_u32(&b, sp->flags);
+        vr_u32(&b, sp->pipelineBindPoint);
+        vr_u32(&b, sp->inputAttachmentCount);
+        vr_put(&b, sp->pInputAttachments, sp->inputAttachmentCount * sizeof(VkAttachmentReference));
+        vr_u32(&b, sp->colorAttachmentCount);
+        vr_put(&b, sp->pColorAttachments, sp->colorAttachmentCount * sizeof(VkAttachmentReference));
+        vr_u32(&b, sp->pResolveAttachments ? 1 : 0);
+        if (sp->pResolveAttachments) vr_put(&b, sp->pResolveAttachments, sp->colorAttachmentCount * sizeof(VkAttachmentReference));
+        vr_u32(&b, sp->pDepthStencilAttachment ? 1 : 0);
+        if (sp->pDepthStencilAttachment) vr_put(&b, sp->pDepthStencilAttachment, sizeof(VkAttachmentReference));
+        vr_u32(&b, sp->preserveAttachmentCount);
+        vr_put(&b, sp->pPreserveAttachments, sp->preserveAttachmentCount * sizeof(uint32_t));
+    }
+    vr_u32(&b, ci->dependencyCount);
+    vr_put(&b, ci->pDependencies, ci->dependencyCount * sizeof *ci->pDependencies);
+    rpc_send(VR_CREATE_RENDER_PASS, &b);
+    free(b.p);
+    *out = (VkRenderPass) (uintptr_t) id;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL destroy_rpass(VkDevice dv, VkRenderPass h, const VkAllocationCallbacks *a) { (void) a; if (h) send_destroy(VR_DESTROY_RENDER_PASS, dv, ID(h)); }
+
+static void VKAPI_CALL render_area_granularity(VkDevice dv, VkRenderPass rp, VkExtent2D *g) { (void) dv; (void) rp; g->width = g->height = 1; }
+
+static VkResult VKAPI_CALL create_fb(VkDevice dv, const VkFramebufferCreateInfo *ci, const VkAllocationCallbacks *a, VkFramebuffer *out) {
+    (void) a;
+    uint64_t id = new_id();
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, id);
+    vr_u32(&b, ci->flags);
+    vr_u64(&b, ID(ci->renderPass));
+    vr_u32(&b, ci->attachmentCount);
+    for (uint32_t i = 0; i < ci->attachmentCount; i++) vr_u64(&b, ID(ci->pAttachments[i]));
+    vr_u32(&b, ci->width);
+    vr_u32(&b, ci->height);
+    vr_u32(&b, ci->layers);
+    rpc_send(VR_CREATE_FRAMEBUFFER, &b);
+    free(b.p);
+    *out = (VkFramebuffer) (uintptr_t) id;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL destroy_fb(VkDevice dv, VkFramebuffer h, const VkAllocationCallbacks *a) { (void) a; if (h) send_destroy(VR_DESTROY_FRAMEBUFFER, dv, ID(h)); }
+
+// ---- 描画用のパイプライン ----
+static void put_stage(vr_buf *b, const VkPipelineShaderStageCreateInfo *st) {
+    vr_u32(b, st->stage);
+    vr_u32(b, st->flags);
+    vr_u64(b, ID(st->module));
+    vr_str(b, st->pName);
+    const VkSpecializationInfo *si = st->pSpecializationInfo;
+    vr_u32(b, si ? si->mapEntryCount : 0);
+    for (uint32_t k = 0; si && k < si->mapEntryCount; k++) {
+        vr_u32(b, si->pMapEntries[k].constantID);
+        vr_u32(b, si->pMapEntries[k].offset);
+        vr_u32(b, (uint32_t) si->pMapEntries[k].size);
+    }
+    vr_bytes(b, si ? si->pData : NULL, si ? (uint32_t) si->dataSize : 0);
+}
+
+static void put_f(vr_buf *b, float f) { vr_put(b, &f, 4); }
+
+static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
+    (void) cache; (void) a;
+    VkResult worst = VK_SUCCESS;
+    for (uint32_t i = 0; i < n; i++) {
+        const VkGraphicsPipelineCreateInfo *c = &ci[i];
+        uint64_t id = new_id();
+        vr_buf b = { 0 };
+        vr_u64(&b, ID(dv));
+        vr_u64(&b, id);
+        vr_u32(&b, c->flags);
+        vr_u64(&b, ID(c->layout));
+        vr_u64(&b, ID(c->renderPass));
+        vr_u32(&b, c->subpass);
+        vr_u32(&b, c->stageCount);
+        for (uint32_t k = 0; k < c->stageCount; k++) put_stage(&b, &c->pStages[k]);
+        const VkPipelineVertexInputStateCreateInfo *vi = c->pVertexInputState;
+        vr_u32(&b, vi ? 1 : 0);
+        if (vi) {
+            vr_u32(&b, vi->vertexBindingDescriptionCount);
+            vr_put(&b, vi->pVertexBindingDescriptions, vi->vertexBindingDescriptionCount * sizeof *vi->pVertexBindingDescriptions);
+            vr_u32(&b, vi->vertexAttributeDescriptionCount);
+            vr_put(&b, vi->pVertexAttributeDescriptions, vi->vertexAttributeDescriptionCount * sizeof *vi->pVertexAttributeDescriptions);
+        }
+        const VkPipelineInputAssemblyStateCreateInfo *ia = c->pInputAssemblyState;
+        vr_u32(&b, ia ? 1 : 0);
+        if (ia) { vr_u32(&b, ia->topology); vr_u32(&b, ia->primitiveRestartEnable); }
+        // 描画しないとき（rasterizerDiscard）は viewport などが無いことがある
+        const VkPipelineViewportStateCreateInfo *vp = c->pViewportState;
+        vr_u32(&b, vp ? 1 : 0);
+        if (vp) {
+            vr_u32(&b, vp->viewportCount);
+            vr_u32(&b, vp->pViewports ? 1 : 0);
+            if (vp->pViewports) vr_put(&b, vp->pViewports, vp->viewportCount * sizeof *vp->pViewports);
+            vr_u32(&b, vp->scissorCount);
+            vr_u32(&b, vp->pScissors ? 1 : 0);
+            if (vp->pScissors) vr_put(&b, vp->pScissors, vp->scissorCount * sizeof *vp->pScissors);
+        }
+        const VkPipelineRasterizationStateCreateInfo *rs = c->pRasterizationState;
+        vr_u32(&b, rs ? 1 : 0);
+        if (rs) {
+            vr_u32(&b, rs->depthClampEnable);
+            vr_u32(&b, rs->rasterizerDiscardEnable);
+            vr_u32(&b, rs->polygonMode);
+            vr_u32(&b, rs->cullMode);
+            vr_u32(&b, rs->frontFace);
+            vr_u32(&b, rs->depthBiasEnable);
+            put_f(&b, rs->depthBiasConstantFactor);
+            put_f(&b, rs->depthBiasClamp);
+            put_f(&b, rs->depthBiasSlopeFactor);
+            put_f(&b, rs->lineWidth);
+        }
+        const VkPipelineMultisampleStateCreateInfo *ms = c->pMultisampleState;
+        vr_u32(&b, ms ? 1 : 0);
+        if (ms) {
+            vr_u32(&b, ms->rasterizationSamples);
+            vr_u32(&b, ms->sampleShadingEnable);
+            put_f(&b, ms->minSampleShading);
+            vr_u32(&b, ms->alphaToCoverageEnable);
+            vr_u32(&b, ms->alphaToOneEnable);
+        }
+        const VkPipelineDepthStencilStateCreateInfo *ds = c->pDepthStencilState;
+        vr_u32(&b, ds ? 1 : 0);
+        if (ds) {
+            vr_u32(&b, ds->depthTestEnable);
+            vr_u32(&b, ds->depthWriteEnable);
+            vr_u32(&b, ds->depthCompareOp);
+            vr_u32(&b, ds->depthBoundsTestEnable);
+            vr_u32(&b, ds->stencilTestEnable);
+            vr_put(&b, &ds->front, sizeof ds->front);
+            vr_put(&b, &ds->back, sizeof ds->back);
+            put_f(&b, ds->minDepthBounds);
+            put_f(&b, ds->maxDepthBounds);
+        }
+        const VkPipelineColorBlendStateCreateInfo *cb = c->pColorBlendState;
+        vr_u32(&b, cb ? 1 : 0);
+        if (cb) {
+            vr_u32(&b, cb->logicOpEnable);
+            vr_u32(&b, cb->logicOp);
+            vr_u32(&b, cb->attachmentCount);
+            vr_put(&b, cb->pAttachments, cb->attachmentCount * sizeof *cb->pAttachments);
+            vr_put(&b, cb->blendConstants, sizeof cb->blendConstants);
+        }
+        const VkPipelineDynamicStateCreateInfo *dy = c->pDynamicState;
+        vr_u32(&b, dy ? dy->dynamicStateCount : 0);
+        for (uint32_t k = 0; dy && k < dy->dynamicStateCount; k++) vr_u32(&b, dy->pDynamicStates[k]);
+        VkResult r = rpc_call(VR_CREATE_GRAPHICS_PIPELINE, &b, NULL);
+        free(b.p);
+        if (r != VK_SUCCESS) { say("graphics pipeline を作れない (%d)", r); out[i] = VK_NULL_HANDLE; worst = r; continue; }
+        out[i] = (VkPipeline) (uintptr_t) id;
+    }
+    return worst;
 }
 
 // ---- shader・パイプライン ----
@@ -1528,9 +1803,8 @@ static void VKAPI_CALL cmd_update(VkCommandBuffer cbh, VkBuffer dst, VkDeviceSiz
 
 static void VKAPI_CALL cmd_barrier(VkCommandBuffer cbh, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep,
                                    uint32_t nm, const VkMemoryBarrier *mb, uint32_t nb, const VkBufferMemoryBarrier *bb, uint32_t ni, const VkImageMemoryBarrier *ib) {
-    (void) ni; (void) ib;
     struct cb *c = (struct cb *) cbh;
-    vr_u32(&c->s, VR_CMD_PIPELINE_BARRIER);
+    vr_u32(&c->s, ni ? VR_CMD_PIPELINE_BARRIER2 : VR_CMD_PIPELINE_BARRIER);
     vr_u32(&c->s, src);
     vr_u32(&c->s, dst);
     vr_u32(&c->s, dep);
@@ -1547,6 +1821,167 @@ static void VKAPI_CALL cmd_barrier(VkCommandBuffer cbh, VkPipelineStageFlags src
         vr_u64(&c->s, bb[i].offset);
         vr_u64(&c->s, bb[i].size);
     }
+    if (!ni) return;
+    vr_u32(&c->s, ni);
+    for (uint32_t i = 0; i < ni; i++) {
+        vr_u32(&c->s, ib[i].srcAccessMask);
+        vr_u32(&c->s, ib[i].dstAccessMask);
+        vr_u32(&c->s, ib[i].oldLayout);
+        vr_u32(&c->s, ib[i].newLayout);
+        vr_u32(&c->s, ib[i].srcQueueFamilyIndex);
+        vr_u32(&c->s, ib[i].dstQueueFamilyIndex);
+        vr_u64(&c->s, ID(ib[i].image));
+        vr_put(&c->s, &ib[i].subresourceRange, sizeof ib[i].subresourceRange);
+    }
+}
+
+// ---- 描画の命令 ----
+static void VKAPI_CALL cmd_begin_rp(VkCommandBuffer cbh, const VkRenderPassBeginInfo *bi, VkSubpassContents contents) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_BEGIN_RENDER_PASS);
+    vr_u64(&c->s, ID(bi->renderPass));
+    vr_u64(&c->s, ID(bi->framebuffer));
+    vr_put(&c->s, &bi->renderArea, sizeof bi->renderArea);
+    vr_u32(&c->s, bi->clearValueCount);
+    vr_put(&c->s, bi->pClearValues, bi->clearValueCount * sizeof *bi->pClearValues);
+    vr_u32(&c->s, contents);
+}
+
+static void VKAPI_CALL cmd_end_rp(VkCommandBuffer cbh) { vr_u32(&((struct cb *) cbh)->s, VR_CMD_END_RENDER_PASS); }
+
+static void VKAPI_CALL cmd_next_subpass(VkCommandBuffer cbh, VkSubpassContents contents) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_NEXT_SUBPASS);
+    vr_u32(&c->s, contents);
+}
+
+static void VKAPI_CALL cmd_draw(VkCommandBuffer cbh, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_DRAW);
+    vr_u32(&c->s, vc);
+    vr_u32(&c->s, ic);
+    vr_u32(&c->s, fv);
+    vr_u32(&c->s, fi);
+}
+
+static void VKAPI_CALL cmd_draw_indexed(VkCommandBuffer cbh, uint32_t n, uint32_t ic, uint32_t first, int32_t vo, uint32_t fi) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_DRAW_INDEXED);
+    vr_u32(&c->s, n);
+    vr_u32(&c->s, ic);
+    vr_u32(&c->s, first);
+    vr_u32(&c->s, (uint32_t) vo);
+    vr_u32(&c->s, fi);
+}
+
+static void draw_indirect(VkCommandBuffer cbh, uint32_t op, VkBuffer bb, VkDeviceSize off, uint32_t n, uint32_t stride) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, op);
+    vr_u64(&c->s, ID(bb));
+    vr_u64(&c->s, off);
+    vr_u32(&c->s, n);
+    vr_u32(&c->s, stride);
+    cb_reads(c, (struct buf *) bb, off, (uint64_t) n * (stride ? stride : 16));
+}
+
+static void VKAPI_CALL cmd_draw_indirect(VkCommandBuffer cbh, VkBuffer bb, VkDeviceSize off, uint32_t n, uint32_t stride) {
+    draw_indirect(cbh, VR_CMD_DRAW_INDIRECT, bb, off, n, stride);
+}
+
+static void VKAPI_CALL cmd_draw_indexed_indirect(VkCommandBuffer cbh, VkBuffer bb, VkDeviceSize off, uint32_t n, uint32_t stride) {
+    draw_indirect(cbh, VR_CMD_DRAW_INDEXED_INDIRECT, bb, off, n, stride);
+}
+
+static void VKAPI_CALL cmd_bind_vbs(VkCommandBuffer cbh, uint32_t first, uint32_t n, const VkBuffer *bs, const VkDeviceSize *offs) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_BIND_VERTEX_BUFFERS);
+    vr_u32(&c->s, first);
+    vr_u32(&c->s, n);
+    for (uint32_t i = 0; i < n; i++) {
+        vr_u64(&c->s, ID(bs[i]));
+        vr_u64(&c->s, offs[i]);
+        cb_reads(c, (struct buf *) bs[i], offs[i], VK_WHOLE_SIZE);
+    }
+}
+
+static void VKAPI_CALL cmd_bind_ib(VkCommandBuffer cbh, VkBuffer bb, VkDeviceSize off, VkIndexType t) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_BIND_INDEX_BUFFER);
+    vr_u64(&c->s, ID(bb));
+    vr_u64(&c->s, off);
+    vr_u32(&c->s, t);
+    cb_reads(c, (struct buf *) bb, off, VK_WHOLE_SIZE);
+}
+
+static void VKAPI_CALL cmd_set_viewport(VkCommandBuffer cbh, uint32_t first, uint32_t n, const VkViewport *v) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_SET_VIEWPORT);
+    vr_u32(&c->s, first);
+    vr_u32(&c->s, n);
+    vr_put(&c->s, v, n * sizeof *v);
+}
+
+static void VKAPI_CALL cmd_set_scissor(VkCommandBuffer cbh, uint32_t first, uint32_t n, const VkRect2D *v) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_SET_SCISSOR);
+    vr_u32(&c->s, first);
+    vr_u32(&c->s, n);
+    vr_put(&c->s, v, n * sizeof *v);
+}
+
+static void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cbh, VkImage im, VkImageLayout l, VkBuffer bb, uint32_t n, const VkBufferImageCopy *rg) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_COPY_IMAGE_TO_BUFFER);
+    vr_u64(&c->s, ID(im));
+    vr_u64(&c->s, ID(bb));
+    vr_u32(&c->s, l);
+    vr_u32(&c->s, n);
+    vr_put(&c->s, rg, n * sizeof *rg);
+    cb_writes(c, (struct buf *) bb, 0, VK_WHOLE_SIZE);
+}
+
+static void VKAPI_CALL cmd_copy_buffer_to_image(VkCommandBuffer cbh, VkBuffer bb, VkImage im, VkImageLayout l, uint32_t n, const VkBufferImageCopy *rg) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_COPY_BUFFER_TO_IMAGE);
+    vr_u64(&c->s, ID(bb));
+    vr_u64(&c->s, ID(im));
+    vr_u32(&c->s, l);
+    vr_u32(&c->s, n);
+    vr_put(&c->s, rg, n * sizeof *rg);
+    cb_reads(c, (struct buf *) bb, 0, VK_WHOLE_SIZE);
+}
+
+static void VKAPI_CALL cmd_clear_color(VkCommandBuffer cbh, VkImage im, VkImageLayout l, const VkClearColorValue *col, uint32_t n, const VkImageSubresourceRange *rg) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_CLEAR_COLOR_IMAGE);
+    vr_u64(&c->s, ID(im));
+    vr_u32(&c->s, l);
+    vr_put(&c->s, col, sizeof *col);
+    vr_u32(&c->s, n);
+    vr_put(&c->s, rg, n * sizeof *rg);
+}
+
+static void VKAPI_CALL cmd_copy_image(VkCommandBuffer cbh, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageCopy *rg) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_COPY_IMAGE);
+    vr_u64(&c->s, ID(s));
+    vr_u32(&c->s, sl);
+    vr_u64(&c->s, ID(d));
+    vr_u32(&c->s, dl);
+    vr_u32(&c->s, n);
+    vr_put(&c->s, rg, n * sizeof *rg);
+}
+
+static void VKAPI_CALL cmd_blit_image(VkCommandBuffer cbh, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageBlit *rg, VkFilter f) {
+    struct cb *c = (struct cb *) cbh;
+    vr_u32(&c->s, VR_CMD_BLIT_IMAGE);
+    vr_u64(&c->s, ID(s));
+    vr_u32(&c->s, sl);
+    vr_u64(&c->s, ID(d));
+    vr_u32(&c->s, dl);
+    vr_u32(&c->s, n);
+    vr_put(&c->s, rg, n * sizeof *rg);
+    vr_u32(&c->s, f);
 }
 
 // ---- 同期 ----
@@ -1892,22 +2327,22 @@ static VkResult VKAPI_CALL not_yet(void) {
 }
 
 static const char *const NOT_YET[] = {
-    "vkQueueBindSparse", "vkBindImageMemory", "vkGetImageMemoryRequirements", "vkGetImageSparseMemoryRequirements",
+    "vkQueueBindSparse", "vkGetImageSparseMemoryRequirements",
     "vkCreateEvent", "vkDestroyEvent", "vkGetEventStatus", "vkSetEvent", "vkResetEvent",
     "vkCreateQueryPool", "vkDestroyQueryPool", "vkGetQueryPoolResults", "vkCreateBufferView", "vkDestroyBufferView",
-    "vkCreateImage", "vkDestroyImage", "vkGetImageSubresourceLayout", "vkCreateImageView", "vkDestroyImageView",
-    "vkCreateGraphicsPipelines", "vkCreateSampler", "vkDestroySampler", "vkCreateFramebuffer", "vkDestroyFramebuffer",
-    "vkCreateRenderPass", "vkDestroyRenderPass", "vkGetRenderAreaGranularity",
-    "vkCmdSetViewport", "vkCmdSetScissor", "vkCmdSetLineWidth", "vkCmdSetDepthBias", "vkCmdSetBlendConstants",
+    "vkGetImageSubresourceLayout", 
+    "vkCreateSampler", "vkDestroySampler", 
+    
+    "vkCmdSetLineWidth", "vkCmdSetDepthBias", "vkCmdSetBlendConstants",
     "vkCmdSetDepthBounds", "vkCmdSetStencilCompareMask", "vkCmdSetStencilWriteMask", "vkCmdSetStencilReference",
-    "vkCmdBindIndexBuffer", "vkCmdBindVertexBuffers", "vkCmdDraw", "vkCmdDrawIndexed", "vkCmdDrawIndirect",
-    "vkCmdDrawIndexedIndirect", "vkCmdCopyImage", "vkCmdBlitImage", "vkCmdCopyBufferToImage", "vkCmdCopyImageToBuffer",
-    "vkCmdClearColorImage", "vkCmdClearDepthStencilImage", "vkCmdClearAttachments", "vkCmdResolveImage",
+    
+    
+    "vkCmdClearDepthStencilImage", "vkCmdClearAttachments", "vkCmdResolveImage",
     "vkCmdSetEvent", "vkCmdResetEvent", "vkCmdWaitEvents", "vkCmdBeginQuery", "vkCmdEndQuery", "vkCmdResetQueryPool",
-    "vkCmdWriteTimestamp", "vkCmdCopyQueryPoolResults", "vkCmdBeginRenderPass", "vkCmdNextSubpass", "vkCmdEndRenderPass",
+    "vkCmdWriteTimestamp", "vkCmdCopyQueryPoolResults", 
     "vkCmdExecuteCommands",
     // 1.1
-    "vkBindImageMemory2", "vkGetDeviceGroupPeerMemoryFeatures", "vkCmdSetDeviceMask", "vkGetImageMemoryRequirements2",
+    "vkGetDeviceGroupPeerMemoryFeatures", "vkCmdSetDeviceMask", 
     "vkGetImageSparseMemoryRequirements2", "vkCreateSamplerYcbcrConversion", "vkDestroySamplerYcbcrConversion",
     "vkCreateDescriptorUpdateTemplate", "vkDestroyDescriptorUpdateTemplate", "vkUpdateDescriptorSetWithTemplate",
     // 1.2
@@ -1990,6 +2425,38 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkGetFenceStatus", fence_status);
     F("vkCreateSemaphore", create_semaphore);
     F("vkDestroySemaphore", destroy_semaphore);
+    F("vkCreateImage", create_image);
+    F("vkDestroyImage", destroy_image);
+    F("vkGetImageMemoryRequirements", image_reqs);
+    F("vkGetImageMemoryRequirements2", image_reqs2);
+    F("vkGetImageMemoryRequirements2KHR", image_reqs2);
+    F("vkBindImageMemory", bind_image);
+    F("vkBindImageMemory2", bind_image2);
+    F("vkBindImageMemory2KHR", bind_image2);
+    F("vkCreateImageView", create_view);
+    F("vkDestroyImageView", destroy_view);
+    F("vkCreateRenderPass", create_rpass);
+    F("vkDestroyRenderPass", destroy_rpass);
+    F("vkGetRenderAreaGranularity", render_area_granularity);
+    F("vkCreateFramebuffer", create_fb);
+    F("vkDestroyFramebuffer", destroy_fb);
+    F("vkCreateGraphicsPipelines", create_graphics_pipelines);
+    F("vkCmdBeginRenderPass", cmd_begin_rp);
+    F("vkCmdEndRenderPass", cmd_end_rp);
+    F("vkCmdNextSubpass", cmd_next_subpass);
+    F("vkCmdDraw", cmd_draw);
+    F("vkCmdDrawIndexed", cmd_draw_indexed);
+    F("vkCmdDrawIndirect", cmd_draw_indirect);
+    F("vkCmdDrawIndexedIndirect", cmd_draw_indexed_indirect);
+    F("vkCmdBindVertexBuffers", cmd_bind_vbs);
+    F("vkCmdBindIndexBuffer", cmd_bind_ib);
+    F("vkCmdSetViewport", cmd_set_viewport);
+    F("vkCmdSetScissor", cmd_set_scissor);
+    F("vkCmdCopyImageToBuffer", cmd_copy_image_to_buffer);
+    F("vkCmdCopyBufferToImage", cmd_copy_buffer_to_image);
+    F("vkCmdClearColorImage", cmd_clear_color);
+    F("vkCmdCopyImage", cmd_copy_image);
+    F("vkCmdBlitImage", cmd_blit_image);
     F("vkGetSemaphoreCounterValue", get_sem_counter);
     F("vkGetSemaphoreCounterValueKHR", get_sem_counter);
     F("vkWaitSemaphores", wait_sems);

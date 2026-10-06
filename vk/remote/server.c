@@ -67,7 +67,13 @@ static int g_portability; // MoltenVK のときは portability_subset を有効�
     X(vkCmdDispatchIndirect) X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) X(vkCmdPipelineBarrier) \
     X(vkCreateFence) X(vkDestroyFence) X(vkResetFences) X(vkWaitForFences) X(vkGetFenceStatus) \
     X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkQueueSubmit) \
-    X(vkWaitSemaphores) X(vkGetSemaphoreCounterValue) X(vkSignalSemaphore)
+    X(vkWaitSemaphores) X(vkGetSemaphoreCounterValue) X(vkSignalSemaphore) \
+    X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView) \
+    X(vkDestroyImageView) X(vkCreateRenderPass) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer) \
+    X(vkCreateGraphicsPipelines) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdNextSubpass) X(vkCmdDraw) \
+    X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) \
+    X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdClearColorImage) \
+    X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkGetPhysicalDeviceImageFormatProperties)
 
 #define DECL(n) static PFN_##n n;
 VKFUNCS(DECL)
@@ -92,7 +98,8 @@ static void idlist_free(idlist **l) {
 static ent *g_tab;
 static size_t g_cap, g_cnt;
 
-enum { K_DEVICE = 1, K_QUEUE, K_BUFFER, K_MEMORY, K_SHADER, K_DSL, K_PLAYOUT, K_PIPELINE, K_DPOOL, K_DSET, K_CPOOL, K_CB, K_FENCE, K_SEM };
+enum { K_DEVICE = 1, K_QUEUE, K_BUFFER, K_MEMORY, K_SHADER, K_DSL, K_PLAYOUT, K_PIPELINE, K_DPOOL, K_DSET, K_CPOOL, K_CB, K_FENCE, K_SEM,
+       K_IMAGE, K_VIEW, K_RPASS, K_FB };
 
 static size_t slot(uint64_t id) { return (size_t) ((id * 0x9E3779B97F4A7C15ull) >> 20) & (g_cap - 1); }
 
@@ -339,6 +346,10 @@ static int last_with_mem(uint64_t mem) {
     return -1;
 }
 
+static void use_buffer_mem(cbinfo *ci, uint64_t mem) {
+    if (ci && mem) idlist_add(&ci->mems, mem);
+}
+
 // バッファの番号 → それがつながっているメモリを、記録の「使うメモリ」に足す
 static void use_buffer(cbinfo *ci, uint64_t buf) {
     if (!ci) return;
@@ -367,7 +378,8 @@ static void cleanup(void) {
     for (size_t i = 0; i < g_cap; i++) if (g_tab[i].id && g_tab[i].kind == K_DEVICE) dev = (VkDevice) (uintptr_t) g_tab[i].h;
     if (dev) {
         vkDeviceWaitIdle(dev);
-        static const int order[] = { K_PIPELINE, K_PLAYOUT, K_SHADER, K_DPOOL, K_DSL, K_CPOOL, K_FENCE, K_SEM, K_BUFFER, K_MEMORY };
+        static const int order[] = { K_PIPELINE, K_FB, K_RPASS, K_PLAYOUT, K_SHADER, K_DPOOL, K_DSL, K_CPOOL, K_FENCE, K_SEM,
+                                     K_VIEW, K_IMAGE, K_BUFFER, K_MEMORY };
         for (size_t o = 0; o < sizeof order / sizeof *order; o++)
             for (size_t i = 0; i < g_cap; i++) {
                 ent *e = &g_tab[i];
@@ -383,6 +395,10 @@ static void cleanup(void) {
                 case K_SEM: vkDestroySemaphore(dev, (VkSemaphore) e->h, NULL); break;
                 case K_BUFFER: vkDestroyBuffer(dev, (VkBuffer) e->h, NULL); break;
                 case K_MEMORY: vkFreeMemory(dev, (VkDeviceMemory) e->h, NULL); break;
+                case K_FB: vkDestroyFramebuffer(dev, (VkFramebuffer) e->h, NULL); break;
+                case K_RPASS: vkDestroyRenderPass(dev, (VkRenderPass) e->h, NULL); break;
+                case K_VIEW: vkDestroyImageView(dev, (VkImageView) e->h, NULL); break;
+                case K_IMAGE: vkDestroyImage(dev, (VkImage) e->h, NULL); break;
                 }
             }
         vkDestroyDevice(dev, NULL);
@@ -513,6 +529,168 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             vkCmdPipelineBarrier(cb, src, dst, dep, nm < 16 ? nm : 16, mb, nb, bb, 0, NULL);
             free(bb);
         } break;
+        case VR_CMD_PIPELINE_BARRIER2: {
+            uint32_t src = vr_ru32(r), dst = vr_ru32(r), dep = vr_ru32(r), nm = vr_ru32(r);
+            VkMemoryBarrier mb[16];
+            for (uint32_t i = 0; i < nm && i < 16; i++) mb[i] = (VkMemoryBarrier) { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, vr_ru32(r), vr_ru32(r) };
+            uint32_t nb = vr_ru32(r);
+            VkBufferMemoryBarrier *bb = calloc(nb ? nb : 1, sizeof *bb);
+            for (uint32_t i = 0; i < nb; i++) {
+                bb[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                bb[i].srcAccessMask = vr_ru32(r);
+                bb[i].dstAccessMask = vr_ru32(r);
+                bb[i].srcQueueFamilyIndex = vr_ru32(r);
+                bb[i].dstQueueFamilyIndex = vr_ru32(r);
+                bb[i].buffer = OBJ(VkBuffer, vr_ru64(r));
+                bb[i].offset = vr_ru64(r);
+                bb[i].size = vr_ru64(r);
+            }
+            uint32_t ni = vr_ru32(r);
+            VkImageMemoryBarrier *ib = calloc(ni ? ni : 1, sizeof *ib);
+            for (uint32_t i = 0; i < ni; i++) {
+                ib[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                ib[i].srcAccessMask = vr_ru32(r);
+                ib[i].dstAccessMask = vr_ru32(r);
+                ib[i].oldLayout = (VkImageLayout) vr_ru32(r);
+                ib[i].newLayout = (VkImageLayout) vr_ru32(r);
+                ib[i].srcQueueFamilyIndex = vr_ru32(r);
+                ib[i].dstQueueFamilyIndex = vr_ru32(r);
+                ib[i].image = OBJ(VkImage, vr_ru64(r));
+                vr_rcopy(r, &ib[i].subresourceRange, sizeof ib[i].subresourceRange);
+            }
+            vkCmdPipelineBarrier(cb, src, dst, dep, nm < 16 ? nm : 16, mb, nb, bb, ni, ib);
+            free(bb);
+            free(ib);
+        } break;
+        case VR_CMD_BEGIN_RENDER_PASS: {
+            VkRenderPassBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+            bi.renderPass = OBJ(VkRenderPass, vr_ru64(r));
+            uint64_t fid = vr_ru64(r);
+            bi.framebuffer = OBJ(VkFramebuffer, fid);
+            vr_rcopy(r, &bi.renderArea, sizeof bi.renderArea);
+            uint32_t nc = vr_ru32(r);
+            VkClearValue cv[16];
+            for (uint32_t i = 0; i < nc && i < 16; i++) vr_rcopy(r, &cv[i], sizeof cv[i]);
+            for (uint32_t i = 16; i < nc; i++) vr_take(r, sizeof(VkClearValue));
+            bi.clearValueCount = nc < 16 ? nc : 16;
+            bi.pClearValues = cv;
+            uint32_t contents = vr_ru32(r);
+            // 描く先の画像のメモリを「使う」として覚える
+            ent *fe = find(fid);
+            if (ci && fe && fe->list)
+                for (uint32_t k = 0; k < fe->list->n; k++) {
+                    ent *ve = find(fe->list->ids[k]);
+                    if (ve) use_buffer_mem(ci, ve->aux);
+                }
+            if (bi.renderPass && bi.framebuffer) vkCmdBeginRenderPass(cb, &bi, (VkSubpassContents) contents);
+        } break;
+        case VR_CMD_END_RENDER_PASS: vkCmdEndRenderPass(cb); break;
+        case VR_CMD_NEXT_SUBPASS: vkCmdNextSubpass(cb, (VkSubpassContents) vr_ru32(r)); break;
+        case VR_CMD_DRAW: {
+            uint32_t a = vr_ru32(r), b = vr_ru32(r), c = vr_ru32(r), d = vr_ru32(r);
+            vkCmdDraw(cb, a, b, c, d);
+        } break;
+        case VR_CMD_DRAW_INDEXED: {
+            uint32_t a = vr_ru32(r), b = vr_ru32(r), c = vr_ru32(r);
+            int32_t d = (int32_t) vr_ru32(r);
+            uint32_t e = vr_ru32(r);
+            vkCmdDrawIndexed(cb, a, b, c, d, e);
+        } break;
+        case VR_CMD_DRAW_INDIRECT:
+        case VR_CMD_DRAW_INDEXED_INDIRECT: {
+            uint64_t bid = vr_ru64(r);
+            use_buffer(ci, bid);
+            VkBuffer b = OBJ(VkBuffer, bid);
+            uint64_t off = vr_ru64(r);
+            uint32_t n = vr_ru32(r), stride = vr_ru32(r);
+            if (op == VR_CMD_DRAW_INDIRECT) vkCmdDrawIndirect(cb, b, off, n, stride);
+            else vkCmdDrawIndexedIndirect(cb, b, off, n, stride);
+        } break;
+        case VR_CMD_BIND_VERTEX_BUFFERS: {
+            uint32_t first = vr_ru32(r), n = vr_ru32(r);
+            VkBuffer bs[32];
+            VkDeviceSize offs[32];
+            for (uint32_t i = 0; i < n; i++) {
+                uint64_t bid = vr_ru64(r);
+                uint64_t off = vr_ru64(r);
+                use_buffer(ci, bid);
+                if (i < 32) { bs[i] = OBJ(VkBuffer, bid); offs[i] = off; }
+            }
+            vkCmdBindVertexBuffers(cb, first, n < 32 ? n : 32, bs, offs);
+        } break;
+        case VR_CMD_BIND_INDEX_BUFFER: {
+            uint64_t bid = vr_ru64(r);
+            use_buffer(ci, bid);
+            uint64_t off = vr_ru64(r);
+            vkCmdBindIndexBuffer(cb, OBJ(VkBuffer, bid), off, (VkIndexType) vr_ru32(r));
+        } break;
+        case VR_CMD_SET_VIEWPORT: {
+            uint32_t first = vr_ru32(r), n = vr_ru32(r);
+            VkViewport v[16];
+            for (uint32_t i = 0; i < n; i++) { if (i < 16) vr_rcopy(r, &v[i], sizeof v[i]); else vr_take(r, sizeof v[0]); }
+            vkCmdSetViewport(cb, first, n < 16 ? n : 16, v);
+        } break;
+        case VR_CMD_SET_SCISSOR: {
+            uint32_t first = vr_ru32(r), n = vr_ru32(r);
+            VkRect2D v[16];
+            for (uint32_t i = 0; i < n; i++) { if (i < 16) vr_rcopy(r, &v[i], sizeof v[i]); else vr_take(r, sizeof v[0]); }
+            vkCmdSetScissor(cb, first, n < 16 ? n : 16, v);
+        } break;
+        case VR_CMD_COPY_IMAGE_TO_BUFFER:
+        case VR_CMD_COPY_BUFFER_TO_IMAGE: {
+            uint64_t a = vr_ru64(r), b = vr_ru64(r);
+            uint32_t layout = vr_ru32(r), n = vr_ru32(r);
+            VkBufferImageCopy *rg = calloc(n ? n : 1, sizeof *rg);
+            for (uint32_t i = 0; i < n; i++) vr_rcopy(r, &rg[i], sizeof rg[i]);
+            if (op == VR_CMD_COPY_IMAGE_TO_BUFFER) {
+                // a = 画像・b = バッファ
+                ent *ie = find(a);
+                if (ie && ci) use_buffer_mem(ci, ie->aux);
+                use_buffer(ci, b);
+                vkCmdCopyImageToBuffer(cb, OBJ(VkImage, a), (VkImageLayout) layout, OBJ(VkBuffer, b), n, rg);
+            } else {
+                // a = バッファ・b = 画像
+                ent *ie = find(b);
+                if (ie && ci) use_buffer_mem(ci, ie->aux);
+                use_buffer(ci, a);
+                vkCmdCopyBufferToImage(cb, OBJ(VkBuffer, a), OBJ(VkImage, b), (VkImageLayout) layout, n, rg);
+            }
+            free(rg);
+        } break;
+        case VR_CMD_CLEAR_COLOR_IMAGE: {
+            uint64_t iid = vr_ru64(r);
+            uint32_t layout = vr_ru32(r);
+            VkClearColorValue c;
+            vr_rcopy(r, &c, sizeof c);
+            uint32_t n = vr_ru32(r);
+            VkImageSubresourceRange rg[16];
+            for (uint32_t i = 0; i < n; i++) { if (i < 16) vr_rcopy(r, &rg[i], sizeof rg[i]); else vr_take(r, sizeof rg[0]); }
+            ent *ie = find(iid);
+            if (ie && ci) use_buffer_mem(ci, ie->aux);
+            vkCmdClearColorImage(cb, OBJ(VkImage, iid), (VkImageLayout) layout, &c, n < 16 ? n : 16, rg);
+        } break;
+        case VR_CMD_COPY_IMAGE:
+        case VR_CMD_BLIT_IMAGE: {
+            uint64_t sid = vr_ru64(r);
+            uint32_t sl = vr_ru32(r);
+            uint64_t did = vr_ru64(r);
+            uint32_t dl = vr_ru32(r), n = vr_ru32(r);
+            ent *se = find(sid), *de = find(did);
+            if (se && ci) use_buffer_mem(ci, se->aux);
+            if (de && ci) use_buffer_mem(ci, de->aux);
+            if (op == VR_CMD_COPY_IMAGE) {
+                VkImageCopy *rg = calloc(n ? n : 1, sizeof *rg);
+                for (uint32_t i = 0; i < n; i++) vr_rcopy(r, &rg[i], sizeof rg[i]);
+                vkCmdCopyImage(cb, OBJ(VkImage, sid), (VkImageLayout) sl, OBJ(VkImage, did), (VkImageLayout) dl, n, rg);
+                free(rg);
+            } else {
+                VkImageBlit *rg = calloc(n ? n : 1, sizeof *rg);
+                for (uint32_t i = 0; i < n; i++) vr_rcopy(r, &rg[i], sizeof rg[i]);
+                uint32_t filter = vr_ru32(r);
+                vkCmdBlitImage(cb, OBJ(VkImage, sid), (VkImageLayout) sl, OBJ(VkImage, did), (VkImageLayout) dl, n, rg, (VkFilter) filter);
+                free(rg);
+            }
+        } break;
         default:
             vlog("知らない記録の命令 %u", op);
             r->bad = 1;
@@ -532,6 +710,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_DESTROY_DESCRIPTOR_POOL: case VR_FREE_MEMORY: case VR_DESTROY_BUFFER: case VR_DESTROY_PIPELINE:
     case VR_DESTROY_PIPELINE_LAYOUT: case VR_DESTROY_SHADER_MODULE: case VR_DESTROY_DSL: case VR_DESTROY_FENCE:
     case VR_DESTROY_SEMAPHORE: case VR_DESTROY_DEVICE: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE:
+    case VR_DESTROY_IMAGE: case VR_DESTROY_IMAGE_VIEW: case VR_DESTROY_RENDER_PASS: case VR_DESTROY_FRAMEBUFFER:
         drain();
         break;
     default:
@@ -1187,6 +1366,309 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         si.value = vr_ru64(r);
         vkSignalSemaphore(d, &si);
         return 1;
+    }
+    case VR_CREATE_IMAGE: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r);
+        VkImageCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        ci.flags = vr_ru32(r);
+        ci.imageType = (VkImageType) vr_ru32(r);
+        ci.format = (VkFormat) vr_ru32(r);
+        ci.extent.width = vr_ru32(r);
+        ci.extent.height = vr_ru32(r);
+        ci.extent.depth = vr_ru32(r);
+        ci.mipLevels = vr_ru32(r);
+        ci.arrayLayers = vr_ru32(r);
+        ci.samples = (VkSampleCountFlagBits) vr_ru32(r);
+        ci.tiling = (VkImageTiling) vr_ru32(r);
+        ci.usage = vr_ru32(r);
+        ci.initialLayout = (VkImageLayout) vr_ru32(r);
+        ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkImage im;
+        VkMemoryRequirements req;
+        memset(&req, 0, sizeof req);
+        VkResult res = vkCreateImage(d, &ci, NULL, &im);
+        if (res == VK_SUCCESS) {
+            put(id, (uint64_t) im, K_IMAGE);
+            vkGetImageMemoryRequirements(d, im, &req);
+        }
+        vr_put(&g_out, &req, sizeof req);
+        return reply(s, res);
+    }
+    case VR_DESTROY_IMAGE:
+    case VR_DESTROY_IMAGE_VIEW:
+    case VR_DESTROY_RENDER_PASS:
+    case VR_DESTROY_FRAMEBUFFER: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r);
+        ent *e = find(id);
+        if (e) {
+            if (op == VR_DESTROY_IMAGE) vkDestroyImage(d, (VkImage) e->h, NULL);
+            else if (op == VR_DESTROY_IMAGE_VIEW) vkDestroyImageView(d, (VkImageView) e->h, NULL);
+            else if (op == VR_DESTROY_RENDER_PASS) vkDestroyRenderPass(d, (VkRenderPass) e->h, NULL);
+            else vkDestroyFramebuffer(d, (VkFramebuffer) e->h, NULL);
+            idlist_free(&e->list);
+            del(id);
+        }
+        return 1;
+    }
+    case VR_BIND_IMAGE_MEMORY: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t iid = vr_ru64(r), mid = vr_ru64(r);
+        uint64_t off = vr_ru64(r);
+        ent *ie = find(iid);
+        if (ie) ie->aux = mid;
+        vkBindImageMemory(d, OBJ(VkImage, iid), OBJ(VkDeviceMemory, mid), off);
+        return 1;
+    }
+    case VR_CREATE_IMAGE_VIEW: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r);
+        VkImageViewCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        ci.flags = vr_ru32(r);
+        uint64_t iid = vr_ru64(r);
+        ci.image = OBJ(VkImage, iid);
+        ci.viewType = (VkImageViewType) vr_ru32(r);
+        ci.format = (VkFormat) vr_ru32(r);
+        vr_rcopy(r, &ci.components, sizeof ci.components);
+        vr_rcopy(r, &ci.subresourceRange, sizeof ci.subresourceRange);
+        VkImageView v;
+        VkResult res = vkCreateImageView(d, &ci, NULL, &v);
+        if (res == VK_SUCCESS) {
+            put(id, (uint64_t) v, K_VIEW);
+            ent *ie = find(iid), *ve = find(id);
+            if (ve && ie) ve->aux = ie->aux; // 見え方からも、もとの画像のメモリが分かるように
+        } else {
+            vlog("image view を作れない (%d)", res);
+        }
+        return 1;
+    }
+    case VR_CREATE_RENDER_PASS: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r);
+        VkRenderPassCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
+        ci.flags = vr_ru32(r);
+        ci.attachmentCount = vr_ru32(r);
+        VkAttachmentDescription *att = calloc(ci.attachmentCount ? ci.attachmentCount : 1, sizeof *att);
+        for (uint32_t i = 0; i < ci.attachmentCount; i++) vr_rcopy(r, &att[i], sizeof att[i]);
+        ci.pAttachments = att;
+        ci.subpassCount = vr_ru32(r);
+        VkSubpassDescription *sub = calloc(ci.subpassCount ? ci.subpassCount : 1, sizeof *sub);
+        // 参照の並びは、まとめて 1 つの塊に置く
+        VkAttachmentReference *refs = calloc(256, sizeof *refs);
+        uint32_t *pres = calloc(256, sizeof *pres);
+        uint32_t nref = 0, npres = 0;
+        for (uint32_t i = 0; i < ci.subpassCount; i++) {
+            sub[i].flags = vr_ru32(r);
+            sub[i].pipelineBindPoint = (VkPipelineBindPoint) vr_ru32(r);
+            uint32_t nin = vr_ru32(r);
+            sub[i].inputAttachmentCount = nin;
+            sub[i].pInputAttachments = refs + nref;
+            for (uint32_t k = 0; k < nin && nref < 256; k++) vr_rcopy(r, &refs[nref++], sizeof *refs);
+            uint32_t ncol = vr_ru32(r);
+            sub[i].colorAttachmentCount = ncol;
+            sub[i].pColorAttachments = refs + nref;
+            for (uint32_t k = 0; k < ncol && nref < 256; k++) vr_rcopy(r, &refs[nref++], sizeof *refs);
+            if (vr_ru32(r)) {
+                sub[i].pResolveAttachments = refs + nref;
+                for (uint32_t k = 0; k < ncol && nref < 256; k++) vr_rcopy(r, &refs[nref++], sizeof *refs);
+            }
+            if (vr_ru32(r)) {
+                sub[i].pDepthStencilAttachment = refs + nref;
+                if (nref < 256) vr_rcopy(r, &refs[nref++], sizeof *refs);
+            }
+            uint32_t np = vr_ru32(r);
+            sub[i].preserveAttachmentCount = np;
+            sub[i].pPreserveAttachments = pres + npres;
+            for (uint32_t k = 0; k < np && npres < 256; k++) pres[npres++] = vr_ru32(r);
+        }
+        ci.pSubpasses = sub;
+        ci.dependencyCount = vr_ru32(r);
+        VkSubpassDependency *dep = calloc(ci.dependencyCount ? ci.dependencyCount : 1, sizeof *dep);
+        for (uint32_t i = 0; i < ci.dependencyCount; i++) vr_rcopy(r, &dep[i], sizeof dep[i]);
+        ci.pDependencies = dep;
+        VkRenderPass rp;
+        VkResult res = r->bad ? VK_ERROR_INITIALIZATION_FAILED : vkCreateRenderPass(d, &ci, NULL, &rp);
+        if (res == VK_SUCCESS) put(id, (uint64_t) rp, K_RPASS);
+        else vlog("render pass を作れない (%d)", res);
+        free(att); free(sub); free(refs); free(pres); free(dep);
+        return 1;
+    }
+    case VR_CREATE_FRAMEBUFFER: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r);
+        VkFramebufferCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+        ci.flags = vr_ru32(r);
+        ci.renderPass = OBJ(VkRenderPass, vr_ru64(r));
+        ci.attachmentCount = vr_ru32(r);
+        VkImageView *v = calloc(ci.attachmentCount ? ci.attachmentCount : 1, sizeof *v);
+        uint64_t vids[32];
+        for (uint32_t i = 0; i < ci.attachmentCount; i++) {
+            uint64_t vid = vr_ru64(r);
+            if (i < 32) vids[i] = vid;
+            v[i] = OBJ(VkImageView, vid);
+        }
+        ci.pAttachments = v;
+        ci.width = vr_ru32(r);
+        ci.height = vr_ru32(r);
+        ci.layers = vr_ru32(r);
+        VkFramebuffer fb;
+        VkResult res = vkCreateFramebuffer(d, &ci, NULL, &fb);
+        if (res == VK_SUCCESS) {
+            put(id, (uint64_t) fb, K_FB);
+            ent *fe = find(id);
+            for (uint32_t i = 0; i < ci.attachmentCount && i < 32 && fe; i++) idlist_add(&fe->list, vids[i]);
+        } else {
+            vlog("framebuffer を作れない (%d)", res);
+        }
+        free(v);
+        return 1;
+    }
+    case VR_CREATE_GRAPHICS_PIPELINE: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r);
+        VkGraphicsPipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+        ci.flags = vr_ru32(r);
+        ci.layout = OBJ(VkPipelineLayout, vr_ru64(r));
+        ci.renderPass = OBJ(VkRenderPass, vr_ru64(r));
+        ci.subpass = vr_ru32(r);
+        // シェーダーの段
+        uint32_t nst = vr_ru32(r);
+        if (nst > 8) nst = 8;
+        VkPipelineShaderStageCreateInfo st[8];
+        VkSpecializationInfo spi[8];
+        VkSpecializationMapEntry me[8][32];
+        for (uint32_t i = 0; i < nst; i++) {
+            st[i] = (VkPipelineShaderStageCreateInfo) { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+            st[i].stage = (VkShaderStageFlagBits) vr_ru32(r);
+            st[i].flags = vr_ru32(r);
+            st[i].module = OBJ(VkShaderModule, vr_ru64(r));
+            uint32_t l;
+            st[i].pName = (const char *) vr_rbytes(r, &l);
+            uint32_t nm = vr_ru32(r);
+            for (uint32_t k = 0; k < nm; k++) {
+                uint32_t a = vr_ru32(r), b = vr_ru32(r), c = vr_ru32(r);
+                if (k < 32) me[i][k] = (VkSpecializationMapEntry) { a, b, c };
+            }
+            uint32_t nd;
+            const void *sd = vr_rbytes(r, &nd);
+            spi[i] = (VkSpecializationInfo) { nm < 32 ? nm : 32, me[i], nd, sd };
+            if (nm) st[i].pSpecializationInfo = &spi[i];
+        }
+        ci.stageCount = nst;
+        ci.pStages = st;
+        // 頂点の入力
+        VkPipelineVertexInputStateCreateInfo vi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+        VkVertexInputBindingDescription vb[32];
+        VkVertexInputAttributeDescription va[32];
+        if (vr_ru32(r)) {
+            vi.vertexBindingDescriptionCount = vr_ru32(r);
+            for (uint32_t i = 0; i < vi.vertexBindingDescriptionCount; i++) { if (i < 32) vr_rcopy(r, &vb[i], sizeof vb[i]); else vr_take(r, sizeof vb[0]); }
+            if (vi.vertexBindingDescriptionCount > 32) vi.vertexBindingDescriptionCount = 32;
+            vi.vertexAttributeDescriptionCount = vr_ru32(r);
+            for (uint32_t i = 0; i < vi.vertexAttributeDescriptionCount; i++) { if (i < 32) vr_rcopy(r, &va[i], sizeof va[i]); else vr_take(r, sizeof va[0]); }
+            if (vi.vertexAttributeDescriptionCount > 32) vi.vertexAttributeDescriptionCount = 32;
+            vi.pVertexBindingDescriptions = vb;
+            vi.pVertexAttributeDescriptions = va;
+            ci.pVertexInputState = &vi;
+        }
+        // 組み立て
+        VkPipelineInputAssemblyStateCreateInfo ia = { .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+        if (vr_ru32(r)) {
+            ia.topology = (VkPrimitiveTopology) vr_ru32(r);
+            ia.primitiveRestartEnable = vr_ru32(r);
+            ci.pInputAssemblyState = &ia;
+        }
+        // 表示する範囲
+        VkPipelineViewportStateCreateInfo vps = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+        VkViewport vpv[16];
+        VkRect2D scv[16];
+        if (vr_ru32(r)) {
+            vps.viewportCount = vr_ru32(r);
+            if (vr_ru32(r)) {
+                for (uint32_t i = 0; i < vps.viewportCount; i++) { if (i < 16) vr_rcopy(r, &vpv[i], sizeof vpv[i]); else vr_take(r, sizeof vpv[0]); }
+                vps.pViewports = vpv;
+            }
+            vps.scissorCount = vr_ru32(r);
+            if (vr_ru32(r)) {
+                for (uint32_t i = 0; i < vps.scissorCount; i++) { if (i < 16) vr_rcopy(r, &scv[i], sizeof scv[i]); else vr_take(r, sizeof scv[0]); }
+                vps.pScissors = scv;
+            }
+            ci.pViewportState = &vps;
+        }
+        // 塗り方
+        VkPipelineRasterizationStateCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+        if (vr_ru32(r)) {
+            rs.depthClampEnable = vr_ru32(r);
+            rs.rasterizerDiscardEnable = vr_ru32(r);
+            rs.polygonMode = (VkPolygonMode) vr_ru32(r);
+            rs.cullMode = vr_ru32(r);
+            rs.frontFace = (VkFrontFace) vr_ru32(r);
+            rs.depthBiasEnable = vr_ru32(r);
+            vr_rcopy(r, &rs.depthBiasConstantFactor, 4);
+            vr_rcopy(r, &rs.depthBiasClamp, 4);
+            vr_rcopy(r, &rs.depthBiasSlopeFactor, 4);
+            vr_rcopy(r, &rs.lineWidth, 4);
+            ci.pRasterizationState = &rs;
+        }
+        // 標本の数
+        VkPipelineMultisampleStateCreateInfo ms = { .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+        if (vr_ru32(r)) {
+            ms.rasterizationSamples = (VkSampleCountFlagBits) vr_ru32(r);
+            ms.sampleShadingEnable = vr_ru32(r);
+            vr_rcopy(r, &ms.minSampleShading, 4);
+            ms.alphaToCoverageEnable = vr_ru32(r);
+            ms.alphaToOneEnable = vr_ru32(r);
+            ci.pMultisampleState = &ms;
+        }
+        // 奥行き・ステンシル
+        VkPipelineDepthStencilStateCreateInfo ds = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+        if (vr_ru32(r)) {
+            ds.depthTestEnable = vr_ru32(r);
+            ds.depthWriteEnable = vr_ru32(r);
+            ds.depthCompareOp = (VkCompareOp) vr_ru32(r);
+            ds.depthBoundsTestEnable = vr_ru32(r);
+            ds.stencilTestEnable = vr_ru32(r);
+            vr_rcopy(r, &ds.front, sizeof ds.front);
+            vr_rcopy(r, &ds.back, sizeof ds.back);
+            vr_rcopy(r, &ds.minDepthBounds, 4);
+            vr_rcopy(r, &ds.maxDepthBounds, 4);
+            ci.pDepthStencilState = &ds;
+        }
+        // 色の重ね方
+        VkPipelineColorBlendStateCreateInfo cb = { .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+        VkPipelineColorBlendAttachmentState cba[16];
+        if (vr_ru32(r)) {
+            cb.logicOpEnable = vr_ru32(r);
+            cb.logicOp = (VkLogicOp) vr_ru32(r);
+            cb.attachmentCount = vr_ru32(r);
+            for (uint32_t i = 0; i < cb.attachmentCount; i++) { if (i < 16) vr_rcopy(r, &cba[i], sizeof cba[i]); else vr_take(r, sizeof cba[0]); }
+            if (cb.attachmentCount > 16) cb.attachmentCount = 16;
+            cb.pAttachments = cba;
+            vr_rcopy(r, cb.blendConstants, sizeof cb.blendConstants);
+            ci.pColorBlendState = &cb;
+        }
+        // 後から変える値
+        VkPipelineDynamicStateCreateInfo dy = { .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+        VkDynamicState dys[32];
+        dy.dynamicStateCount = vr_ru32(r);
+        for (uint32_t i = 0; i < dy.dynamicStateCount; i++) { uint32_t v = vr_ru32(r); if (i < 32) dys[i] = (VkDynamicState) v; }
+        if (dy.dynamicStateCount > 32) dy.dynamicStateCount = 32;
+        dy.pDynamicStates = dys;
+        if (dy.dynamicStateCount) ci.pDynamicState = &dy;
+        VkPipeline pp;
+        VkResult res = r->bad ? VK_ERROR_INITIALIZATION_FAILED : vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &ci, NULL, &pp);
+        if (res == VK_SUCCESS) put(id, (uint64_t) pp, K_PIPELINE);
+        else vlog("graphics pipeline を作れない (%d)", res);
+        return reply(s, res);
+    }
+    case VR_GET_IMAGE_FORMAT_PROPS: {
+        uint32_t fmt = vr_ru32(r), type = vr_ru32(r), tiling = vr_ru32(r), usage = vr_ru32(r), flags = vr_ru32(r);
+        VkImageFormatProperties ip;
+        memset(&ip, 0, sizeof ip);
+        VkResult res = vkGetPhysicalDeviceImageFormatProperties(g_pd, (VkFormat) fmt, (VkImageType) type, (VkImageTiling) tiling, usage, flags, &ip);
+        vr_put(&g_out, &ip, sizeof ip);
+        return reply(s, res);
     }
     case VR_QUEUE_WAIT_IDLE: return reply(s, vkQueueWaitIdle((VkQueue) (uintptr_t) H(vr_ru64(r))));
     case VR_DEVICE_WAIT_IDLE: return reply(s, vkDeviceWaitIdle(DEV(vr_ru64(r))));
