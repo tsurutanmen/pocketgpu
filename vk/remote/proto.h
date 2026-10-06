@@ -21,6 +21,8 @@
 #define VR_CAP_QUERY 128u            // query pool（タイムスタンプ・occlusion）。VR_CREATE_QUERY_POOL など
 #define VR_CAP_JPEG 256u             // VR_READ_JPEG：窓に出すコマを受け手が JPEG に縮めて返す
 #define VR_CAP_JPEG_PIPE 1024u       // VR_READ_JPEG_PIPE：今のコマを後ろで縮め始めて、ひとつ前のコマの JPEG を返す
+#define VR_CAP_BDA 4096u            // buffer device address：VR_GET_BUFFER_ADDRESS と、VR_ALLOC_MEMORY の末尾の flags（VkMemoryAllocateFlagsInfo）
+#define VR_CAP_NULL_DESC 2048u      // 空（VK_NULL_HANDLE）の descriptor と頂点バッファを受ける。GPU が持たなければ受け手が代わりの物を使う
 #define VR_CAP_D3D 512u              // DirectX（DXVK）の土台：VR_CREATE_BUFFER_VIEW・texel buffer の descriptor・VR_GET_IMAGE_SUBRESOURCE_LAYOUT
 #define VR_CAP_NEW_MASK (VR_CAP_VK13 | VR_CAP_DYNAMIC_RENDERING | VR_CAP_SYNC2 | VR_CAP_RENDER_PASS2 | VR_CAP_CMD10 | VR_CAP_EXT_DYNAMIC_STATE | VR_CAP_QUERY)
 // 1.3 の受け手は、VR_GET_FORMAT_PROPS の返事の後ろに VkFormatProperties3 の 3 つの値（u64）を付ける。古いドライバは読まない
@@ -102,6 +104,7 @@ enum vr_op {
     VR_DESTROY_BUFFER_VIEW,
     VR_GET_IMAGE_SUBRESOURCE_LAYOUT, // [同期] device・image・aspect・mip・layer → VkSubresourceLayout（VR_CAP_D3D）
     VR_READ_JPEG_PIPE,           // [同期] VR_READ_JPEG と同じ。返すのはひとつ前のコマの JPEG（最初は空）。縮めるのを次のコマの仕事と重ねる（VR_CAP_JPEG_PIPE）
+    VR_GET_BUFFER_ADDRESS,       // [同期] device・buffer → GPU の中のアドレス（u64）（VR_CAP_BDA）
     VR_OP_COUNT
 };
 

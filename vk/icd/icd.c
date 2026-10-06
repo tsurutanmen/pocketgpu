@@ -130,7 +130,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_DESTROY_QUERY_POOL] = "DESTROY_QUERY_POOL", [VR_GET_QUERY_POOL_RESULTS] = "GET_QUERY_POOL_RESULTS",
     [VR_RESET_QUERY_POOL] = "RESET_QUERY_POOL", [VR_CREATE_BUFFER_VIEW] = "CREATE_BUFFER_VIEW",
     [VR_DESTROY_BUFFER_VIEW] = "DESTROY_BUFFER_VIEW", [VR_GET_IMAGE_SUBRESOURCE_LAYOUT] = "GET_IMAGE_SUBRESOURCE_LAYOUT",
-    [VR_READ_JPEG_PIPE] = "READ_JPEG_PIPE",
+    [VR_READ_JPEG_PIPE] = "READ_JPEG_PIPE", [VR_GET_BUFFER_ADDRESS] = "GET_BUFFER_ADDRESS",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -371,6 +371,7 @@ static struct {
     int tried, ok;
     VkPhysicalDeviceProperties props;
     VkPhysicalDeviceFeatures feats;
+    VkPhysicalDeviceFeatures real; // 受け手の GPU が本当に持つ機能（名乗りだけの物を、装置を作るときに外すため）
     VkPhysicalDeviceMemoryProperties mem;
     uint32_t nq;
     VkQueueFamilyProperties q[16];
@@ -379,6 +380,14 @@ static struct {
     uint32_t caps; // 受け手ができること（VR_CAP_*）
 } g_hw;
 static SRWLOCK g_hw_lock = SRWLOCK_INIT;
+
+// IPHONE_VK_DXVK3=1 のとき、新しい DXVK（3.x）が必須にする物のうち、ドライバがまだ全部は運べない物も名乗る
+// （descriptor indexing の 5 つ・inline uniform block・maintenance5 と 6）。確かめ終わったら外す
+static int dxvk3(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_DXVK3"); v = e && *e == '1'; }
+    return v;
+}
 
 // 中継するだけで済む（新しい入口が要らない）拡張だけを見せる
 static const char *const ALLOWED_EXT[] = {
@@ -392,6 +401,8 @@ static const char *const ALLOWED_EXT[] = {
     // DXVK が使う物。中身はシェーダーと値だけなので、受け手の装置で有効にすれば通る
     "VK_KHR_image_format_list", "VK_KHR_sampler_mirror_clamp_to_edge",
     "VK_EXT_shader_stencil_export", "VK_EXT_shader_viewport_index_layer",
+    // attachment の読み書きをしない印（値を運ぶだけ）
+    "VK_KHR_load_store_op_none", "VK_EXT_load_store_op_none",
 };
 
 // 受け手が caps で名乗ったときだけ見せる拡張（受け手の装置でも有効にする）
@@ -402,6 +413,7 @@ static const struct { const char *name; uint32_t cap; } CAP_EXT[] = {
 };
 
 static int allowed_ext(const char *name) {
+    if (dxvk3() && (!strcmp(name, "VK_KHR_maintenance5") || !strcmp(name, "VK_KHR_maintenance6"))) return 1;
     for (size_t i = 0; i < sizeof ALLOWED_EXT / sizeof *ALLOWED_EXT; i++)
         if (!strcmp(name, ALLOWED_EXT[i])) return 1;
     for (size_t i = 0; i < sizeof CAP_EXT / sizeof *CAP_EXT; i++)
@@ -484,6 +496,9 @@ static void bc_block(VkFormat f, const uint8_t *blk, uint8_t *tile, uint32_t tb)
 
 static void mask_features(VkPhysicalDeviceFeatures *f) {
     if (g_bc) f->textureCompressionBC = VK_TRUE;
+    // 新しい DXVK は geometry shader と cull distance を必須にする。iPhone の GPU は持たないので名乗りだけする。
+    // geometry shader を使う pipeline は作らずに失敗を返す（DXVK はその描画を飛ばす）
+    if (dxvk3()) f->geometryShader = f->shaderCullDistance = VK_TRUE;
     // 中継していない機能は「無い」と答える
     f->sparseBinding = f->sparseResidencyBuffer = f->sparseResidencyImage2D = f->sparseResidencyImage3D = VK_FALSE;
     f->sparseResidency2Samples = f->sparseResidency4Samples = f->sparseResidency8Samples = f->sparseResidency16Samples = VK_FALSE;
@@ -511,6 +526,7 @@ static int hello(void) {
             vr_rd rd = { out.p, out.n, 0, 0 };
             vr_rcopy(&rd, &g_hw.props, sizeof g_hw.props);
             vr_rcopy(&rd, &g_hw.feats, sizeof g_hw.feats);
+            g_hw.real = g_hw.feats;
             vr_rcopy(&rd, &g_hw.mem, sizeof g_hw.mem);
             uint32_t nq = vr_ru32(&rd);
             for (uint32_t i = 0; i < nq; i++) {
@@ -537,6 +553,10 @@ static int hello(void) {
             if (g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_swapchain", 70 };
             // ドライバの中だけで済む拡張（受け手には送らない）
             if ((g_hw.caps & VR_CAP_NEW_MASK) && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_copy_commands2", 1 };
+            // depth clip は pipeline を作るときに depth clamp に置き換える（DXVK 2 が拡張の無い GPU でしていたのと同じ）
+            if (dxvk3() && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_depth_clip_enable", 1 };
+            // 空の descriptor は受け手が受ける（GPU が持たなければ代わりの物で）
+            if (dxvk3() && (g_hw.caps & VR_CAP_NULL_DESC) && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_robustness2", 1 };
             if (!rd.bad) {
                 char real[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
                 memcpy(real, g_hw.props.deviceName, sizeof real);
@@ -595,7 +615,7 @@ struct mem {
     struct mem *prev, *next;
 };
 
-struct buf { uint64_t size; VkMemoryRequirements req; struct mem *m; uint64_t memoff; };
+struct buf { uint64_t size; VkMemoryRequirements req; struct mem *m; uint64_t memoff; uint64_t addr; }; // addr：受け手の GPU の中のアドレス
 
 typedef struct { struct mem *m; uint64_t off, len, serial; struct queue *q; } rng;
 
@@ -923,6 +943,8 @@ static const stinfo FEAT_ST[] = {
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT, sizeof(VkPhysicalDeviceExtendedDynamicStateFeaturesEXT) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT, sizeof(VkPhysicalDeviceExtendedDynamicState2FeaturesEXT) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES, sizeof(VkPhysicalDeviceHostQueryResetFeatures) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES, sizeof(VkPhysicalDeviceMaintenance5Features) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES, sizeof(VkPhysicalDeviceMaintenance6Features) },
 };
 
 // 1.3 に向けて足した機能の構造体。装置を作るときは、中継できない機能を 0 にしてから送る
@@ -930,7 +952,8 @@ static int new_feature_st(VkStructureType st) {
     return st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES || st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES ||
            st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES ||
            st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT ||
-           st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT || st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES;
+           st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT || st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES ||
+           st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES || st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES;
 }
 
 static const stinfo PROP_ST[] = {
@@ -947,6 +970,9 @@ static const stinfo PROP_ST[] = {
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES, sizeof(VkPhysicalDeviceVulkan13Properties) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES, sizeof(VkPhysicalDeviceDepthStencilResolveProperties) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES, sizeof(VkPhysicalDeviceMaintenance4Properties) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES, sizeof(VkPhysicalDeviceMaintenance5Properties) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_PROPERTIES, sizeof(VkPhysicalDeviceMaintenance6Properties) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT, sizeof(VkPhysicalDeviceRobustness2PropertiesEXT) },
 };
 
 static uint32_t st_size(const stinfo *t, size_t n, VkStructureType st) {
@@ -981,6 +1007,18 @@ static void mask_ext_features(VkBaseOutStructure *s) {
         f->subgroupBroadcastDynamicId = k.subgroupBroadcastDynamicId;
         f->timelineSemaphore = k.timelineSemaphore;
         if (g_hw.caps & VR_CAP_QUERY) f->hostQueryReset = k.hostQueryReset;
+        f->samplerMirrorClampToEdge = k.samplerMirrorClampToEdge; // sampler の値を運ぶだけ
+        if (dxvk3()) {
+            // binding ごとの flags はまだ運ばない。受け手は set を書き換える前に、その set を使う仕事を待つので、
+            // 「使っている間に書き換える」は待つ形で守られる
+            f->descriptorIndexing = k.descriptorIndexing;
+            f->descriptorBindingSampledImageUpdateAfterBind = k.descriptorBindingSampledImageUpdateAfterBind;
+            f->descriptorBindingUpdateUnusedWhilePending = k.descriptorBindingUpdateUnusedWhilePending;
+            f->descriptorBindingPartiallyBound = k.descriptorBindingPartiallyBound;
+            f->runtimeDescriptorArray = k.runtimeDescriptorArray;
+            // アドレスは受け手の本物を返す。shader がアドレスでたどって書いた中身は、ドライバの写しの見張りに入らない
+            if (g_hw.caps & VR_CAP_BDA) f->bufferDeviceAddress = k.bufferDeviceAddress;
+        }
     } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES) {
         VkPhysicalDeviceVulkan13Features k = *(VkPhysicalDeviceVulkan13Features *) s, *f = (void *) s;
         memset(BODY(f), 0, sizeof *f - sizeof(VkBaseOutStructure));
@@ -999,6 +1037,12 @@ static void mask_ext_features(VkBaseOutStructure *s) {
         f->dynamicRendering = (g_hw.caps & VR_CAP_DYNAMIC_RENDERING) ? k.dynamicRendering : VK_FALSE;
         f->shaderIntegerDotProduct = k.shaderIntegerDotProduct;
         f->maintenance4 = k.maintenance4;
+        // DXVK 3 は印だけを見る（inline uniform block の descriptor は使わない）。書き込みはまだ飛ばす
+        if (dxvk3()) f->inlineUniformBlock = k.inlineUniformBlock;
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES) {
+        if (!dxvk3()) ((VkPhysicalDeviceMaintenance5Features *) s)->maintenance5 = VK_FALSE;
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES) {
+        if (!dxvk3()) ((VkPhysicalDeviceMaintenance6Features *) s)->maintenance6 = VK_FALSE;
     } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES) {
         VkPhysicalDeviceDynamicRenderingFeatures *f = (void *) s;
         if (!(g_hw.caps & VR_CAP_DYNAMIC_RENDERING)) f->dynamicRendering = VK_FALSE;
@@ -1070,6 +1114,17 @@ static void VKAPI_CALL get_props2(VkPhysicalDevice pd, VkPhysicalDevicePropertie
 static void VKAPI_CALL get_features2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f) {
     get_features(pd, &f->features);
     query_chain(VR_GET_FEATURES2, f->pNext, FEAT_ST, sizeof FEAT_ST / sizeof *FEAT_ST, &f->features, sizeof f->features);
+    // ドライバの中で済ませる機能
+    for (VkBaseOutStructure *x = f->pNext; x; x = x->pNext)
+        if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT)
+            ((VkPhysicalDeviceDepthClipEnableFeaturesEXT *) x)->depthClipEnable = dxvk3() ? VK_TRUE : VK_FALSE;
+        else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) {
+            // 範囲の外の読みは 0（GPU の robustBufferAccess に頼る）。画像の範囲の外は名乗らない
+            VkPhysicalDeviceRobustness2FeaturesEXT *r2 = (void *) x;
+            VkBool32 on = dxvk3() && (g_hw.caps & VR_CAP_NULL_DESC) ? VK_TRUE : VK_FALSE;
+            r2->robustBufferAccess2 = r2->nullDescriptor = on;
+            r2->robustImageAccess2 = VK_FALSE;
+        }
 }
 
 static void VKAPI_CALL get_queue_families(VkPhysicalDevice pd, uint32_t *n, VkQueueFamilyProperties *q) {
@@ -1253,7 +1308,14 @@ static VkResult VKAPI_CALL create_device(VkPhysicalDevice pd, const VkDeviceCrea
         else if (st_size(FEAT_ST, sizeof FEAT_ST / sizeof *FEAT_ST, s->sType) && nc < 32) chain[nc++] = s;
     }
     vr_u32(&b, base ? 1 : 0);
-    if (base) vr_put(&b, base, sizeof *base);
+    if (base) {
+        // 名乗りだけの機能（ドライバがほどく BC など）は、受け手の装置では有効にしない
+        VkPhysicalDeviceFeatures en = *base;
+        VkBool32 *e = (VkBool32 *) &en;
+        const VkBool32 *rf = (const VkBool32 *) &g_hw.real;
+        for (size_t k = 0; k < sizeof en / sizeof(VkBool32); k++) e[k] = e[k] && rf[k];
+        vr_put(&b, &en, sizeof en);
+    }
     vr_u32(&b, nc);
     for (uint32_t i = 0; i < nc; i++) {
         uint32_t sz = st_size(FEAT_ST, sizeof FEAT_ST / sizeof *FEAT_ST, chain[i]->sType);
@@ -1357,6 +1419,13 @@ static VkResult VKAPI_CALL alloc_memory(VkDevice dv, const VkMemoryAllocateInfo 
     vr_u64(&b, ID(m));
     vr_u64(&b, m->size);
     vr_u32(&b, m->type);
+    if (g_hw.caps & VR_CAP_BDA) {
+        // アドレスを使うメモリの印（VkMemoryAllocateFlagsInfo）を末尾に付ける
+        uint32_t fl = 0;
+        for (const VkBaseInStructure *x = ai->pNext; x; x = x->pNext)
+            if (x->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO) fl = ((const VkMemoryAllocateFlagsInfo *) x)->flags;
+        vr_u32(&b, fl);
+    }
     VkResult r = rpc_call(VR_ALLOC_MEMORY, &b, NULL);
     free(b.p);
     if (r != VK_SUCCESS) {
@@ -1429,7 +1498,11 @@ static VkResult VKAPI_CALL create_buffer(VkDevice dv, const VkBufferCreateInfo *
     vr_u64(&b, ID(bf));
     vr_u32(&b, ci->flags);
     vr_u64(&b, ci->size);
-    vr_u32(&b, ci->usage);
+    // maintenance5 では、使い道を pNext の 64 ビットの形で渡せる。今の受け手は 32 ビットまでしか使わない
+    uint32_t usage = ci->usage;
+    for (const VkBaseInStructure *x = ci->pNext; x; x = x->pNext)
+        if (x->sType == VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO) usage = (uint32_t) ((const VkBufferUsageFlags2CreateInfo *) x)->usage;
+    vr_u32(&b, usage);
     VkResult r = rpc_call(VR_CREATE_BUFFER, &b, &o);
     if (r == VK_SUCCESS && o.n >= sizeof bf->req) memcpy(&bf->req, o.p, sizeof bf->req);
     free(b.p);
@@ -1826,6 +1899,15 @@ static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCach
     VkResult worst = VK_SUCCESS;
     for (uint32_t i = 0; i < n; i++) {
         const VkGraphicsPipelineCreateInfo *c = &ci[i];
+        int gs = 0;
+        for (uint32_t k = 0; k < c->stageCount; k++) gs |= c->pStages[k].stage == VK_SHADER_STAGE_GEOMETRY_BIT;
+        if (gs && !g_hw.real.geometryShader) {
+            static int once;
+            if (!once++) say("geometry shader を使う pipeline は、受け手の GPU が持たないので作らない");
+            out[i] = VK_NULL_HANDLE;
+            worst = VK_ERROR_UNKNOWN;
+            continue;
+        }
         uint64_t id = new_id();
         vr_buf b = { 0 };
         vr_u64(&b, ID(dv));
@@ -1861,7 +1943,12 @@ static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCach
         const VkPipelineRasterizationStateCreateInfo *rs = c->pRasterizationState;
         vr_u32(&b, rs ? 1 : 0);
         if (rs) {
-            vr_u32(&b, rs->depthClampEnable);
+            // depth clip の指定があれば depth clamp に置き換える：切るなら丸めない、切らないなら丸める
+            VkBool32 clamp = rs->depthClampEnable;
+            for (const VkBaseInStructure *x = rs->pNext; x; x = x->pNext)
+                if (x->sType == VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT)
+                    clamp = !((const VkPipelineRasterizationDepthClipStateCreateInfoEXT *) x)->depthClipEnable;
+            vr_u32(&b, clamp);
             vr_u32(&b, rs->rasterizerDiscardEnable);
             vr_u32(&b, rs->polygonMode);
             vr_u32(&b, rs->cullMode);
@@ -4009,6 +4096,62 @@ static void VKAPI_CALL cmd_wait_events(VkCommandBuffer cbh, uint32_t n, const Vk
     cmd_barrier(cbh, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, dst ? dst : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, k, all, nb, bb, ni, ib);
 }
 
+// ---- maintenance5 と 6 の入口。1.0 の入口に直す ----
+static void VKAPI_CALL cmd_bind_ib(VkCommandBuffer cbh, VkBuffer bb, VkDeviceSize off, VkIndexType t);
+
+static void VKAPI_CALL cmd_bind_sets2(VkCommandBuffer cbh, const VkBindDescriptorSetsInfo *i) {
+    // 描く用と計算用の両方の段に効く指定なら、両方につなぐ
+    if (i->stageFlags & (VK_SHADER_STAGE_ALL_GRAPHICS))
+        cmd_bind_sets(cbh, VK_PIPELINE_BIND_POINT_GRAPHICS, i->layout, i->firstSet, i->descriptorSetCount, i->pDescriptorSets, i->dynamicOffsetCount, i->pDynamicOffsets);
+    if (i->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+        cmd_bind_sets(cbh, VK_PIPELINE_BIND_POINT_COMPUTE, i->layout, i->firstSet, i->descriptorSetCount, i->pDescriptorSets, i->dynamicOffsetCount, i->pDynamicOffsets);
+}
+
+static void VKAPI_CALL cmd_push2(VkCommandBuffer cbh, const VkPushConstantsInfo *i) {
+    cmd_push(cbh, i->layout, i->stageFlags, i->offset, i->size, i->pValues);
+}
+
+static void VKAPI_CALL cmd_bind_ib2(VkCommandBuffer cbh, VkBuffer bb, VkDeviceSize off, VkDeviceSize size, VkIndexType t) {
+    (void) size;
+    if (!bb) return; // 空の index buffer：使う描画は無いので、つながない
+    cmd_bind_ib(cbh, bb, off, t);
+}
+
+static void VKAPI_CALL rendering_area_granularity(VkDevice dv, const VkRenderingAreaInfo *i, VkExtent2D *g) {
+    (void) dv; (void) i;
+    g->width = g->height = 1;
+}
+
+static void VKAPI_CALL get_subres_layout2(VkDevice dv, VkImage im, const VkImageSubresource2 *sr, VkSubresourceLayout2 *l) {
+    get_subres_layout(dv, im, &sr->imageSubresource, &l->subresourceLayout);
+}
+
+// 作る前の画像の並び方：同じ形の画像を受け手に作らせて尋ね、すぐ消す
+static void VKAPI_CALL get_device_image_subres_layout(VkDevice dv, const VkDeviceImageSubresourceInfo *i, VkSubresourceLayout2 *l) {
+    memset(&l->subresourceLayout, 0, sizeof l->subresourceLayout);
+    VkImage im;
+    if (create_image(dv, i->pCreateInfo, NULL, &im) != VK_SUCCESS) return;
+    get_subres_layout(dv, im, &i->pSubresource->imageSubresource, &l->subresourceLayout);
+    destroy_image(dv, im, NULL);
+}
+
+// ---- buffer device address：受け手の GPU の中のアドレスを尋ねて覚える ----
+static VkDeviceAddress VKAPI_CALL get_buffer_address(VkDevice dv, const VkBufferDeviceAddressInfo *i) {
+    struct buf *bf = (struct buf *) i->buffer;
+    if (!bf || !need_cap(VR_CAP_BDA, "vkGetBufferDeviceAddress")) return 0;
+    if (bf->addr) return bf->addr;
+    vr_buf b = { 0 }, o = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, ID(bf));
+    if (rpc_call(VR_GET_BUFFER_ADDRESS, &b, &o) == VK_SUCCESS && o.n >= 8) memcpy(&bf->addr, o.p, 8);
+    free(b.p);
+    free(o.p);
+    return bf->addr;
+}
+
+static uint64_t VKAPI_CALL get_buffer_capture_address(VkDevice dv, const VkBufferDeviceAddressInfo *i) { (void) dv; (void) i; return 0; }
+static uint64_t VKAPI_CALL get_memory_capture_address(VkDevice dv, const VkDeviceMemoryOpaqueCaptureAddressInfo *i) { (void) dv; (void) i; return 0; }
+
 // ---- query（GPU に数えさせる：遮蔽・時刻） ----
 // 受け手の VR_CREATE_QUERY_POOL などに送る。結果は受け手が出した仕事を全部待ってから読む
 static VkResult VKAPI_CALL create_qpool(VkDevice dv, const VkQueryPoolCreateInfo *ci, const VkAllocationCallbacks *a, VkQueryPool *out) {
@@ -4482,6 +4625,26 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkSetPrivateDataEXT", set_pdata);
     F("vkGetPrivateData", get_pdata);
     F("vkGetPrivateDataEXT", get_pdata);
+    F("vkGetBufferDeviceAddress", get_buffer_address);
+    F("vkGetBufferDeviceAddressKHR", get_buffer_address);
+    F("vkGetBufferDeviceAddressEXT", get_buffer_address);
+    F("vkGetBufferOpaqueCaptureAddress", get_buffer_capture_address);
+    F("vkGetBufferOpaqueCaptureAddressKHR", get_buffer_capture_address);
+    F("vkGetDeviceMemoryOpaqueCaptureAddress", get_memory_capture_address);
+    F("vkGetDeviceMemoryOpaqueCaptureAddressKHR", get_memory_capture_address);
+    F("vkCmdBindDescriptorSets2", cmd_bind_sets2);
+    F("vkCmdBindDescriptorSets2KHR", cmd_bind_sets2);
+    F("vkCmdPushConstants2", cmd_push2);
+    F("vkCmdPushConstants2KHR", cmd_push2);
+    F("vkCmdBindIndexBuffer2", cmd_bind_ib2);
+    F("vkCmdBindIndexBuffer2KHR", cmd_bind_ib2);
+    F("vkGetRenderingAreaGranularity", rendering_area_granularity);
+    F("vkGetRenderingAreaGranularityKHR", rendering_area_granularity);
+    F("vkGetImageSubresourceLayout2", get_subres_layout2);
+    F("vkGetImageSubresourceLayout2KHR", get_subres_layout2);
+    F("vkGetImageSubresourceLayout2EXT", get_subres_layout2);
+    F("vkGetDeviceImageSubresourceLayout", get_device_image_subres_layout);
+    F("vkGetDeviceImageSubresourceLayoutKHR", get_device_image_subres_layout);
     F("vkCreateBufferView", create_bview);
     F("vkDestroyBufferView", destroy_bview);
     F("vkGetImageSubresourceLayout", get_subres_layout);

@@ -92,7 +92,7 @@ static int g_portability; // MoltenVK のときは portability_subset を有効�
     X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetPrimitiveTopology) X(vkCmdSetViewportWithCount) X(vkCmdSetScissorWithCount) \
     X(vkCmdBindVertexBuffers2) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) \
     X(vkCmdSetDepthBoundsTestEnable) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCmdSetRasterizerDiscardEnable) \
-    X(vkCmdSetDepthBiasEnable) X(vkCmdSetPrimitiveRestartEnable)
+    X(vkCmdSetDepthBiasEnable) X(vkCmdSetPrimitiveRestartEnable) X(vkGetBufferDeviceAddress)
 
 #define DECL(n) static PFN_##n n;
 VKFUNCS(DECL)
@@ -100,6 +100,19 @@ VKFUNCS_OPT(DECL)
 #undef DECL
 
 static uint32_t g_caps = VR_CAP_DELTA; // 受け手ができること（あいさつで名乗る）
+// 空の descriptor（robustness2 の nullDescriptor）を GPU が持つか。持てば装置を作るときに有効にする。
+// 持たなければ（MoltenVK）、空の頂点バッファだけは 0 で埋めた代わりのバッファに差し替える
+static int g_nulldesc_gpu;
+// 調べ用：VKR_LIKE_IOS=1 で、PC の代役が iPhone の GPU のふりをする（BC・geometry shader・cull distance・空の descriptor を持たない）。
+// 持たない機能を有効にして装置を作ろうとすると、MoltenVK と同じように断る
+static int like_ios(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VKR_LIKE_IOS"); v = e && *e == '1'; }
+    return v;
+}
+static VkBuffer g_dummy_vb;
+static VkDeviceMemory g_dummy_mem;
+static VkBuffer dummy_vb(void);
 static int g_fmt3;                     // VkFormatProperties3 を答えられる
 
 // ---- PC が振った番号 → ここの本物の Vulkan の物 ----
@@ -223,6 +236,8 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT feds = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT };
     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT feds2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT };
     VkPhysicalDeviceHostQueryResetFeatures fhqr = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES };
+    VkPhysicalDeviceBufferDeviceAddressFeatures fbda = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES };
+    int e_bda = has_ext(ep, ne, "VK_KHR_buffer_device_address");
     void *head = NULL, **link = &head;
 #define LINK(cond, s) if (cond) { *link = &s; link = &s.pNext; }
     LINK(v13, f13)
@@ -231,6 +246,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     LINK(e_eds, feds)
     LINK(e_eds2, feds2)
     LINK(v12 || e_hqr, fhqr)
+    LINK(v12 || e_bda, fbda)
 #undef LINK
     VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = head };
     if (vkGetPhysicalDeviceFeatures2) vkGetPhysicalDeviceFeatures2(g_pd, &f2);
@@ -281,6 +297,20 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
 #if defined(__APPLE__) || defined(_WIN32)
     caps |= VR_CAP_JPEG | VR_CAP_JPEG_PIPE; // 窓に出すコマを JPEG に縮められる（iPhone は ImageIO、PC の代役は WIC）
 #endif
+    // buffer device address（GPU の中のバッファのアドレス）
+    if (fbda.bufferDeviceAddress && (v12 || e_bda)) {
+        vkGetBufferDeviceAddress = (PFN_vkGetBufferDeviceAddress) load_opt(v12, "vkGetBufferDeviceAddress", e_bda ? "KHR" : NULL);
+        if (vkGetBufferDeviceAddress) caps |= VR_CAP_BDA;
+    }
+    // 空の descriptor
+    g_nulldesc_gpu = 0;
+    if (has_ext(ep, ne, "VK_EXT_robustness2") && vkGetPhysicalDeviceFeatures2) {
+        VkPhysicalDeviceRobustness2FeaturesEXT r2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT };
+        VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &r2 };
+        vkGetPhysicalDeviceFeatures2(g_pd, &f2);
+        g_nulldesc_gpu = r2.nullDescriptor == VK_TRUE && !like_ios();
+    }
+    caps |= VR_CAP_NULL_DESC;
     // 調べ用：VKR_CAPS=数 で名乗る印を絞る（古い受け手のふりをする）
     const char *mask = getenv("VKR_CAPS");
     if (mask && *mask) caps &= (uint32_t) strtoul(mask, NULL, 0);
@@ -641,8 +671,12 @@ static void cleanup(void) {
                 case K_BVIEW: vkDestroyBufferView(dev, (VkBufferView) e->h, NULL); break;
                 }
             }
+        if (g_dummy_vb) vkDestroyBuffer(dev, g_dummy_vb, NULL);
+        if (g_dummy_mem) vkFreeMemory(dev, g_dummy_mem, NULL);
         vkDestroyDevice(dev, NULL);
     }
+    g_dummy_vb = VK_NULL_HANDLE;
+    g_dummy_mem = VK_NULL_HANDLE;
     for (size_t i = 0; i < g_cap; i++) if (g_tab[i].id) { idlist_free(&g_tab[i].list); free(g_tab[i].last); }
     free(g_tab);
     g_tab = NULL;
@@ -936,6 +970,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
                 uint64_t off = vr_ru64(r);
                 use_buffer(ci, bid);
                 if (i < 32) { bs[i] = OBJ(VkBuffer, bid); offs[i] = off; }
+                if (i < 32 && !bid && !g_nulldesc_gpu) { bs[i] = dummy_vb(); offs[i] = 0; }
             }
             vkCmdBindVertexBuffers(cb, first, n < 32 ? n : 32, bs, offs);
         } break;
@@ -1102,6 +1137,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
                 uint64_t bid = vr_ru64(r), off = vr_ru64(r), sz = vr_ru64(r), sd = vr_ru64(r);
                 use_buffer(ci, bid);
                 if (i < 32) { bs[i] = OBJ(VkBuffer, bid); offs[i] = off; sizes[i] = sz; strides[i] = sd; }
+                if (i < 32 && !bid && !g_nulldesc_gpu) { bs[i] = dummy_vb(); offs[i] = 0; sizes[i] = VK_WHOLE_SIZE; }
             }
             if (!r->bad && vkCmdBindVertexBuffers2)
                 vkCmdBindVertexBuffers2(cb, first, n < 32 ? n : 32, bs, offs, has_size ? sizes : NULL, has_stride ? strides : NULL);
@@ -1271,6 +1307,33 @@ done:
 }
 #endif
 
+// ---- 空の頂点バッファの代わり ----
+// 空の descriptor を持たない GPU（MoltenVK）に、空の頂点バッファを渡すと落ちる。0 で埋めた 1 MiB のバッファに差し替える
+static VkBuffer dummy_vb(void) {
+    if (g_dummy_vb || !g_dev) return g_dummy_vb;
+    VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 1u << 20,
+                              .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT };
+    VkBuffer b;
+    if (vkCreateBuffer(g_dev, &bc, NULL, &b) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(g_dev, b, &req);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_pd, &mp);
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t t = 0;
+    while (t < mp.memoryTypeCount && !((req.memoryTypeBits & (1u << t)) && (mp.memoryTypes[t].propertyFlags & want) == want)) t++;
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = t };
+    VkDeviceMemory m;
+    if (t == mp.memoryTypeCount || vkAllocateMemory(g_dev, &ai, NULL, &m) != VK_SUCCESS) { vkDestroyBuffer(g_dev, b, NULL); return VK_NULL_HANDLE; }
+    void *p = NULL;
+    if (vkMapMemory(g_dev, m, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS && p) { memset(p, 0, (size_t) req.size); vkUnmapMemory(g_dev, m); }
+    vkBindBufferMemory(g_dev, b, m, 0);
+    g_dummy_vb = b;
+    g_dummy_mem = m;
+    vlog("空の頂点バッファの代わりを作った");
+    return b;
+}
+
 // ---- 先送りの JPEG（VR_READ_JPEG_PIPE） ----
 // 今のコマを写して別の糸で縮め始め、返事にはひとつ前のコマの JPEG を入れる。
 // 縮めている間に、受け手は次のコマの仕事を進められる（窓に出るのは 1 コマ遅れる）
@@ -1407,6 +1470,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkPhysicalDeviceMemoryProperties m;
         vkGetPhysicalDeviceProperties(g_pd, &p);
         vkGetPhysicalDeviceFeatures(g_pd, &f);
+        if (like_ios()) f.textureCompressionBC = f.geometryShader = f.shaderCullDistance = VK_FALSE;
         vkGetPhysicalDeviceMemoryProperties(g_pd, &m);
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         // iPhone では、iOS がこのアプリに許すメモリのほうが、MoltenVK の答える量よりずっと小さい（超えるとアプリが止められる）。
@@ -1498,6 +1562,10 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkPhysicalDeviceFeatures feats;
         memset(&feats, 0, sizeof feats);
         if (has_f) vr_rcopy(r, &feats, sizeof feats);
+        if (like_ios() && (feats.textureCompressionBC || feats.geometryShader || feats.shaderCullDistance)) {
+            vlog("iPhone のふり：持たない機能（BC・geometry shader・cull distance）を有効にしようとしたので断る");
+            return reply(s, VK_ERROR_FEATURE_NOT_PRESENT);
+        }
         // 機能の鎖（Vulkan11Features など）は中身ごと届く
         uint32_t nc = vr_ru32(r);
         void *head = NULL, **link = &head, *blocks[32];
@@ -1510,6 +1578,13 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             blocks[i] = b;
             *link = b;
             link = (void **) &b->pNext;
+        }
+        VkPhysicalDeviceRobustness2FeaturesEXT r2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, .nullDescriptor = VK_TRUE };
+        if (g_nulldesc_gpu) {
+            int has = 0;
+            for (uint32_t i = 0; i < n_names; i++) if (!strcmp(names[i], "VK_EXT_robustness2")) has = 1;
+            if (!has && n_names < 64) names[n_names++] = "VK_EXT_robustness2";
+            *link = &r2;
         }
         VkDeviceCreateInfo dci = { .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = head, .queueCreateInfoCount = nq,
             .pQueueCreateInfos = qci, .enabledExtensionCount = n_names, .ppEnabledExtensionNames = names, .pEnabledFeatures = has_f ? &feats : NULL };
@@ -1565,6 +1640,12 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
         mai.allocationSize = vr_ru64(r);
         mai.memoryTypeIndex = vr_ru32(r);
+        // 末尾の flags（VkMemoryAllocateFlagsInfo）。古いドライバは付けない
+        VkMemoryAllocateFlagsInfo mfi = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+        if (!r->bad && r->at + 4 <= r->n) {
+            mfi.flags = vr_ru32(r);
+            if (mfi.flags) mai.pNext = &mfi;
+        }
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         // iOS の上限を超えそうなら、アプリが止められる前に「足りない」と断る
         {
@@ -2776,6 +2857,14 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t first = vr_ru32(r), n = vr_ru32(r);
         if (qp && vkResetQueryPool) vkResetQueryPool(d, qp, first, n);
         return 1;
+    }
+    case VR_GET_BUFFER_ADDRESS: {
+        VkDevice d = DEV(vr_ru64(r));
+        VkBuffer b = OBJ(VkBuffer, vr_ru64(r));
+        VkBufferDeviceAddressInfo bi = { .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = b };
+        uint64_t a = b && vkGetBufferDeviceAddress && !r->bad ? vkGetBufferDeviceAddress(d, &bi) : 0;
+        vr_u64(&g_out, a);
+        return reply(s, 0);
     }
     case VR_CREATE_BUFFER_VIEW: {
         VkDevice d = DEV(vr_ru64(r));
