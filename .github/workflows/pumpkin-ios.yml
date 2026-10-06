@@ -29,10 +29,30 @@ jobs:
           cd pumpkin
           rustup show
           rustup target add aarch64-apple-ios
-      - name: build
+      # 2 回目からは、取ってきた部品と途中の成果を使い回す
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            pumpkin/target
+          key: pumpkin-ios-${{ hashFiles('pumpkin/Cargo.lock') }}
+          restore-keys: pumpkin-ios-
+      - name: nix を呼び込んでいる部品
         run: |
           cd pumpkin
-          cargo build -p pumpkin-ios --release --target aarch64-apple-ios 2>&1 | tail -40
+          cargo tree -i nix --target aarch64-apple-ios -e normal,features -p pumpkin-ios 2>&1 | head -40 || true
+      # nix 0.31 は iOS 向けに、libc の古い版に無い定数を使う。libc を最新にして合わせる
+      - name: libc を最新に
+        run: |
+          cd pumpkin
+          cargo update -p libc 2>&1 | tail -3
+          cargo tree -p pumpkin-ios --target aarch64-apple-ios -i libc --depth 0 2>&1 | head -3
+      - name: build
+        run: |
+          set -o pipefail
+          cd pumpkin
+          cargo build -p pumpkin-ios --release --target aarch64-apple-ios 2>&1 | grep -E "^(error|warning: unused)|^\s+-->|Finished" | head -60
           ls -la target/aarch64-apple-ios/release/
       - name: collect
         run: |
