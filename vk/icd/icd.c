@@ -180,28 +180,13 @@ static VkResult rpc_call(uint32_t op, vr_buf *b, vr_buf *out) {
     return res;
 }
 
-static int connect_locked(void) {
-    WSADATA w;
-    WSAStartup(MAKEWORD(2, 2), &w);
-    const char *e = getenv("IPHONE_VK");
-    char host[128] = "127.0.0.1", port[16] = "50061";
-    if (e && *e) {
-        const char *c = strrchr(e, ':');
-        if (c) {
-            size_t n = (size_t) (c - e) < sizeof host - 1 ? (size_t) (c - e) : sizeof host - 1;
-            memcpy(host, e, n);
-            host[n] = 0;
-            snprintf(port, sizeof port, "%s", c + 1);
-        } else {
-            snprintf(host, sizeof host, "%s", e);
-        }
-    }
+// host:port に TCP でつなぐ。1.5 秒でつながらなければ諦める（iPhone がいないときにアプリを待たせない）
+static vr_sock tcp_connect(const char *host, const char *port) {
     struct addrinfo hints = { 0 }, *ai = NULL;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, port, &hints, &ai) != 0 || !ai) return 0;
+    if (getaddrinfo(host, port, &hints, &ai) != 0 || !ai) return INVALID_SOCKET;
     vr_sock s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    // 1.5 秒でつながらなければ諦める（iPhone がいないときにアプリを待たせない）
     u_long nb = 1;
     ioctlsocket(s, FIONBIO, &nb);
     connect(s, ai->ai_addr, (int) ai->ai_addrlen);
@@ -215,8 +200,106 @@ static int connect_locked(void) {
     int ok = select(0, NULL, &wf, &ef, &tv) == 1 && FD_ISSET(s, &wf);
     nb = 0;
     ioctlsocket(s, FIONBIO, &nb);
-    if (!ok) { closesocket(s); say("%s:%s につながらない", host, port); return 0; }
+    if (!ok) { closesocket(s); return INVALID_SOCKET; }
+    DWORD to = 5000; // 最初のあいさつまでは 5 秒で諦める
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *) &to, sizeof to);
+    return s;
+}
+
+// ---- USB の iPhone に直接つなぐ ----
+// iTunes と一緒に入る Apple Mobile Device Service が 127.0.0.1:27015 で待っている（usbmuxd）。
+// 「この iPhone のこの番号につないで」と頼むと、その接続がそのまま USB の通り道になる。
+// Python の中継（usb_forward.py）を通さないので、1 段ぶん速い
+static char *mux_call(vr_sock s, const char *type, const char *extra) {
+    char body[1024];
+    int n = snprintf(body, sizeof body,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        "<plist version=\"1.0\"><dict><key>MessageType</key><string>%s</string>"
+        "<key>ClientVersionString</key><string>iphone-vk</string><key>ProgName</key><string>iphone-vk</string>%s</dict></plist>\n",
+        type, extra);
+    uint32_t h[4] = { 16 + (uint32_t) n, 1, 8, 1 };
+    if (!vr_send_all(s, h, sizeof h) || !vr_send_all(s, body, (size_t) n)) return NULL;
+    if (!vr_recv_all(s, h, sizeof h) || h[0] < 16 || h[0] > (1u << 20)) return NULL;
+    char *r = malloc(h[0] - 16 + 1);
+    if (!r) return NULL;
+    if (!vr_recv_all(s, r, h[0] - 16)) { free(r); return NULL; }
+    r[h[0] - 16] = 0;
+    return r;
+}
+
+// <key>名前</key> の次の <integer> を読む。見つからなければ -1
+static long long plist_int_after(const char *at, const char *key, const char *limit) {
+    char k[64];
+    snprintf(k, sizeof k, "<key>%s</key>", key);
+    const char *q = strstr(at, k);
+    if (!q || (limit && q > limit)) return -1;
+    q = strstr(q, "<integer>");
+    return q ? atoll(q + 9) : -1;
+}
+
+static vr_sock usb_connect(int port) {
+    // 試験では IPHONE_VK_MUX=番号 で偽物の usbmuxd に向けられる
+    const char *mp = getenv("IPHONE_VK_MUX");
+    char mport[16];
+    snprintf(mport, sizeof mport, "%s", mp && *mp ? mp : "27015");
+    vr_sock s = tcp_connect("127.0.0.1", mport);
+    if (s == INVALID_SOCKET) { say("Apple Mobile Device Service（127.0.0.1:27015）につながらない"); return s; }
+    char *list = mux_call(s, "ListDevices", "");
+    closesocket(s);
+    if (!list) { say("usbmuxd が機器の一覧を返さない"); return INVALID_SOCKET; }
+    // 機器ごとの Properties の中で、ConnectionType が USB のものの DeviceID を使う（Wi-Fi 越しの同期は使わない）
+    long long dev = -1;
+    for (const char *q = list; dev < 0 && (q = strstr(q, "<key>ConnectionType</key>")); q++) {
+        const char *v = strstr(q, "<string>");
+        const char *end = strstr(q, "</dict>");
+        if (v && !strncmp(v + 8, "USB<", 4)) dev = plist_int_after(q, "DeviceID", end);
+    }
+    free(list);
+    if (dev < 0) { say("USB でつながった iPhone が見えない"); return INVALID_SOCKET; }
+    s = tcp_connect("127.0.0.1", mport);
+    if (s == INVALID_SOCKET) return s;
+    char extra[160];
+    snprintf(extra, sizeof extra, "<key>DeviceID</key><integer>%lld</integer><key>PortNumber</key><integer>%u</integer>",
+             dev, (unsigned) htons((u_short) port));
+    char *res = mux_call(s, "Connect", extra);
+    long long num = res ? plist_int_after(res, "Number", NULL) : -1;
+    free(res);
+    if (num != 0) { closesocket(s); say("iPhone の %d 番につながらない（usbmuxd の返事 %lld）", port, num); return INVALID_SOCKET; }
+    return s;
+}
+
+static int connect_locked(void) {
+    WSADATA w;
+    WSAStartup(MAKEWORD(2, 2), &w);
+    // IPHONE_VK：「usb」か「usb:番号」なら USB の iPhone に直接。それ以外は host:port
+    const char *e = getenv("IPHONE_VK");
+    char host[128] = "127.0.0.1", port[16] = "50061";
+    vr_sock s;
+    if (e && !strncmp(e, "usb", 3) && (e[3] == 0 || e[3] == ':')) {
+        int p = e[3] == ':' ? atoi(e + 4) : 50060;
+        s = usb_connect(p);
+        snprintf(host, sizeof host, "USB の iPhone");
+        snprintf(port, sizeof port, "%d", p);
+    } else {
+        if (e && *e) {
+            const char *c = strrchr(e, ':');
+            if (c) {
+                size_t n = (size_t) (c - e) < sizeof host - 1 ? (size_t) (c - e) : sizeof host - 1;
+                memcpy(host, e, n);
+                host[n] = 0;
+                snprintf(port, sizeof port, "%s", c + 1);
+            } else {
+                snprintf(host, sizeof host, "%s", e);
+            }
+        }
+        s = tcp_connect(host, port);
+    }
+    if (s == INVALID_SOCKET) { say("%s:%s につながらない", host, port); return 0; }
     vr_nodelay(s);
+    int big = 4 << 20;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *) &big, sizeof big);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *) &big, sizeof big);
     DWORD to = 5000; // 最初のあいさつだけは 5 秒で諦める
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *) &to, sizeof to);
     g_sock = s;

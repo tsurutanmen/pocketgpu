@@ -8,6 +8,8 @@ extern "C" {
 int vkr_serve(const char * host, int port);
 // アプリが前にいないときは 1。その間は GPU に新しい仕事を出さずに待つ（出すと GPU を失う）
 void vkr_set_paused(int on);
+// USB の通り道の速さを測る受け口（vk/remote/bw.c）。戻ってこないので別のスレッドで呼ぶ
+int vkr_bw_serve(const char * host, int port);
 
 #ifdef __cplusplus
 }

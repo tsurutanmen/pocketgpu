@@ -9,6 +9,9 @@ struct RpcServerApp: App {
         // 記録を PC から読めるようにする（USB の 50059 番。PC は app/pc/iphone_applog.py）
         let t = Thread { rpc_bridge_serve_log(50059) }
         t.start()
+        // USB の通り道の速さを測る受け口（50058 番。PC は app/pc/usb_bw.py）
+        let b = Thread { _ = vkr_bw_serve("127.0.0.1", 50058) }
+        b.start()
     }
     var body: some Scene { WindowGroup { ContentView() } }
 }

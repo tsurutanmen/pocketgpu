@@ -16,8 +16,8 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: 計算の受け手
-        CFBundleShortVersionString: "0.7.9"
-        CFBundleVersion: "17"
+        CFBundleShortVersionString: "0.7.10"
+        CFBundleVersion: "18"
         UILaunchScreen: {}
         NSLocalNetworkUsageDescription: PC からの計算の依頼を受け取るために使います
         UIRequiredDeviceCapabilities: [metal]
