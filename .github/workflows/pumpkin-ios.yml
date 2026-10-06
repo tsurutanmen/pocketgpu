@@ -6,6 +6,7 @@ on:
   push:
     paths:
       - mc/pumpkin-ios/**
+      - mc/patch_nix_ios.py
       - .github/workflows/pumpkin-ios.yml
 jobs:
   build:
@@ -38,16 +39,18 @@ jobs:
             pumpkin/target
           key: pumpkin-ios-${{ hashFiles('pumpkin/Cargo.lock') }}
           restore-keys: pumpkin-ios-
-      - name: nix を呼び込んでいる部品
+      # nix 0.31 は iOS でも、カーネル拡張の制御用ソケットを使えるとしているが、libc は iOS 向けにそれを持っていない。
+      # 写しを作って、その部分だけ macOS に絞り、Pumpkin に写しの方を使わせる
+      - name: nix を iOS 向けに直す
         run: |
           cd pumpkin
-          cargo tree -i nix --target aarch64-apple-ios -e normal,features -p pumpkin-ios 2>&1 | head -40 || true
-      # nix 0.31 は iOS 向けに、libc の古い版に無い定数を使う。libc を最新にして合わせる
-      - name: libc を最新に
-        run: |
-          cd pumpkin
-          cargo update -p libc 2>&1 | tail -3
-          cargo tree -p pumpkin-ios --target aarch64-apple-ios -i libc --depth 0 2>&1 | head -3
+          cargo fetch --target aarch64-apple-ios -q
+          src=$(ls -d ~/.cargo/registry/src/*/nix-0.31.* | sort -V | tail -1)
+          echo "直す nix：$src"
+          mkdir -p patched && rm -rf patched/nix && cp -R "$src" patched/nix
+          python3 ../mc/patch_nix_ios.py patched/nix
+          printf '\n[patch.crates-io]\nnix = { path = "patched/nix" }\n' >> Cargo.toml
+          tail -3 Cargo.toml
       - name: build
         run: |
           set -o pipefail
