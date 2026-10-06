@@ -1,0 +1,28 @@
+name: vkcube-win
+# Vulkan の定番の見本 vkcube（回る立方体）を Windows 用に組む。iPhone の GPU で描いて窓に出す試験に使う（改造しない）
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/vkcube.yml
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - name: Vulkan-Tools
+        run: git clone --depth 1 --branch vulkan-sdk-1.4.363.0 https://github.com/KhronosGroup/Vulkan-Tools.git vt
+      - name: configure
+        run: cmake -S vt -B build -D UPDATE_DEPS=ON -D BUILD_WERROR=OFF -D BUILD_TESTS=OFF -D BUILD_ICD=OFF -D BUILD_VULKANINFO=OFF -D BUILD_CUBE=ON
+      - name: build
+        run: |
+          cmake --build build --config Release --target vkcube
+          Get-ChildItem -Recurse build -Filter vkcube*.exe | Select-Object FullName,Length
+      - name: collect
+        run: |
+          New-Item -ItemType Directory out | Out-Null
+          Get-ChildItem -Recurse build -Filter vkcube.exe | Copy-Item -Destination out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vkcube-win
+          path: out/
