@@ -8,6 +8,7 @@ on:
       - mc/pumpkin-ios/**
       - mc/patch_nix_ios.py
       - mc/patch_num_threads_ios.py
+      - mc/patch_sysinfo_ios.py
       - .github/workflows/pumpkin-ios.yml
 jobs:
   build:
@@ -55,7 +56,12 @@ jobs:
           echo "直す num_threads：$src2"
           rm -rf patched/num_threads && cp -R "$src2" patched/num_threads
           python3 ../mc/patch_num_threads_ios.py patched/num_threads
-          printf '\n[patch.crates-io]\nnix = { path = "patched/nix" }\nnum_threads = { path = "patched/num_threads" }\n' >> Cargo.toml
+          # sysinfo も iOS で macOS の調べ方を使う。iOS では「対応していない OS」向けの版を使わせる
+          src3=$(ls -d ~/.cargo/registry/src/*/sysinfo-0.38.* | sort -V | tail -1)
+          echo "直す sysinfo：$src3"
+          rm -rf patched/sysinfo && cp -R "$src3" patched/sysinfo
+          python3 ../mc/patch_sysinfo_ios.py patched/sysinfo
+          printf '\n[patch.crates-io]\nnix = { path = "patched/nix" }\nnum_threads = { path = "patched/num_threads" }\nsysinfo = { path = "patched/sysinfo" }\n' >> Cargo.toml
           tail -3 Cargo.toml
       - name: build
         run: |
