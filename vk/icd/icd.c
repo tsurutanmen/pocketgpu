@@ -2892,6 +2892,35 @@ static VkResult VKAPI_CALL device_wait_idle(VkDevice dv) {
 // ---- まだ中継していない必須の入口 ----
 // Vulkan 1.2 の装置は、必須の入口がそろっていないといけない（そろっていないと装置作りを止めるレイヤーがある）。
 // 呼ばれたら「無い」と答える。x64 の呼び方では、引数の数が違っても呼び出し側が片づけるので、1 つの関数で受けられる
+// ---- VkEvent ----
+// 受け手には送らない。待つ側（vkCmdWaitEvents）を、全部の仕切り（vkCmdPipelineBarrier）に置き換える。
+// event は同じキューの中だけで使う物なので、仕切りで submit の順に従わせれば、少し広く待つだけで同じ意味になる。
+// llama.cpp は GPU を 2 つ使うとき、GPU どうしの待ち合わせに使う
+struct event { int set; };
+static VkResult VKAPI_CALL create_event(VkDevice dv, const VkEventCreateInfo *ci, const VkAllocationCallbacks *a, VkEvent *out) {
+    (void) dv; (void) ci; (void) a;
+    struct event *e = calloc(1, sizeof *e);
+    if (!e) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    *out = (VkEvent) e;
+    return VK_SUCCESS;
+}
+static void VKAPI_CALL destroy_event(VkDevice dv, VkEvent ev, const VkAllocationCallbacks *a) { (void) dv; (void) a; free((struct event *) ev); }
+static VkResult VKAPI_CALL get_event_status(VkDevice dv, VkEvent ev) { (void) dv; return ((struct event *) ev)->set ? VK_EVENT_SET : VK_EVENT_RESET; }
+static VkResult VKAPI_CALL set_event(VkDevice dv, VkEvent ev) { (void) dv; ((struct event *) ev)->set = 1; return VK_SUCCESS; }
+static VkResult VKAPI_CALL reset_event(VkDevice dv, VkEvent ev) { (void) dv; ((struct event *) ev)->set = 0; return VK_SUCCESS; }
+static void VKAPI_CALL cmd_set_event(VkCommandBuffer cbh, VkEvent ev, VkPipelineStageFlags st) { (void) cbh; (void) st; ((struct event *) ev)->set = 1; }
+static void VKAPI_CALL cmd_reset_event(VkCommandBuffer cbh, VkEvent ev, VkPipelineStageFlags st) { (void) cbh; (void) ev; (void) st; }
+static void VKAPI_CALL cmd_wait_events(VkCommandBuffer cbh, uint32_t n, const VkEvent *evs, VkPipelineStageFlags src, VkPipelineStageFlags dst,
+                                       uint32_t nm, const VkMemoryBarrier *mb, uint32_t nb, const VkBufferMemoryBarrier *bb,
+                                       uint32_t ni, const VkImageMemoryBarrier *ib) {
+    (void) n; (void) evs; (void) src;
+    VkMemoryBarrier all[16];
+    uint32_t k = 0;
+    for (; k < nm && k < 15; k++) all[k] = mb[k];
+    all[k++] = (VkMemoryBarrier) { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+    cmd_barrier(cbh, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, dst ? dst : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, k, all, nb, bb, ni, ib);
+}
+
 static VkResult VKAPI_CALL not_yet(void) {
     say("まだ中継していない入口が呼ばれた");
     return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -2899,7 +2928,6 @@ static VkResult VKAPI_CALL not_yet(void) {
 
 static const char *const NOT_YET[] = {
     "vkQueueBindSparse", "vkGetImageSparseMemoryRequirements",
-    "vkCreateEvent", "vkDestroyEvent", "vkGetEventStatus", "vkSetEvent", "vkResetEvent",
     "vkCreateQueryPool", "vkDestroyQueryPool", "vkGetQueryPoolResults", "vkCreateBufferView", "vkDestroyBufferView",
     "vkGetImageSubresourceLayout", 
     
@@ -2909,7 +2937,7 @@ static const char *const NOT_YET[] = {
     
     
     "vkCmdClearDepthStencilImage", "vkCmdClearAttachments", "vkCmdResolveImage",
-    "vkCmdSetEvent", "vkCmdResetEvent", "vkCmdWaitEvents", "vkCmdBeginQuery", "vkCmdEndQuery", "vkCmdResetQueryPool",
+    "vkCmdBeginQuery", "vkCmdEndQuery", "vkCmdResetQueryPool",
     "vkCmdWriteTimestamp", "vkCmdCopyQueryPoolResults", 
     "vkCmdExecuteCommands",
     // 1.1
@@ -2989,6 +3017,14 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkCmdFillBuffer", cmd_fill);
     F("vkCmdUpdateBuffer", cmd_update);
     F("vkCmdPipelineBarrier", cmd_barrier);
+    F("vkCreateEvent", create_event);
+    F("vkDestroyEvent", destroy_event);
+    F("vkGetEventStatus", get_event_status);
+    F("vkSetEvent", set_event);
+    F("vkResetEvent", reset_event);
+    F("vkCmdSetEvent", cmd_set_event);
+    F("vkCmdResetEvent", cmd_reset_event);
+    F("vkCmdWaitEvents", cmd_wait_events);
     F("vkCreateFence", create_fence);
     F("vkDestroyFence", destroy_fence);
     F("vkResetFences", reset_fences);
