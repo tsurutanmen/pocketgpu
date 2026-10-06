@@ -1,0 +1,44 @@
+name: dxvk-macos
+# DXVK-macOS（Gcenx・zlib）を Windows 用の DLL として組む。
+# DXVK を Apple の GPU（MoltenVK）が持つ機能だけで DirectX 10/11 を描けるように直した版。
+# DirectX のアプリ → この d3d11.dll・dxgi.dll → Vulkan → iPhone のドライバ → iPhone の GPU、とつなぐため
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/dxvk-macos.yml
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: 道具
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq meson ninja-build mingw-w64 glslang-tools
+          x86_64-w64-mingw32-gcc --version | head -1
+      - name: DXVK-macOS
+        run: |
+          git clone --depth 1 --branch v1.10.3-20230507 https://github.com/Gcenx/DXVK-macOS.git dxvk || git clone --depth 1 https://github.com/Gcenx/DXVK-macOS.git dxvk
+          git -C dxvk log -1 --format="%H %cd %s"
+          git -C dxvk submodule update --init --recursive --depth 1
+          ls dxvk
+      - name: build（64 ビット）
+        run: |
+          cd dxvk
+          # mingw の pthread 版を使う（DXVK の決まり）
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix || true
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix || true
+          meson setup build64 --cross-file build-win64.txt --buildtype release --strip -Denable_d3d9=false 2>&1 | tail -20
+          ninja -C build64 2>&1 | tail -15
+          find build64 -name "*.dll" | head
+      - name: collect
+        run: |
+          mkdir out
+          find dxvk/build64 -name "*.dll" -exec cp {} out/ \;
+          git -C dxvk log -1 --format="%H" > out/DXVK_COMMIT.txt
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dxvk-macos-win64
+          path: out/
