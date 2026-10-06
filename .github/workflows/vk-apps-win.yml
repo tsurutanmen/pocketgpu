@@ -1,0 +1,83 @@
+name: vk-apps-win
+# 実在の Vulkan のアプリを Windows 用に組む。iPhone の Vulkan ドライバ越しに、改造せずに動くかを試すため
+#   whisper.cpp（文字起こし）・stable-diffusion.cpp（画像生成）・vulkaninfo（問い合わせを一通り）
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/vk-apps-win.yml
+env:
+  VULKAN_VERSION: 1.4.357.0
+  CPUFLAGS: -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+jobs:
+  whisper:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+      - name: whisper.cpp
+        shell: bash
+        run: |
+          git clone https://github.com/ggml-org/whisper.cpp.git whisper.cpp
+          git -C whisper.cpp checkout 60c0be6ac8fa71b1a2ae2dd938a31a34a508e774
+      - name: build whisper-cli (CPU + Vulkan)
+        run: |
+          cmake -S whisper.cpp -B build -T ClangCL -DBUILD_SHARED_LIBS=OFF -DGGML_VULKAN=ON -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF -DWHISPER_SDL2=OFF $env:CPUFLAGS.Split(' ')
+          cmake --build build --config Release -j 4 --target whisper-cli whisper-bench
+          dir build\bin\Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whisper-vk-win
+          path: build/bin/Release/*.exe
+
+  sd:
+    runs-on: windows-2025
+    timeout-minutes: 75
+    steps:
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+      - name: stable-diffusion.cpp
+        shell: bash
+        run: |
+          git clone https://github.com/leejet/stable-diffusion.cpp.git sd
+          git -C sd checkout 3f8527a46c54ecf4cb4ed6003da8e8982283c73c
+          git -C sd submodule update --init --recursive --depth 1
+      - uses: ilammy/msvc-dev-cmd@v1
+      # 本家の Windows の作り方（共有ライブラリ・Ninja・cl）で、Vulkan を足す
+      - name: build sd-cli (CPU + Vulkan)
+        run: |
+          cmake -S sd -B build -G Ninja -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS='/bigobj /EHsc' -DGGML_NATIVE=OFF -DSD_BUILD_SHARED_LIBS=ON -DSD_BUILD_SHARED_GGML_LIB=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DSD_VULKAN=ON
+          cmake --build build
+          dir build\bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sd-vk-win
+          path: build/bin/
+
+  vulkaninfo:
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - name: Vulkan-Tools
+        run: git clone --depth 1 --branch vulkan-sdk-1.4.363.0 https://github.com/KhronosGroup/Vulkan-Tools.git vt
+      - name: configure
+        run: cmake -S vt -B build -D UPDATE_DEPS=ON -D BUILD_WERROR=OFF -D BUILD_TESTS=OFF -D BUILD_ICD=OFF -D BUILD_VULKANINFO=ON -D BUILD_CUBE=OFF
+      - name: build
+        run: cmake --build build --config Release --target vulkaninfo
+      - name: collect
+        run: |
+          New-Item -ItemType Directory out | Out-Null
+          Get-ChildItem -Recurse build -Filter vulkaninfo.exe | Copy-Item -Destination out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vulkaninfo-win
+          path: out/
