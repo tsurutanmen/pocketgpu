@@ -17,6 +17,8 @@ struct RpcServerApp: App {
         // USB の通り道の速さを測る受け口（50058 番。PC は app/pc/usb_bw.py）
         let b = Thread { _ = vkr_bw_serve("127.0.0.1", 50058) }
         b.start()
+        // Apple の機能（文字認識など）を Windows から使う受け口（50057 番。PC は app/pc/apple_ocr.py）
+        AppleFeatures.shared.start()
     }
     var body: some Scene { WindowGroup { ContentView() } }
 }
