@@ -19,6 +19,8 @@
 //   往復は「GPU の答えを持ち帰る」ときだけになる
 #include "../remote/proto.h"
 #include "../remote/wire.h"
+#include <windows.h>
+#include <dbghelp.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +45,55 @@ static void say(const char *fmt, ...) {
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
+}
+
+// ---- 落ちたときに、どのプログラムのどこで落ちたかを書き出す（IPHONE_VK_LOG=1 のとき） ----
+static void where(const char *tag, void *addr) {
+    HMODULE m = NULL;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR) addr, &m)) {
+        GetModuleFileNameA(m, name, sizeof name);
+        const char *b = strrchr(name, '\\');
+        // 関数の名前は、横に置いた .pdb から dbghelp で引く
+        static int sym_ready;
+        if (!sym_ready) { sym_ready = 1; SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS); SymInitialize(GetCurrentProcess(), NULL, TRUE); }
+        char sbuf[sizeof(SYMBOL_INFO) + 256];
+        SYMBOL_INFO *si = (SYMBOL_INFO *) sbuf;
+        memset(sbuf, 0, sizeof sbuf);
+        si->SizeOfStruct = sizeof(SYMBOL_INFO);
+        si->MaxNameLen = 255;
+        DWORD64 disp = 0;
+        int named = SymFromAddr(GetCurrentProcess(), (DWORD64) (uintptr_t) addr, &disp, si);
+        fprintf(stderr, "[iphone-vk] %s %s+0x%llx %s%s+0x%llx\n", tag, b ? b + 1 : name, (unsigned long long) ((uintptr_t) addr - (uintptr_t) m),
+                named ? "" : "", named ? si->Name : "?", (unsigned long long) disp);
+    } else {
+        fprintf(stderr, "[iphone-vk] %s %p\n", tag, addr);
+    }
+}
+
+static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+        code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_ARRAY_BOUNDS_EXCEEDED)
+        return EXCEPTION_CONTINUE_SEARCH;
+    static volatile LONG once;
+    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    fprintf(stderr, "[iphone-vk] 落ちた：例外 0x%08lx", code);
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2)
+        fprintf(stderr, "（%s %p）", ep->ExceptionRecord->ExceptionInformation[0] == 1 ? "書き込み" : "読み出し",
+                (void *) ep->ExceptionRecord->ExceptionInformation[1]);
+    fputc('\n', stderr);
+    where("場所", ep->ExceptionRecord->ExceptionAddress);
+    void *fr[40];
+    USHORT n = RtlCaptureStackBackTrace(0, 40, fr, NULL);
+    for (USHORT i = 0; i < n; i++) where("  呼び出し元", fr[i]);
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+__attribute__((constructor)) static void install_crash_handler(void) {
+    const char *e = getenv("IPHONE_VK_LOG");
+    if (e && *e && *e != '0') AddVectoredExceptionHandler(1, crash_handler);
 }
 
 // ---- 数える（IPHONE_VK_STATS=1） ----
@@ -1142,9 +1193,12 @@ static VkResult VKAPI_CALL create_buffer(VkDevice dv, const VkBufferCreateInfo *
     return VK_SUCCESS;
 }
 
+static void forget_buffer_in_sets(struct buf *bf);
+
 static void VKAPI_CALL destroy_buffer(VkDevice dv, VkBuffer bb, const VkAllocationCallbacks *a) {
     (void) a;
     if (!bb) return;
+    forget_buffer_in_sets((struct buf *) bb);
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, ID(bb));
@@ -1906,10 +1960,33 @@ static VkResult VKAPI_CALL create_compute_pipelines(VkDevice dv, VkPipelineCache
 }
 
 // ---- descriptor ----
+// 全部の descriptor pool の一覧。バッファを消したときに、それを指している descriptor を外すために使う
+static SRWLOCK g_pools_lock = SRWLOCK_INIT;
+static struct dpool **g_pools;
+static size_t g_npools, g_cappools;
+
+// 消すバッファを指している descriptor を外す。外さないと、その set をもう一度使ったときに、
+// 消えたバッファ（解放したメモリ）を読みに行って落ちる（stable-diffusion.cpp が作業用のバッファを作り直すときに起きた）
+static void forget_buffer_in_sets(struct buf *bf) {
+    AcquireSRWLockShared(&g_pools_lock);
+    for (size_t i = 0; i < g_npools; i++)
+        for (struct dset *s = g_pools[i]->head; s; s = s->next)
+            for (uint32_t k = 0; k < s->n; k++)
+                if (s->e[k].b == bf) s->e[k].b = NULL;
+    ReleaseSRWLockShared(&g_pools_lock);
+}
+
 static VkResult VKAPI_CALL create_dpool(VkDevice dv, const VkDescriptorPoolCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorPool *out) {
     (void) a;
     struct dpool *p = calloc(1, sizeof *p);
     if (!p) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    AcquireSRWLockExclusive(&g_pools_lock);
+    if (g_npools == g_cappools) {
+        g_cappools = g_cappools ? g_cappools * 2 : 16;
+        g_pools = realloc(g_pools, g_cappools * sizeof *g_pools);
+    }
+    g_pools[g_npools++] = p;
+    ReleaseSRWLockExclusive(&g_pools_lock);
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, ID(p));
@@ -1924,8 +2001,10 @@ static VkResult VKAPI_CALL create_dpool(VkDevice dv, const VkDescriptorPoolCreat
 }
 
 static void free_sets_of(struct dpool *p) {
+    AcquireSRWLockExclusive(&g_pools_lock);
     for (struct dset *s = p->head, *nx; s; s = nx) { nx = s->next; free(s->e); free(s); }
     p->head = NULL;
+    ReleaseSRWLockExclusive(&g_pools_lock);
 }
 
 static void VKAPI_CALL destroy_dpool(VkDevice dv, VkDescriptorPool pp, const VkAllocationCallbacks *a) {
@@ -1936,6 +2015,10 @@ static void VKAPI_CALL destroy_dpool(VkDevice dv, VkDescriptorPool pp, const VkA
     vr_u64(&b, ID(pp));
     rpc_send(VR_DESTROY_DESCRIPTOR_POOL, &b);
     free(b.p);
+    AcquireSRWLockExclusive(&g_pools_lock);
+    for (size_t i = 0; i < g_npools; i++)
+        if (g_pools[i] == (struct dpool *) pp) { g_pools[i] = g_pools[--g_npools]; break; }
+    ReleaseSRWLockExclusive(&g_pools_lock);
     free_sets_of((struct dpool *) pp);
     free((struct dpool *) pp);
 }
@@ -1960,8 +2043,10 @@ static VkResult VKAPI_CALL alloc_dsets(VkDevice dv, const VkDescriptorSetAllocat
     for (uint32_t i = 0; i < ai->descriptorSetCount; i++) {
         struct dset *s = calloc(1, sizeof *s);
         s->pool = p;
+        AcquireSRWLockExclusive(&g_pools_lock);
         s->next = p->head;
         p->head = s;
+        ReleaseSRWLockExclusive(&g_pools_lock);
         out[i] = (VkDescriptorSet) s;
         vr_u64(&b, ID(ai->pSetLayouts[i]));
         vr_u64(&b, ID(s));
@@ -1983,10 +2068,12 @@ static VkResult VKAPI_CALL free_dsets(VkDevice dv, VkDescriptorPool pp, uint32_t
         if (!sets[i]) continue;
         vr_u64(&b, ID(sets[i]));
         struct dset *s = (struct dset *) sets[i], **pp2 = &p->head;
+        AcquireSRWLockExclusive(&g_pools_lock);
         while (*pp2 && *pp2 != s) pp2 = &(*pp2)->next;
         if (*pp2) *pp2 = s->next;
         free(s->e);
         free(s);
+        ReleaseSRWLockExclusive(&g_pools_lock);
     }
     rpc_send(VR_FREE_DESCRIPTOR_SETS, &b);
     free(b.p);

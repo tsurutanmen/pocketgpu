@@ -53,7 +53,7 @@ static VkPhysicalDevice g_pd;
 static int g_portability; // MoltenVK のときは portability_subset を有効にする必要がある
 
 #define VKFUNCS(X) \
-    X(vkCreateInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceFeatures) \
+    X(vkCreateInstance) X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceFeatures) \
     X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkEnumerateDeviceExtensionProperties) \
     X(vkGetPhysicalDeviceFeatures2) X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceFormatProperties) \
     X(vkCreateDevice) X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkDeviceWaitIdle) X(vkQueueWaitIdle) \
@@ -223,10 +223,11 @@ static int vk_init(void) {
 // 待つのは、出した仕事が使っている物を変えるときだけ（その仕事まで待つ）。
 // 関係の無い物を変える命令は待たないので、GPU が計算している間に次の命令を作れる
 static VkDevice g_dev;
-typedef struct { VkFence f; int own; uint64_t cbs[64]; uint32_t ncb; } inflight;
+typedef struct { VkFence f; int own; uint64_t cbs[64]; uint32_t ncb; uint64_t *snap; uint32_t nsnap; } inflight; // snap：調べ用、submit した時点の set
 static inflight g_fl[256];
 static int g_nfl;
 static VkResult g_err;          // GPU を失ったなど。次に返事をするときに伝える
+static int g_lost;              // この接続で GPU を失った。切れたあと Vulkan を作り直す
 static volatile int g_paused;   // アプリが前にいない間は 1（GPU に新しい仕事を出さない）
 
 // アプリから呼ぶ：前にいないときは 1
@@ -340,6 +341,7 @@ static void drain_upto(int k) {
         vlog("出した仕事を待てない (%d)", r);
         if (r < 0) g_err = r;
     }
+    for (int i = 0; i <= k; i++) { free(g_fl[i].snap); g_fl[i].snap = NULL; }
     for (int i = 0; i <= k; i++) {
         if (!g_fl[i].own) continue;
         vkResetFences(g_dev, 1, &g_fl[i].f);
@@ -404,15 +406,45 @@ static int last_with_fence(VkFence f) {
     return -1;
 }
 
+// ---- submit を GPU の上で順に並べる鎖 ----
+// ドライバは fence の待ちを PC で待たずに返す。アプリは「前の仕事は終わった」と思って次を出すので、
+// 受け手で前の submit と次の submit が GPU の上で重なると、終わる前の答えを読んで GPU を失うことがある（whisper）。
+// そこで受け手が、どの submit も「前の submit が終わってから始める」ように semaphore でつなぐ。
+// 別のキューの間でも効く。VKR_CHAIN=1 で使う
+static VkSemaphore g_chain[4];
+static int g_chain_last = -1;
+static int g_chain_on = -1;
+static int chain_on(void) {
+    if (g_chain_on < 0) { const char *e = getenv("VKR_CHAIN"); g_chain_on = e && *e == '1'; } // 標準では使わない（whisper の件には効かなかった）
+    return g_chain_on;
+}
+static int chain_ready(void) {
+    if (!g_dev) return 0;
+    if (g_chain[0]) return 1;
+    VkSemaphoreCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+    for (int i = 0; i < 4; i++)
+        if (vkCreateSemaphore(g_dev, &ci, NULL, &g_chain[i]) != VK_SUCCESS) {
+            for (int k = 0; k < i; k++) vkDestroySemaphore(g_dev, g_chain[k], NULL);
+            memset(g_chain, 0, sizeof g_chain);
+            return 0;
+        }
+    g_chain_last = -1;
+    return 1;
+}
+
 // ---- 1 つの接続の間に作った物を、切れたときに片づける ----
 static void cleanup(void) {
     drain();
     for (size_t i = 0; i < g_ncbi; i++) { free(g_cbi[i].sets); idlist_free(&g_cbi[i].mems); }
     g_ncbi = 0;
+    if (g_err == VK_ERROR_DEVICE_LOST) g_lost = 1;
     g_err = VK_SUCCESS;
     if (g_dev) {
         for (int i = 0; i < g_nfpool; i++) vkDestroyFence(g_dev, g_fpool[i], NULL);
+        for (int i = 0; i < 4; i++) if (g_chain[i]) vkDestroySemaphore(g_dev, g_chain[i], NULL);
     }
+    memset(g_chain, 0, sizeof g_chain);
+    g_chain_last = -1;
     g_nfpool = 0;
     g_dev = VK_NULL_HANDLE;
     for (int kind = K_PIPELINE; kind >= K_DEVICE; kind--) { (void) kind; }
@@ -1223,6 +1255,28 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
             uint64_t sid = vr_ru64(r);
             if (dbg_on() && sid != dbg_prev) { dset_of(sid)->n = 0; dbg_prev = sid; }
+            if (getenv("VKR_CHECK")) {
+                int k1 = last_with_set(sid), k2 = -1;
+                for (int q = g_nfl - 1; q >= 0 && k2 < 0; q--)
+                    for (uint32_t j = 0; j < g_fl[q].nsnap; j++) if (g_fl[q].snap[j] == sid) { k2 = q; break; }
+                // 同じ実物（ハンドル）を、違う id で使っている走り中の仕事があるか
+                VkDescriptorSet hs = OBJ(VkDescriptorSet, sid);
+                for (int q = g_nfl - 1; q > k1 && q >= 0; q--)
+                    for (uint32_t j = 0; j < g_fl[q].nsnap; j++) {
+                        ent *oe = find(g_fl[q].snap[j]);
+                        if (g_fl[q].snap[j] != sid && oe && (VkDescriptorSet) (uintptr_t) oe->h == hs) {
+                            vlog("取りこぼし（実物）：set %llu の実物は、%d 番目の仕事では set %llu として使われている（%s）", (unsigned long long) sid, q,
+                                 (unsigned long long) g_fl[q].snap[j], vkGetFenceStatus(g_dev, g_fl[q].f) == VK_SUCCESS ? "もう終わっている" : "まだ走っている");
+                            break;
+                        }
+                    }
+                if (k2 > k1) {
+                    VkResult st = vkGetFenceStatus(g_dev, g_fl[k2].f);
+                    vlog("取りこぼし：set %llu を書き換える。今の判定は %d 番目まで待つが、submit の時点では %d 番目（%s）が使っていた。その command buffer：%llu",
+                         (unsigned long long) sid, k1, k2, st == VK_SUCCESS ? "もう終わっている" : "まだ走っている",
+                         (unsigned long long) (g_fl[k2].ncb ? g_fl[k2].cbs[0] : 0));
+                }
+            }
             drain_upto(last_with_set(sid));
             w.dstSet = OBJ(VkDescriptorSet, sid);
             w.dstBinding = vr_ru32(r);
@@ -1424,9 +1478,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (ns > 8) ns = 8; // ドライバが 8 ずつに分けて送ってくる
         VkSubmitInfo si[8];
         VkTimelineSemaphoreSubmitInfo tl[8];
-        VkSemaphore ws[8][8], ss[8][8];
-        uint64_t wv[8][8], sv[8][8];
-        VkPipelineStageFlags wst[8][8];
+        VkSemaphore ws[8][9], ss[8][9];
+        uint64_t wv[8][9], sv[8][9];
+        VkPipelineStageFlags wst[8][9];
         VkCommandBuffer cbs[8][64];
         uint64_t cids[64];
         uint32_t ncid = 0;
@@ -1457,6 +1511,39 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             tl[i].pSignalSemaphoreValues = sv[i];
         }
         VkFence f = OBJ(VkFence, vr_ru64(r));
+        // 同時に走らせる submit は 64 本まで（VKR_MAXFL=n で変える・0 なら上限なし）。
+        // 代役の RTX で whisper を流すと、128 本では GPU を失い、64 本までなら通った。原因はまだわからない
+        {
+            static int maxfl = -1;
+            if (maxfl < 0) { const char *e = getenv("VKR_MAXFL"); maxfl = e ? atoi(e) : 64; }
+            if (maxfl > 0 && g_nfl >= maxfl) drain_upto(g_nfl - maxfl);
+        }
+        // 同じ command buffer を、前に出した分が終わる前にもう一度出すのは Vulkan では禁止（NVIDIA では GPU を失う）。
+        // アプリは待ったつもりで出してくるので、まだ走っていたら、それが終わるまで待つ
+        {
+            int k = -1;
+            for (uint32_t i = 0; i < ncid; i++) { int q = last_with_cb(cids[i]); if (q > k) k = q; }
+            if (k >= 0) {
+                if (getenv("VKR_CHECK")) vlog("submit %llu：まだ走っている command buffer をもう一度出そうとした（%d 番目まで待つ）", (unsigned long long) g_st.submits + 1, k);
+                drain_upto(k);
+            }
+        }
+        if (chain_on() && !g_err && chain_ready())
+            for (uint32_t i = 0; i < ns; i++) {
+                if (g_chain_last >= 0) {
+                    uint32_t k = si[i].waitSemaphoreCount;
+                    ws[i][k] = g_chain[g_chain_last];
+                    wst[i][k] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                    wv[i][k] = 0;
+                    si[i].waitSemaphoreCount = tl[i].waitSemaphoreValueCount = k + 1;
+                }
+                int next = (g_chain_last + 1) & 3;
+                uint32_t k = si[i].signalSemaphoreCount;
+                ss[i][k] = g_chain[next];
+                sv[i][k] = 0;
+                si[i].signalSemaphoreCount = tl[i].signalSemaphoreValueCount = k + 1;
+                g_chain_last = next;
+            }
         // 出した仕事は必ず fence で追う（アプリが付けていなければ自前の物を付ける）
         int own = 0;
         if (!f) { f = own_fence(); own = 1; }
@@ -1491,6 +1578,17 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             e->f = f;
             e->own = own;
             e->ncb = ncid;
+            e->snap = NULL;
+            e->nsnap = 0;
+            if (getenv("VKR_CHECK")) {
+                uint32_t tot = 0;
+                for (uint32_t k = 0; k < ncid; k++) { cbinfo *c = cbi(cids[k], 0); if (c) tot += c->n; }
+                e->snap = malloc((tot ? tot : 1) * sizeof *e->snap);
+                for (uint32_t k = 0; k < ncid; k++) {
+                    cbinfo *c = cbi(cids[k], 0);
+                    if (c) for (uint32_t j = 0; j < c->n; j++) e->snap[e->nsnap++] = c->sets[j];
+                }
+            }
             memcpy(e->cbs, cids, ncid * sizeof *cids);
         } else {
             if (!g_err) vlog("vkQueueSubmit 失敗 (%d)。この接続ではもう GPU を使えない", res);
@@ -1909,6 +2007,20 @@ int vkr_serve(const char *host, int port) {
 #endif
         vlog("つながった");
         serve_client(c);
+        if (g_lost) {
+#ifdef _WIN32
+            // PC の代役（RTX）は、GPU を失うと同じプロセスでは Vulkan を作り直しても装置を作れない（-3 が続く）。
+            // プロセスごと終わり、立て直しは外の台本に任せる
+            vlog("GPU を失ったので終わる（代役は立て直しが要る）");
+            exit(3);
+#endif
+            // GPU を失ったあとは、同じ Vulkan のままだと次の装置が作れないことがある
+            vlog("GPU を失ったので、Vulkan を作り直す");
+            vkDestroyInstance(g_inst, NULL);
+            g_inst = VK_NULL_HANDLE;
+            g_lost = 0;
+            if (!vk_init()) vlog("Vulkan を作り直せない");
+        }
 #ifdef _WIN32
         closesocket(c);
 #else
