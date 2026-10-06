@@ -13,6 +13,10 @@
 #endif
 #ifdef __APPLE__
 #include <os/log.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>
+#endif
 #endif
 #include <stdarg.h>
 #include <time.h>
@@ -554,6 +558,17 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         vkGetPhysicalDeviceProperties(g_pd, &p);
         vkGetPhysicalDeviceFeatures(g_pd, &f);
         vkGetPhysicalDeviceMemoryProperties(g_pd, &m);
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        // iPhone では、iOS がこのアプリに許すメモリのほうが、MoltenVK の答える量よりずっと小さい（超えるとアプリが止められる）。
+        // いま使ってよい量から余裕を引いた量に合わせて答える。llama.cpp などはこれを見て、載せる量や会話の長さを決める
+        {
+            size_t avail = os_proc_available_memory();
+            uint64_t ok = avail > (768ull << 20) ? (uint64_t) avail - (768ull << 20) : 0;
+            for (uint32_t i = 0; i < m.memoryHeapCount; i++)
+                if (m.memoryHeaps[i].size > ok) m.memoryHeaps[i].size = ok;
+            vlog("使ってよいメモリ %llu MB（iOS がいま許す %llu MB から余裕を引いた）", (unsigned long long) (ok >> 20), (unsigned long long) (avail >> 20));
+        }
+#endif
         vr_put(&g_out, &p, sizeof p);
         vr_put(&g_out, &f, sizeof f);
         vr_put(&g_out, &m, sizeof m);
@@ -689,6 +704,16 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
         mai.allocationSize = vr_ru64(r);
         mai.memoryTypeIndex = vr_ru32(r);
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+        // iOS の上限を超えそうなら、アプリが止められる前に「足りない」と断る
+        {
+            size_t avail = os_proc_available_memory();
+            if (mai.allocationSize + (256ull << 20) > (uint64_t) avail) {
+                vlog("メモリ %llu MB は確保しない（iOS がいま許すのは %llu MB）", (unsigned long long) (mai.allocationSize >> 20), (unsigned long long) (avail >> 20));
+                return reply(s, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            }
+        }
+#endif
         VkDeviceMemory m;
         VkResult res = vkAllocateMemory(d, &mai, NULL, &m);
         if (res == VK_SUCCESS) {
