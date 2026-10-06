@@ -1,0 +1,42 @@
+name: dxvk3-win
+# 新しい DXVK（doitsujin/dxvk・zlib）を Windows 用の DLL として組む。
+# DXVK-macOS 1.10.3 の次に、iPhone のドライバ越しで動かしたい版。組み方は本家の artifacts.yml に合わせた
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "組む DXVK のタグか枝"
+        required: true
+        default: "v3.1.1"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux/archlinux:base-devel
+    timeout-minutes: 60
+    steps:
+      - name: 道具
+        run: pacman -Syu --needed --noconfirm git meson mingw-w64-gcc glslang
+      - name: DXVK
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          git clone --recursive --branch "$REF" https://github.com/doitsujin/dxvk.git dxvk
+          git -C dxvk log -1 --format="%H %cd %s"
+      - name: build
+        run: |
+          cd dxvk
+          ./package-release.sh "$REF" build --no-package 2>&1 | tail -20
+          find build -name "*.dll" | head -20
+        env:
+          REF: ${{ inputs.ref }}
+      - name: collect
+        run: |
+          mkdir out
+          cp -r dxvk/build/dxvk-*/x64 out/
+          git -C dxvk log -1 --format="%H" > out/DXVK_COMMIT.txt
+          cp dxvk/LICENSE out/
+          ls -la out out/x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dxvk3-win64
+          path: out/

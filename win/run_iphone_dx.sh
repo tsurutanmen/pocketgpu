@@ -1,0 +1,55 @@
+#!/bin/bash
+# iPhone の実機で、10/6 夜に代役で通した物をまとめて試す。iPhone は受け手のアプリを開いたまま・自動ロックなし・USB でつなぐ。
+#   win/run_iphone_dx.sh [版の名前]
+#   1. 装置の拡張と、BC を読めるか  2. Vulkan の三角形と足し算  3. vkcube：JPEG の先送りあり・なし
+#   4. DirectX 11 の三角形と立方体（BC1 も）  5. DirectX のサンプル（BC は GPU が読めなければドライバがほどく）
+V=${1:-v0722}
+VKB=/d/iphone-rpc/vkbuild
+OUT=$VKB/iphone_runs/$V
+WOUT=$(cygpath -w "$OUT")
+mkdir -p "$OUT"
+export IPHONE_VK=${IPHONE_VK_ADDR:-usb} # 代役で試すときは IPHONE_VK_ADDR=127.0.0.1:50070
+VKCMD='D:/iphone-rpc/vkbuild/iphone-vk.cmd'
+run() { timeout "$1" cmd.exe //c "$VKCMD" "${@:2}"; }
+echo "結果は $OUT"
+
+echo "== 1. 装置の拡張"
+IPHONE_VK_LOG=1 run 120 "D:/iphone-rpc/vkbuild/extlist.exe" iPhone > "$OUT/extlist.txt" 2>&1
+grep -a "受け手の GPU\|caps\|BC の\|: [0-9]*$" "$OUT/extlist.txt" | head -5
+
+echo "== 2. Vulkan の三角形と足し算"
+for t in tri tri13 vecadd; do
+    (cd "$OUT" && run 120 "D:/iphone-rpc/vkbuild/$t.exe") > "$OUT/$t.txt" 2>&1
+    echo "$t：$(grep -a -v '^\[iphone-vk\]' "$OUT/$t.txt" | tail -1)"
+done
+
+echo "== 3. vkcube（300 コマ）JPEG の先送りあり・なし"
+for p in 1 0; do
+    for sz in "500 500" "1280 720"; do
+        set -- $sz
+        IPHONE_VK_JPEG_PIPE=$p IPHONE_VK_LOG=1 IPHONE_VK_STATS=1 \
+            run 300 "D:/iphone-rpc/vkcube/vkcube.exe" --gpu_number 1 --c 300 --suppress_popups --width $1 --height $2 > "$OUT/vkcube_${1}_pipe$p.txt" 2>&1
+        echo "vkcube ${1}x${2} 先送り $p：$(grep -a -o '[0-9.]* コマ/秒' "$OUT/vkcube_${1}_pipe$p.txt" | head -1)"
+    done
+done
+
+echo "== 4. DirectX 11（DXVK-macOS）"
+D=$VKB/d3d11
+(cd "$D" && DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=info DXVK_LOG_PATH=none IPHONE_VK_LOG=1 \
+    run 180 "D:/iphone-rpc/vkbuild/d3d11/d3d11tri.exe" "$WOUT\\d3d11tri.ppm") > "$OUT/d3d11tri.txt" 2>&1
+echo "三角形：$(grep -a '検算\|失敗\|not supported' "$OUT/d3d11tri.txt" | head -3 | tr '\n' ' ')（代役とふつうの DirectX は 7a12ddcb）"
+for m in plain bc1; do
+    arg=""; [ $m = bc1 ] && arg=bc1
+    (cd "$D" && DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=info DXVK_LOG_PATH=none IPHONE_VK_LOG=1 IPHONE_VK_STATS=1 \
+        run 300 "D:/iphone-rpc/vkbuild/d3d11/d3d11cube.exe" 300 "$WOUT\\d3d11cube_$m.ppm" $arg) > "$OUT/d3d11cube_$m.txt" 2>&1
+    echo "立方体 $m：$(grep -a 'コマ/秒\|検算\|失敗' "$OUT/d3d11cube_$m.txt" | grep -av '^\[iphone-vk\]' | tr '\n' ' ')"
+done
+echo "（代役とふつうの DirectX は d760538a・BC1 はふつう 139f0d27・ドライバでほどくと b186cdaa）"
+# DXVK が「足りない」と言った機能を拾う
+grep -a -h "not supported\|Failed\|err:" "$OUT"/d3d11*.txt | sort | uniq -c | head -10
+
+echo "== 5. DirectX のサンプル"
+bash /d/iphone-rpc/app/win/run_d3d11_samples.sh "$IPHONE_VK" EmptyProject11 SimpleSample11 BasicHLSL11 CascadedShadowMaps11 FluidCS11 HDRToneMappingCS11 SimpleBezier11 OIT11 2>&1 | tee "$OUT/samples.txt"
+for f in tri tri13 d3d11tri d3d11cube_plain d3d11cube_bc1; do
+    [ -f "$OUT/$f.ppm" ] && python -X utf8 /d/iphone-rpc/app/vk/tools/ppm2png.py "$OUT/$f.ppm" "$OUT/$f.png" > /dev/null
+done
