@@ -500,6 +500,37 @@ static int last_with_pool(uint64_t pool) {
     return -1;
 }
 
+// その descriptor pool から取った set を、まだ走っている仕事が使っているか（set の aux は pool の id）
+static int last_with_dpool(uint64_t pool) {
+    for (int i = g_nfl - 1; i >= 0; i--)
+        for (uint32_t k = 0; k < g_fl[i].ncb; k++) {
+            cbinfo *c = cbi(g_fl[i].cbs[k], 0);
+            if (!c) continue;
+            for (uint32_t j = 0; j < c->n; j++) {
+                ent *e = find(c->sets[j]);
+                if (e && e->kind == K_DSET && e->aux == pool) return i;
+            }
+        }
+    return -1;
+}
+
+// pool を空にしたり消したりしたら、そこから取った set の表の行も消す
+static void drop_sets_of_pool(uint64_t pool) {
+    size_t n = 0, cap = 0;
+    uint64_t *ids = NULL;
+    for (size_t i = 0; i < g_cap; i++)
+        if (g_tab[i].id && g_tab[i].kind == K_DSET && g_tab[i].aux == pool) {
+            if (n == cap) { cap = cap ? cap * 2 : 64; ids = realloc(ids, cap * sizeof *ids); }
+            ids[n++] = g_tab[i].id;
+        }
+    for (size_t i = 0; i < n; i++) {
+        ent *e = find(ids[i]);
+        if (e) idlist_free(&e->list);
+        del(ids[i]);
+    }
+    free(ids);
+}
+
 static int last_with_set(uint64_t set) {
     for (int i = g_nfl - 1; i >= 0; i--)
         for (uint32_t k = 0; k < g_fl[i].ncb; k++) {
@@ -1815,18 +1846,25 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_DESTROY_DESCRIPTOR_POOL: {
         VkDevice d = DEV(vr_ru64(r));
         uint64_t id = vr_ru64(r);
+        // ドライバは仕事の終わりを待たずに「終わった」と答えるので、まだ GPU が使っている set があれば待つ
+        drain_upto(last_with_dpool(id));
         vkDestroyDescriptorPool(d, OBJ(VkDescriptorPool, id), NULL);
+        drop_sets_of_pool(id);
         del(id);
         return 1;
     }
     case VR_RESET_DESCRIPTOR_POOL: {
         VkDevice d = DEV(vr_ru64(r));
-        vkResetDescriptorPool(d, OBJ(VkDescriptorPool, vr_ru64(r)), 0);
+        uint64_t id = vr_ru64(r);
+        drain_upto(last_with_dpool(id));
+        vkResetDescriptorPool(d, OBJ(VkDescriptorPool, id), 0);
+        drop_sets_of_pool(id);
         return 1;
     }
     case VR_ALLOC_DESCRIPTOR_SETS: {
         VkDevice d = DEV(vr_ru64(r));
-        VkDescriptorPool pool = OBJ(VkDescriptorPool, vr_ru64(r));
+        uint64_t pid = vr_ru64(r);
+        VkDescriptorPool pool = OBJ(VkDescriptorPool, pid);
         uint32_t n = vr_ru32(r);
         for (uint32_t i = 0; i < n; i++) {
             VkDescriptorSetLayout l = OBJ(VkDescriptorSetLayout, vr_ru64(r));
@@ -1834,8 +1872,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             VkDescriptorSetAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &l };
             VkDescriptorSet ds;
             VkResult res = vkAllocateDescriptorSets(d, &ai, &ds);
-            if (res == VK_SUCCESS) put(id, (uint64_t) ds, K_DSET);
-            else vlog("descriptor set を取れない (%d)", res);
+            if (res == VK_SUCCESS) {
+                put(id, (uint64_t) ds, K_DSET);
+                ent *se = find(id);
+                if (se) se->aux = pid; // どの pool から取ったか
+            } else vlog("descriptor set を取れない (%d)", res);
         }
         return 1;
     }
@@ -1846,6 +1887,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         for (uint32_t i = 0; i < n; i++) {
             uint64_t id = vr_ru64(r);
             VkDescriptorSet ds = OBJ(VkDescriptorSet, id);
+            drain_upto(last_with_set(id));
             vkFreeDescriptorSets(d, pool, 1, &ds);
             del(id);
         }

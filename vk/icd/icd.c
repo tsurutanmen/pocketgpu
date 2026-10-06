@@ -412,7 +412,78 @@ static int allowed_ext(const char *name) {
 // 1.3 と名乗っているか（受け手が VR_CAP_VK13 を名乗った）
 static int vk13(void) { return (g_hw.caps & VR_CAP_VK13) != 0; }
 
+static int g_bc; // 1 なら、BC の圧縮テクスチャをドライバがほどいて、ふつうの画素の画像として受け手に送る
+
+// ---- BC の圧縮テクスチャをほどく ----
+// iPhone の GPU は BC（DirectX のゲームがよく使う圧縮）を読めないので、受け手にはふつうの画素の画像を作らせ、
+// アプリが BC のまま送ってくる中身は、写す命令を記録するときに CPU でほどいてから送る
+#define BCDEC_IMPLEMENTATION
+#define BCDEC_STATIC
+#define BCDEC_BC4BC5_PRECISE
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#include "../third_party/bcdec/bcdec.h"
+#pragma GCC diagnostic pop
+
+static VkFormat bc_sub(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC3_UNORM_BLOCK: case VK_FORMAT_BC7_UNORM_BLOCK:
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK: case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: case VK_FORMAT_BC2_SRGB_BLOCK:
+    case VK_FORMAT_BC3_SRGB_BLOCK: case VK_FORMAT_BC7_SRGB_BLOCK:
+        return VK_FORMAT_R8G8B8A8_SRGB;
+    case VK_FORMAT_BC4_UNORM_BLOCK: return VK_FORMAT_R8_UNORM;
+    case VK_FORMAT_BC4_SNORM_BLOCK: return VK_FORMAT_R8_SNORM;
+    case VK_FORMAT_BC5_UNORM_BLOCK: return VK_FORMAT_R8G8_UNORM;
+    case VK_FORMAT_BC5_SNORM_BLOCK: return VK_FORMAT_R8G8_SNORM;
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK: case VK_FORMAT_BC6H_SFLOAT_BLOCK: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
+static uint32_t bc_block_bytes(VkFormat f) {
+    return f == VK_FORMAT_BC1_RGB_UNORM_BLOCK || f == VK_FORMAT_BC1_RGB_SRGB_BLOCK || f == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ||
+                   f == VK_FORMAT_BC1_RGBA_SRGB_BLOCK || f == VK_FORMAT_BC4_UNORM_BLOCK || f == VK_FORMAT_BC4_SNORM_BLOCK
+               ? 8 : 16;
+}
+
+static uint32_t texel_bytes(VkFormat sub) {
+    return sub == VK_FORMAT_R8_UNORM || sub == VK_FORMAT_R8_SNORM ? 1
+         : sub == VK_FORMAT_R8G8_UNORM || sub == VK_FORMAT_R8G8_SNORM ? 2
+         : sub == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
+}
+
+// 1 つの塊（4x4 の画素）をほどいて、tile に 1 行 4 * tb バイトで並べる
+static void bc_block(VkFormat f, const uint8_t *blk, uint8_t *tile, uint32_t tb) {
+    int pitch = (int) (4 * tb);
+    switch (f) {
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK: case VK_FORMAT_BC1_RGB_SRGB_BLOCK:
+        bcdec_bc1(blk, tile, pitch);
+        for (int i = 0; i < 16; i++) tile[i * 4 + 3] = 255; // 透明の無い BC1
+        break;
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: bcdec_bc1(blk, tile, pitch); break;
+    case VK_FORMAT_BC2_UNORM_BLOCK: case VK_FORMAT_BC2_SRGB_BLOCK: bcdec_bc2(blk, tile, pitch); break;
+    case VK_FORMAT_BC3_UNORM_BLOCK: case VK_FORMAT_BC3_SRGB_BLOCK: bcdec_bc3(blk, tile, pitch); break;
+    case VK_FORMAT_BC7_UNORM_BLOCK: case VK_FORMAT_BC7_SRGB_BLOCK: bcdec_bc7(blk, tile, pitch); break;
+    case VK_FORMAT_BC4_UNORM_BLOCK: bcdec_bc4(blk, tile, pitch, 0); break;
+    case VK_FORMAT_BC4_SNORM_BLOCK: bcdec_bc4(blk, tile, pitch, 1); break;
+    case VK_FORMAT_BC5_UNORM_BLOCK: bcdec_bc5(blk, tile, pitch, 0); break;
+    case VK_FORMAT_BC5_SNORM_BLOCK: bcdec_bc5(blk, tile, pitch, 1); break;
+    case VK_FORMAT_BC6H_UFLOAT_BLOCK: case VK_FORMAT_BC6H_SFLOAT_BLOCK: {
+        // bcdec は R・G・B の half を返す（行の長さは half の数）。A に 1.0 を足して 4 つにする
+        uint16_t rgb[16 * 3];
+        bcdec_bc6h_half(blk, rgb, 4 * 3, f == VK_FORMAT_BC6H_SFLOAT_BLOCK);
+        uint16_t *o = (uint16_t *) tile;
+        for (int i = 0; i < 16; i++) { o[i * 4] = rgb[i * 3]; o[i * 4 + 1] = rgb[i * 3 + 1]; o[i * 4 + 2] = rgb[i * 3 + 2]; o[i * 4 + 3] = 0x3C00; }
+        break;
+    }
+    default: break;
+    }
+}
+
 static void mask_features(VkPhysicalDeviceFeatures *f) {
+    if (g_bc) f->textureCompressionBC = VK_TRUE;
     // 中継していない機能は「無い」と答える
     f->sparseBinding = f->sparseResidencyBuffer = f->sparseResidencyImage2D = f->sparseResidencyImage3D = VK_FALSE;
     f->sparseResidency2Samples = f->sparseResidency4Samples = f->sparseResidency8Samples = f->sparseResidency16Samples = VK_FALSE;
@@ -476,6 +547,10 @@ static int hello(void) {
                 if (g_hw.props.apiVersion > top)
                     g_hw.props.apiVersion = VK_MAKE_API_VERSION(0, 1, VK_API_VERSION_MINOR(top), VK_API_VERSION_PATCH(g_hw.props.apiVersion));
                 if (g_hw.caps & ~VR_CAP_DELTA) say("受け手ができること（caps）0x%x", g_hw.caps);
+                // GPU が BC を読めなければ、ドライバがほどく（IPHONE_VK_BC=1 で、読める GPU でもほどく・0 でほどかない）
+                const char *bce = getenv("IPHONE_VK_BC");
+                g_bc = bce && *bce ? *bce == '1' : !g_hw.feats.textureCompressionBC;
+                if (g_bc) say("BC の圧縮テクスチャはドライバがほどく");
                 mask_features(&g_hw.feats);
                 // PC から見ると iPhone のメモリは USB の先にあるので、「別のメモリを持つ GPU」と名乗る。
                 // 共有メモリの GPU（integrated）と名乗ると、llama.cpp などはデータを CPU から直接書ける所に置こうとして、
@@ -538,8 +613,21 @@ struct queue { VK_LOADER_DATA loader; struct dev *d; uint32_t fam, idx; };
 
 struct dent { uint32_t binding, elem, type; struct buf *b; uint64_t off, range; };
 struct dpool;
-struct dset { struct dpool *pool; struct dset *next; uint32_t n, cap; struct dent *e; };
-struct dpool { struct dset *head; };
+// descriptor set の形。pool の残りを数えるため、種類ごとの数を覚えておく。
+// 形を消したあとも、その形で取った set が残っていれば数を使うので、数え札（refs）で持つ
+struct dsl { volatile LONG refs; uint32_t nt; struct { uint32_t type, count; } t[16]; };
+struct dset { struct dpool *pool; struct dset *next; uint32_t n, cap; struct dent *e; struct dsl *layout; };
+// 受け手に頼まずに set を取るので、pool の残り（set の数と種類ごとの数）はドライバが数える
+struct dpool { struct dset *head; uint32_t max_sets, used_sets, nsz; struct { uint32_t type, total, used; } sz[16]; };
+
+static void dsl_unref(struct dsl *l) {
+    if (l && InterlockedDecrement(&l->refs) == 0) free(l);
+}
+
+static int pool_slot(struct dpool *p, uint32_t type) {
+    for (uint32_t j = 0; j < p->nsz; j++) if (p->sz[j].type == type) return (int) j;
+    return -1;
+}
 
 struct cpool { uint32_t fam; struct cb *head; };
 struct cb {
@@ -554,7 +642,9 @@ struct cb {
     size_t nr, capr;
     rng *rd;           // GPU が読むかもしれない範囲（submit の前に、ここだけ送る）
     size_t nrd, caprd;
+    struct bctmp *bct; // BC をほどいた中身を入れた一時バッファ（記録し直すときに消す）
 };
+struct bctmp { VkBuffer b; VkDeviceMemory m; struct bctmp *next; };
 
 struct fence { uint64_t serial; struct queue *q; double last_poll; };
 
@@ -1009,6 +1099,20 @@ static void VKAPI_CALL get_mem2(VkPhysicalDevice pd, VkPhysicalDeviceMemoryPrope
 
 // p3 があれば 1.3 の 64 ビットの形も埋める（受け手が後ろに付けていればそれを、無ければ 1.0 の形を広げる）
 static void get_format_ex(VkFormat f, VkFormatProperties *p, VkFormatProperties3 *p3) {
+    // ほどく BC は、置き換えた形式でできることのうち、BC の画像に許されること（読む・写す）だけを見せる
+    VkFormat bcf = g_bc ? bc_sub(f) : VK_FORMAT_UNDEFINED;
+    if (bcf) {
+        get_format_ex(bcf, p, p3);
+        const VkFormatFeatureFlags keep = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                          VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT;
+        p->optimalTilingFeatures &= keep;
+        p->linearTilingFeatures = p->bufferFeatures = 0;
+        if (p3) {
+            p3->optimalTilingFeatures &= keep;
+            p3->linearTilingFeatures = p3->bufferFeatures = 0;
+        }
+        return;
+    }
     vr_buf b = { 0 }, out = { 0 };
     vr_u32(&b, (uint32_t) f);
     memset(p, 0, sizeof *p);
@@ -1068,6 +1172,13 @@ static VkResult VKAPI_CALL enum_device_layers(VkPhysicalDevice pd, uint32_t *n, 
 
 static VkResult VKAPI_CALL get_image_format(VkPhysicalDevice pd, VkFormat f, VkImageType t, VkImageTiling ti, VkImageUsageFlags u, VkImageCreateFlags fl, VkImageFormatProperties *p) {
     (void) pd;
+    if (g_bc && bc_sub(f)) {
+        memset(p, 0, sizeof *p);
+        const VkImageUsageFlags ok = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (ti != VK_IMAGE_TILING_OPTIMAL || (u & ~ok)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        f = bc_sub(f);
+        fl &= ~(VkImageCreateFlags) VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
+    }
     vr_buf b = { 0 }, out = { 0 };
     vr_u32(&b, f);
     vr_u32(&b, t);
@@ -1373,7 +1484,8 @@ static VkResult VKAPI_CALL bind_buffer2(VkDevice dv, uint32_t n, const VkBindBuf
 }
 
 // ---- 画像 ----
-struct img { VkMemoryRequirements req; struct mem *m; uint64_t memoff; };
+struct img { VkMemoryRequirements req; struct mem *m; uint64_t memoff; VkFormat bc; }; // bc：ほどいて持つ BC の形式
+
 
 // 受け手の装置では swapchain を使わないので、PRESENT_SRC の形は GENERAL に読み替える
 static VkImageLayout fix_layout(VkImageLayout l) {
@@ -1384,6 +1496,14 @@ static VkResult VKAPI_CALL create_image(VkDevice dv, const VkImageCreateInfo *ci
     (void) a;
     struct img *im = calloc(1, sizeof *im);
     if (!im) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    VkImageCreateInfo bci;
+    if (g_bc && bc_sub(ci->format)) {
+        bci = *ci;
+        bci.format = bc_sub(ci->format);
+        bci.flags &= ~(VkImageCreateFlags) VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
+        im->bc = ci->format;
+        ci = &bci;
+    }
     vr_buf b = { 0 }, o = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, ID(im));
@@ -1462,7 +1582,8 @@ static VkResult VKAPI_CALL create_view(VkDevice dv, const VkImageViewCreateInfo 
     vr_u32(&b, ci->flags);
     vr_u64(&b, ID(ci->image));
     vr_u32(&b, ci->viewType);
-    vr_u32(&b, ci->format);
+    // ほどいて持つ画像の見え方は、置き換えた形式で
+    vr_u32(&b, g_bc && bc_sub(ci->format) ? bc_sub(ci->format) : ci->format);
     vr_put(&b, &ci->components, sizeof ci->components);
     vr_put(&b, &ci->subresourceRange, sizeof ci->subresourceRange);
     rpc_send(VR_CREATE_IMAGE_VIEW, &b);
@@ -2255,13 +2376,21 @@ static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreate
         free(b.p); \
     }
 DESTROY_SIMPLE(destroy_shader, VkShaderModule, VR_DESTROY_SHADER_MODULE)
-DESTROY_SIMPLE(destroy_dsl, VkDescriptorSetLayout, VR_DESTROY_DSL)
 DESTROY_SIMPLE(destroy_playout, VkPipelineLayout, VR_DESTROY_PIPELINE_LAYOUT)
 DESTROY_SIMPLE(destroy_pipeline, VkPipeline, VR_DESTROY_PIPELINE)
 
 static VkResult VKAPI_CALL create_dsl(VkDevice dv, const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorSetLayout *out) {
     (void) a;
-    uint64_t id = new_id();
+    struct dsl *l = calloc(1, sizeof *l);
+    if (!l) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    l->refs = 1;
+    for (uint32_t i = 0; i < ci->bindingCount; i++) {
+        uint32_t t = ci->pBindings[i].descriptorType, k = 0;
+        while (k < l->nt && l->t[k].type != t) k++;
+        if (k == l->nt && l->nt < 16) l->t[l->nt++].type = t;
+        if (k < 16) l->t[k].count += ci->pBindings[i].descriptorCount;
+    }
+    uint64_t id = ID(l);
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, id);
@@ -2275,8 +2404,15 @@ static VkResult VKAPI_CALL create_dsl(VkDevice dv, const VkDescriptorSetLayoutCr
     }
     rpc_send(VR_CREATE_DSL, &b);
     free(b.p);
-    *out = (VkDescriptorSetLayout) (uintptr_t) id;
+    *out = (VkDescriptorSetLayout) l;
     return VK_SUCCESS;
+}
+
+static void VKAPI_CALL destroy_dsl(VkDevice dv, VkDescriptorSetLayout h, const VkAllocationCallbacks *a) {
+    (void) a;
+    if (!h) return;
+    send_destroy(VR_DESTROY_DSL, dv, ID(h));
+    dsl_unref((struct dsl *) h);
 }
 
 static void VKAPI_CALL dsl_support(VkDevice dv, const VkDescriptorSetLayoutCreateInfo *ci, VkDescriptorSetLayoutSupport *s) {
@@ -2371,6 +2507,12 @@ static VkResult VKAPI_CALL create_dpool(VkDevice dv, const VkDescriptorPoolCreat
     (void) a;
     struct dpool *p = calloc(1, sizeof *p);
     if (!p) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    p->max_sets = ci->maxSets;
+    for (uint32_t i = 0; i < ci->poolSizeCount; i++) {
+        int j = pool_slot(p, ci->pPoolSizes[i].type);
+        if (j < 0 && p->nsz < 16) { j = (int) p->nsz++; p->sz[j].type = ci->pPoolSizes[i].type; }
+        if (j >= 0) p->sz[j].total += ci->pPoolSizes[i].descriptorCount;
+    }
     AcquireSRWLockExclusive(&g_pools_lock);
     if (g_npools == g_cappools) {
         g_cappools = g_cappools ? g_cappools * 2 : 16;
@@ -2393,8 +2535,10 @@ static VkResult VKAPI_CALL create_dpool(VkDevice dv, const VkDescriptorPoolCreat
 
 static void free_sets_of(struct dpool *p) {
     AcquireSRWLockExclusive(&g_pools_lock);
-    for (struct dset *s = p->head, *nx; s; s = nx) { nx = s->next; free(s->e); free(s); }
+    for (struct dset *s = p->head, *nx; s; s = nx) { nx = s->next; dsl_unref(s->layout); free(s->e); free(s); }
     p->head = NULL;
+    p->used_sets = 0;
+    for (uint32_t j = 0; j < p->nsz; j++) p->sz[j].used = 0;
     ReleaseSRWLockExclusive(&g_pools_lock);
 }
 
@@ -2427,6 +2571,30 @@ static VkResult VKAPI_CALL reset_dpool(VkDevice dv, VkDescriptorPool pp, VkDescr
 
 static VkResult VKAPI_CALL alloc_dsets(VkDevice dv, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out) {
     struct dpool *p = (struct dpool *) ai->descriptorPool;
+    // pool の残りが足りなければ、受け手に頼まずに「足りない」と返す（DXVK などは、それを見て新しい pool を作る）
+    uint32_t need[16] = { 0 };
+    int short_of = 0;
+    AcquireSRWLockExclusive(&g_pools_lock);
+    if (p->used_sets + ai->descriptorSetCount > p->max_sets) short_of = 1;
+    for (uint32_t i = 0; i < ai->descriptorSetCount && !short_of; i++) {
+        const struct dsl *l = (const struct dsl *) ai->pSetLayouts[i];
+        for (uint32_t k = 0; k < l->nt; k++) {
+            if (!l->t[k].count) continue;
+            int j = pool_slot(p, l->t[k].type);
+            if (j < 0) { short_of = 1; break; }
+            need[j] += l->t[k].count;
+        }
+    }
+    for (uint32_t j = 0; j < p->nsz && !short_of; j++) if (p->sz[j].used + need[j] > p->sz[j].total) short_of = 1;
+    if (!short_of) {
+        p->used_sets += ai->descriptorSetCount;
+        for (uint32_t j = 0; j < p->nsz; j++) p->sz[j].used += need[j];
+    }
+    ReleaseSRWLockExclusive(&g_pools_lock);
+    if (short_of) {
+        for (uint32_t i = 0; i < ai->descriptorSetCount; i++) out[i] = VK_NULL_HANDLE;
+        return VK_ERROR_OUT_OF_POOL_MEMORY;
+    }
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, ID(p));
@@ -2434,6 +2602,8 @@ static VkResult VKAPI_CALL alloc_dsets(VkDevice dv, const VkDescriptorSetAllocat
     for (uint32_t i = 0; i < ai->descriptorSetCount; i++) {
         struct dset *s = calloc(1, sizeof *s);
         s->pool = p;
+        s->layout = (struct dsl *) ai->pSetLayouts[i];
+        InterlockedIncrement(&s->layout->refs);
         AcquireSRWLockExclusive(&g_pools_lock);
         s->next = p->head;
         p->head = s;
@@ -2462,6 +2632,15 @@ static VkResult VKAPI_CALL free_dsets(VkDevice dv, VkDescriptorPool pp, uint32_t
         AcquireSRWLockExclusive(&g_pools_lock);
         while (*pp2 && *pp2 != s) pp2 = &(*pp2)->next;
         if (*pp2) *pp2 = s->next;
+        // 返した set の分を、pool の残りに戻す
+        if (s->layout) {
+            if (p->used_sets) p->used_sets--;
+            for (uint32_t k = 0; k < s->layout->nt; k++) {
+                int j = pool_slot(p, s->layout->t[k].type);
+                if (j >= 0) p->sz[j].used = p->sz[j].used > s->layout->t[k].count ? p->sz[j].used - s->layout->t[k].count : 0;
+            }
+            dsl_unref(s->layout);
+        }
         free(s->e);
         free(s);
         ReleaseSRWLockExclusive(&g_pools_lock);
@@ -2616,9 +2795,22 @@ static VkResult VKAPI_CALL create_cpool(VkDevice dv, const VkCommandPoolCreateIn
     return VK_SUCCESS;
 }
 
-static void cb_clear(struct cb *c) { c->s.n = 0; c->nr = 0; c->nrd = 0; }
+static void VKAPI_CALL destroy_buffer(VkDevice dv, VkBuffer h, const VkAllocationCallbacks *a);
+static void VKAPI_CALL free_memory(VkDevice dv, VkDeviceMemory h, const VkAllocationCallbacks *a);
 
-static void cb_free(struct cb *c) { free(c->s.p); free(c->r); free(c->rd); free(c); }
+static void bct_free(struct cb *c) {
+    for (struct bctmp *t = c->bct, *nx; t; t = nx) {
+        nx = t->next;
+        destroy_buffer((VkDevice) c->d, t->b, NULL);
+        free_memory((VkDevice) c->d, t->m, NULL);
+        free(t);
+    }
+    c->bct = NULL;
+}
+
+static void cb_clear(struct cb *c) { c->s.n = 0; c->nr = 0; c->nrd = 0; bct_free(c); }
+
+static void cb_free(struct cb *c) { bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c); }
 
 static void VKAPI_CALL destroy_cpool(VkDevice dv, VkCommandPool pp, const VkAllocationCallbacks *a) {
     (void) a;
@@ -2995,6 +3187,7 @@ static void VKAPI_CALL cmd_set_scissor(VkCommandBuffer cbh, uint32_t first, uint
 
 static void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cbh, VkImage im, VkImageLayout l, VkBuffer bb, uint32_t n, const VkBufferImageCopy *rg) {
     struct cb *c = (struct cb *) cbh;
+    if (im && ((struct img *) im)->bc) { say("BC：ほどいた画像を BC のままバッファへ読み出すことはまだできない（飛ばした）"); return; }
     vr_u32(&c->s, VR_CMD_COPY_IMAGE_TO_BUFFER);
     vr_u64(&c->s, ID(im));
     vr_u64(&c->s, ID(bb));
@@ -3004,8 +3197,76 @@ static void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cbh, VkImage im,
     cb_writes(c, (struct buf *) bb, 0, VK_WHOLE_SIZE);
 }
 
+// BC の中身（CPU から見えるバッファの写し）をほどいて、一時バッファに詰めて並べる。うまくいけば一時バッファを返す
+static VkBuffer bc_unpack(struct cb *c, struct buf *src, VkFormat f, const VkBufferImageCopy *r) {
+    VkDevice dv = (VkDevice) c->d;
+    if (!src || !src->m || !src->m->shadow) { say("BC：CPU から見えないバッファからは写せない（飛ばした）"); return VK_NULL_HANDLE; }
+    VkFormat sub = bc_sub(f);
+    uint32_t tb = texel_bytes(sub), bb = bc_block_bytes(f);
+    uint32_t w = r->imageExtent.width, h = r->imageExtent.height, dz = r->imageExtent.depth ? r->imageExtent.depth : 1;
+    uint32_t layers = r->imageSubresource.layerCount ? r->imageSubresource.layerCount : 1;
+    uint32_t rowlen = r->bufferRowLength ? r->bufferRowLength : w, imgh = r->bufferImageHeight ? r->bufferImageHeight : h;
+    uint32_t bw = (rowlen + 3) / 4, bh = (imgh + 3) / 4;
+    uint64_t slice = (uint64_t) bw * bh * bb, size = (uint64_t) w * h * dz * layers * tb;
+    if (!size) return VK_NULL_HANDLE;
+    VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT };
+    VkBuffer tmp;
+    if (create_buffer(dv, &bc, NULL, &tmp) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkMemoryRequirements req;
+    buffer_reqs(dv, tmp, &req);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
+                                 .memoryTypeIndex = pick_mem(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
+    VkDeviceMemory mem;
+    if (alloc_memory(dv, &mai, NULL, &mem) != VK_SUCCESS) { destroy_buffer(dv, tmp, NULL); return VK_NULL_HANDLE; }
+    bind_buffer(dv, tmp, mem, 0);
+    uint8_t *dst = NULL;
+    map_memory(dv, mem, 0, VK_WHOLE_SIZE, 0, (void **) &dst);
+    const uint8_t *base = src->m->shadow + src->memoff + r->bufferOffset, *end = src->m->shadow + src->m->size;
+    uint8_t tile[4 * 4 * 8];
+    for (uint32_t ly = 0; ly < layers; ly++)
+        for (uint32_t z = 0; z < dz; z++) {
+            const uint8_t *sl = base + ((uint64_t) ly * dz + z) * slice;
+            uint8_t *dsl = dst + ((uint64_t) ly * dz + z) * w * h * tb;
+            for (uint32_t by = 0; by < (h + 3) / 4; by++)
+                for (uint32_t bx = 0; bx < (w + 3) / 4; bx++) {
+                    const uint8_t *blk = sl + ((uint64_t) by * bw + bx) * bb;
+                    if (blk + bb > end) continue; // アプリの中身が足りない
+                    bc_block(f, blk, tile, tb);
+                    for (uint32_t y = 0; y < 4 && by * 4 + y < h; y++) {
+                        uint32_t cw = w - bx * 4 < 4 ? w - bx * 4 : 4;
+                        memcpy(dsl + ((uint64_t) (by * 4 + y) * w + bx * 4) * tb, tile + y * 4 * tb, (size_t) cw * tb);
+                    }
+                }
+        }
+    struct bctmp *t = calloc(1, sizeof *t);
+    t->b = tmp;
+    t->m = mem;
+    t->next = c->bct;
+    c->bct = t;
+    return tmp;
+}
+
 static void VKAPI_CALL cmd_copy_buffer_to_image(VkCommandBuffer cbh, VkBuffer bb, VkImage im, VkImageLayout l, uint32_t n, const VkBufferImageCopy *rg) {
     struct cb *c = (struct cb *) cbh;
+    struct img *ii = (struct img *) im;
+    if (ii && ii->bc) {
+        // 1 つずつほどいて、一時バッファから写す
+        for (uint32_t i = 0; i < n; i++) {
+            VkBuffer tmp = bc_unpack(c, (struct buf *) bb, ii->bc, &rg[i]);
+            if (!tmp) continue;
+            VkBufferImageCopy r = rg[i];
+            r.bufferOffset = 0;
+            r.bufferRowLength = r.bufferImageHeight = 0;
+            vr_u32(&c->s, VR_CMD_COPY_BUFFER_TO_IMAGE);
+            vr_u64(&c->s, ID(tmp));
+            vr_u64(&c->s, ID(im));
+            vr_u32(&c->s, fix_layout(l));
+            vr_u32(&c->s, 1);
+            vr_put(&c->s, &r, sizeof r);
+            cb_reads(c, (struct buf *) tmp, 0, VK_WHOLE_SIZE);
+        }
+        return;
+    }
     vr_u32(&c->s, VR_CMD_COPY_BUFFER_TO_IMAGE);
     vr_u64(&c->s, ID(bb));
     vr_u64(&c->s, ID(im));

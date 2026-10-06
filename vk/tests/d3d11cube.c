@@ -1,7 +1,8 @@
 // DirectX 11 で、窓に回る立方体を出す試験。ゲームでよく使う物をひと通り使う：
 // 窓と swapchain・頂点と index の buffer・毎コマ書き換える定数の buffer・テクスチャと sampler・奥行きの buffer。
 // 横に DXVK の d3d11.dll・dxgi.dll を置くと、DirectX の頼みが Vulkan に直される。
-//   d3d11cube.exe [コマ数] [出す PPM のファイル名]
+//   d3d11cube.exe [コマ数] [出す PPM のファイル名] [bc1]
+// bc1 を付けると、テクスチャを BC1（DirectX のゲームがよく使う圧縮）で持つ
 // 決めたコマ数を出して 1 秒あたりのコマ数を出す。最後に、決めた角度の 1 枚を窓の外に描いて、検算の値を出す
 #define COBJMACROS
 #define INITGUID
@@ -98,6 +99,7 @@ int main(int argc, char **argv) {
     SetConsoleOutputCP(CP_UTF8);
     int frames = argc > 1 ? atoi(argv[1]) : 300;
     const char *out = argc > 2 ? argv[2] : "d3d11cube.ppm";
+    int bc1 = argc > 3 && !strcmp(argv[3], "bc1");
     HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
     PFN_COMPILE D3DCompileFn = dc ? (PFN_COMPILE) GetProcAddress(dc, "D3DCompile") : NULL;
     if (!D3DCompileFn) { printf("d3dcompiler_47.dll が無い\n"); return 1; }
@@ -157,6 +159,23 @@ int main(int argc, char **argv) {
     D3D11_TEXTURE2D_DESC xt = { .Width = TEX, .Height = TEX, .MipLevels = 1, .ArraySize = 1, .Format = DXGI_FORMAT_R8G8B8A8_UNORM,
                                 .SampleDesc = { 1, 0 }, .Usage = D3D11_USAGE_IMMUTABLE, .BindFlags = D3D11_BIND_SHADER_RESOURCE };
     D3D11_SUBRESOURCE_DATA xd0 = { px, TEX * 4, 0 };
+    // BC1：4x4 の塊ごとに 2 色と 2 ビットの番号。市松の 1 マスは塊 2 つ分なので、塊の中は 1 色になる
+    uint8_t *bc = malloc((TEX / 4) * (TEX / 4) * 8);
+    if (bc1) {
+        for (int by = 0; by < TEX / 4; by++)
+            for (int bx = 0; bx < TEX / 4; bx++) {
+                uint32_t c = px[by * 4 * TEX + bx * 4];
+                uint16_t c565 = (uint16_t) ((((c >> 3) & 0x1f) << 11) | (((c >> 10) & 0x3f) << 5) | ((c >> 19) & 0x1f));
+                uint8_t *b = bc + (by * (TEX / 4) + bx) * 8;
+                b[0] = b[2] = (uint8_t) c565;
+                b[1] = b[3] = (uint8_t) (c565 >> 8);
+                b[4] = b[5] = b[6] = b[7] = 0;
+            }
+        xt.Format = DXGI_FORMAT_BC1_UNORM;
+        xd0.pSysMem = bc;
+        xd0.SysMemPitch = (TEX / 4) * 8;
+        printf("テクスチャは BC1\n");
+    }
     ID3D11Texture2D *tex = NULL;
     ID3D11ShaderResourceView *srv = NULL;
     if (FAILED(ID3D11Device_CreateTexture2D(dev, &xt, &xd0, &tex))) { printf("テクスチャを作れない\n"); return 1; }
