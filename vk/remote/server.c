@@ -74,11 +74,27 @@ static int g_portability; // MoltenVK のときは portability_subset を有効�
     X(vkCreateGraphicsPipelines) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdNextSubpass) X(vkCmdDraw) \
     X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdClearColorImage) \
-    X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkGetPhysicalDeviceImageFormatProperties) X(vkCreateSampler) X(vkDestroySampler)
+    X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkGetPhysicalDeviceImageFormatProperties) X(vkCreateSampler) X(vkDestroySampler) \
+    X(vkCmdSetLineWidth) X(vkCmdSetDepthBias) X(vkCmdSetBlendConstants) X(vkCmdSetDepthBounds) X(vkCmdSetStencilCompareMask) \
+    X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdClearAttachments) X(vkCmdClearDepthStencilImage) \
+    X(vkCmdResolveImage) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkGetQueryPoolResults) X(vkCmdResetQueryPool) \
+    X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp) X(vkCmdCopyQueryPoolResults) X(vkGetPhysicalDeviceFormatProperties2)
+
+// 1.2・1.3 の入口。本体の名前か拡張の名前で読む。GPU が持っていなければ NULL のまま（そのときは caps で名乗らない）
+#define VKFUNCS_OPT(X) \
+    X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdPipelineBarrier2) X(vkCreateRenderPass2) X(vkResetQueryPool) \
+    X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetPrimitiveTopology) X(vkCmdSetViewportWithCount) X(vkCmdSetScissorWithCount) \
+    X(vkCmdBindVertexBuffers2) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) \
+    X(vkCmdSetDepthBoundsTestEnable) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCmdSetRasterizerDiscardEnable) \
+    X(vkCmdSetDepthBiasEnable) X(vkCmdSetPrimitiveRestartEnable)
 
 #define DECL(n) static PFN_##n n;
 VKFUNCS(DECL)
+VKFUNCS_OPT(DECL)
 #undef DECL
+
+static uint32_t g_caps = VR_CAP_DELTA; // 受け手ができること（あいさつで名乗る）
+static int g_fmt3;                     // VkFormatProperties3 を答えられる
 
 // ---- PC が振った番号 → ここの本物の Vulkan の物 ----
 // aux：バッファならつないだメモリの番号。list：descriptor set なら中のバッファの番号の並び
@@ -101,7 +117,7 @@ static ent *g_tab;
 static size_t g_cap, g_cnt;
 
 enum { K_DEVICE = 1, K_QUEUE, K_BUFFER, K_MEMORY, K_SHADER, K_DSL, K_PLAYOUT, K_PIPELINE, K_DPOOL, K_DSET, K_CPOOL, K_CB, K_FENCE, K_SEM,
-       K_IMAGE, K_VIEW, K_RPASS, K_FB, K_SAMPLER };
+       K_IMAGE, K_VIEW, K_RPASS, K_FB, K_SAMPLER, K_QPOOL };
 
 static size_t slot(uint64_t id) { return (size_t) ((id * 0x9E3779B97F4A7C15ull) >> 20) & (g_cap - 1); }
 
@@ -166,6 +182,104 @@ static void del(uint64_t id) {
 #define DEV(id) ((VkDevice) (uintptr_t) H(id))
 #define OBJ(T, id) ((T) (uintptr_t) H(id))
 
+// ---- 受け手ができることを調べる ----
+// 本物の GPU が持っているか（版・拡張・機能）を見て、入口を読めたものだけを caps で名乗る。
+// iPhone の MoltenVK は 1.3 の一部しか持たないことがあるので、名乗る前に必ず確かめる
+static int has_ext(const VkExtensionProperties *ep, uint32_t ne, const char *name) {
+    for (uint32_t i = 0; i < ne; i++) if (!strcmp(ep[i].extensionName, name)) return 1;
+    return 0;
+}
+
+// 本体の名前で読めればそれを、無ければ拡張の名前（末尾 suffix）で読む
+static PFN_vkVoidFunction load_opt(int core, const char *name, const char *suffix) {
+    PFN_vkVoidFunction f = core ? gipa(g_inst, name) : NULL;
+    if (!f && suffix) {
+        char n2[96];
+        snprintf(n2, sizeof n2, "%s%s", name, suffix);
+        f = gipa(g_inst, n2);
+    }
+    return f;
+}
+
+static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t api) {
+#define CLEAR(n) n = NULL;
+    VKFUNCS_OPT(CLEAR)
+#undef CLEAR
+    int v12 = VK_API_VERSION_MAJOR(api) > 1 || VK_API_VERSION_MINOR(api) >= 2;
+    int v13 = VK_API_VERSION_MAJOR(api) > 1 || VK_API_VERSION_MINOR(api) >= 3;
+    int e_dr = has_ext(ep, ne, "VK_KHR_dynamic_rendering"), e_s2 = has_ext(ep, ne, "VK_KHR_synchronization2");
+    int e_eds = has_ext(ep, ne, "VK_EXT_extended_dynamic_state"), e_eds2 = has_ext(ep, ne, "VK_EXT_extended_dynamic_state2");
+    int e_rp2 = has_ext(ep, ne, "VK_KHR_create_renderpass2"), e_hqr = has_ext(ep, ne, "VK_EXT_host_query_reset");
+    // 機能を尋ねる（持っている拡張・版の構造体だけを鎖にする）
+    VkPhysicalDeviceVulkan13Features f13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+    VkPhysicalDeviceDynamicRenderingFeatures fdr = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES };
+    VkPhysicalDeviceSynchronization2Features fs2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES };
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT feds = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT };
+    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT feds2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT };
+    VkPhysicalDeviceHostQueryResetFeatures fhqr = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES };
+    void *head = NULL, **link = &head;
+#define LINK(cond, s) if (cond) { *link = &s; link = &s.pNext; }
+    LINK(v13, f13)
+    LINK(e_dr, fdr)
+    LINK(e_s2, fs2)
+    LINK(e_eds, feds)
+    LINK(e_eds2, feds2)
+    LINK(v12 || e_hqr, fhqr)
+#undef LINK
+    VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = head };
+    if (vkGetPhysicalDeviceFeatures2) vkGetPhysicalDeviceFeatures2(g_pd, &f2);
+    uint32_t caps = VR_CAP_DELTA | VR_CAP_CMD10 | VR_CAP_QUERY; // 1.0 の入口だけで済むもの
+#define LOAD_OPT(n, core, sfx) n = (PFN_##n) load_opt(core, #n, sfx);
+    // dynamic rendering
+    int core = v13 && f13.dynamicRendering, ext = e_dr && fdr.dynamicRendering;
+    if (core || ext) {
+        LOAD_OPT(vkCmdBeginRendering, core, ext ? "KHR" : NULL)
+        LOAD_OPT(vkCmdEndRendering, core, ext ? "KHR" : NULL)
+        if (vkCmdBeginRendering && vkCmdEndRendering) caps |= VR_CAP_DYNAMIC_RENDERING;
+    }
+    // synchronization2
+    core = v13 && f13.synchronization2, ext = e_s2 && fs2.synchronization2;
+    if (core || ext) {
+        LOAD_OPT(vkCmdPipelineBarrier2, core, ext ? "KHR" : NULL)
+        if (vkCmdPipelineBarrier2) caps |= VR_CAP_SYNC2;
+    }
+    // render pass 2（1.2 で本体入り）
+    if (v12 || e_rp2) {
+        LOAD_OPT(vkCreateRenderPass2, v12, e_rp2 ? "KHR" : NULL)
+        if (vkCreateRenderPass2) caps |= VR_CAP_RENDER_PASS2;
+    }
+    // CPU からの query の reset（1.2 で本体入り）
+    if (fhqr.hostQueryReset) LOAD_OPT(vkResetQueryPool, v12, e_hqr ? "EXT" : NULL)
+    // extended dynamic state 1・2（1.3 で本体入り）
+    core = v13, ext = e_eds && feds.extendedDynamicState && e_eds2 && feds2.extendedDynamicState2;
+    if (core || ext) {
+        const char *sx = ext ? "EXT" : NULL;
+        LOAD_OPT(vkCmdSetCullMode, core, sx) LOAD_OPT(vkCmdSetFrontFace, core, sx) LOAD_OPT(vkCmdSetPrimitiveTopology, core, sx)
+        LOAD_OPT(vkCmdSetViewportWithCount, core, sx) LOAD_OPT(vkCmdSetScissorWithCount, core, sx) LOAD_OPT(vkCmdBindVertexBuffers2, core, sx)
+        LOAD_OPT(vkCmdSetDepthTestEnable, core, sx) LOAD_OPT(vkCmdSetDepthWriteEnable, core, sx) LOAD_OPT(vkCmdSetDepthCompareOp, core, sx)
+        LOAD_OPT(vkCmdSetDepthBoundsTestEnable, core, sx) LOAD_OPT(vkCmdSetStencilTestEnable, core, sx) LOAD_OPT(vkCmdSetStencilOp, core, sx)
+        LOAD_OPT(vkCmdSetRasterizerDiscardEnable, core, sx) LOAD_OPT(vkCmdSetDepthBiasEnable, core, sx)
+        LOAD_OPT(vkCmdSetPrimitiveRestartEnable, core, sx)
+        if (vkCmdSetCullMode && vkCmdSetFrontFace && vkCmdSetPrimitiveTopology && vkCmdSetViewportWithCount && vkCmdSetScissorWithCount &&
+            vkCmdBindVertexBuffers2 && vkCmdSetDepthTestEnable && vkCmdSetDepthWriteEnable && vkCmdSetDepthCompareOp &&
+            vkCmdSetDepthBoundsTestEnable && vkCmdSetStencilTestEnable && vkCmdSetStencilOp && vkCmdSetRasterizerDiscardEnable &&
+            vkCmdSetDepthBiasEnable && vkCmdSetPrimitiveRestartEnable)
+            caps |= VR_CAP_EXT_DYNAMIC_STATE;
+    }
+#undef LOAD_OPT
+    // 1.3 と名乗れるのは、GPU が 1.3 で、1.3 の必須の入口を全部本体の名前で読めたとき
+    const uint32_t need13 = VR_CAP_DYNAMIC_RENDERING | VR_CAP_SYNC2 | VR_CAP_RENDER_PASS2 | VR_CAP_EXT_DYNAMIC_STATE;
+    if (v13 && (caps & need13) == need13) caps |= VR_CAP_VK13;
+    g_fmt3 = (v13 || has_ext(ep, ne, "VK_KHR_format_feature_flags2")) && vkGetPhysicalDeviceFormatProperties2;
+    // 調べ用：VKR_CAPS=数 で名乗る印を絞る（古い受け手のふりをする）
+    const char *mask = getenv("VKR_CAPS");
+    if (mask && *mask) caps &= (uint32_t) strtoul(mask, NULL, 0);
+    g_caps = caps;
+    vlog("できること（caps）0x%x：1.3 %s・dynamic rendering %s・sync2 %s・render pass 2 %s・extended dynamic state %s・query %s",
+         caps, caps & VR_CAP_VK13 ? "○" : "×", caps & VR_CAP_DYNAMIC_RENDERING ? "○" : "×", caps & VR_CAP_SYNC2 ? "○" : "×",
+         caps & VR_CAP_RENDER_PASS2 ? "○" : "×", caps & VR_CAP_EXT_DYNAMIC_STATE ? "○" : "×", caps & VR_CAP_QUERY ? "○" : "×");
+}
+
 // ---- 起動 ----
 static int vk_init(void) {
 #ifdef _WIN32
@@ -177,7 +291,12 @@ static int vk_init(void) {
     gipa = (PFN_vkGetInstanceProcAddr) vkGetInstanceProcAddr;
 #endif
     vkCreateInstance = (PFN_vkCreateInstance) gipa(NULL, "vkCreateInstance");
-    VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "iphone-rpc-vk", .apiVersion = VK_API_VERSION_1_2 };
+    // 装置で使える版は instance の版と GPU の版の小さい方になる。1.3 の入口を本体の名前で使えるように、できれば 1.3 で作る
+    uint32_t iv = VK_API_VERSION_1_0;
+    PFN_vkEnumerateInstanceVersion eiv = (PFN_vkEnumerateInstanceVersion) gipa(NULL, "vkEnumerateInstanceVersion");
+    if (eiv) eiv(&iv);
+    uint32_t want = VK_API_VERSION_MAJOR(iv) > 1 || VK_API_VERSION_MINOR(iv) >= 3 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_2;
+    VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "iphone-rpc-vk", .apiVersion = want };
     const char *ext[] = { "VK_KHR_portability_enumeration" };
     VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
     // portability_enumeration は Vulkan のローダーが持つ拡張。iPhone のように MoltenVK を直接つなぐと無いので、
@@ -212,10 +331,11 @@ static int vk_init(void) {
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_pd, NULL, &ne, ep);
     for (uint32_t i = 0; i < ne; i++) if (!strcmp(ep[i].extensionName, "VK_KHR_portability_subset")) g_portability = 1;
-    free(ep);
     VkPhysicalDeviceProperties p;
     vkGetPhysicalDeviceProperties(g_pd, &p);
     vlog("受け手の GPU: %s", p.deviceName);
+    detect_caps(ep, ne, p.apiVersion < want ? p.apiVersion : want);
+    free(ep);
     return 1;
 }
 
@@ -453,7 +573,7 @@ static void cleanup(void) {
     if (dev) {
         vkDeviceWaitIdle(dev);
         static const int order[] = { K_PIPELINE, K_FB, K_RPASS, K_PLAYOUT, K_SHADER, K_DPOOL, K_DSL, K_SAMPLER, K_CPOOL, K_FENCE, K_SEM,
-                                     K_VIEW, K_IMAGE, K_BUFFER, K_MEMORY };
+                                     K_QPOOL, K_VIEW, K_IMAGE, K_BUFFER, K_MEMORY };
         for (size_t o = 0; o < sizeof order / sizeof *order; o++)
             for (size_t i = 0; i < g_cap; i++) {
                 ent *e = &g_tab[i];
@@ -474,6 +594,7 @@ static void cleanup(void) {
                 case K_VIEW: vkDestroyImageView(dev, (VkImageView) e->h, NULL); break;
                 case K_IMAGE: vkDestroyImage(dev, (VkImage) e->h, NULL); break;
                 case K_SAMPLER: vkDestroySampler(dev, (VkSampler) e->h, NULL); break;
+                case K_QPOOL: vkDestroyQueryPool(dev, (VkQueryPool) e->h, NULL); break;
                 }
             }
         vkDestroyDevice(dev, NULL);
@@ -507,6 +628,67 @@ static void *build_chain(vr_rd *r, uint32_t count, void **blocks, uint32_t *size
         link = (void **) &b->pNext;
     }
     return head;
+}
+
+// 画像（または見え方）の番号 → それがつながっているメモリを、記録の「使うメモリ」に足す
+static void use_image(cbinfo *ci, uint64_t id) {
+    if (!ci) return;
+    ent *e = find(id);
+    if (e) use_buffer_mem(ci, e->aux);
+}
+
+// dynamic rendering の描く先 1 つを読む。描く先と resolve 先の画像のメモリを「使う」として覚える
+static void read_rendering_att(vr_rd *r, VkRenderingAttachmentInfo *a, cbinfo *ci) {
+    *a = (VkRenderingAttachmentInfo) { .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    uint64_t vid = vr_ru64(r);
+    a->imageView = OBJ(VkImageView, vid);
+    a->imageLayout = (VkImageLayout) vr_ru32(r);
+    a->resolveMode = (VkResolveModeFlagBits) vr_ru32(r);
+    uint64_t rid = vr_ru64(r);
+    a->resolveImageView = OBJ(VkImageView, rid);
+    a->resolveImageLayout = (VkImageLayout) vr_ru32(r);
+    a->loadOp = (VkAttachmentLoadOp) vr_ru32(r);
+    a->storeOp = (VkAttachmentStoreOp) vr_ru32(r);
+    vr_rcopy(r, &a->clearValue, sizeof a->clearValue);
+    use_image(ci, vid);
+    use_image(ci, rid);
+}
+
+// 後から変える値（VkDynamicState の番号ごと）。小数はビットのまま届く
+static void set_dynamic(VkCommandBuffer cb, uint32_t st, uint32_t n, const uint32_t *v) {
+    float f[96];
+    memcpy(f, v, (size_t) (n < 96 ? n : 96) * 4);
+#define NEED(k) if (n < (k)) break
+    switch (st) {
+    case VK_DYNAMIC_STATE_LINE_WIDTH: NEED(1); vkCmdSetLineWidth(cb, f[0]); return;
+    case VK_DYNAMIC_STATE_DEPTH_BIAS: NEED(3); vkCmdSetDepthBias(cb, f[0], f[1], f[2]); return;
+    case VK_DYNAMIC_STATE_BLEND_CONSTANTS: NEED(4); vkCmdSetBlendConstants(cb, f); return;
+    case VK_DYNAMIC_STATE_DEPTH_BOUNDS: NEED(2); vkCmdSetDepthBounds(cb, f[0], f[1]); return;
+    case VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK: NEED(2); vkCmdSetStencilCompareMask(cb, v[0], v[1]); return;
+    case VK_DYNAMIC_STATE_STENCIL_WRITE_MASK: NEED(2); vkCmdSetStencilWriteMask(cb, v[0], v[1]); return;
+    case VK_DYNAMIC_STATE_STENCIL_REFERENCE: NEED(2); vkCmdSetStencilReference(cb, v[0], v[1]); return;
+    default: break;
+    }
+    if (!(g_caps & VR_CAP_EXT_DYNAMIC_STATE)) { vlog("この値（%u）は変えられない", st); return; }
+    switch (st) {
+    case VK_DYNAMIC_STATE_CULL_MODE: NEED(1); vkCmdSetCullMode(cb, v[0]); return;
+    case VK_DYNAMIC_STATE_FRONT_FACE: NEED(1); vkCmdSetFrontFace(cb, (VkFrontFace) v[0]); return;
+    case VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY: NEED(1); vkCmdSetPrimitiveTopology(cb, (VkPrimitiveTopology) v[0]); return;
+    case VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT: vkCmdSetViewportWithCount(cb, (n < 96 ? n : 96) / 6, (const VkViewport *) f); return;
+    case VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT: vkCmdSetScissorWithCount(cb, (n < 96 ? n : 96) / 4, (const VkRect2D *) v); return;
+    case VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE: NEED(1); vkCmdSetDepthTestEnable(cb, v[0]); return;
+    case VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE: NEED(1); vkCmdSetDepthWriteEnable(cb, v[0]); return;
+    case VK_DYNAMIC_STATE_DEPTH_COMPARE_OP: NEED(1); vkCmdSetDepthCompareOp(cb, (VkCompareOp) v[0]); return;
+    case VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE: NEED(1); vkCmdSetDepthBoundsTestEnable(cb, v[0]); return;
+    case VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE: NEED(1); vkCmdSetStencilTestEnable(cb, v[0]); return;
+    case VK_DYNAMIC_STATE_STENCIL_OP: NEED(5); vkCmdSetStencilOp(cb, v[0], (VkStencilOp) v[1], (VkStencilOp) v[2], (VkStencilOp) v[3], (VkCompareOp) v[4]); return;
+    case VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE: NEED(1); vkCmdSetRasterizerDiscardEnable(cb, v[0]); return;
+    case VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE: NEED(1); vkCmdSetDepthBiasEnable(cb, v[0]); return;
+    case VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE: NEED(1); vkCmdSetPrimitiveRestartEnable(cb, v[0]); return;
+    default: break;
+    }
+#undef NEED
+    vlog("知らない値の変え方 %u（値 %u 個）", st, n);
 }
 
 // ---- command buffer に積まれた命令を実行する ----
@@ -786,6 +968,166 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
                 free(rg);
             }
         } break;
+        // ---- 1.3 に向けて足した命令 ----
+        case VR_CMD_BEGIN_RENDERING: {
+            VkRenderingInfo ri = { .sType = VK_STRUCTURE_TYPE_RENDERING_INFO };
+            ri.flags = vr_ru32(r);
+            vr_rcopy(r, &ri.renderArea, sizeof ri.renderArea);
+            ri.layerCount = vr_ru32(r);
+            ri.viewMask = vr_ru32(r);
+            uint32_t nc = vr_ru32(r);
+            VkRenderingAttachmentInfo ca[16], da, sa, skip;
+            for (uint32_t i = 0; i < nc && !r->bad; i++) read_rendering_att(r, i < 16 ? &ca[i] : &skip, ci);
+            ri.colorAttachmentCount = nc < 16 ? nc : 16;
+            ri.pColorAttachments = ca;
+            if (vr_ru32(r)) { read_rendering_att(r, &da, ci); ri.pDepthAttachment = &da; }
+            if (vr_ru32(r)) { read_rendering_att(r, &sa, ci); ri.pStencilAttachment = &sa; }
+            tracef(ci, "  begin rendering 色 %u・depth %s・stencil %s", nc, ri.pDepthAttachment ? "あり" : "なし", ri.pStencilAttachment ? "あり" : "なし");
+            if (!r->bad && vkCmdBeginRendering) vkCmdBeginRendering(cb, &ri);
+        } break;
+        case VR_CMD_END_RENDERING:
+            if (vkCmdEndRendering) vkCmdEndRendering(cb);
+            break;
+        case VR_CMD_BARRIER_SYNC2: {
+            VkDependencyInfo di = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            di.dependencyFlags = vr_ru32(r);
+            uint32_t nm = vr_ru32(r);
+            if (nm > r->n - r->at) { r->bad = 1; break; }
+            VkMemoryBarrier2 *mb = calloc(nm ? nm : 1, sizeof *mb);
+            for (uint32_t i = 0; i < nm; i++) {
+                mb[i].sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                mb[i].srcStageMask = vr_ru64(r);
+                mb[i].srcAccessMask = vr_ru64(r);
+                mb[i].dstStageMask = vr_ru64(r);
+                mb[i].dstAccessMask = vr_ru64(r);
+            }
+            uint32_t nb = vr_ru32(r);
+            if (nb > r->n - r->at) { free(mb); r->bad = 1; break; }
+            VkBufferMemoryBarrier2 *bb = calloc(nb ? nb : 1, sizeof *bb);
+            for (uint32_t i = 0; i < nb; i++) {
+                bb[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+                bb[i].srcStageMask = vr_ru64(r);
+                bb[i].srcAccessMask = vr_ru64(r);
+                bb[i].dstStageMask = vr_ru64(r);
+                bb[i].dstAccessMask = vr_ru64(r);
+                bb[i].srcQueueFamilyIndex = vr_ru32(r);
+                bb[i].dstQueueFamilyIndex = vr_ru32(r);
+                bb[i].buffer = OBJ(VkBuffer, vr_ru64(r));
+                bb[i].offset = vr_ru64(r);
+                bb[i].size = vr_ru64(r);
+            }
+            uint32_t ni = vr_ru32(r);
+            if (ni > r->n - r->at) { free(mb); free(bb); r->bad = 1; break; }
+            VkImageMemoryBarrier2 *ib = calloc(ni ? ni : 1, sizeof *ib);
+            for (uint32_t i = 0; i < ni; i++) {
+                ib[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                ib[i].srcStageMask = vr_ru64(r);
+                ib[i].srcAccessMask = vr_ru64(r);
+                ib[i].dstStageMask = vr_ru64(r);
+                ib[i].dstAccessMask = vr_ru64(r);
+                ib[i].oldLayout = (VkImageLayout) vr_ru32(r);
+                ib[i].newLayout = (VkImageLayout) vr_ru32(r);
+                ib[i].srcQueueFamilyIndex = vr_ru32(r);
+                ib[i].dstQueueFamilyIndex = vr_ru32(r);
+                ib[i].image = OBJ(VkImage, vr_ru64(r));
+                vr_rcopy(r, &ib[i].subresourceRange, sizeof ib[i].subresourceRange);
+            }
+            di.memoryBarrierCount = nm;
+            di.pMemoryBarriers = mb;
+            di.bufferMemoryBarrierCount = nb;
+            di.pBufferMemoryBarriers = bb;
+            di.imageMemoryBarrierCount = ni;
+            di.pImageMemoryBarriers = ib;
+            tracef(ci, "  barrier2 memory %u・buffer %u・image %u", nm, nb, ni);
+            if (!r->bad && vkCmdPipelineBarrier2) vkCmdPipelineBarrier2(cb, &di);
+            free(mb);
+            free(bb);
+            free(ib);
+        } break;
+        case VR_CMD_SET_DYNAMIC: {
+            uint32_t st = vr_ru32(r), n = vr_ru32(r);
+            uint32_t v[96];
+            for (uint32_t i = 0; i < n && !r->bad; i++) { uint32_t x = vr_ru32(r); if (i < 96) v[i] = x; }
+            if (!r->bad) set_dynamic(cb, st, n < 96 ? n : 96, v);
+        } break;
+        case VR_CMD_BIND_VERTEX_BUFFERS2: {
+            uint32_t first = vr_ru32(r), n = vr_ru32(r), has_size = vr_ru32(r), has_stride = vr_ru32(r);
+            VkBuffer bs[32];
+            VkDeviceSize offs[32], sizes[32], strides[32];
+            for (uint32_t i = 0; i < n && !r->bad; i++) {
+                uint64_t bid = vr_ru64(r), off = vr_ru64(r), sz = vr_ru64(r), sd = vr_ru64(r);
+                use_buffer(ci, bid);
+                if (i < 32) { bs[i] = OBJ(VkBuffer, bid); offs[i] = off; sizes[i] = sz; strides[i] = sd; }
+            }
+            if (!r->bad && vkCmdBindVertexBuffers2)
+                vkCmdBindVertexBuffers2(cb, first, n < 32 ? n : 32, bs, offs, has_size ? sizes : NULL, has_stride ? strides : NULL);
+        } break;
+        case VR_CMD_CLEAR_ATTACHMENTS: {
+            uint32_t na = vr_ru32(r);
+            if (na > r->n - r->at) { r->bad = 1; break; }
+            VkClearAttachment *ca = calloc(na ? na : 1, sizeof *ca);
+            for (uint32_t i = 0; i < na; i++) vr_rcopy(r, &ca[i], sizeof ca[i]);
+            uint32_t nr = vr_ru32(r);
+            if (nr > r->n - r->at) { free(ca); r->bad = 1; break; }
+            VkClearRect *rc = calloc(nr ? nr : 1, sizeof *rc);
+            for (uint32_t i = 0; i < nr; i++) vr_rcopy(r, &rc[i], sizeof rc[i]);
+            if (!r->bad) vkCmdClearAttachments(cb, na, ca, nr, rc);
+            free(ca);
+            free(rc);
+        } break;
+        case VR_CMD_CLEAR_DEPTH_STENCIL_IMAGE: {
+            uint64_t iid = vr_ru64(r);
+            uint32_t layout = vr_ru32(r);
+            VkClearDepthStencilValue v;
+            vr_rcopy(r, &v, sizeof v);
+            uint32_t n = vr_ru32(r);
+            VkImageSubresourceRange rg[16];
+            for (uint32_t i = 0; i < n; i++) { if (i < 16) vr_rcopy(r, &rg[i], sizeof rg[i]); else vr_take(r, sizeof rg[0]); }
+            use_image(ci, iid);
+            if (!r->bad) vkCmdClearDepthStencilImage(cb, OBJ(VkImage, iid), (VkImageLayout) layout, &v, n < 16 ? n : 16, rg);
+        } break;
+        case VR_CMD_RESOLVE_IMAGE: {
+            uint64_t sid = vr_ru64(r);
+            uint32_t sl = vr_ru32(r);
+            uint64_t did = vr_ru64(r);
+            uint32_t dl = vr_ru32(r), n = vr_ru32(r);
+            if (n > r->n - r->at) { r->bad = 1; break; }
+            VkImageResolve *rg = calloc(n ? n : 1, sizeof *rg);
+            for (uint32_t i = 0; i < n; i++) vr_rcopy(r, &rg[i], sizeof rg[i]);
+            use_image(ci, sid);
+            use_image(ci, did);
+            if (!r->bad) vkCmdResolveImage(cb, OBJ(VkImage, sid), (VkImageLayout) sl, OBJ(VkImage, did), (VkImageLayout) dl, n, rg);
+            free(rg);
+        } break;
+        case VR_CMD_RESET_QUERY_POOL: {
+            VkQueryPool qp = OBJ(VkQueryPool, vr_ru64(r));
+            uint32_t first = vr_ru32(r), n = vr_ru32(r);
+            if (!r->bad && qp) vkCmdResetQueryPool(cb, qp, first, n);
+        } break;
+        case VR_CMD_BEGIN_QUERY: {
+            VkQueryPool qp = OBJ(VkQueryPool, vr_ru64(r));
+            uint32_t q = vr_ru32(r), flags = vr_ru32(r);
+            if (!r->bad && qp) vkCmdBeginQuery(cb, qp, q, flags);
+        } break;
+        case VR_CMD_END_QUERY: {
+            VkQueryPool qp = OBJ(VkQueryPool, vr_ru64(r));
+            uint32_t q = vr_ru32(r);
+            if (!r->bad && qp) vkCmdEndQuery(cb, qp, q);
+        } break;
+        case VR_CMD_WRITE_TIMESTAMP: {
+            uint32_t stage = vr_ru32(r);
+            VkQueryPool qp = OBJ(VkQueryPool, vr_ru64(r));
+            uint32_t q = vr_ru32(r);
+            if (!r->bad && qp) vkCmdWriteTimestamp(cb, (VkPipelineStageFlagBits) stage, qp, q);
+        } break;
+        case VR_CMD_COPY_QUERY_RESULTS: {
+            VkQueryPool qp = OBJ(VkQueryPool, vr_ru64(r));
+            uint32_t first = vr_ru32(r), n = vr_ru32(r);
+            uint64_t bid = vr_ru64(r), off = vr_ru64(r), stride = vr_ru64(r);
+            uint32_t flags = vr_ru32(r);
+            use_buffer(ci, bid);
+            if (!r->bad && qp) vkCmdCopyQueryPoolResults(cb, qp, first, n, OBJ(VkBuffer, bid), off, stride, flags);
+        } break;
         default:
             vlog("知らない記録の命令 %u", op);
             r->bad = 1;
@@ -821,6 +1163,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_DESTROY_SEMAPHORE: case VR_DESTROY_DEVICE: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE:
     case VR_DESTROY_IMAGE: case VR_DESTROY_IMAGE_VIEW: case VR_DESTROY_RENDER_PASS: case VR_DESTROY_FRAMEBUFFER:
     case VR_DESTROY_SAMPLER:
+    // query の結果は、出した仕事が全部終わってから読む（ドライバは fence を待たずに「終わった」と答えているので）
+    case VR_DESTROY_QUERY_POOL: case VR_GET_QUERY_POOL_RESULTS: case VR_RESET_QUERY_POOL:
         drain();
         break;
     default:
@@ -830,7 +1174,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     if (g_err != VK_SUCCESS) {
         switch (op) {
         case VR_MEM_READ: case VR_MEM_READ_DELTA: case VR_WAIT_FOR_FENCES: case VR_GET_FENCE_STATUS: case VR_WAIT_SEMAPHORES:
-        case VR_GET_SEMAPHORE_COUNTER: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE:
+        case VR_GET_SEMAPHORE_COUNTER: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE: case VR_GET_QUERY_POOL_RESULTS:
             return reply(s, g_err);
         default:
             break;
@@ -875,7 +1219,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         vr_u32(&g_out, ne);
         vr_put(&g_out, e, sizeof *e * ne);
         free(e);
-        vr_u32(&g_out, VR_CAP_DELTA);
+        vr_u32(&g_out, g_caps);
         return reply(s, 0);
     }
     case VR_GET_FEATURES2:
@@ -901,9 +1245,19 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         return reply(s, 0);
     }
     case VR_GET_FORMAT_PROPS: {
+        VkFormat fmt = (VkFormat) vr_ru32(r);
         VkFormatProperties fp;
-        vkGetPhysicalDeviceFormatProperties(g_pd, (VkFormat) vr_ru32(r), &fp);
+        vkGetPhysicalDeviceFormatProperties(g_pd, fmt, &fp);
         vr_put(&g_out, &fp, sizeof fp);
+        if (g_fmt3) {
+            // 1.3 の 64 ビットの形（STORAGE_READ_WITHOUT_FORMAT など 1.0 の形に無い印がある）を後ろに付ける
+            VkFormatProperties3 f3 = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 };
+            VkFormatProperties2 f2 = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &f3 };
+            vkGetPhysicalDeviceFormatProperties2(g_pd, fmt, &f2);
+            vr_u64(&g_out, f3.linearTilingFeatures);
+            vr_u64(&g_out, f3.optimalTilingFeatures);
+            vr_u64(&g_out, f3.bufferFeatures);
+        }
         return reply(s, 0);
     }
     case VR_CREATE_DEVICE: {
@@ -1915,6 +2269,26 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (dy.dynamicStateCount > 32) dy.dynamicStateCount = 32;
         dy.pDynamicStates = dys;
         if (dy.dynamicStateCount) ci.pDynamicState = &dy;
+        // 末尾に付いている物（[sType][中身]）。古いドライバは付けない
+        VkPipelineRenderingCreateInfo pri = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+        VkFormat cfmt[16];
+        while (!r->bad && r->at + 8 <= r->n) {
+            uint32_t st = vr_ru32(r), len;
+            const uint8_t *blob = vr_rbytes(r, &len);
+            if (!blob) break;
+            vr_rd br = { blob, len, 0, 0 };
+            if (st == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO) {
+                // dynamic rendering：render pass の代わりに、描く先の形式を渡す
+                pri.viewMask = vr_ru32(&br);
+                uint32_t nc = vr_ru32(&br);
+                for (uint32_t i = 0; i < nc; i++) { uint32_t f = vr_ru32(&br); if (i < 16) cfmt[i] = (VkFormat) f; }
+                pri.colorAttachmentCount = nc < 16 ? nc : 16;
+                pri.pColorAttachmentFormats = cfmt;
+                pri.depthAttachmentFormat = (VkFormat) vr_ru32(&br);
+                pri.stencilAttachmentFormat = (VkFormat) vr_ru32(&br);
+                if (!br.bad) { pri.pNext = ci.pNext; ci.pNext = &pri; }
+            }
+        }
         VkPipeline pp;
         VkResult res = r->bad ? VK_ERROR_INITIALIZATION_FAILED : vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &ci, NULL, &pp);
         if (res == VK_SUCCESS) put(id, (uint64_t) pp, K_PIPELINE);
@@ -1949,6 +2323,155 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     }
     case VR_QUEUE_WAIT_IDLE: return reply(s, vkQueueWaitIdle((VkQueue) (uintptr_t) H(vr_ru64(r))));
     case VR_DEVICE_WAIT_IDLE: return reply(s, vkDeviceWaitIdle(DEV(vr_ru64(r))));
+    // ---- 1.3 に向けて足した命令 ----
+    case VR_CREATE_RENDER_PASS2: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r);
+        VkRenderPassCreateInfo2 ci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2 };
+        ci.flags = vr_ru32(r);
+        ci.attachmentCount = vr_ru32(r);
+        if (ci.attachmentCount > r->n - r->at) return 1;
+        VkAttachmentDescription2 *att = calloc(ci.attachmentCount ? ci.attachmentCount : 1, sizeof *att);
+        for (uint32_t i = 0; i < ci.attachmentCount; i++) {
+            att[i].sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;
+            att[i].flags = vr_ru32(r);
+            att[i].format = (VkFormat) vr_ru32(r);
+            att[i].samples = (VkSampleCountFlagBits) vr_ru32(r);
+            att[i].loadOp = (VkAttachmentLoadOp) vr_ru32(r);
+            att[i].storeOp = (VkAttachmentStoreOp) vr_ru32(r);
+            att[i].stencilLoadOp = (VkAttachmentLoadOp) vr_ru32(r);
+            att[i].stencilStoreOp = (VkAttachmentStoreOp) vr_ru32(r);
+            att[i].initialLayout = (VkImageLayout) vr_ru32(r);
+            att[i].finalLayout = (VkImageLayout) vr_ru32(r);
+        }
+        ci.pAttachments = att;
+        ci.subpassCount = vr_ru32(r);
+        if (ci.subpassCount > r->n - r->at) { free(att); return 1; }
+        VkSubpassDescription2 *sub = calloc(ci.subpassCount ? ci.subpassCount : 1, sizeof *sub);
+        VkSubpassDescriptionDepthStencilResolve *dsr = calloc(ci.subpassCount ? ci.subpassCount : 1, sizeof *dsr);
+        // 参照の並びは、まとめて 1 つの塊に置く
+        VkAttachmentReference2 *refs = calloc(256, sizeof *refs);
+        uint32_t *pres = calloc(256, sizeof *pres);
+        uint32_t nref = 0, npres = 0;
+#define REF2() do { VkAttachmentReference2 x_ = { .sType = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2 }; \
+                     x_.attachment = vr_ru32(r); x_.layout = (VkImageLayout) vr_ru32(r); x_.aspectMask = vr_ru32(r); \
+                     if (nref < 256) refs[nref++] = x_; } while (0)
+        for (uint32_t i = 0; i < ci.subpassCount && !r->bad; i++) {
+            sub[i].sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2;
+            sub[i].flags = vr_ru32(r);
+            sub[i].pipelineBindPoint = (VkPipelineBindPoint) vr_ru32(r);
+            sub[i].viewMask = vr_ru32(r);
+            uint32_t nin = vr_ru32(r);
+            sub[i].inputAttachmentCount = nin;
+            sub[i].pInputAttachments = refs + nref;
+            for (uint32_t k = 0; k < nin && !r->bad; k++) REF2();
+            uint32_t ncol = vr_ru32(r);
+            sub[i].colorAttachmentCount = ncol;
+            sub[i].pColorAttachments = refs + nref;
+            for (uint32_t k = 0; k < ncol && !r->bad; k++) REF2();
+            if (vr_ru32(r)) {
+                sub[i].pResolveAttachments = refs + nref;
+                for (uint32_t k = 0; k < ncol && !r->bad; k++) REF2();
+            }
+            if (vr_ru32(r)) {
+                sub[i].pDepthStencilAttachment = refs + nref;
+                REF2();
+            }
+            uint32_t np = vr_ru32(r);
+            sub[i].preserveAttachmentCount = np;
+            sub[i].pPreserveAttachments = pres + npres;
+            for (uint32_t k = 0; k < np && !r->bad; k++) { uint32_t x = vr_ru32(r); if (npres < 256) pres[npres++] = x; }
+            // depth・stencil の resolve（VkSubpassDescriptionDepthStencilResolve）
+            if (vr_ru32(r)) {
+                dsr[i].sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE;
+                dsr[i].depthResolveMode = (VkResolveModeFlagBits) vr_ru32(r);
+                dsr[i].stencilResolveMode = (VkResolveModeFlagBits) vr_ru32(r);
+                if (vr_ru32(r)) {
+                    dsr[i].pDepthStencilResolveAttachment = refs + nref;
+                    REF2();
+                }
+                sub[i].pNext = &dsr[i];
+            }
+        }
+#undef REF2
+        if (nref >= 256 || npres >= 256) r->bad = 1;
+        ci.pSubpasses = sub;
+        ci.dependencyCount = vr_ru32(r);
+        if (ci.dependencyCount > r->n - r->at) ci.dependencyCount = 0, r->bad = 1;
+        VkSubpassDependency2 *dep = calloc(ci.dependencyCount ? ci.dependencyCount : 1, sizeof *dep);
+        VkMemoryBarrier2 *dmb = calloc(ci.dependencyCount ? ci.dependencyCount : 1, sizeof *dmb);
+        for (uint32_t i = 0; i < ci.dependencyCount && !r->bad; i++) {
+            dep[i].sType = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2;
+            dep[i].srcSubpass = vr_ru32(r);
+            dep[i].dstSubpass = vr_ru32(r);
+            dep[i].srcStageMask = vr_ru32(r);
+            dep[i].dstStageMask = vr_ru32(r);
+            dep[i].srcAccessMask = vr_ru32(r);
+            dep[i].dstAccessMask = vr_ru32(r);
+            dep[i].dependencyFlags = vr_ru32(r);
+            dep[i].viewOffset = (int32_t) vr_ru32(r);
+            // sync2 の memory barrier が付いていれば、stage と access はそちらが使われる
+            if (vr_ru32(r)) {
+                dmb[i].sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                dmb[i].srcStageMask = vr_ru64(r);
+                dmb[i].srcAccessMask = vr_ru64(r);
+                dmb[i].dstStageMask = vr_ru64(r);
+                dmb[i].dstAccessMask = vr_ru64(r);
+                dep[i].pNext = &dmb[i];
+            }
+        }
+        ci.pDependencies = dep;
+        uint32_t ncv = vr_ru32(r), cv[32];
+        for (uint32_t i = 0; i < ncv && !r->bad; i++) { uint32_t x = vr_ru32(r); if (i < 32) cv[i] = x; }
+        ci.correlatedViewMaskCount = ncv < 32 ? ncv : 32;
+        ci.pCorrelatedViewMasks = cv;
+        VkRenderPass rp;
+        VkResult res = r->bad || !vkCreateRenderPass2 ? VK_ERROR_INITIALIZATION_FAILED : vkCreateRenderPass2(d, &ci, NULL, &rp);
+        if (res == VK_SUCCESS) put(id, (uint64_t) rp, K_RPASS);
+        else vlog("render pass 2 を作れない (%d)", res);
+        free(att); free(sub); free(dsr); free(refs); free(pres); free(dep); free(dmb);
+        return 1;
+    }
+    case VR_CREATE_QUERY_POOL: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r);
+        VkQueryPoolCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        ci.queryType = (VkQueryType) vr_ru32(r);
+        ci.queryCount = vr_ru32(r);
+        ci.pipelineStatistics = vr_ru32(r);
+        VkQueryPool qp;
+        VkResult res = vkCreateQueryPool(d, &ci, NULL, &qp);
+        if (res == VK_SUCCESS) put(id, (uint64_t) qp, K_QPOOL);
+        else vlog("query pool を作れない (%d)", res);
+        return 1;
+    }
+    case VR_DESTROY_QUERY_POOL: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r);
+        vkDestroyQueryPool(d, OBJ(VkQueryPool, id), NULL);
+        del(id);
+        return 1;
+    }
+    case VR_GET_QUERY_POOL_RESULTS: {
+        VkDevice d = DEV(vr_ru64(r));
+        VkQueryPool qp = OBJ(VkQueryPool, vr_ru64(r));
+        uint32_t first = vr_ru32(r), n = vr_ru32(r);
+        uint64_t size = vr_ru64(r), stride = vr_ru64(r);
+        uint32_t flags = vr_ru32(r);
+        if (!qp || !size || size > (64u << 20)) return reply(s, VK_ERROR_INITIALIZATION_FAILED);
+        vr_reserve(&g_out, (size_t) size);
+        memset(g_out.p, 0, (size_t) size);
+        VkResult res = vkGetQueryPoolResults(d, qp, first, n, (size_t) size, g_out.p, stride, flags);
+        g_out.n = (size_t) size;
+        return reply(s, res);
+    }
+    case VR_RESET_QUERY_POOL: {
+        VkDevice d = DEV(vr_ru64(r));
+        VkQueryPool qp = OBJ(VkQueryPool, vr_ru64(r));
+        uint32_t first = vr_ru32(r), n = vr_ru32(r);
+        if (qp && vkResetQueryPool) vkResetQueryPool(d, qp, first, n);
+        return 1;
+    }
     }
     vlog("知らない命令 %u", op);
     return 0;

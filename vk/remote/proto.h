@@ -9,8 +9,18 @@
 // 出した仕事が全部終わるのを自分の中で待つ（drain）。受け手の中で待つぶんには往復が要らない
 #define VR_DEFAULT_PORT 50060
 
-// 受け手ができること。あいさつの返事の最後に付ける。古い受け手は付けない
+// 受け手ができること。あいさつの返事の最後に付ける。古い受け手は付けない。
+// 印の無い命令は、古い受け手には送らない（知らない記録の命令が来ると、受け手はその command buffer を捨てる）
 #define VR_CAP_DELTA 1u   // VR_MEM_READ_DELTA：前回送った中身との違いだけを詰めて送る
+#define VR_CAP_VK13 2u               // 本物の GPU が Vulkan 1.3 を持ち、受け手が 1.3 の入口を本体の名前で呼べる。ドライバは 1.3 と名乗ってよい
+#define VR_CAP_DYNAMIC_RENDERING 4u  // VR_CMD_BEGIN_RENDERING・VR_CMD_END_RENDERING と、graphics pipeline の末尾の「描く先の形式」
+#define VR_CAP_SYNC2 8u              // VR_CMD_BARRIER_SYNC2（vkCmdPipelineBarrier2）
+#define VR_CAP_RENDER_PASS2 16u      // VR_CREATE_RENDER_PASS2
+#define VR_CAP_CMD10 32u             // 1.0 の残りの記録命令：VR_CMD_SET_DYNAMIC の 1.0 の値・CLEAR_ATTACHMENTS・CLEAR_DEPTH_STENCIL_IMAGE・RESOLVE_IMAGE
+#define VR_CAP_EXT_DYNAMIC_STATE 64u // VR_CMD_SET_DYNAMIC の extended dynamic state（1.3 で本体入り）の値と VR_CMD_BIND_VERTEX_BUFFERS2
+#define VR_CAP_QUERY 128u            // query pool（タイムスタンプ・occlusion）。VR_CREATE_QUERY_POOL など
+#define VR_CAP_NEW_MASK (VR_CAP_VK13 | VR_CAP_DYNAMIC_RENDERING | VR_CAP_SYNC2 | VR_CAP_RENDER_PASS2 | VR_CAP_CMD10 | VR_CAP_EXT_DYNAMIC_STATE | VR_CAP_QUERY)
+// 1.3 の受け手は、VR_GET_FORMAT_PROPS の返事の後ろに VkFormatProperties3 の 3 つの値（u64）を付ける。古いドライバは読まない
 
 // 返事のある命令（往復が 1 回かかる）には [同期] と書く。ほかは送りっぱなし
 enum vr_op {
@@ -78,6 +88,12 @@ enum vr_op {
     VR_CREATE_SAMPLER,           // device・id・VkSamplerCreateInfo の pNext より後ろ
     VR_DESTROY_SAMPLER,
     VR_MEM_READ_DELTA,           // [同期] memory・offset・大きさ → 形（0 そのまま・1 前回との違い）・中身。受け手が VR_CAP_DELTA を名乗ったときだけ使う
+    // ---- Vulkan 1.3 に向けて足した（版は 3 のまま。受け手が caps で名乗ったときだけ使う） ----
+    VR_CREATE_RENDER_PASS2,      // device・id・VkRenderPassCreateInfo2 の要点（VR_CAP_RENDER_PASS2）
+    VR_CREATE_QUERY_POOL,        // device・id・種類・数・統計の印（VR_CAP_QUERY）
+    VR_DESTROY_QUERY_POOL,
+    VR_GET_QUERY_POOL_RESULTS,   // [同期] device・pool・最初・数・大きさ・間隔・flags → 結果・中身。受け手は出した仕事を全部待ってから読む
+    VR_RESET_QUERY_POOL,         // device・pool・最初・数（CPU からの reset）
     VR_OP_COUNT
 };
 
@@ -93,7 +109,7 @@ enum vr_cmd {
     VR_CMD_UPDATE_BUFFER,         // dst・offset・中身
     VR_CMD_PIPELINE_BARRIER,      // src/dst stage・dependency・memory barriers[]・buffer barriers[]
     VR_CMD_DISPATCH_INDIRECT,     // buffer・offset
-    VR_CMD_RESET_QUERY_POOL,      // （まだ使わない）
+    VR_CMD_RESET_QUERY_POOL,      // pool・最初・数（VR_CAP_QUERY）
     // ---- 描画 ----
     VR_CMD_BEGIN_RENDER_PASS,     // render pass・framebuffer・範囲・消す色の並び・contents
     VR_CMD_END_RENDER_PASS,
@@ -112,4 +128,21 @@ enum vr_cmd {
     VR_CMD_DRAW_INDEXED_INDIRECT, // buffer・offset・数・間隔
     VR_CMD_COPY_IMAGE,            // src・layout・dst・layout・VkImageCopy の並び
     VR_CMD_BLIT_IMAGE,            // src・layout・dst・layout・VkImageBlit の並び・filter
+    // ---- Vulkan 1.3 に向けて足した（受け手が caps で名乗ったときだけ積む） ----
+    VR_CMD_BEGIN_RENDERING,       // flags・範囲・layer の数・view の印・色の並び・depth・stencil（VR_CAP_DYNAMIC_RENDERING）
+    VR_CMD_END_RENDERING,
+    VR_CMD_BARRIER_SYNC2,         // dependency flags・memory / buffer / image barrier の並び。stage と access は 64 ビット（VR_CAP_SYNC2）
+    VR_CMD_SET_DYNAMIC,           // VkDynamicState の番号・値の数・値（u32 の並び。小数はそのままのビット）（VR_CAP_CMD10・VR_CAP_EXT_DYNAMIC_STATE）
+    VR_CMD_BIND_VERTEX_BUFFERS2,  // 最初・(buffer・offset・大きさ・間隔) の並び（VR_CAP_EXT_DYNAMIC_STATE）
+    VR_CMD_CLEAR_ATTACHMENTS,     // VkClearAttachment の並び・VkClearRect の並び（VR_CAP_CMD10）
+    VR_CMD_CLEAR_DEPTH_STENCIL_IMAGE, // image・layout・値・範囲の並び（VR_CAP_CMD10）
+    VR_CMD_RESOLVE_IMAGE,         // src・layout・dst・layout・VkImageResolve の並び（VR_CAP_CMD10）
+    VR_CMD_BEGIN_QUERY,           // pool・番号・flags（VR_CAP_QUERY）
+    VR_CMD_END_QUERY,             // pool・番号
+    VR_CMD_WRITE_TIMESTAMP,       // stage（1.0 の形）・pool・番号
+    VR_CMD_COPY_QUERY_RESULTS,    // pool・最初・数・buffer・offset・間隔・flags
 };
+
+// graphics pipeline（VR_CREATE_GRAPHICS_PIPELINE）の末尾に付けてよい物。[u32 sType][中身の bytes] を並べる。
+// 古い受け手は末尾を読まないので、付けても壊れない
+//   VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO：view の印・色の数・色の形式の並び・depth の形式・stencil の形式
