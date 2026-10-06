@@ -1,0 +1,28 @@
+name: vk-layers-win
+# Vulkan の検証レイヤー（Khronos の間違い探し）を Windows 用に組む。
+# PC の代役の受け手に挟んで、ドライバ越しに流れてきた命令の間違いを見つけるため
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/vk-layers-win.yml
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - name: Vulkan-ValidationLayers
+        run: git clone --depth 1 --branch vulkan-sdk-1.4.363.0 https://github.com/KhronosGroup/Vulkan-ValidationLayers.git vvl
+      - name: configure
+        run: cmake -S vvl -B build -D UPDATE_DEPS=ON -D BUILD_WERROR=OFF -D BUILD_TESTS=OFF -D CMAKE_BUILD_TYPE=Release
+      - name: build
+        run: cmake --build build --config Release -j 4
+      - name: collect
+        run: |
+          New-Item -ItemType Directory out | Out-Null
+          Get-ChildItem -Recurse build -Include VkLayer_khronos_validation.dll,VkLayer_khronos_validation.json | Copy-Item -Destination out
+          Get-ChildItem out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vk-layers-win
+          path: out/
