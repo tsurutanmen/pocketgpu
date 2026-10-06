@@ -16,8 +16,8 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: 計算の受け手
-        CFBundleShortVersionString: "0.7.18"
-        CFBundleVersion: "26"
+        CFBundleShortVersionString: "0.7.19"
+        CFBundleVersion: "27"
         UILaunchScreen: {}
         NSLocalNetworkUsageDescription: PC からの計算の依頼を受け取るために使います
         NSSpeechRecognitionUsageDescription: PC から送られた音声を文字にするために使います
@@ -48,3 +48,5 @@ targets:
       - sdk: QuartzCore.framework
       - sdk: UIKit.framework
       - sdk: CoreGraphics.framework
+      # 窓に出すコマを JPEG に縮める（vk/remote/server.c）
+      - sdk: ImageIO.framework

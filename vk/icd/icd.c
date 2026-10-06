@@ -20,6 +20,8 @@
 #include "../remote/proto.h"
 #include "../remote/wire.h"
 #include <windows.h>
+#define COBJMACROS
+#include <wincodec.h>
 #include <dbghelp.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -123,6 +125,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_CREATE_FRAMEBUFFER] = "CREATE_FRAMEBUFFER", [VR_DESTROY_FRAMEBUFFER] = "DESTROY_FRAMEBUFFER",
     [VR_CREATE_GRAPHICS_PIPELINE] = "CREATE_GRAPHICS_PIPELINE", [VR_GET_IMAGE_FORMAT_PROPS] = "GET_IMAGE_FORMAT_PROPS",
     [VR_CREATE_SAMPLER] = "CREATE_SAMPLER", [VR_DESTROY_SAMPLER] = "DESTROY_SAMPLER", [VR_MEM_READ_DELTA] = "MEM_READ_DELTA",
+    [VR_READ_JPEG] = "READ_JPEG",
     [VR_CREATE_RENDER_PASS2] = "CREATE_RENDER_PASS2", [VR_CREATE_QUERY_POOL] = "CREATE_QUERY_POOL",
     [VR_DESTROY_QUERY_POOL] = "DESTROY_QUERY_POOL", [VR_GET_QUERY_POOL_RESULTS] = "GET_QUERY_POOL_RESULTS",
     [VR_RESET_QUERY_POOL] = "RESET_QUERY_POOL",
@@ -507,6 +510,7 @@ struct mem {
     void **addrs;      // GetWriteWatch の受け皿
     uint8_t *dirty;    // ページごとの「まだ送っていない」印
     int delta;         // 窓に出すコマ用：受け手に前回との違いだけを送ってもらう（VR_MEM_READ_DELTA）
+    int jpeg;          // 窓に出すコマ用：引き取らずに、受け手に JPEG に縮めて送ってもらう（VR_READ_JPEG）
     struct mem *prev, *next;
 };
 
@@ -729,7 +733,9 @@ static void complete(struct dev *d, struct queue *q, uint64_t upto) {
     rng *take = NULL;
     size_t nt = 0, ct = 0, k = 0;
     for (size_t i = 0; i < d->npend; i++) {
-        if (d->pend[i].serial <= upto && (!q || d->pend[i].q == q)) rng_add(&take, &nt, &ct, d->pend[i].m, d->pend[i].off, d->pend[i].len, d->pend[i].serial);
+        if (d->pend[i].serial <= upto && (!q || d->pend[i].q == q)) {
+            if (!d->pend[i].m->jpeg) rng_add(&take, &nt, &ct, d->pend[i].m, d->pend[i].off, d->pend[i].len, d->pend[i].serial);
+        }
         else d->pend[k++] = d->pend[i];
     }
     d->npend = k;
@@ -1855,6 +1861,8 @@ struct swapchain {
     HWND hwnd;
     uint32_t w, h, n, next;
     VkFormat fmt;
+    int use_jpeg;        // 受け手に JPEG に縮めてもらう
+    uint64_t jpeg_bytes; // 受け取った JPEG の合計
     VkImage img[8];
     VkDeviceMemory imem[8];
     VkBuffer rb[8];         // 持ち帰り用（CPU から見えるメモリ）
@@ -1904,7 +1912,9 @@ static void VKAPI_CALL destroy_swapchain(VkDevice dv, VkSwapchainKHR h, const Vk
         if (sc->rb[i]) destroy_buffer(dv, sc->rb[i], NULL);
         if (sc->rbmem[i]) free_memory(dv, sc->rbmem[i], NULL);
     }
-    if (sc->frames) say("swapchain：%llu コマ・%.1f コマ/秒", (unsigned long long) sc->frames, sc->frames * 1000.0 / (now_ms() - sc->t0));
+    if (sc->frames) say("swapchain：%llu コマ・%.1f コマ/秒%s", (unsigned long long) sc->frames, sc->frames * 1000.0 / (now_ms() - sc->t0),
+                        sc->use_jpeg ? "・JPEG" : "");
+    if (sc->frames && sc->use_jpeg) say("JPEG：1 コマ平均 %.1f KB", sc->jpeg_bytes / 1024.0 / (double) sc->frames);
     free(sc);
 }
 
@@ -1917,6 +1927,10 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
     sc->w = ci->imageExtent.width;
     sc->h = ci->imageExtent.height;
     sc->fmt = ci->imageFormat;
+    {
+        const char *e = getenv("IPHONE_VK_JPEG");
+        sc->use_jpeg = (g_hw.caps & VR_CAP_JPEG) && !(e && *e == '0');
+    }
     sc->n = ci->minImageCount < 2 ? 2 : ci->minImageCount > 8 ? 8 : ci->minImageCount;
     sc->pend = -1;
     VkResult r = VK_SUCCESS;
@@ -1940,7 +1954,9 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
         VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
             .memoryTypeIndex = pick_mem(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
         if ((r = alloc_memory(dv, &mai, NULL, &sc->rbmem[i])) != VK_SUCCESS) break;
-        ((struct mem *) sc->rbmem[i])->delta = 1;
+        // 受け手が JPEG に縮められるなら、引き取らずに JPEG で受け取る（IPHONE_VK_JPEG=0 で止める）。無理なら違いだけ受け取る
+        if (sc->use_jpeg) ((struct mem *) sc->rbmem[i])->jpeg = 1;
+        else ((struct mem *) sc->rbmem[i])->delta = 1;
         bind_buffer(dv, sc->rb[i], sc->rbmem[i], 0);
         map_memory(dv, sc->rbmem[i], 0, VK_WHOLE_SIZE, 0, (void **) &sc->px[i]);
         VkFenceCreateInfo fc = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
@@ -2005,9 +2021,54 @@ static VkResult VKAPI_CALL acquire_image2(VkDevice dv, const VkAcquireNextImageI
 }
 
 // 持ち帰った画像 j を窓に描き写す
+// 受け手に JPEG にしてもらったコマを、WIC でほどいて写し（BGRA）に書く。失敗したら 0
+static int jpeg_fetch(struct swapchain *sc, uint32_t j) {
+    static IWICImagingFactory *fac;
+    if (!fac) {
+        CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **) &fac))) return 0;
+    }
+    static int q = -1;
+    if (q < 0) { const char *e = getenv("IPHONE_VK_JPEG_Q"); q = e && atoi(e) > 0 ? atoi(e) : 80; }
+    vr_buf b = { 0 }, out = { 0 };
+    vr_u64(&b, ID(sc->rbmem[j]));
+    vr_u64(&b, 0);
+    vr_u32(&b, sc->w);
+    vr_u32(&b, sc->h);
+    vr_u32(&b, sc->w * 4);
+    vr_u32(&b, sc->fmt == VK_FORMAT_B8G8R8A8_UNORM || sc->fmt == VK_FORMAT_B8G8R8A8_SRGB ? 1 : 0);
+    vr_u32(&b, (uint32_t) q);
+    VkResult r = rpc_call(VR_READ_JPEG, &b, &out);
+    free(b.p);
+    int ok = 0;
+    IWICStream *st = NULL;
+    IWICBitmapDecoder *dec = NULL;
+    IWICBitmapFrameDecode *fr = NULL;
+    IWICFormatConverter *cv = NULL;
+    if (r != VK_SUCCESS || !out.n) goto done;
+    sc->jpeg_bytes += out.n;
+    if (FAILED(IWICImagingFactory_CreateStream(fac, &st))) goto done;
+    if (FAILED(IWICStream_InitializeFromMemory(st, out.p, (DWORD) out.n))) goto done;
+    if (FAILED(IWICImagingFactory_CreateDecoderFromStream(fac, (IStream *) st, NULL, WICDecodeMetadataCacheOnDemand, &dec))) goto done;
+    if (FAILED(IWICBitmapDecoder_GetFrame(dec, 0, &fr))) goto done;
+    if (FAILED(IWICImagingFactory_CreateFormatConverter(fac, &cv))) goto done;
+    if (FAILED(IWICFormatConverter_Initialize(cv, (IWICBitmapSource *) fr, &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom))) goto done;
+    if (FAILED(IWICFormatConverter_CopyPixels(cv, NULL, sc->w * 4, sc->w * 4 * sc->h, sc->px[j]))) goto done;
+    ok = 1;
+done:
+    if (cv) IWICFormatConverter_Release(cv);
+    if (fr) IWICBitmapFrameDecode_Release(fr);
+    if (dec) IWICBitmapDecoder_Release(dec);
+    if (st) IWICStream_Release(st);
+    free(out.p);
+    return ok;
+}
+
 static VkResult blit(struct swapchain *sc, uint32_t j) {
     if (!sc->hwnd) return VK_SUCCESS;
     uint8_t *px = sc->px[j];
+    // JPEG で受け取ったときは、もう B・G・R・A の並びになっている
+    int is_bgra = sc->use_jpeg && jpeg_fetch(sc, j);
     BITMAPINFO bmi = { 0 };
     bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
     bmi.bmiHeader.biWidth = (LONG) sc->w;
@@ -2015,7 +2076,7 @@ static VkResult blit(struct swapchain *sc, uint32_t j) {
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
-    if (sc->fmt == VK_FORMAT_R8G8B8A8_UNORM || sc->fmt == VK_FORMAT_R8G8B8A8_SRGB)
+    if (!is_bgra && (sc->fmt == VK_FORMAT_R8G8B8A8_UNORM || sc->fmt == VK_FORMAT_R8G8B8A8_SRGB))
         for (size_t p = 0; p < (size_t) sc->w * sc->h; p++) { uint8_t t = px[p * 4]; px[p * 4] = px[p * 4 + 2]; px[p * 4 + 2] = t; }
     RECT rc;
     GetClientRect(sc->hwnd, &rc);

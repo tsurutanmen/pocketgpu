@@ -10,8 +10,12 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#define COBJMACROS
+#include <wincodec.h>
 #endif
 #ifdef __APPLE__
+#include <CoreGraphics/CoreGraphics.h>
+#include <ImageIO/ImageIO.h>
 #include <os/log.h>
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
@@ -271,6 +275,9 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     const uint32_t need13 = VR_CAP_DYNAMIC_RENDERING | VR_CAP_SYNC2 | VR_CAP_RENDER_PASS2 | VR_CAP_EXT_DYNAMIC_STATE;
     if (v13 && (caps & need13) == need13) caps |= VR_CAP_VK13;
     g_fmt3 = (v13 || has_ext(ep, ne, "VK_KHR_format_feature_flags2")) && vkGetPhysicalDeviceFormatProperties2;
+#if defined(__APPLE__) || defined(_WIN32)
+    caps |= VR_CAP_JPEG; // 窓に出すコマを JPEG に縮められる（iPhone は ImageIO、PC の代役は WIC）
+#endif
     // 調べ用：VKR_CAPS=数 で名乗る印を絞る（古い受け手のふりをする）
     const char *mask = getenv("VKR_CAPS");
     if (mask && *mask) caps &= (uint32_t) strtoul(mask, NULL, 0);
@@ -1135,6 +1142,98 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
     }
 }
 
+// ---- 窓に出すコマを JPEG に縮める（VR_READ_JPEG） ----
+// px は 1 行 stride バイトの 32 ビットの画素。bgra なら B・G・R・A、違えば R・G・B・A の並び。成功なら out に JPEG を足す
+#if defined(__APPLE__)
+static int jpeg_encode(const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, int bgra, int q, vr_buf *out) {
+    int ok = 0;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGBitmapInfo bi = bgra ? (CGBitmapInfo) (kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst)
+                           : (CGBitmapInfo) (kCGBitmapByteOrder32Big | kCGImageAlphaNoneSkipLast);
+    CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, px, (size_t) stride * h, NULL);
+    CGImageRef img = CGImageCreate(w, h, 8, 32, stride, cs, bi, dp, NULL, false, kCGRenderingIntentDefault);
+    CFMutableDataRef data = CFDataCreateMutable(NULL, 0);
+    CGImageDestinationRef dst = CGImageDestinationCreateWithData(data, CFSTR("public.jpeg"), 1, NULL);
+    float qf = (float) q / 100.0f;
+    CFNumberRef qn = CFNumberCreate(NULL, kCFNumberFloatType, &qf);
+    const void *keys[] = { kCGImageDestinationLossyCompressionQuality };
+    const void *vals[] = { qn };
+    CFDictionaryRef props = CFDictionaryCreate(NULL, keys, vals, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    if (img && dst) {
+        CGImageDestinationAddImage(dst, img, props);
+        if (CGImageDestinationFinalize(dst)) {
+            vr_put(out, CFDataGetBytePtr(data), (size_t) CFDataGetLength(data));
+            ok = 1;
+        }
+    }
+    if (props) CFRelease(props);
+    if (qn) CFRelease(qn);
+    if (dst) CFRelease(dst);
+    if (data) CFRelease(data);
+    if (img) CGImageRelease(img);
+    if (dp) CGDataProviderRelease(dp);
+    if (cs) CGColorSpaceRelease(cs);
+    return ok;
+}
+#elif defined(_WIN32)
+static int jpeg_encode(const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, int bgra, int q, vr_buf *out) {
+    static IWICImagingFactory *fac;
+    if (!fac) {
+        CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **) &fac))) return 0;
+    }
+    int ok = 0;
+    IStream *st = NULL;
+    IWICBitmapEncoder *enc = NULL;
+    IWICBitmapFrameEncode *fr = NULL;
+    IPropertyBag2 *bag = NULL;
+    uint8_t *rgb = malloc((size_t) w * 3 * h);
+    if (!rgb || FAILED(CreateStreamOnHGlobal(NULL, TRUE, &st))) goto done;
+    if (FAILED(IWICImagingFactory_CreateEncoder(fac, &GUID_ContainerFormatJpeg, NULL, &enc))) goto done;
+    if (FAILED(IWICBitmapEncoder_Initialize(enc, st, WICBitmapEncoderNoCache))) goto done;
+    if (FAILED(IWICBitmapEncoder_CreateNewFrame(enc, &fr, &bag))) goto done;
+    PROPBAG2 opt = { 0 };
+    opt.pstrName = (LPOLESTR) L"ImageQuality";
+    VARIANT v;
+    VariantInit(&v);
+    v.vt = VT_R4;
+    v.fltVal = (float) q / 100.0f;
+    IPropertyBag2_Write(bag, 1, &opt, &v);
+    if (FAILED(IWICBitmapFrameEncode_Initialize(fr, bag))) goto done;
+    IWICBitmapFrameEncode_SetSize(fr, w, h);
+    WICPixelFormatGUID pf = GUID_WICPixelFormat24bppBGR;
+    IWICBitmapFrameEncode_SetPixelFormat(fr, &pf);
+    // GPU のメモリはキャッシュが効かないことがあるので、まとめて写してから並べ替える
+    uint8_t *tmp = malloc((size_t) stride * h);
+    if (!tmp) goto done;
+    memcpy(tmp, px, (size_t) stride * h);
+    px = tmp;
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t *s = px + (size_t) y * stride;
+        uint8_t *d = rgb + (size_t) y * w * 3;
+        for (uint32_t x = 0; x < w; x++, s += 4, d += 3) {
+            if (bgra) { d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; } else { d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; }
+        }
+    }
+    free(tmp);
+    if (FAILED(IWICBitmapFrameEncode_WritePixels(fr, h, w * 3, w * 3 * h, rgb))) goto done;
+    if (FAILED(IWICBitmapFrameEncode_Commit(fr)) || FAILED(IWICBitmapEncoder_Commit(enc))) goto done;
+    HGLOBAL hg = NULL;
+    if (FAILED(GetHGlobalFromStream(st, &hg))) goto done;
+    STATSTG ss;
+    if (FAILED(st->lpVtbl->Stat(st, &ss, STATFLAG_NONAME))) goto done;
+    void *p = GlobalLock(hg);
+    if (p) { vr_put(out, p, (size_t) ss.cbSize.QuadPart); GlobalUnlock(hg); ok = 1; }
+done:
+    if (bag) IPropertyBag2_Release(bag);
+    if (fr) IWICBitmapFrameEncode_Release(fr);
+    if (enc) IWICBitmapEncoder_Release(enc);
+    if (st) st->lpVtbl->Release(st);
+    free(rgb);
+    return ok;
+}
+#endif
+
 // ---- 1 つの命令を実行する。返事が要るものは reply する ----
 static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     g_cur_op = op;
@@ -1173,7 +1272,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     // GPU を失っていたら、返事のある命令でそれを伝える（黙って間違った答えを返さない）
     if (g_err != VK_SUCCESS) {
         switch (op) {
-        case VR_MEM_READ: case VR_MEM_READ_DELTA: case VR_WAIT_FOR_FENCES: case VR_GET_FENCE_STATUS: case VR_WAIT_SEMAPHORES:
+        case VR_MEM_READ: case VR_MEM_READ_DELTA: case VR_READ_JPEG: case VR_WAIT_FOR_FENCES: case VR_GET_FENCE_STATUS: case VR_WAIT_SEMAPHORES:
         case VR_GET_SEMAPHORE_COUNTER: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE: case VR_GET_QUERY_POOL_RESULTS:
             return reply(s, g_err);
         default:
@@ -1411,6 +1510,34 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (!e || !e->map || off > e->size || n > e->size - off) return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
         vr_put(&g_out, (uint8_t *) e->map + off, (size_t) n);
         return reply(s, 0);
+    }
+    case VR_READ_JPEG: {
+        static double jt_wait, jt_enc;
+        static uint64_t jn, jbytes;
+        double jt0 = t_ms();
+        uint64_t mid = vr_ru64(r);
+        drain_upto(last_with_mem(mid));
+        jt_wait += t_ms() - jt0;
+        if (g_err != VK_SUCCESS) return reply(s, g_err);
+        ent *e = find(mid);
+        uint64_t off = vr_ru64(r);
+        uint32_t w = vr_ru32(r), h = vr_ru32(r), stride = vr_ru32(r), bgra = vr_ru32(r), q = vr_ru32(r);
+        if (!e || !e->map || w == 0 || h == 0 || stride < w * 4 || off > e->size || (uint64_t) stride * h > e->size - off)
+            return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
+#if defined(__APPLE__) || defined(_WIN32)
+        double jt1 = t_ms();
+        size_t before = g_out.n;
+        if (!jpeg_encode((const uint8_t *) e->map + off, w, h, stride, (int) bgra, (int) (q ? q : 80), &g_out)) return reply(s, VK_ERROR_UNKNOWN);
+        jt_enc += t_ms() - jt1;
+        jbytes += g_out.n - before;
+        if (++jn % 100 == 0)
+            vlog("JPEG：%llu コマ・GPU を待つ %.1f ms・縮める %.1f ms・平均 %.1f KB（1 コマあたり）", (unsigned long long) jn,
+                 jt_wait / 100, jt_enc / 100, jbytes / 1024.0 / 100), jt_wait = jt_enc = 0, jbytes = 0;
+        return reply(s, 0);
+#else
+        (void) bgra; (void) q;
+        return reply(s, VK_ERROR_FEATURE_NOT_PRESENT);
+#endif
     }
     case VR_MEM_READ_DELTA: {
         // ドライバ側の写しと同じものを持っておき、今回との違い（XOR）を 4 バイトずつ見て、
