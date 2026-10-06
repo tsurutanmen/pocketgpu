@@ -1,0 +1,68 @@
+name: d3d11-samples-win
+# DirectX SDK の DirectX 11 のサンプル（walbourn/directx-sdk-samples・MIT）を Windows 用に組む。
+# DirectX のアプリ → DXVK → iPhone のドライバ、の道を本物のアプリで試すため。
+# 素材（Media）は 318MB あるので、試すサンプルが使う物だけを入れる
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/d3d11-samples-win.yml
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: microsoft/setup-msbuild@v2
+      - name: samples
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/walbourn/directx-sdk-samples.git s
+          git -C s log -1 --format="%H %cd" | tee s/SAMPLES_COMMIT.txt
+      - name: build
+        shell: pwsh
+        run: |
+          cd s
+          # 2019 の作り（v142）を、この機械にある 2022 の道具（v143）で組む
+          $list = @(
+            'Direct3D11Tutorials/Tutorials_2019.sln',
+            'EmptyProject11/EmptyProject11_2019.sln',
+            'SimpleSample11/SimpleSample11_2019.sln',
+            'BasicHLSL11/BasicHLSL11_2019_Win10.sln',
+            'BasicCompute11/BasicCompute11_2019_Win10.sln',
+            'CascadedShadowMaps11/CascadedShadowMaps11_2019_Win10.sln',
+            'VarianceShadows11/VarianceShadows11_2019_Win10.sln',
+            'FluidCS11/FluidCS11_2019_Win10.sln',
+            'NBodyGravityCS11/NBodyGravityCS11_2019_Win10.sln',
+            'HDRToneMappingCS11/HDRToneMappingCS11_2019_Win10.sln',
+            'SimpleBezier11/SimpleBezier11_2019_Win10.sln',
+            'DynamicShaderLinkage11/DynamicShaderLinkage11_2019_Win10.sln',
+            'MultithreadedRendering11/MultithreadedRendering11_2019_Win10.sln',
+            'OIT11/OIT11_2019_Win10.sln'
+          )
+          $ok = @(); $ng = @()
+          foreach ($s in $list) {
+            msbuild $s /m /nologo /v:minimal /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:PreferredToolArchitecture=x64
+            if ($LASTEXITCODE -eq 0) { $ok += $s } else { $ng += $s }
+          }
+          Write-Host "組めた: $($ok.Count)"; $ok
+          Write-Host "組めなかった: $($ng.Count)"; $ng
+          Get-ChildItem -Recurse -Filter *.exe | Where-Object { $_.FullName -notmatch '\\obj\\' } | ForEach-Object { $_.FullName }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: d3d11-samples
+          path: |
+            s/SAMPLES_COMMIT.txt
+            s/LICENSE
+            s/**/Release/*.exe
+            s/**/*.hlsl
+            s/**/*.hlsli
+            s/**/*.fx
+            s/**/*.fxh
+            s/Direct3D11Tutorials/**/*.dds
+            s/Media/UI/**
+            s/Media/Tiny/**
+            s/Media/Misc/**
+            s/Media/powerplant/**
+            s/Media/Teapot/**
+            s/Media/Tiger/**
+            !s/**/obj/**
