@@ -2,8 +2,11 @@
 // 送り方：[u32 長さ][JSON の頼み][u32 長さ][中身のバイト]。返し方：[u32 長さ][JSON の答え]。一つのつなぎで何回でも続けられる
 //   {"op":"hello"}                          → できること・iOS の版・機種
 //   {"op":"ocr","langs":["ja-JP","en-US"]}  → 中身は画像（PNG・JPEG・HEIC）。文字認識（Vision）の結果
-//   {"op":"asr","lang":"ja-JP","ext":"wav"} → 中身は音声のファイル。音声認識（SFSpeechRecognizer）の結果
+//   {"op":"asr","lang":"ja-JP","ext":"wav"} → 中身は音声のファイル。音声認識の結果（標準は iOS 26 の SpeechAnalyzer）
 //   {"op":"llm",…}・{"op":"llm_status"}     → Apple Intelligence の言葉のモデル（FMBridge.swift・Xcode 26 で組んだときだけ）
+//   {"op":"translate","text":"…","from":"ja","to":"en"} → 翻訳（TranslateBridge.swift・言語が iPhone に入っていること）
+//   {"op":"tts","text":"…","lang":"ja-JP"}  → 読み上げた音声の WAV を base64 で。{"op":"voices"} で声の一覧
+import AVFoundation
 import Foundation
 import Network
 import Speech
@@ -77,7 +80,7 @@ final class AppleFeatures {
             var sys = utsname()
             uname(&sys)
             let model = withUnsafePointer(to: &sys.machine) { $0.withMemoryRebound(to: CChar.self, capacity: 256) { String(cString: $0) } }
-            var features = ["ocr", "asr"]
+            var features = ["ocr", "asr", "tts", "translate"]
             #if canImport(FoundationModels)
             features.append("llm")
             #endif
@@ -86,6 +89,26 @@ final class AppleFeatures {
             return ocr(body, langs: req["langs"] as? [String] ?? ["ja-JP", "en-US"], fast: req["fast"] as? Bool ?? false)
         case "llm", "llm_status":
             return llm(req, statusOnly: op == "llm_status")
+        case "translate":
+            let text = req["text"] as? String ?? ""
+            let from = req["from"] as? String ?? "ja"
+            let to = req["to"] as? String ?? "en"
+            #if compiler(>=6.2) && canImport(Translation)
+            if #available(iOS 26.0, *) {
+                let t0 = Date()
+                var r = TranslateBridge.run(text: text, from: from, to: to)
+                r["ms"] = Int(Date().timeIntervalSince(t0) * 1000)
+                return r
+            }
+            #endif
+            return ["error": "この版では翻訳が使えない"]
+        case "tts":
+            return tts(text: req["text"] as? String ?? "", lang: req["lang"] as? String ?? "ja-JP",
+                       rate: req["rate"] as? Double, voice: req["voice"] as? String)
+        case "voices":
+            return ["voices": AVSpeechSynthesisVoice.speechVoices().map {
+                ["id": $0.identifier, "name": $0.name, "lang": $0.language, "quality": $0.quality.rawValue]
+            }]
         case "asr":
             return asr(body, lang: req["lang"] as? String ?? "ja-JP", ext: req["ext"] as? String ?? "wav",
                        onDevice: req["on_device"] as? Bool ?? true, engine: req["engine"] as? String ?? "new")
@@ -169,6 +192,47 @@ final class AppleFeatures {
         defer { lock.unlock() }
         if finals.isEmpty, let failure { return ["error": "音声認識が失敗：\(failure)", "engine": "SFSpeechRecognizer"] }
         return ["text": finals.joined(), "engine": "SFSpeechRecognizer", "on_device": req.requiresOnDeviceRecognition, "segments": finals.count]
+    }
+
+    // ---- 読み上げ（AVSpeechSynthesizer） ----
+    // 文を音声にして、WAV のバイトを base64 で返す。iPhone のスピーカーからは鳴らさない
+    private let synthLock = NSLock()
+    private var synths: [AVSpeechSynthesizer] = [] // 書き終わるまで手放さない
+
+    private func tts(text: String, lang: String, rate: Double?, voice: String?) -> [String: Any] {
+        let u = AVSpeechUtterance(string: text)
+        if let voice, let v = AVSpeechSynthesisVoice(identifier: voice) { u.voice = v } else { u.voice = AVSpeechSynthesisVoice(language: lang) }
+        if let rate { u.rate = Float(rate) }
+        let synth = AVSpeechSynthesizer()
+        synthLock.lock(); synths.append(synth); synthLock.unlock()
+        defer { synthLock.lock(); synths.removeAll { $0 === synth }; synthLock.unlock() }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("tts-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let done = DispatchSemaphore(value: 0)
+        var file: AVAudioFile?
+        var failure: String?
+        let t0 = Date()
+        synth.write(u) { buf in
+            guard let pcm = buf as? AVAudioPCMBuffer else { return }
+            if pcm.frameLength == 0 { done.signal(); return } // 終わりの印
+            do {
+                if file == nil {
+                    file = try AVAudioFile(forWriting: url, settings: pcm.format.settings,
+                                           commonFormat: pcm.format.commonFormat, interleaved: pcm.format.isInterleaved)
+                }
+                try file?.write(from: pcm)
+            } catch {
+                failure = "音声を書けない：\(error.localizedDescription)"
+                done.signal()
+            }
+        }
+        if done.wait(timeout: .now() + 120) == .timedOut { return ["error": "2 分で終わらなかった"] }
+        file = nil // 閉じて書き切る
+        if let failure { return ["error": failure] }
+        guard let data = try? Data(contentsOf: url) else { return ["error": "音声を読めない"] }
+        let ms = Int(Date().timeIntervalSince(t0) * 1000)
+        log("読み上げ：\(text.count) 文字・\(ms) ms")
+        return ["wav_b64": data.base64EncodedString(), "ms": ms, "voice": u.voice?.identifier ?? ""]
     }
 
     // ---- 文字認識（Vision の VNRecognizeTextRequest） ----
