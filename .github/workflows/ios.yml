@@ -9,12 +9,24 @@ on:
       - vk/remote/**
       - .github/workflows/ios.yml
   workflow_dispatch:
+    inputs:
+      xcode:
+        description: "使う Xcode の版（例 26.3）。空なら標準の Xcode"
+        required: false
+        default: ""
 jobs:
   build:
     runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      # Foundation Models（Apple Intelligence）は Xcode 26 で組んだときだけ入る
+      - name: Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          if [ -n "${{ inputs.xcode }}" ]; then sudo xcode-select -s "/Applications/Xcode_${{ inputs.xcode }}.app"; fi
+          xcodebuild -version
 
       # Windows 側の llama.cpp と同じ版にそろえる（RPC の取り決めの版が合わないとつながらない）
       - name: llama.cpp b11412

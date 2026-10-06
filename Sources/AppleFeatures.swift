@@ -2,6 +2,7 @@
 // 送り方：[u32 長さ][JSON の頼み][u32 長さ][中身のバイト]。返し方：[u32 長さ][JSON の答え]。一つのつなぎで何回でも続けられる
 //   {"op":"hello"}                          → できること・iOS の版・機種
 //   {"op":"ocr","langs":["ja-JP","en-US"]}  → 中身は画像（PNG・JPEG・HEIC）。文字認識（Vision）の結果
+//   {"op":"llm",…}・{"op":"llm_status"}     → Apple Intelligence の言葉のモデル（FMBridge.swift・Xcode 26 で組んだときだけ）
 import Foundation
 import Network
 import UIKit
@@ -74,12 +75,31 @@ final class AppleFeatures {
             var sys = utsname()
             uname(&sys)
             let model = withUnsafePointer(to: &sys.machine) { $0.withMemoryRebound(to: CChar.self, capacity: 256) { String(cString: $0) } }
-            return ["features": ["ocr"], "ios": UIDevice.current.systemVersion, "model": model]
+            var features = ["ocr"]
+            #if canImport(FoundationModels)
+            features.append("llm")
+            #endif
+            return ["features": features, "ios": UIDevice.current.systemVersion, "model": model]
         case "ocr":
             return ocr(body, langs: req["langs"] as? [String] ?? ["ja-JP", "en-US"], fast: req["fast"] as? Bool ?? false)
+        case "llm", "llm_status":
+            return llm(req, statusOnly: op == "llm_status")
         default:
             return ["error": "知らない頼み：\(op)"]
         }
+    }
+
+    // ---- Apple Intelligence の言葉のモデル（Foundation Models・iOS 26） ----
+    // Xcode 26 で組んだときだけ入る。Xcode 16 で組むと「この版には無い」と答える
+    private func llm(_ req: [String: Any], statusOnly: Bool) -> [String: Any] {
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, *) {
+            return FMBridge.run(req, statusOnly: statusOnly)
+        }
+        return ["error": "iOS 26 より前なので使えない"]
+        #else
+        return ["error": "この版は Xcode 26 で組んでいないので、Foundation Models が入っていない"]
+        #endif
     }
 
     // ---- 文字認識（Vision の VNRecognizeTextRequest） ----
