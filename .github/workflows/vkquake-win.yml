@@ -1,0 +1,83 @@
+# vkQuake（GPL-2.0）を Windows 用に組んで成果物を上げる。iPhone の GPU で動かす軽い 3D のゲームの 1 本目
+# 本家の build-windows.yml は windows-2025-vs2026 で組んでいる。
+# これは windows-2022 に合わせて直したもの。
+# プロジェクトの道具セットが v145 なので v143 に上書きしている。
+# v143 で通るかは実際に回すまで確かでない。通らなければ runs-on を windows-2025-vs2026 にして上書きを外す。
+# Quake のデータ pak0.pak は成果物に入れない。手元の id1 フォルダに置く。
+
+name: vkquake-windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 組む vkQuake のタグか枝
+        required: true
+        default: "1.36.0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vkquake-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      # 本家の vkQuake を別の場所に取ってくる
+      - name: vkQuake を取得
+        uses: actions/checkout@v4
+        with:
+          repository: Novum/vkQuake
+          ref: ${{ inputs.ref }}
+          path: vkQuake
+
+      # 本家は組み立て時に Vulkan SDK を入れている。同じ版を入れる。
+      # 実行用のドライバは入れない。入れると手元の環境変数の検証と混ざる。
+      - name: Vulkan SDK を導入
+        uses: jakoch/install-vulkan-sdk-action@v1.6.0
+        with:
+          vulkan_version: 1.4.341.1
+          install_runtime: false
+          cache: true
+          stripdown: true
+
+      - name: MSBuild を使えるようにする
+        uses: microsoft/setup-msbuild@v2
+
+      # 道具セットを v143 にして Release の x64 だけ組む
+      - name: 組み立て
+        shell: pwsh
+        working-directory: vkQuake
+        run: |
+          msbuild Windows\VisualStudio\vkquake.sln `
+            -property:Configuration=Release `
+            -property:Platform=x64 `
+            -property:PlatformToolset=v143 `
+            -maxcpucount `
+            -verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { throw "組み立てに失敗した" }
+
+      # できた物を 1 か所に集める
+      - name: 成果物を集める
+        shell: pwsh
+        run: |
+          $src = "vkQuake\Windows\VisualStudio\Build-vkQuake\x64\Release"
+          if (-not (Test-Path "$src\vkQuake.exe")) { throw "vkQuake.exe が無い" }
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item "$src\*.exe" out
+          Copy-Item "$src\*.dll" out
+          Copy-Item "vkQuake\LICENSE.txt" out
+          Get-ChildItem out | Select-Object Name, Length
+          Get-FileHash out\vkQuake.exe -Algorithm SHA256 | Format-List
+
+      - name: 成果物を上げる
+        uses: actions/upload-artifact@v4
+        with:
+          name: vkquake-windows-x64-${{ inputs.ref }}
+          path: out
+          if-no-files-found: error
+          retention-days: 14
