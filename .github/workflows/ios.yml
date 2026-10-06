@@ -18,6 +18,10 @@ on:
         description: "マイクラのサーバー（Pumpkin・GPL-3.0）を入れる"
         required: false
         default: "false"
+# Pumpkin の成果物を別の workflow から取ってくるので、actions を読めるようにする
+permissions:
+  contents: read
+  actions: read
 jobs:
   build:
     runs-on: macos-15
