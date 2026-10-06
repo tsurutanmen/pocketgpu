@@ -1,0 +1,46 @@
+name: pumpkin-ios
+# Pumpkin（Rust 製のマイクラのサーバー・GPL-3.0）を、iPhone のアプリに入れる静的ライブラリとして組む。
+# プラグイン（WebAssembly）は iPhone で使えないので、mc/pumpkin-ios の入口はプラグイン無しで起動する
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - mc/pumpkin-ios/**
+      - .github/workflows/pumpkin-ios.yml
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app && xcodebuild -version
+      - name: Pumpkin
+        run: |
+          git clone https://github.com/Pumpkin-MC/Pumpkin.git pumpkin
+          git -C pumpkin log -1 --format="%H %cd"
+          mkdir -p pumpkin/crates/pumpkin-ios
+          cp mc/pumpkin-ios/Cargo.toml mc/pumpkin-ios/lib.rs pumpkin/crates/pumpkin-ios/
+          # 入口を workspace に足す
+          perl -0pi -e 's/members = \[/members = [\n    "crates\/pumpkin-ios",/' pumpkin/Cargo.toml
+          head -8 pumpkin/Cargo.toml
+      - name: Rust
+        run: |
+          cd pumpkin
+          rustup show
+          rustup target add aarch64-apple-ios
+      - name: build
+        run: |
+          cd pumpkin
+          cargo build -p pumpkin-ios --release --target aarch64-apple-ios 2>&1 | tail -40
+          ls -la target/aarch64-apple-ios/release/
+      - name: collect
+        run: |
+          mkdir out
+          cp pumpkin/target/aarch64-apple-ios/release/libpumpkin_ios.a out/
+          git -C pumpkin log -1 --format="%H" > out/PUMPKIN_COMMIT.txt
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pumpkin-ios
+          path: out/
