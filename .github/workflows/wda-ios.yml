@@ -1,0 +1,113 @@
+# appium/WebDriverAgent を署名なしで組み、署名前の IPA にして上げる。
+# ここでは署名しない。署名は PC 側の AltStore などで行う。
+# 組み方は appium/WebDriverAgent の Scripts/ci/build-real.sh に合わせてある。
+name: wda-ios
+
+on:
+  workflow_dispatch:
+    inputs:
+      wda_ref:
+        description: "組む WebDriverAgent のタグかブランチ"
+        required: true
+        default: "v16.14.0"
+      align_xctest_id:
+        description: "xctest の CFBundleIdentifier を Runner と同じにする。AltStore が xctest の署名で止まる時の実験用"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      XCODE_APP: /Applications/Xcode_26.3.app
+      WDA_DIR: WebDriverAgent
+      APP_NAME: WebDriverAgentRunner-Runner.app
+      BUILT: ${{ github.workspace }}/appium_wda_ios/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app
+
+    steps:
+      # 2026年9月の runner image には Xcode_26.3.app が入っている。
+      # 無ければ入っている Xcode を並べて止める。
+      - name: Xcode 26.3 に切り替える
+        run: |
+          if [ ! -d "$XCODE_APP" ]; then
+            ls -d /Applications/Xcode*
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_APP"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      # inputs は run に直接埋めず、いったん env に渡す。
+      - name: WebDriverAgent を取得する
+        env:
+          WDA_REF: ${{ inputs.wda_ref }}
+        run: |
+          git clone --depth 1 --branch "$WDA_REF" https://github.com/appium/WebDriverAgent.git "$WDA_DIR"
+          git -C "$WDA_DIR" log -1 --format='%H %s'
+
+      # CODE_SIGNING_ALLOWED=NO で署名の段を飛ばす。
+      # ARCHS=arm64 と generic/platform=iOS は公式の実機用ジョブと同じ。
+      # 公式の実機用ジョブは Resources/WebDriverAgent.bundle を作らない。
+      # 足りないと言われた時だけ mkdir -p Resources/WebDriverAgent.bundle を足す。
+      - name: 署名なしで組む
+        run: |
+          cd "$WDA_DIR"
+          xcodebuild clean build-for-testing \
+            -project WebDriverAgent.xcodeproj \
+            -derivedDataPath "$GITHUB_WORKSPACE/appium_wda_ios" \
+            -scheme WebDriverAgentRunner \
+            -destination "generic/platform=iOS" \
+            CODE_SIGNING_ALLOWED=NO ARCHS=arm64
+
+      # xctest が無いと Runner は何も起こせない。
+      # WebDriverAgentLib.framework は xctest の中に入っているのが正しい形。
+      - name: 組み上がりを確かめる
+        run: |
+          test -d "$BUILT"
+          test -d "$BUILT/PlugIns/WebDriverAgentRunner.xctest"
+          test -d "$BUILT/PlugIns/WebDriverAgentRunner.xctest/Frameworks/WebDriverAgentLib.framework"
+          find "$BUILT" -maxdepth 4 -not -path '*/_CodeSignature*' | sort
+          echo "--- Runner"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$BUILT/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$BUILT/Info.plist"
+          echo "--- xctest"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$BUILT/PlugIns/WebDriverAgentRunner.xctest/Info.plist"
+          lipo -info "$BUILT/WebDriverAgentRunner-Runner"
+
+      # 上のトップレベルの Frameworks は IPA に入れない。
+      # XCTest 類は iPhone 側の開発者ディスクイメージのものを使わせる。
+      # 公式の zip も Frameworks/* を除いて作っている。
+      - name: IPA にする
+        env:
+          ALIGN_XCTEST_ID: ${{ inputs.align_xctest_id }}
+        run: |
+          rm -rf Payload WebDriverAgent.ipa
+          mkdir Payload
+          cp -R "$BUILT" Payload/
+          xattr -cr Payload || true
+          if [ "$ALIGN_XCTEST_ID" = "true" ]; then
+            RUNNER_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "Payload/$APP_NAME/Info.plist")
+            /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $RUNNER_ID" "Payload/$APP_NAME/PlugIns/WebDriverAgentRunner.xctest/Info.plist"
+            echo "xctest の ID を $RUNNER_ID にした"
+          fi
+          zip -qry WebDriverAgent.ipa Payload -x "Payload/$APP_NAME/Frameworks/*"
+          ls -l WebDriverAgent.ipa
+          unzip -l WebDriverAgent.ipa | tail -n 60
+
+      # upload-artifact は v4 のまま。
+      # v4 は Node 20 向けで、Node 20 は 2026年9月23日に runner から外れる予定だった。
+      # 警告や失敗が出たら v7 に上げる。
+      - name: IPA を上げる
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebDriverAgent-ipa
+          path: WebDriverAgent.ipa
+          if-no-files-found: error
+          retention-days: 14
