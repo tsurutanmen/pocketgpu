@@ -69,4 +69,8 @@ jobs:
             s/Media/powerplant/**
             s/Media/Teapot/**
             s/Media/Tiger/**
+            s/Media/ShadowColumns/**
+            s/Media/Squid/**
+            s/Media/Light Probes/uffizi_cross.dds
+            s/Media/Light Probes/uffizi_cross32.DDS
             !s/**/obj/**
