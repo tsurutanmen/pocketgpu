@@ -148,7 +148,12 @@ static int vk_init(void) {
     VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
     // portability_enumeration は Vulkan のローダーが持つ拡張。iPhone のように MoltenVK を直接つなぐと無いので、
     // あるときだけ有効にする（無いのに頼むと vkCreateInstance が失敗する）
+#ifdef _WIN32
+    // Windows では有効にしない（有効にすると、暗黙のレイヤーが挟まった vkCreateDevice が戻ってこなかった）
+    PFN_vkEnumerateInstanceExtensionProperties enum_ext = NULL;
+#else
     PFN_vkEnumerateInstanceExtensionProperties enum_ext = (PFN_vkEnumerateInstanceExtensionProperties) gipa(NULL, "vkEnumerateInstanceExtensionProperties");
+#endif
     uint32_t nie = 0;
     if (enum_ext) enum_ext(NULL, &nie, NULL);
     VkExtensionProperties *ie = calloc(nie ? nie : 1, sizeof *ie);
@@ -980,6 +985,9 @@ int vkr_serve(const char *host, int port) {
 int main(int argc, char **argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
+    // PC で代役をするときは、画面取り込みなどの部品（暗黙のレイヤー）を挟まない。
+    // OBS が起動している間、OBS の部品が vkCreateDevice から戻ってこなかった
+    SetEnvironmentVariableA("VK_LOADER_LAYERS_DISABLE", "~implicit~");
 #endif
     return vkr_serve(argc > 1 ? argv[1] : "127.0.0.1", argc > 2 ? atoi(argv[2]) : VR_DEFAULT_PORT);
 }
