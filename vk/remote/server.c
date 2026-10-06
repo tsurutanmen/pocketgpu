@@ -83,7 +83,8 @@ VKFUNCS(DECL)
 // ---- PC が振った番号 → ここの本物の Vulkan の物 ----
 // aux：バッファならつないだメモリの番号。list：descriptor set なら中のバッファの番号の並び
 typedef struct { uint64_t *ids; uint32_t n, cap; } idlist;
-typedef struct { uint64_t id, h; uint32_t kind; void *map; uint64_t size; uint64_t aux; idlist *list; } ent;
+typedef struct { uint64_t id, h; uint32_t kind; void *map; uint64_t size; uint64_t aux; idlist *list;
+                 uint8_t *last; } ent; // last：ドライバが持っているはずの中身。VR_MEM_READ_DELTA で使う
 
 static void idlist_add(idlist **l, uint64_t id) {
     if (!*l) *l = calloc(1, sizeof **l);
@@ -125,8 +126,8 @@ static void put(uint64_t id, uint64_t h, uint32_t kind) {
     size_t s = slot(id);
     while (g_tab[s].id && g_tab[s].id != id) s = (s + 1) & (g_cap - 1);
     if (!g_tab[s].id) g_cnt++;
-    if (g_tab[s].id == id) idlist_free(&g_tab[s].list);
-    g_tab[s] = (ent) { id, h, kind, NULL, 0, 0, NULL };
+    if (g_tab[s].id == id) { idlist_free(&g_tab[s].list); free(g_tab[s].last); }
+    g_tab[s] = (ent) { id, h, kind, NULL, 0, 0, NULL, NULL };
 }
 
 static ent *find(uint64_t id) {
@@ -147,6 +148,8 @@ static void del(uint64_t id) {
     size_t s = slot(id);
     while (g_tab[s].id && g_tab[s].id != id) s = (s + 1) & (g_cap - 1);
     if (!g_tab[s].id) return;
+    free(g_tab[s].last);
+    g_tab[s].last = NULL;
     g_tab[s].id = 0;
     g_cnt--;
     for (size_t j = (s + 1) & (g_cap - 1); g_tab[j].id; j = (j + 1) & (g_cap - 1)) {
@@ -405,7 +408,7 @@ static void cleanup(void) {
             }
         vkDestroyDevice(dev, NULL);
     }
-    for (size_t i = 0; i < g_cap; i++) if (g_tab[i].id) idlist_free(&g_tab[i].list);
+    for (size_t i = 0; i < g_cap; i++) if (g_tab[i].id) { idlist_free(&g_tab[i].list); free(g_tab[i].last); }
     free(g_tab);
     g_tab = NULL;
     g_cap = g_cnt = 0;
@@ -722,7 +725,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     // GPU を失っていたら、返事のある命令でそれを伝える（黙って間違った答えを返さない）
     if (g_err != VK_SUCCESS) {
         switch (op) {
-        case VR_MEM_READ: case VR_WAIT_FOR_FENCES: case VR_GET_FENCE_STATUS: case VR_WAIT_SEMAPHORES:
+        case VR_MEM_READ: case VR_MEM_READ_DELTA: case VR_WAIT_FOR_FENCES: case VR_GET_FENCE_STATUS: case VR_WAIT_SEMAPHORES:
         case VR_GET_SEMAPHORE_COUNTER: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE:
             return reply(s, g_err);
         default:
@@ -768,6 +771,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         vr_u32(&g_out, ne);
         vr_put(&g_out, e, sizeof *e * ne);
         free(e);
+        vr_u32(&g_out, VR_CAP_DELTA);
         return reply(s, 0);
     }
     case VR_GET_FEATURES2:
@@ -934,8 +938,10 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t off = vr_ru64(r);
         uint32_t n;
         const void *d = vr_rbytes(r, &n);
-        if (e && e->map && d && off <= e->size && n <= e->size - off) memcpy((uint8_t *) e->map + off, d, n);
-        else vlog("範囲の外への書き込みを捨てた（%llu + %u）", (unsigned long long) off, n);
+        if (e && e->map && d && off <= e->size && n <= e->size - off) {
+            memcpy((uint8_t *) e->map + off, d, n);
+            if (e->last) memcpy(e->last + off, d, n);
+        } else vlog("範囲の外への書き込みを捨てた（%llu + %u）", (unsigned long long) off, n);
         return 1;
     }
     case VR_MEM_READ: {
@@ -946,6 +952,45 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t off = vr_ru64(r), n = vr_ru64(r);
         if (!e || !e->map || off > e->size || n > e->size - off) return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
         vr_put(&g_out, (uint8_t *) e->map + off, (size_t) n);
+        return reply(s, 0);
+    }
+    case VR_MEM_READ_DELTA: {
+        // ドライバ側の写しと同じものを持っておき、今回との違い（XOR）を 4 バイトずつ見て、
+        // 「同じ語が続く数・違う語の数・その XOR」の並びで送る。変わっていない所はほとんど 0 バイトになる
+        uint64_t mid = vr_ru64(r);
+        drain_upto(last_with_mem(mid));
+        if (g_err != VK_SUCCESS) return reply(s, g_err);
+        ent *e = find(mid);
+        uint64_t off = vr_ru64(r), n = vr_ru64(r);
+        if (!e || !e->map || off > e->size || n > e->size - off) return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
+        if (!e->last && e->size <= (256u << 20)) e->last = calloc(1, (size_t) e->size);
+        const uint8_t *cur = (const uint8_t *) e->map + off;
+        if (e->last && (off & 3) == 0 && (n & 3) == 0) {
+            // GPU のメモリはキャッシュが効かないことがあり、4 バイトずつ読むと遅い。先にまとめて写してから比べる
+            static uint8_t *tmp;
+            static size_t tcap;
+            if (tcap < n) { free(tmp); tmp = malloc((size_t) n); tcap = tmp ? (size_t) n : 0; }
+            if (tmp) { memcpy(tmp, cur, (size_t) n); cur = tmp; }
+            const uint32_t *c = (const uint32_t *) cur;
+            uint32_t *l = (uint32_t *) (e->last + off);
+            size_t words = (size_t) (n / 4);
+            vr_u32(&g_out, 1);
+            for (size_t i = 0; i < words;) {
+                size_t z = i;
+                while (z < words && c[z] == l[z]) z++;
+                if (z == words) break;
+                size_t k = z;
+                while (k < words && c[k] != l[k]) k++;
+                vr_u32(&g_out, (uint32_t) (z - i));
+                vr_u32(&g_out, (uint32_t) (k - z));
+                for (size_t t = z; t < k; t++) { uint32_t x = c[t] ^ l[t]; vr_put(&g_out, &x, 4); l[t] = c[t]; }
+                i = k;
+            }
+        } else {
+            vr_u32(&g_out, 0);
+            vr_put(&g_out, cur, (size_t) n);
+            if (e->last) memcpy(e->last + off, cur, (size_t) n);
+        }
         return reply(s, 0);
     }
     case VR_CREATE_SHADER_MODULE: {

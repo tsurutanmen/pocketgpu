@@ -71,7 +71,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_CREATE_RENDER_PASS] = "CREATE_RENDER_PASS", [VR_DESTROY_RENDER_PASS] = "DESTROY_RENDER_PASS",
     [VR_CREATE_FRAMEBUFFER] = "CREATE_FRAMEBUFFER", [VR_DESTROY_FRAMEBUFFER] = "DESTROY_FRAMEBUFFER",
     [VR_CREATE_GRAPHICS_PIPELINE] = "CREATE_GRAPHICS_PIPELINE", [VR_GET_IMAGE_FORMAT_PROPS] = "GET_IMAGE_FORMAT_PROPS",
-    [VR_CREATE_SAMPLER] = "CREATE_SAMPLER", [VR_DESTROY_SAMPLER] = "DESTROY_SAMPLER",
+    [VR_CREATE_SAMPLER] = "CREATE_SAMPLER", [VR_DESTROY_SAMPLER] = "DESTROY_SAMPLER", [VR_MEM_READ_DELTA] = "MEM_READ_DELTA",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -234,6 +234,7 @@ static struct {
     VkQueueFamilyProperties q[16];
     uint32_t ne;
     VkExtensionProperties ext[64];
+    uint32_t caps; // 受け手ができること（VR_CAP_*）
 } g_hw;
 static SRWLOCK g_hw_lock = SRWLOCK_INIT;
 
@@ -295,6 +296,9 @@ static int hello(void) {
                 if (allowed_ext(x.extensionName) && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = x;
             }
             if (g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_swapchain", 70 };
+            if (rd.at + 4 <= rd.n) g_hw.caps = vr_ru32(&rd); // 古い受け手は付けない
+            const char *dl = getenv("IPHONE_VK_DELTA");
+            if (dl && *dl == '0') g_hw.caps &= ~VR_CAP_DELTA;
             if (!rd.bad) {
                 char real[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
                 memcpy(real, g_hw.props.deviceName, sizeof real);
@@ -341,6 +345,7 @@ struct mem {
     size_t npages;
     void **addrs;      // GetWriteWatch の受け皿
     uint8_t *dirty;    // ページごとの「まだ送っていない」印
+    int delta;         // 窓に出すコマ用：受け手に前回との違いだけを送ってもらう（VR_MEM_READ_DELTA）
     struct mem *prev, *next;
 };
 
@@ -481,8 +486,9 @@ static void read_back_many(rng *r, size_t n) {
             vr_u64(&b, ID(r[i].m));
             vr_u64(&b, at);
             vr_u64(&b, k);
-            g_stat.calls[VR_MEM_READ]++;
-            put_msg_locked(VR_MEM_READ, &b);
+            uint32_t op = r[i].m->delta && (g_hw.caps & VR_CAP_DELTA) ? VR_MEM_READ_DELTA : VR_MEM_READ;
+            g_stat.calls[op]++;
+            put_msg_locked(op, &b);
             b.n = 0;
             nreq++;
         }
@@ -496,6 +502,39 @@ static void read_back_many(rng *r, size_t n) {
             if ((int32_t) h[0] < 0) {
                 if (!g_dead) say("受け手が失敗を返した (%d)。この先は全部失敗にする", (int32_t) h[0]);
                 g_dead = 1;
+            }
+            if ((int32_t) h[0] == VK_SUCCESS && r[i].m->delta && (g_hw.caps & VR_CAP_DELTA)) {
+                // 形（0 そのまま・1 違い）を読んでから中身
+                uint8_t *buf = malloc(h[1] ? h[1] : 1);
+                if (!buf || (h[1] && !vr_recv_all(g_sock, buf, h[1]))) { free(buf); ok = 0; g_dead = 1; break; }
+                g_stat.bytes_in += 8 + h[1];
+                uint32_t mode = 2;
+                if (h[1] >= 4) memcpy(&mode, buf, 4);
+                uint8_t *dst = r[i].m->shadow + at;
+                if (mode == 0 && h[1] - 4 == k) {
+                    memcpy(dst, buf + 4, (size_t) k);
+                } else if (mode == 1) {
+                    uint32_t *w = (uint32_t *) dst;
+                    size_t words = (size_t) (k / 4), pos = 0, q = 4;
+                    while (q + 8 <= h[1]) {
+                        uint32_t z, lits;
+                        memcpy(&z, buf + q, 4);
+                        memcpy(&lits, buf + q + 4, 4);
+                        q += 8;
+                        pos += z;
+                        if (pos + lits > words || q + (size_t) lits * 4 > h[1]) { g_dead = 1; break; }
+                        for (uint32_t t = 0; t < lits; t++, pos++, q += 4) {
+                            uint32_t x;
+                            memcpy(&x, buf + q, 4);
+                            w[pos] ^= x;
+                        }
+                    }
+                } else {
+                    g_dead = 1;
+                }
+                if (g_dead) say("違いの読み出しが壊れていた。この先は全部失敗にする");
+                free(buf);
+                continue;
             }
             if ((int32_t) h[0] == VK_SUCCESS && h[1] == k) {
                 if (!vr_recv_all(g_sock, r[i].m->shadow + at, k)) { ok = 0; g_dead = 1; break; }
@@ -1444,6 +1483,9 @@ static VkResult VKAPI_CALL surface_modes(VkPhysicalDevice pd, VkSurfaceKHR s, ui
 }
 
 // ---- swapchain：受け手に画像を作り、出すたびに 1 コマを持ち帰って窓に描き写す ----
+// 出すときは待たずに、画像を持ち帰り用のバッファに写す仕事だけ頼む。窓に描くのは 1 つ前のコマ
+// （1 コマ遅れる代わりに、GPU が次のコマを描いている間に前のコマを運べる）。
+// 持ち帰り用は画像ごとに別のメモリにする（受け手は同じメモリを使う仕事までしか待たないので、前のコマだけ先に受け取れる）
 struct swapchain {
     struct dev *d;
     HWND hwnd;
@@ -1451,12 +1493,13 @@ struct swapchain {
     VkFormat fmt;
     VkImage img[8];
     VkDeviceMemory imem[8];
-    VkBuffer rb;            // 持ち帰り用（CPU から見えるメモリ）
-    VkDeviceMemory rbmem;
-    uint8_t *px;
+    VkBuffer rb[8];         // 持ち帰り用（CPU から見えるメモリ）
+    VkDeviceMemory rbmem[8];
+    uint8_t *px[8];
     VkCommandPool pool;
-    VkCommandBuffer cmd[8]; // 画像 i を持ち帰り用に写す（あらかじめ記録しておく）
-    VkFence fence;
+    VkCommandBuffer cmd[8]; // 画像 i を持ち帰り用 i に写す（あらかじめ記録しておく）
+    VkFence fence[8];
+    int pend;               // 写しを頼んだが、まだ窓に出していない画像（無ければ -1）
     VkQueue q;
     uint64_t frames;
     double t0;
@@ -1488,14 +1531,15 @@ static void VKAPI_CALL destroy_swapchain(VkDevice dv, VkSwapchainKHR h, const Vk
     (void) a;
     struct swapchain *sc = (struct swapchain *) h;
     if (!sc) return;
-    if (sc->fence) destroy_fence(dv, sc->fence, NULL);
+    if (sc->pend >= 0 && sc->fence[sc->pend]) wait_fences(dv, 1, &sc->fence[sc->pend], VK_TRUE, UINT64_MAX);
     if (sc->pool) destroy_cpool(dv, sc->pool, NULL);
     for (uint32_t i = 0; i < sc->n; i++) {
+        if (sc->fence[i]) destroy_fence(dv, sc->fence[i], NULL);
         if (sc->img[i]) destroy_image(dv, sc->img[i], NULL);
         if (sc->imem[i]) free_memory(dv, sc->imem[i], NULL);
+        if (sc->rb[i]) destroy_buffer(dv, sc->rb[i], NULL);
+        if (sc->rbmem[i]) free_memory(dv, sc->rbmem[i], NULL);
     }
-    if (sc->rb) destroy_buffer(dv, sc->rb, NULL);
-    if (sc->rbmem) free_memory(dv, sc->rbmem, NULL);
     if (sc->frames) say("swapchain：%llu コマ・%.1f コマ/秒", (unsigned long long) sc->frames, sc->frames * 1000.0 / (now_ms() - sc->t0));
     free(sc);
 }
@@ -1510,6 +1554,7 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
     sc->h = ci->imageExtent.height;
     sc->fmt = ci->imageFormat;
     sc->n = ci->minImageCount < 2 ? 2 : ci->minImageCount > 8 ? 8 : ci->minImageCount;
+    sc->pend = -1;
     VkResult r = VK_SUCCESS;
     for (uint32_t i = 0; i < sc->n && r == VK_SUCCESS; i++) {
         VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = ci->imageFormat,
@@ -1523,22 +1568,23 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
         if ((r = alloc_memory(dv, &mai, NULL, &sc->imem[i])) != VK_SUCCESS) break;
         bind_image(dv, sc->img[i], sc->imem[i], 0);
     }
-    if (r == VK_SUCCESS) {
+    for (uint32_t i = 0; i < sc->n && r == VK_SUCCESS; i++) {
         VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize) sc->w * sc->h * 4, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT };
-        r = create_buffer(dv, &bc, NULL, &sc->rb);
-    }
-    if (r == VK_SUCCESS) {
+        if ((r = create_buffer(dv, &bc, NULL, &sc->rb[i])) != VK_SUCCESS) break;
         VkMemoryRequirements req;
-        buffer_reqs(dv, sc->rb, &req);
+        buffer_reqs(dv, sc->rb[i], &req);
         VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
             .memoryTypeIndex = pick_mem(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
-        r = alloc_memory(dv, &mai, NULL, &sc->rbmem);
+        if ((r = alloc_memory(dv, &mai, NULL, &sc->rbmem[i])) != VK_SUCCESS) break;
+        ((struct mem *) sc->rbmem[i])->delta = 1;
+        bind_buffer(dv, sc->rb[i], sc->rbmem[i], 0);
+        map_memory(dv, sc->rbmem[i], 0, VK_WHOLE_SIZE, 0, (void **) &sc->px[i]);
+        VkFenceCreateInfo fc = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        r = create_fence(dv, &fc, NULL, &sc->fence[i]);
     }
     uint32_t fam = 0;
     for (uint32_t i = 0; i < g_hw.nq; i++) if (g_hw.q[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { fam = i; break; }
     if (r == VK_SUCCESS) {
-        bind_buffer(dv, sc->rb, sc->rbmem, 0);
-        map_memory(dv, sc->rbmem, 0, VK_WHOLE_SIZE, 0, (void **) &sc->px);
         VkCommandPoolCreateInfo pc = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = fam };
         r = create_cpool(dv, &pc, NULL, &sc->pool);
     }
@@ -1555,14 +1601,10 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
             .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT };
         cmd_barrier(sc->cmd[i], VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         VkBufferImageCopy rg = { .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { sc->w, sc->h, 1 } };
-        cmd_copy_image_to_buffer(sc->cmd[i], sc->img[i], VK_IMAGE_LAYOUT_GENERAL, sc->rb, 1, &rg);
+        cmd_copy_image_to_buffer(sc->cmd[i], sc->img[i], VK_IMAGE_LAYOUT_GENERAL, sc->rb[i], 1, &rg);
         end_cb(sc->cmd[i]);
     }
-    if (r == VK_SUCCESS) {
-        VkFenceCreateInfo fc = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        r = create_fence(dv, &fc, NULL, &sc->fence);
-        get_queue(dv, fam, 0, &sc->q);
-    }
+    if (r == VK_SUCCESS) get_queue(dv, fam, 0, &sc->q);
     if (r != VK_SUCCESS) { destroy_swapchain(dv, (VkSwapchainKHR) sc, NULL); return r; }
     if (ci->oldSwapchain) say("swapchain を作り直した（%u x %u）", sc->w, sc->h);
     else say("swapchain：%u x %u・%u 枚", sc->w, sc->h, sc->n);
@@ -1598,51 +1640,62 @@ static VkResult VKAPI_CALL acquire_image2(VkDevice dv, const VkAcquireNextImageI
     return acquire_image(dv, ai->swapchain, ai->timeout, ai->semaphore, ai->fence, idx);
 }
 
+// 持ち帰った画像 j を窓に描き写す
+static VkResult blit(struct swapchain *sc, uint32_t j) {
+    if (!sc->hwnd) return VK_SUCCESS;
+    uint8_t *px = sc->px[j];
+    BITMAPINFO bmi = { 0 };
+    bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
+    bmi.bmiHeader.biWidth = (LONG) sc->w;
+    bmi.bmiHeader.biHeight = -(LONG) sc->h; // 上から下へ
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    if (sc->fmt == VK_FORMAT_R8G8B8A8_UNORM || sc->fmt == VK_FORMAT_R8G8B8A8_SRGB)
+        for (size_t p = 0; p < (size_t) sc->w * sc->h; p++) { uint8_t t = px[p * 4]; px[p * 4] = px[p * 4 + 2]; px[p * 4 + 2] = t; }
+    RECT rc;
+    GetClientRect(sc->hwnd, &rc);
+    HDC dc = GetDC(sc->hwnd);
+    SetStretchBltMode(dc, COLORONCOLOR);
+    StretchDIBits(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, 0, 0, (int) sc->w, (int) sc->h, px, &bmi, DIB_RGB_COLORS, SRCCOPY);
+    ReleaseDC(sc->hwnd, dc);
+    sc->frames++;
+    // IPHONE_VK_DUMP=コマ番号:ファイル名 で、そのコマを PPM に書く（絵が正しいかを確かめる用）
+    const char *dump = getenv("IPHONE_VK_DUMP");
+    if (dump && (uint64_t) atoi(dump) == sc->frames && strchr(dump, ':')) {
+        FILE *fp = fopen(strchr(dump, ':') + 1, "wb");
+        if (fp) {
+            fprintf(fp, "P6\n%u %u\n255\n", sc->w, sc->h);
+            for (size_t p = 0; p < (size_t) sc->w * sc->h; p++) { uint8_t rgb[3] = { px[p * 4 + 2], px[p * 4 + 1], px[p * 4] }; fwrite(rgb, 1, 3, fp); }
+            fclose(fp);
+            say("%llu コマ目を %s に書いた", (unsigned long long) sc->frames, strchr(dump, ':') + 1);
+        }
+    }
+    // 窓の大きさが変わったら、作り直してもらう
+    if ((uint32_t) (rc.right - rc.left) != sc->w || (uint32_t) (rc.bottom - rc.top) != sc->h) return VK_SUBOPTIMAL_KHR;
+    return VK_SUCCESS;
+}
+
 static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi) {
     VkResult worst = VK_SUCCESS;
     for (uint32_t i = 0; i < pi->swapchainCount; i++) {
         struct swapchain *sc = (struct swapchain *) pi->pSwapchains[i];
         uint32_t idx = pi->pImageIndices[i];
         VkDevice dv = (VkDevice) sc->d;
-        // 描き終わりを待ってから、画像を持ち帰り用に写す
+        // 描き終わりを待ってから画像を持ち帰り用に写す仕事を頼む（待たない）
         VkPipelineStageFlags st[16];
         for (uint32_t k = 0; k < 16; k++) st[k] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
         VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .waitSemaphoreCount = i == 0 ? (pi->waitSemaphoreCount < 16 ? pi->waitSemaphoreCount : 16) : 0,
             .pWaitSemaphores = pi->pWaitSemaphores, .pWaitDstStageMask = st, .commandBufferCount = 1, .pCommandBuffers = &sc->cmd[idx] };
-        VkResult r = queue_submit(qh, 1, &si, sc->fence);
-        if (r == VK_SUCCESS) r = wait_fences(dv, 1, &sc->fence, VK_TRUE, UINT64_MAX); // ここで 1 コマを持ち帰る
-        reset_fences(dv, 1, &sc->fence);
-        if (r == VK_SUCCESS && sc->hwnd) {
-            BITMAPINFO bmi = { 0 };
-            bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
-            bmi.bmiHeader.biWidth = (LONG) sc->w;
-            bmi.bmiHeader.biHeight = -(LONG) sc->h; // 上から下へ
-            bmi.bmiHeader.biPlanes = 1;
-            bmi.bmiHeader.biBitCount = 32;
-            bmi.bmiHeader.biCompression = BI_RGB;
-            if (sc->fmt == VK_FORMAT_R8G8B8A8_UNORM || sc->fmt == VK_FORMAT_R8G8B8A8_SRGB)
-                for (size_t p = 0; p < (size_t) sc->w * sc->h; p++) { uint8_t t = sc->px[p * 4]; sc->px[p * 4] = sc->px[p * 4 + 2]; sc->px[p * 4 + 2] = t; }
-            RECT rc;
-            GetClientRect(sc->hwnd, &rc);
-            HDC dc = GetDC(sc->hwnd);
-            SetStretchBltMode(dc, COLORONCOLOR);
-            StretchDIBits(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, 0, 0, (int) sc->w, (int) sc->h, sc->px, &bmi, DIB_RGB_COLORS, SRCCOPY);
-            ReleaseDC(sc->hwnd, dc);
-            sc->frames++;
-            // IPHONE_VK_DUMP=コマ番号:ファイル名 で、そのコマを PPM に書く（絵が正しいかを確かめる用）
-            const char *dump = getenv("IPHONE_VK_DUMP");
-            if (dump && (uint64_t) atoi(dump) == sc->frames && strchr(dump, ':')) {
-                FILE *fp = fopen(strchr(dump, ':') + 1, "wb");
-                if (fp) {
-                    fprintf(fp, "P6\n%u %u\n255\n", sc->w, sc->h);
-                    for (size_t p = 0; p < (size_t) sc->w * sc->h; p++) { uint8_t rgb[3] = { sc->px[p * 4 + 2], sc->px[p * 4 + 1], sc->px[p * 4] }; fwrite(rgb, 1, 3, fp); }
-                    fclose(fp);
-                    say("%llu コマ目を %s に書いた", (unsigned long long) sc->frames, strchr(dump, ':') + 1);
-                }
-            }
-            // 窓の大きさが変わったら、作り直してもらう
-            if ((uint32_t) (rc.right - rc.left) != sc->w || (uint32_t) (rc.bottom - rc.top) != sc->h) r = VK_SUBOPTIMAL_KHR;
+        VkResult r = queue_submit(qh, 1, &si, sc->fence[idx]);
+        // 1 つ前に頼んだコマを受け取って窓に描く（GPU はその間にさっき頼んだ分を進める）
+        if (r == VK_SUCCESS && sc->pend >= 0) {
+            uint32_t j = (uint32_t) sc->pend;
+            r = wait_fences(dv, 1, &sc->fence[j], VK_TRUE, UINT64_MAX);
+            reset_fences(dv, 1, &sc->fence[j]);
+            if (r == VK_SUCCESS) r = blit(sc, j);
         }
+        sc->pend = (int) idx;
         if (pi->pResults) pi->pResults[i] = r;
         if (r < 0 || (worst == VK_SUCCESS && r != VK_SUCCESS)) worst = r;
     }

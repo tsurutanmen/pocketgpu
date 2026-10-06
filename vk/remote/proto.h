@@ -9,6 +9,9 @@
 // 出した仕事が全部終わるのを自分の中で待つ（drain）。受け手の中で待つぶんには往復が要らない
 #define VR_DEFAULT_PORT 50060
 
+// 受け手ができること。あいさつの返事の最後に付ける。古い受け手は付けない
+#define VR_CAP_DELTA 1u   // VR_MEM_READ_DELTA：前回送った中身との違いだけを詰めて送る
+
 // 返事のある命令（往復が 1 回かかる）には [同期] と書く。ほかは送りっぱなし
 enum vr_op {
     VR_HELLO = 1,             // [同期] 版 → 装置の性質・メモリ・キューの種類
@@ -74,6 +77,7 @@ enum vr_op {
     VR_GET_IMAGE_FORMAT_PROPS,   // [同期] → 結果・VkImageFormatProperties
     VR_CREATE_SAMPLER,           // device・id・VkSamplerCreateInfo の pNext より後ろ
     VR_DESTROY_SAMPLER,
+    VR_MEM_READ_DELTA,           // [同期] memory・offset・大きさ → 形（0 そのまま・1 前回との違い）・中身。受け手が VR_CAP_DELTA を名乗ったときだけ使う
     VR_OP_COUNT
 };
 
