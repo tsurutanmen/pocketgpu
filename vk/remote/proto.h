@@ -72,6 +72,8 @@ enum vr_op {
     VR_DESTROY_FRAMEBUFFER,
     VR_CREATE_GRAPHICS_PIPELINE, // [同期] 作れたかを返す
     VR_GET_IMAGE_FORMAT_PROPS,   // [同期] → 結果・VkImageFormatProperties
+    VR_CREATE_SAMPLER,           // device・id・VkSamplerCreateInfo の pNext より後ろ
+    VR_DESTROY_SAMPLER,
     VR_OP_COUNT
 };
 

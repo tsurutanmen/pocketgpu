@@ -19,6 +19,7 @@
 #endif
 #endif
 #include <stdarg.h>
+#include <stddef.h>
 #include <time.h>
 #ifndef _WIN32
 #include <unistd.h>
@@ -73,7 +74,7 @@ static int g_portability; // MoltenVK のときは portability_subset を有効�
     X(vkCreateGraphicsPipelines) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdNextSubpass) X(vkCmdDraw) \
     X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCmdClearColorImage) \
-    X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkGetPhysicalDeviceImageFormatProperties)
+    X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkGetPhysicalDeviceImageFormatProperties) X(vkCreateSampler) X(vkDestroySampler)
 
 #define DECL(n) static PFN_##n n;
 VKFUNCS(DECL)
@@ -99,7 +100,7 @@ static ent *g_tab;
 static size_t g_cap, g_cnt;
 
 enum { K_DEVICE = 1, K_QUEUE, K_BUFFER, K_MEMORY, K_SHADER, K_DSL, K_PLAYOUT, K_PIPELINE, K_DPOOL, K_DSET, K_CPOOL, K_CB, K_FENCE, K_SEM,
-       K_IMAGE, K_VIEW, K_RPASS, K_FB };
+       K_IMAGE, K_VIEW, K_RPASS, K_FB, K_SAMPLER };
 
 static size_t slot(uint64_t id) { return (size_t) ((id * 0x9E3779B97F4A7C15ull) >> 20) & (g_cap - 1); }
 
@@ -378,7 +379,7 @@ static void cleanup(void) {
     for (size_t i = 0; i < g_cap; i++) if (g_tab[i].id && g_tab[i].kind == K_DEVICE) dev = (VkDevice) (uintptr_t) g_tab[i].h;
     if (dev) {
         vkDeviceWaitIdle(dev);
-        static const int order[] = { K_PIPELINE, K_FB, K_RPASS, K_PLAYOUT, K_SHADER, K_DPOOL, K_DSL, K_CPOOL, K_FENCE, K_SEM,
+        static const int order[] = { K_PIPELINE, K_FB, K_RPASS, K_PLAYOUT, K_SHADER, K_DPOOL, K_DSL, K_SAMPLER, K_CPOOL, K_FENCE, K_SEM,
                                      K_VIEW, K_IMAGE, K_BUFFER, K_MEMORY };
         for (size_t o = 0; o < sizeof order / sizeof *order; o++)
             for (size_t i = 0; i < g_cap; i++) {
@@ -399,6 +400,7 @@ static void cleanup(void) {
                 case K_RPASS: vkDestroyRenderPass(dev, (VkRenderPass) e->h, NULL); break;
                 case K_VIEW: vkDestroyImageView(dev, (VkImageView) e->h, NULL); break;
                 case K_IMAGE: vkDestroyImage(dev, (VkImage) e->h, NULL); break;
+                case K_SAMPLER: vkDestroySampler(dev, (VkSampler) e->h, NULL); break;
                 }
             }
         vkDestroyDevice(dev, NULL);
@@ -711,6 +713,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_DESTROY_PIPELINE_LAYOUT: case VR_DESTROY_SHADER_MODULE: case VR_DESTROY_DSL: case VR_DESTROY_FENCE:
     case VR_DESTROY_SEMAPHORE: case VR_DESTROY_DEVICE: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE:
     case VR_DESTROY_IMAGE: case VR_DESTROY_IMAGE_VIEW: case VR_DESTROY_RENDER_PASS: case VR_DESTROY_FRAMEBUFFER:
+    case VR_DESTROY_SAMPLER:
         drain();
         break;
     default:
@@ -1107,8 +1110,25 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             w.dstArrayElement = vr_ru32(r);
             w.descriptorType = (VkDescriptorType) vr_ru32(r);
             w.descriptorCount = vr_ru32(r);
-            VkDescriptorBufferInfo *bi = calloc(w.descriptorCount ? w.descriptorCount : 1, sizeof *bi);
             ent *se = find(sid);
+            int image = w.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || w.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                        w.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
+                        w.descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+            if (image) {
+                VkDescriptorImageInfo *ii = calloc(w.descriptorCount ? w.descriptorCount : 1, sizeof *ii);
+                for (uint32_t k = 0; k < w.descriptorCount; k++) {
+                    ii[k].sampler = OBJ(VkSampler, vr_ru64(r));
+                    uint64_t vid = vr_ru64(r);
+                    ii[k].imageView = OBJ(VkImageView, vid);
+                    ii[k].imageLayout = (VkImageLayout) vr_ru32(r);
+                    if (se && vid) idlist_add(&se->list, vid); // 見え方の aux はもとの画像のメモリ
+                }
+                w.pImageInfo = ii;
+                vkUpdateDescriptorSets(d, 1, &w, 0, NULL);
+                free(ii);
+                continue;
+            }
+            VkDescriptorBufferInfo *bi = calloc(w.descriptorCount ? w.descriptorCount : 1, sizeof *bi);
             for (uint32_t k = 0; k < w.descriptorCount; k++) {
                 uint64_t bid = vr_ru64(r);
                 bi[k].buffer = OBJ(VkBuffer, bid);
@@ -1661,6 +1681,24 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (res == VK_SUCCESS) put(id, (uint64_t) pp, K_PIPELINE);
         else vlog("graphics pipeline を作れない (%d)", res);
         return reply(s, res);
+    }
+    case VR_CREATE_SAMPLER: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r);
+        VkSamplerCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+        vr_rcopy(r, (uint8_t *) &ci + offsetof(VkSamplerCreateInfo, flags), sizeof ci - offsetof(VkSamplerCreateInfo, flags));
+        VkSampler sm;
+        VkResult res = vkCreateSampler(d, &ci, NULL, &sm);
+        if (res == VK_SUCCESS) put(id, (uint64_t) sm, K_SAMPLER);
+        else vlog("sampler を作れない (%d)", res);
+        return 1;
+    }
+    case VR_DESTROY_SAMPLER: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r);
+        vkDestroySampler(d, OBJ(VkSampler, id), NULL);
+        del(id);
+        return 1;
     }
     case VR_GET_IMAGE_FORMAT_PROPS: {
         uint32_t fmt = vr_ru32(r), type = vr_ru32(r), tiling = vr_ru32(r), usage = vr_ru32(r), flags = vr_ru32(r);
