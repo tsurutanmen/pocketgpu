@@ -18,6 +18,10 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/walbourn/directx-sdk-samples.git s
           git -C s log -1 --format="%H %cd" | tee s/SAMPLES_COMMIT.txt
+          # DXUT は d3d11.dll と dxgi.dll を Windows のフォルダからしか読まない。
+          # 試験で横に置いた DXVK を使わせるため、アプリのフォルダも先に探すようにする。ここだけ元のサンプルと違う
+          perl -pi -e 's/(L"(?:d3d11|dxgi)\.dll", nullptr, )0x00000800/${1}0x00000A00/' s/DXUT/Core/DXUTmisc.cpp
+          grep -n 'L"d3d11.dll"\|L"dxgi.dll"' s/DXUT/Core/DXUTmisc.cpp
       - name: build
         shell: pwsh
         run: |
