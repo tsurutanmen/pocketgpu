@@ -485,6 +485,10 @@ static void read_back_many(rng *r, size_t n) {
             uint64_t k = r[i].off + r[i].len - at < piece ? r[i].off + r[i].len - at : piece;
             uint32_t h[2];
             if (!vr_recv_all(g_sock, h, 8)) { ok = 0; g_dead = 1; break; }
+            if ((int32_t) h[0] < 0) {
+                if (!g_dead) say("受け手が失敗を返した (%d)。この先は全部失敗にする", (int32_t) h[0]);
+                g_dead = 1;
+            }
             if ((int32_t) h[0] == VK_SUCCESS && h[1] == k) {
                 if (!vr_recv_all(g_sock, r[i].m->shadow + at, k)) { ok = 0; g_dead = 1; break; }
             } else {
@@ -1590,7 +1594,7 @@ static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *f
     if (known) {
         for (uint32_t i = 0; i < n; i++) complete((struct dev *) dv, ((struct fence *) fs[i])->q, ((struct fence *) fs[i])->serial);
         g_stat.skipped++;
-        return VK_SUCCESS;
+        return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
     }
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
@@ -1629,7 +1633,7 @@ static VkResult VKAPI_CALL fence_status(VkDevice dv, VkFence fh) {
         // submit に付けた fence は「終わった」と答える（版 3 の待ち方）
         complete((struct dev *) dv, fc->q, fc->serial);
         g_stat.skipped++;
-        return VK_SUCCESS;
+        return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
     }
     double t = now_ms();
     int spinning = t - fc->last_poll < 2.0;
@@ -1747,7 +1751,7 @@ static VkResult VKAPI_CALL wait_sems(VkDevice dv, const VkSemaphoreWaitInfo *wi,
             for (uint32_t i = 0; i < wi->semaphoreCount; i++)
                 if (need[i]) sem_reached(d, (struct sem *) wi->pSemaphores[i], need[i]);
             g_stat.skipped++;
-            return VK_SUCCESS;
+            return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
         }
     }
     vr_buf b = { 0 };

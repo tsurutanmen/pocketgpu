@@ -165,6 +165,8 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             // 後ろに回ると GPU が使えない。前に戻ったら GPU に戻す
             rpc_bridge_set_background(phase == .background ? 1 : 0)
+            // Vulkan の受け手は、前にいない間（切り替えの途中も含む）は GPU に仕事を出さずに待つ
+            vkr_set_paused(phase == .active ? 0 : 1)
         }
         .onReceive(tick) { _ in
             log = readBridge { rpc_bridge_log($0, $1) }

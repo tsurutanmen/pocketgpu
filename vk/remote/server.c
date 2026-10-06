@@ -15,6 +15,10 @@
 #include <os/log.h>
 #endif
 #include <stdarg.h>
+#include <time.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 // 記録。iPhone ではアプリの中の printf が見えないので os_log に出す（PC から USB で読める）
 static void vlog(const char *fmt, ...) {
@@ -66,7 +70,21 @@ VKFUNCS(DECL)
 #undef DECL
 
 // ---- PC が振った番号 → ここの本物の Vulkan の物 ----
-typedef struct { uint64_t id, h; uint32_t kind; void *map; uint64_t size; } ent;
+// aux：バッファならつないだメモリの番号。list：descriptor set なら中のバッファの番号の並び
+typedef struct { uint64_t *ids; uint32_t n, cap; } idlist;
+typedef struct { uint64_t id, h; uint32_t kind; void *map; uint64_t size; uint64_t aux; idlist *list; } ent;
+
+static void idlist_add(idlist **l, uint64_t id) {
+    if (!*l) *l = calloc(1, sizeof **l);
+    idlist *x = *l;
+    for (uint32_t i = 0; i < x->n; i++) if (x->ids[i] == id) return;
+    if (x->n == x->cap) { x->cap = x->cap ? x->cap * 2 : 8; x->ids = realloc(x->ids, x->cap * sizeof *x->ids); }
+    x->ids[x->n++] = id;
+}
+
+static void idlist_free(idlist **l) {
+    if (*l) { free((*l)->ids); free(*l); *l = NULL; }
+}
 static ent *g_tab;
 static size_t g_cap, g_cnt;
 
@@ -95,7 +113,8 @@ static void put(uint64_t id, uint64_t h, uint32_t kind) {
     size_t s = slot(id);
     while (g_tab[s].id && g_tab[s].id != id) s = (s + 1) & (g_cap - 1);
     if (!g_tab[s].id) g_cnt++;
-    g_tab[s] = (ent) { id, h, kind, NULL, 0 };
+    if (g_tab[s].id == id) idlist_free(&g_tab[s].list);
+    g_tab[s] = (ent) { id, h, kind, NULL, 0, 0, NULL };
 }
 
 static ent *find(uint64_t id) {
@@ -186,10 +205,61 @@ static int vk_init(void) {
 }
 
 // ---- 出した仕事が終わるのを受け手の中で待つ（版 3） ----
+// 待つのは、出した仕事が使っている物を変えるときだけ（その仕事まで待つ）。
+// 関係の無い物を変える命令は待たないので、GPU が計算している間に次の命令を作れる
 static VkDevice g_dev;
-typedef struct { VkFence f; int own; } inflight;
+typedef struct { VkFence f; int own; uint64_t cbs[64]; uint32_t ncb; } inflight;
 static inflight g_fl[256];
 static int g_nfl;
+static VkResult g_err;          // GPU を失ったなど。次に返事をするときに伝える
+static volatile int g_paused;   // アプリが前にいない間は 1（GPU に新しい仕事を出さない）
+
+// アプリから呼ぶ：前にいないときは 1
+void vkr_set_paused(int on) { g_paused = on; }
+
+static double t_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double) c.QuadPart * 1000.0 / (double) f.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double) ts.tv_sec * 1000.0 + (double) ts.tv_nsec / 1e6;
+#endif
+}
+
+static void sleep_ms(int ms) {
+#ifdef _WIN32
+    Sleep((DWORD) ms);
+#else
+    usleep((useconds_t) ms * 1000);
+#endif
+}
+
+// 1 つの接続の間に、どこに時間がかかったか
+static struct { double wait_ms, record_ms, submit_ms, paused_ms; uint64_t waits, records, submits; uint64_t wait_by_op[64]; } g_st;
+static uint32_t g_cur_op; // いま処理している命令（どの命令で GPU を待ったかを数える）
+
+// command buffer ごとに、どの command pool の物か・記録した中でどの descriptor set を使うか
+typedef struct { uint64_t cb, pool; uint64_t *sets; uint32_t n, cap; idlist *mems; } cbinfo;
+static cbinfo *g_cbi;
+static size_t g_ncbi, g_capcbi;
+
+static cbinfo *cbi(uint64_t cb, int create) {
+    for (size_t i = 0; i < g_ncbi; i++) if (g_cbi[i].cb == cb) return &g_cbi[i];
+    if (!create) return NULL;
+    if (g_ncbi == g_capcbi) { g_capcbi = g_capcbi ? g_capcbi * 2 : 64; g_cbi = realloc(g_cbi, g_capcbi * sizeof *g_cbi); }
+    g_cbi[g_ncbi] = (cbinfo) { cb, 0, NULL, 0, 0, NULL };
+    return &g_cbi[g_ncbi++];
+}
+
+static void cbi_add_set(cbinfo *c, uint64_t set) {
+    for (uint32_t i = 0; i < c->n; i++) if (c->sets[i] == set) return;
+    if (c->n == c->cap) { c->cap = c->cap ? c->cap * 2 : 16; c->sets = realloc(c->sets, c->cap * sizeof *c->sets); }
+    c->sets[c->n++] = set;
+}
 static VkFence g_fpool[64]; // 使い回す自前の fence
 static int g_nfpool;
 
@@ -201,24 +271,88 @@ static VkFence own_fence(void) {
     return f;
 }
 
-static void drain(void) {
-    if (!g_nfl || !g_dev) { g_nfl = 0; return; }
+// k 番目までに出した仕事が終わるのを待って、一覧から外す
+static void drain_upto(int k) {
+    if (k < 0 || !g_nfl) return;
+    if (!g_dev) { g_nfl = 0; return; }
+    if (k >= g_nfl) k = g_nfl - 1;
     VkFence fs[256];
-    for (int i = 0; i < g_nfl; i++) fs[i] = g_fl[i].f;
-    VkResult r = vkWaitForFences(g_dev, (uint32_t) g_nfl, fs, VK_TRUE, UINT64_MAX);
-    if (r != VK_SUCCESS) vlog("出した仕事を待てない (%d)", r);
-    for (int i = 0; i < g_nfl; i++) {
+    for (int i = 0; i <= k; i++) fs[i] = g_fl[i].f;
+    double t0 = t_ms();
+    VkResult r = vkWaitForFences(g_dev, (uint32_t) (k + 1), fs, VK_TRUE, UINT64_MAX);
+    g_st.wait_ms += t_ms() - t0;
+    g_st.waits++;
+    if (g_cur_op < 64) g_st.wait_by_op[g_cur_op]++;
+    if (r != VK_SUCCESS) {
+        vlog("出した仕事を待てない (%d)", r);
+        if (r < 0) g_err = r;
+    }
+    for (int i = 0; i <= k; i++) {
         if (!g_fl[i].own) continue;
         vkResetFences(g_dev, 1, &g_fl[i].f);
         if (g_nfpool < 64) g_fpool[g_nfpool++] = g_fl[i].f;
         else vkDestroyFence(g_dev, g_fl[i].f, NULL);
     }
-    g_nfl = 0;
+    memmove(g_fl, g_fl + k + 1, (size_t) (g_nfl - k - 1) * sizeof *g_fl);
+    g_nfl -= k + 1;
+}
+
+static void drain(void) { drain_upto(g_nfl - 1); }
+
+// その物を使う仕事のうち、いちばん後に出したものの番号（無ければ -1）
+static int last_with_cb(uint64_t cb) {
+    for (int i = g_nfl - 1; i >= 0; i--)
+        for (uint32_t k = 0; k < g_fl[i].ncb; k++) if (g_fl[i].cbs[k] == cb) return i;
+    return -1;
+}
+
+static int last_with_pool(uint64_t pool) {
+    for (int i = g_nfl - 1; i >= 0; i--)
+        for (uint32_t k = 0; k < g_fl[i].ncb; k++) {
+            cbinfo *c = cbi(g_fl[i].cbs[k], 0);
+            if (c && c->pool == pool) return i;
+        }
+    return -1;
+}
+
+static int last_with_set(uint64_t set) {
+    for (int i = g_nfl - 1; i >= 0; i--)
+        for (uint32_t k = 0; k < g_fl[i].ncb; k++) {
+            cbinfo *c = cbi(g_fl[i].cbs[k], 0);
+            if (!c) continue;
+            for (uint32_t j = 0; j < c->n; j++) if (c->sets[j] == set) return i;
+        }
+    return -1;
+}
+
+static int last_with_mem(uint64_t mem) {
+    for (int i = g_nfl - 1; i >= 0; i--)
+        for (uint32_t k = 0; k < g_fl[i].ncb; k++) {
+            cbinfo *c = cbi(g_fl[i].cbs[k], 0);
+            if (!c || !c->mems) continue;
+            for (uint32_t j = 0; j < c->mems->n; j++) if (c->mems->ids[j] == mem) return i;
+        }
+    return -1;
+}
+
+// バッファの番号 → それがつながっているメモリを、記録の「使うメモリ」に足す
+static void use_buffer(cbinfo *ci, uint64_t buf) {
+    if (!ci) return;
+    ent *e = find(buf);
+    if (e && e->aux) idlist_add(&ci->mems, e->aux);
+}
+
+static int last_with_fence(VkFence f) {
+    for (int i = g_nfl - 1; i >= 0; i--) if (g_fl[i].f == f) return i;
+    return -1;
 }
 
 // ---- 1 つの接続の間に作った物を、切れたときに片づける ----
 static void cleanup(void) {
     drain();
+    for (size_t i = 0; i < g_ncbi; i++) { free(g_cbi[i].sets); idlist_free(&g_cbi[i].mems); }
+    g_ncbi = 0;
+    g_err = VK_SUCCESS;
     if (g_dev) {
         for (int i = 0; i < g_nfpool; i++) vkDestroyFence(g_dev, g_fpool[i], NULL);
     }
@@ -249,6 +383,7 @@ static void cleanup(void) {
             }
         vkDestroyDevice(dev, NULL);
     }
+    for (size_t i = 0; i < g_cap; i++) if (g_tab[i].id) idlist_free(&g_tab[i].list);
     free(g_tab);
     g_tab = NULL;
     g_cap = g_cnt = 0;
@@ -280,7 +415,7 @@ static void *build_chain(vr_rd *r, uint32_t count, void **blocks, uint32_t *size
 }
 
 // ---- command buffer に積まれた命令を実行する ----
-static void replay(VkCommandBuffer cb, vr_rd *r) {
+static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
     while (r->at < r->n && !r->bad) {
         uint32_t op = vr_ru32(r);
         switch (op) {
@@ -294,7 +429,15 @@ static void replay(VkCommandBuffer cb, vr_rd *r) {
             VkPipelineLayout pl = OBJ(VkPipelineLayout, vr_ru64(r));
             uint32_t first = vr_ru32(r), n = vr_ru32(r);
             VkDescriptorSet sets[32];
-            for (uint32_t i = 0; i < n && i < 32; i++) sets[i] = OBJ(VkDescriptorSet, vr_ru64(r));
+            for (uint32_t i = 0; i < n && i < 32; i++) {
+                uint64_t sid = vr_ru64(r);
+                sets[i] = OBJ(VkDescriptorSet, sid);
+                if (ci) {
+                    cbi_add_set(ci, sid);
+                    ent *se = find(sid);
+                    if (se && se->list) for (uint32_t k = 0; k < se->list->n; k++) use_buffer(ci, se->list->ids[k]);
+                }
+            }
             uint32_t nd = vr_ru32(r);
             uint32_t dyn[64];
             for (uint32_t i = 0; i < nd && i < 64; i++) dyn[i] = vr_ru32(r);
@@ -315,11 +458,16 @@ static void replay(VkCommandBuffer cb, vr_rd *r) {
             vkCmdDispatchBase(cb, a, b, c, x, y, z);
         } break;
         case VR_CMD_DISPATCH_INDIRECT: {
-            VkBuffer b = OBJ(VkBuffer, vr_ru64(r));
+            uint64_t bid = vr_ru64(r);
+            use_buffer(ci, bid);
+            VkBuffer b = OBJ(VkBuffer, bid);
             vkCmdDispatchIndirect(cb, b, vr_ru64(r));
         } break;
         case VR_CMD_COPY_BUFFER: {
-            VkBuffer src = OBJ(VkBuffer, vr_ru64(r)), dst = OBJ(VkBuffer, vr_ru64(r));
+            uint64_t sid = vr_ru64(r), did = vr_ru64(r);
+            use_buffer(ci, sid);
+            use_buffer(ci, did);
+            VkBuffer src = OBJ(VkBuffer, sid), dst = OBJ(VkBuffer, did);
             uint32_t n = vr_ru32(r);
             VkBufferCopy *rg = malloc(sizeof *rg * (n ? n : 1));
             for (uint32_t i = 0; i < n; i++) { rg[i].srcOffset = vr_ru64(r); rg[i].dstOffset = vr_ru64(r); rg[i].size = vr_ru64(r); }
@@ -327,12 +475,16 @@ static void replay(VkCommandBuffer cb, vr_rd *r) {
             free(rg);
         } break;
         case VR_CMD_FILL_BUFFER: {
-            VkBuffer b = OBJ(VkBuffer, vr_ru64(r));
+            uint64_t bid = vr_ru64(r);
+            use_buffer(ci, bid);
+            VkBuffer b = OBJ(VkBuffer, bid);
             uint64_t off = vr_ru64(r), sz = vr_ru64(r);
             vkCmdFillBuffer(cb, b, off, sz, vr_ru32(r));
         } break;
         case VR_CMD_UPDATE_BUFFER: {
-            VkBuffer b = OBJ(VkBuffer, vr_ru64(r));
+            uint64_t bid = vr_ru64(r);
+            use_buffer(ci, bid);
+            VkBuffer b = OBJ(VkBuffer, bid);
             uint64_t off = vr_ru64(r);
             uint32_t sz;
             const void *d = vr_rbytes(r, &sz);
@@ -366,11 +518,13 @@ static void replay(VkCommandBuffer cb, vr_rd *r) {
 
 // ---- 1 つの命令を実行する。返事が要るものは reply する ----
 static int handle(vr_sock s, uint32_t op, vr_rd *r) {
+    g_cur_op = op;
     // 出した仕事が使っているかもしれない物を変える・調べる命令の前に、出した仕事が全部終わるのを待つ
     switch (op) {
-    case VR_MEM_WRITE: case VR_MEM_READ: case VR_RESET_FENCES: case VR_GET_FENCE_STATUS: case VR_GET_SEMAPHORE_COUNTER:
-    case VR_RECORD_COMMAND_BUFFER: case VR_RESET_COMMAND_BUFFER: case VR_RESET_COMMAND_POOL: case VR_FREE_COMMAND_BUFFERS:
-    case VR_DESTROY_COMMAND_POOL: case VR_UPDATE_DESCRIPTOR_SETS: case VR_RESET_DESCRIPTOR_POOL: case VR_FREE_DESCRIPTOR_SETS:
+    // （command buffer の記録し直し・command pool の reset・descriptor の書き換え・fence の reset は、
+    //   それを使う仕事までしか待たない。それぞれの命令の中で待つ）
+    case VR_GET_FENCE_STATUS: case VR_GET_SEMAPHORE_COUNTER: case VR_FREE_COMMAND_BUFFERS:
+    case VR_DESTROY_COMMAND_POOL: case VR_RESET_DESCRIPTOR_POOL: case VR_FREE_DESCRIPTOR_SETS:
     case VR_DESTROY_DESCRIPTOR_POOL: case VR_FREE_MEMORY: case VR_DESTROY_BUFFER: case VR_DESTROY_PIPELINE:
     case VR_DESTROY_PIPELINE_LAYOUT: case VR_DESTROY_SHADER_MODULE: case VR_DESTROY_DSL: case VR_DESTROY_FENCE:
     case VR_DESTROY_SEMAPHORE: case VR_DESTROY_DEVICE: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE:
@@ -378,6 +532,16 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         break;
     default:
         break;
+    }
+    // GPU を失っていたら、返事のある命令でそれを伝える（黙って間違った答えを返さない）
+    if (g_err != VK_SUCCESS) {
+        switch (op) {
+        case VR_MEM_READ: case VR_WAIT_FOR_FENCES: case VR_GET_FENCE_STATUS: case VR_WAIT_SEMAPHORES:
+        case VR_GET_SEMAPHORE_COUNTER: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE:
+            return reply(s, g_err);
+        default:
+            break;
+        }
     }
     switch (op) {
     case VR_PING: return reply(s, 0);
@@ -548,13 +712,18 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     }
     case VR_BIND_BUFFER_MEMORY: {
         VkDevice d = DEV(vr_ru64(r));
-        VkBuffer b = OBJ(VkBuffer, vr_ru64(r));
-        VkDeviceMemory m = OBJ(VkDeviceMemory, vr_ru64(r));
+        uint64_t bid = vr_ru64(r), mid = vr_ru64(r);
+        VkBuffer b = OBJ(VkBuffer, bid);
+        VkDeviceMemory m = OBJ(VkDeviceMemory, mid);
+        ent *be = find(bid);
+        if (be) be->aux = mid;
         vkBindBufferMemory(d, b, m, vr_ru64(r));
         return 1;
     }
     case VR_MEM_WRITE: {
-        ent *e = find(vr_ru64(r));
+        uint64_t mid = vr_ru64(r);
+        drain_upto(last_with_mem(mid));
+        ent *e = find(mid);
         uint64_t off = vr_ru64(r);
         uint32_t n;
         const void *d = vr_rbytes(r, &n);
@@ -563,7 +732,10 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         return 1;
     }
     case VR_MEM_READ: {
-        ent *e = find(vr_ru64(r));
+        uint64_t mid = vr_ru64(r);
+        drain_upto(last_with_mem(mid));
+        if (g_err != VK_SUCCESS) return reply(s, g_err);
+        ent *e = find(mid);
         uint64_t off = vr_ru64(r), n = vr_ru64(r);
         if (!e || !e->map || off > e->size || n > e->size - off) return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
         vr_put(&g_out, (uint8_t *) e->map + off, (size_t) n);
@@ -724,13 +896,22 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t nw = vr_ru32(r);
         for (uint32_t i = 0; i < nw; i++) {
             VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-            w.dstSet = OBJ(VkDescriptorSet, vr_ru64(r));
+            uint64_t sid = vr_ru64(r);
+            drain_upto(last_with_set(sid));
+            w.dstSet = OBJ(VkDescriptorSet, sid);
             w.dstBinding = vr_ru32(r);
             w.dstArrayElement = vr_ru32(r);
             w.descriptorType = (VkDescriptorType) vr_ru32(r);
             w.descriptorCount = vr_ru32(r);
             VkDescriptorBufferInfo *bi = calloc(w.descriptorCount ? w.descriptorCount : 1, sizeof *bi);
-            for (uint32_t k = 0; k < w.descriptorCount; k++) { bi[k].buffer = OBJ(VkBuffer, vr_ru64(r)); bi[k].offset = vr_ru64(r); bi[k].range = vr_ru64(r); }
+            ent *se = find(sid);
+            for (uint32_t k = 0; k < w.descriptorCount; k++) {
+                uint64_t bid = vr_ru64(r);
+                bi[k].buffer = OBJ(VkBuffer, bid);
+                bi[k].offset = vr_ru64(r);
+                bi[k].range = vr_ru64(r);
+                if (se) idlist_add(&se->list, bid);
+            }
             w.pBufferInfo = bi;
             vkUpdateDescriptorSets(d, 1, &w, 0, NULL);
             free(bi);
@@ -756,18 +937,26 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     }
     case VR_RESET_COMMAND_POOL: {
         VkDevice d = DEV(vr_ru64(r));
-        vkResetCommandPool(d, OBJ(VkCommandPool, vr_ru64(r)), 0);
+        uint64_t pid = vr_ru64(r);
+        drain_upto(last_with_pool(pid));
+        vkResetCommandPool(d, OBJ(VkCommandPool, pid), 0);
         return 1;
     }
     case VR_ALLOC_COMMAND_BUFFERS: {
         VkDevice d = DEV(vr_ru64(r));
-        VkCommandPool pool = OBJ(VkCommandPool, vr_ru64(r));
+        uint64_t pid = vr_ru64(r);
+        VkCommandPool pool = OBJ(VkCommandPool, pid);
         uint32_t level = vr_ru32(r), n = vr_ru32(r);
         for (uint32_t i = 0; i < n; i++) {
             VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = (VkCommandBufferLevel) level, .commandBufferCount = 1 };
             VkCommandBuffer cb;
             uint64_t id = vr_ru64(r);
-            if (vkAllocateCommandBuffers(d, &ai, &cb) == VK_SUCCESS) put(id, (uint64_t) (uintptr_t) cb, K_CB);
+            if (vkAllocateCommandBuffers(d, &ai, &cb) == VK_SUCCESS) {
+                put(id, (uint64_t) (uintptr_t) cb, K_CB);
+                cbinfo *c = cbi(id, 1);
+                c->pool = pid;
+                c->n = 0;
+            }
         }
         return 1;
     }
@@ -784,20 +973,30 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         return 1;
     }
     case VR_RECORD_COMMAND_BUFFER: {
-        VkCommandBuffer cb = (VkCommandBuffer) (uintptr_t) H(vr_ru64(r));
+        uint64_t cid = vr_ru64(r);
+        VkCommandBuffer cb = (VkCommandBuffer) (uintptr_t) H(cid);
         uint32_t flags = vr_ru32(r), n;
         const uint8_t *stream = vr_rbytes(r, &n);
         if (!cb) return 1;
+        drain_upto(last_with_cb(cid));
+        double t0 = t_ms();
         vkResetCommandBuffer(cb, 0);
         VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = flags };
         vkBeginCommandBuffer(cb, &bi);
         vr_rd sr = { stream, n, 0, 0 };
-        replay(cb, &sr);
+        cbinfo *ci = cbi(cid, 1);
+        ci->n = 0;
+        if (ci->mems) ci->mems->n = 0;
+        replay(cb, &sr, ci);
         vkEndCommandBuffer(cb);
+        g_st.record_ms += t_ms() - t0;
+        g_st.records++;
         return 1;
     }
     case VR_RESET_COMMAND_BUFFER: {
-        VkCommandBuffer cb = (VkCommandBuffer) (uintptr_t) H(vr_ru64(r));
+        uint64_t cid = vr_ru64(r);
+        VkCommandBuffer cb = (VkCommandBuffer) (uintptr_t) H(cid);
+        drain_upto(last_with_cb(cid));
         if (cb) vkResetCommandBuffer(cb, 0);
         return 1;
     }
@@ -821,8 +1020,25 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkDevice d = DEV(vr_ru64(r));
         uint32_t n = vr_ru32(r);
         VkFence f[64];
-        for (uint32_t i = 0; i < n && i < 64; i++) f[i] = OBJ(VkFence, vr_ru64(r));
-        if (op == VR_RESET_FENCES) { vkResetFences(d, n, f); return 1; }
+        uint64_t fid[64];
+        for (uint32_t i = 0; i < n && i < 64; i++) { fid[i] = vr_ru64(r); f[i] = OBJ(VkFence, fid[i]); }
+        if (op == VR_RESET_FENCES) {
+            // ドライバはもう「終わった」と答えているので、アプリは待ったつもりで reset してくる。
+            // まだ計算中の仕事に付いている fence は待たずに、その名前を新しい fence に付け替える。
+            // 古い fence は仕事が終わったら自前の物として使い回す
+            for (uint32_t i = 0; i < n && i < 64; i++) {
+                int k = last_with_fence(f[i]);
+                if (k >= 0) {
+                    for (int j = 0; j < g_nfl; j++) if (g_fl[j].f == f[i]) g_fl[j].own = 1;
+                    VkFence nf = own_fence();
+                    if (nf) put(fid[i], (uint64_t) nf, K_FENCE);
+                    else { drain_upto(k); vkResetFences(d, 1, &f[i]); }
+                } else {
+                    vkResetFences(d, 1, &f[i]);
+                }
+            }
+            return 1;
+        }
         uint32_t all = vr_ru32(r);
         uint64_t timeout = vr_ru64(r);
         return reply(s, vkWaitForFences(d, n, f, all, timeout));
@@ -860,6 +1076,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t wv[8][8], sv[8][8];
         VkPipelineStageFlags wst[8][8];
         VkCommandBuffer cbs[8][64];
+        uint64_t cids[64];
+        uint32_t ncid = 0;
         for (uint32_t i = 0; i < ns; i++) {
             si[i] = (VkSubmitInfo) { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &tl[i] };
             tl[i] = (VkTimelineSemaphoreSubmitInfo) { .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
@@ -872,7 +1090,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             tl[i].pWaitSemaphoreValues = wv[i];
             uint32_t nc = vr_ru32(r);
             if (nc > 64) nc = 64;
-            for (uint32_t k = 0; k < nc; k++) cbs[i][k] = (VkCommandBuffer) (uintptr_t) H(vr_ru64(r));
+            for (uint32_t k = 0; k < nc; k++) {
+                uint64_t cid = vr_ru64(r);
+                cbs[i][k] = (VkCommandBuffer) (uintptr_t) H(cid);
+                if (ncid < 64) cids[ncid++] = cid;
+            }
             si[i].commandBufferCount = nc;
             si[i].pCommandBuffers = cbs[i];
             uint32_t nsg = vr_ru32(r);
@@ -887,10 +1109,27 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         int own = 0;
         if (!f) { f = own_fence(); own = 1; }
         if (g_nfl == 256) drain();
-        VkResult res = vkQueueSubmit(q, ns, si, f);
-        if (res == VK_SUCCESS) g_fl[g_nfl++] = (inflight) { f, own };
-        else {
-            vlog("vkQueueSubmit 失敗 (%d)", res);
+        // iPhone のアプリが前にいない間は GPU を使えない。出すと GPU を失うので、前に戻るまで待つ（PC は待たされるだけ）
+        if (g_paused) {
+            vlog("アプリが前にいないので、前に戻るまで GPU に仕事を出さずに待つ");
+            double t0 = t_ms();
+            while (g_paused) sleep_ms(20);
+            g_st.paused_ms += t_ms() - t0;
+            vlog("前に戻ったので続ける");
+        }
+        double t0 = t_ms();
+        VkResult res = g_err ? g_err : vkQueueSubmit(q, ns, si, f);
+        g_st.submit_ms += t_ms() - t0;
+        g_st.submits++;
+        if (res == VK_SUCCESS) {
+            inflight *e = &g_fl[g_nfl++];
+            e->f = f;
+            e->own = own;
+            e->ncb = ncid;
+            memcpy(e->cbs, cids, ncid * sizeof *cids);
+        } else {
+            if (!g_err) vlog("vkQueueSubmit 失敗 (%d)。この接続ではもう GPU を使えない", res);
+            if (res < 0) g_err = res;
             if (own && g_nfpool < 64) g_fpool[g_nfpool++] = f;
         }
         return 1;
@@ -944,6 +1183,18 @@ static void serve_client(vr_sock c) {
         if (!handle(c, h[0], &r)) break;
     }
     free(buf);
+    if (g_st.submits)
+        vlog("この接続：submit %llu 回 %.0f ms・記録 %llu 回 %.0f ms・GPU を待った %llu 回 %.0f ms・後ろで止めた %.0f ms",
+             (unsigned long long) g_st.submits, g_st.submit_ms, (unsigned long long) g_st.records, g_st.record_ms,
+             (unsigned long long) g_st.waits, g_st.wait_ms, g_st.paused_ms);
+    if (g_st.waits) {
+        char line[400];
+        int at = snprintf(line, sizeof line, "GPU を待った命令（命令の番号:回数）");
+        for (int i = 0; i < 64 && at < (int) sizeof line - 16; i++)
+            if (g_st.wait_by_op[i]) at += snprintf(line + at, sizeof line - at, " %d:%llu", i, (unsigned long long) g_st.wait_by_op[i]);
+        vlog("%s", line);
+    }
+    memset(&g_st, 0, sizeof g_st);
     cleanup();
 }
 

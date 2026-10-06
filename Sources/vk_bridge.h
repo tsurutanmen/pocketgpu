@@ -6,6 +6,8 @@ extern "C" {
 
 // 受け手を始める。戻ってこない（アプリを閉じるまで待ち受け続ける）ので、別のスレッドで呼ぶ
 int vkr_serve(const char * host, int port);
+// アプリが前にいないときは 1。その間は GPU に新しい仕事を出さずに待つ（出すと GPU を失う）
+void vkr_set_paused(int on);
 
 #ifdef __cplusplus
 }
