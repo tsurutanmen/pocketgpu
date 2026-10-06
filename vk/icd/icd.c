@@ -3197,30 +3197,20 @@ static void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cbh, VkImage im,
     cb_writes(c, (struct buf *) bb, 0, VK_WHOLE_SIZE);
 }
 
-// BC の中身（CPU から見えるバッファの写し）をほどいて、一時バッファに詰めて並べる。うまくいけば一時バッファを返す
-static VkBuffer bc_unpack(struct cb *c, struct buf *src, VkFormat f, const VkBufferImageCopy *r) {
-    VkDevice dv = (VkDevice) c->d;
-    if (!src || !src->m || !src->m->shadow) { say("BC：CPU から見えないバッファからは写せない（飛ばした）"); return VK_NULL_HANDLE; }
-    VkFormat sub = bc_sub(f);
-    uint32_t tb = texel_bytes(sub), bb = bc_block_bytes(f);
+// BC の写す範囲 1 つを、ほどいたあとの大きさ（ふつうの画素で詰めて並べる）
+static uint64_t bc_region_size(VkFormat f, const VkBufferImageCopy *r) {
+    uint64_t dz = r->imageExtent.depth ? r->imageExtent.depth : 1, layers = r->imageSubresource.layerCount ? r->imageSubresource.layerCount : 1;
+    return (uint64_t) r->imageExtent.width * r->imageExtent.height * dz * layers * texel_bytes(bc_sub(f));
+}
+
+// BC の中身（CPU から見えるバッファの写し）をほどいて、dst に詰めて並べる
+static void bc_decode_region(const struct buf *src, VkFormat f, const VkBufferImageCopy *r, uint8_t *dst) {
+    uint32_t tb = texel_bytes(bc_sub(f)), bb = bc_block_bytes(f);
     uint32_t w = r->imageExtent.width, h = r->imageExtent.height, dz = r->imageExtent.depth ? r->imageExtent.depth : 1;
     uint32_t layers = r->imageSubresource.layerCount ? r->imageSubresource.layerCount : 1;
     uint32_t rowlen = r->bufferRowLength ? r->bufferRowLength : w, imgh = r->bufferImageHeight ? r->bufferImageHeight : h;
     uint32_t bw = (rowlen + 3) / 4, bh = (imgh + 3) / 4;
-    uint64_t slice = (uint64_t) bw * bh * bb, size = (uint64_t) w * h * dz * layers * tb;
-    if (!size) return VK_NULL_HANDLE;
-    VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT };
-    VkBuffer tmp;
-    if (create_buffer(dv, &bc, NULL, &tmp) != VK_SUCCESS) return VK_NULL_HANDLE;
-    VkMemoryRequirements req;
-    buffer_reqs(dv, tmp, &req);
-    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
-                                 .memoryTypeIndex = pick_mem(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
-    VkDeviceMemory mem;
-    if (alloc_memory(dv, &mai, NULL, &mem) != VK_SUCCESS) { destroy_buffer(dv, tmp, NULL); return VK_NULL_HANDLE; }
-    bind_buffer(dv, tmp, mem, 0);
-    uint8_t *dst = NULL;
-    map_memory(dv, mem, 0, VK_WHOLE_SIZE, 0, (void **) &dst);
+    uint64_t slice = (uint64_t) bw * bh * bb;
     const uint8_t *base = src->m->shadow + src->memoff + r->bufferOffset, *end = src->m->shadow + src->m->size;
     uint8_t tile[4 * 4 * 8];
     for (uint32_t ly = 0; ly < layers; ly++)
@@ -3232,12 +3222,27 @@ static VkBuffer bc_unpack(struct cb *c, struct buf *src, VkFormat f, const VkBuf
                     const uint8_t *blk = sl + ((uint64_t) by * bw + bx) * bb;
                     if (blk + bb > end) continue; // アプリの中身が足りない
                     bc_block(f, blk, tile, tb);
-                    for (uint32_t y = 0; y < 4 && by * 4 + y < h; y++) {
-                        uint32_t cw = w - bx * 4 < 4 ? w - bx * 4 : 4;
+                    uint32_t cw = w - bx * 4 < 4 ? w - bx * 4 : 4;
+                    for (uint32_t y = 0; y < 4 && by * 4 + y < h; y++)
                         memcpy(dsl + ((uint64_t) (by * 4 + y) * w + bx * 4) * tb, tile + y * 4 * tb, (size_t) cw * tb);
-                    }
                 }
         }
+}
+
+// ほどいた中身を入れる一時バッファ（CPU から見えるメモリ）。command buffer を記録し直すときに消す
+static VkBuffer bc_tmp(struct cb *c, uint64_t size, uint8_t **ptr) {
+    VkDevice dv = (VkDevice) c->d;
+    VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT };
+    VkBuffer tmp;
+    if (create_buffer(dv, &bc, NULL, &tmp) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkMemoryRequirements req;
+    buffer_reqs(dv, tmp, &req);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
+                                 .memoryTypeIndex = pick_mem(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) };
+    VkDeviceMemory mem;
+    if (alloc_memory(dv, &mai, NULL, &mem) != VK_SUCCESS) { destroy_buffer(dv, tmp, NULL); return VK_NULL_HANDLE; }
+    bind_buffer(dv, tmp, mem, 0);
+    map_memory(dv, mem, 0, VK_WHOLE_SIZE, 0, (void **) ptr);
     struct bctmp *t = calloc(1, sizeof *t);
     t->b = tmp;
     t->m = mem;
@@ -3250,21 +3255,30 @@ static void VKAPI_CALL cmd_copy_buffer_to_image(VkCommandBuffer cbh, VkBuffer bb
     struct cb *c = (struct cb *) cbh;
     struct img *ii = (struct img *) im;
     if (ii && ii->bc) {
-        // 1 つずつほどいて、一時バッファから写す
+        // 全部の範囲をほどいて 1 つの一時バッファに並べ、そこから 1 回で写す（一時バッファを作る往復を 1 回にする）
+        const struct buf *src = (const struct buf *) bb;
+        if (!src || !src->m || !src->m->shadow) { say("BC：CPU から見えないバッファからは写せない（飛ばした）"); return; }
+        VkBufferImageCopy *r2 = malloc((n ? n : 1) * sizeof *r2);
+        uint64_t total = 0;
         for (uint32_t i = 0; i < n; i++) {
-            VkBuffer tmp = bc_unpack(c, (struct buf *) bb, ii->bc, &rg[i]);
-            if (!tmp) continue;
-            VkBufferImageCopy r = rg[i];
-            r.bufferOffset = 0;
-            r.bufferRowLength = r.bufferImageHeight = 0;
+            r2[i] = rg[i];
+            r2[i].bufferOffset = total;
+            r2[i].bufferRowLength = r2[i].bufferImageHeight = 0;
+            total += (bc_region_size(ii->bc, &rg[i]) + 15) & ~(uint64_t) 15;
+        }
+        uint8_t *dst = NULL;
+        VkBuffer tmp = total ? bc_tmp(c, total, &dst) : VK_NULL_HANDLE;
+        if (tmp && dst) {
+            for (uint32_t i = 0; i < n; i++) bc_decode_region(src, ii->bc, &rg[i], dst + r2[i].bufferOffset);
             vr_u32(&c->s, VR_CMD_COPY_BUFFER_TO_IMAGE);
             vr_u64(&c->s, ID(tmp));
             vr_u64(&c->s, ID(im));
             vr_u32(&c->s, fix_layout(l));
-            vr_u32(&c->s, 1);
-            vr_put(&c->s, &r, sizeof r);
+            vr_u32(&c->s, n);
+            vr_put(&c->s, r2, n * sizeof *r2);
             cb_reads(c, (struct buf *) tmp, 0, VK_WHOLE_SIZE);
         }
+        free(r2);
         return;
     }
     vr_u32(&c->s, VR_CMD_COPY_BUFFER_TO_IMAGE);
