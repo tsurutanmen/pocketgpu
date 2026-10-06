@@ -4,9 +4,6 @@ name: d3d11-samples-win
 # 素材（Media）は 318MB あるので、試すサンプルが使う物だけを入れる
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - .github/workflows/d3d11-samples-win.yml
 jobs:
   build:
     runs-on: windows-2022

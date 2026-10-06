@@ -3,10 +3,6 @@ name: build-pc-tools
 # 160 は stable-diffusion.cpp が使う長さ。llama.cpp と whisper.cpp もこれに合わせる
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - patches/whisper_rpc.py
-      - .github/workflows/pc-tools.yml
 env:
   CFLAGS: -DGGML_MAX_NAME=160
   CXXFLAGS: -DGGML_MAX_NAME=160

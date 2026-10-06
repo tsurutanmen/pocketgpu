@@ -3,9 +3,6 @@ name: vk-apps-win
 #   whisper.cpp（文字起こし）・stable-diffusion.cpp（画像生成）・vulkaninfo（問い合わせを一通り）
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - .github/workflows/vk-apps-win.yml
 env:
   VULKAN_VERSION: 1.4.357.0
   CPUFLAGS: -DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON

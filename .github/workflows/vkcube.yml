@@ -2,9 +2,6 @@ name: vkcube-win
 # Vulkan の定番の見本 vkcube（回る立方体）を Windows 用に組む。iPhone の GPU で描いて窓に出す試験に使う（改造しない）
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - .github/workflows/vkcube.yml
 jobs:
   build:
     runs-on: windows-2025

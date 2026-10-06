@@ -1,10 +1,6 @@
 name: build-whisper-win
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - patches/whisper_rpc.py
-      - .github/workflows/whisper-win.yml
 jobs:
   build:
     runs-on: windows-latest

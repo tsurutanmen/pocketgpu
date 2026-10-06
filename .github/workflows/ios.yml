@@ -1,13 +1,5 @@
 name: build-ios
 on:
-  push:
-    paths:
-      - Sources/**
-      - project.yml
-      - patches/ios_memory.py
-      - patches/rpc_no_abort.py
-      - vk/remote/**
-      - .github/workflows/ios.yml
   workflow_dispatch:
     inputs:
       xcode:

@@ -2,12 +2,6 @@ name: vk-shaders
 # 試験用のシェーダーを SPIR-V にして、C から読める形（*_spv.h）にする。PC に glslang を入れずに済ませる
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - vk/tests/*.vert
-      - vk/tests/*.frag
-      - vk/tests/*.comp
-      - .github/workflows/vk-shaders.yml
 jobs:
   build:
     runs-on: ubuntu-latest

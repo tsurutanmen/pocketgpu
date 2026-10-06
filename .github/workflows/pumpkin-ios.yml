@@ -3,13 +3,6 @@ name: pumpkin-ios
 # プラグイン（WebAssembly）は iPhone で使えないので、mc/pumpkin-ios の入口はプラグイン無しで起動する
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - mc/pumpkin-ios/**
-      - mc/patch_nix_ios.py
-      - mc/patch_num_threads_ios.py
-      - mc/patch_sysinfo_ios.py
-      - .github/workflows/pumpkin-ios.yml
 jobs:
   build:
     runs-on: macos-15

@@ -4,9 +4,6 @@ name: dxvk-macos
 # DirectX のアプリ → この d3d11.dll・dxgi.dll → Vulkan → iPhone のドライバ → iPhone の GPU、とつなぐため
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - .github/workflows/dxvk-macos.yml
 jobs:
   build:
     runs-on: ubuntu-24.04

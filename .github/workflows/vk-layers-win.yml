@@ -3,9 +3,6 @@ name: vk-layers-win
 # PC の代役の受け手に挟んで、ドライバ越しに流れてきた命令の間違いを見つけるため
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - .github/workflows/vk-layers-win.yml
 jobs:
   build:
     runs-on: windows-2025
