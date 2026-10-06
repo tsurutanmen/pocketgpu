@@ -2,9 +2,11 @@
 // 送り方：[u32 長さ][JSON の頼み][u32 長さ][中身のバイト]。返し方：[u32 長さ][JSON の答え]。一つのつなぎで何回でも続けられる
 //   {"op":"hello"}                          → できること・iOS の版・機種
 //   {"op":"ocr","langs":["ja-JP","en-US"]}  → 中身は画像（PNG・JPEG・HEIC）。文字認識（Vision）の結果
+//   {"op":"asr","lang":"ja-JP","ext":"wav"} → 中身は音声のファイル。音声認識（SFSpeechRecognizer）の結果
 //   {"op":"llm",…}・{"op":"llm_status"}     → Apple Intelligence の言葉のモデル（FMBridge.swift・Xcode 26 で組んだときだけ）
 import Foundation
 import Network
+import Speech
 import UIKit
 import Vision
 
@@ -75,7 +77,7 @@ final class AppleFeatures {
             var sys = utsname()
             uname(&sys)
             let model = withUnsafePointer(to: &sys.machine) { $0.withMemoryRebound(to: CChar.self, capacity: 256) { String(cString: $0) } }
-            var features = ["ocr"]
+            var features = ["ocr", "asr"]
             #if canImport(FoundationModels)
             features.append("llm")
             #endif
@@ -84,6 +86,9 @@ final class AppleFeatures {
             return ocr(body, langs: req["langs"] as? [String] ?? ["ja-JP", "en-US"], fast: req["fast"] as? Bool ?? false)
         case "llm", "llm_status":
             return llm(req, statusOnly: op == "llm_status")
+        case "asr":
+            return asr(body, lang: req["lang"] as? String ?? "ja-JP", ext: req["ext"] as? String ?? "wav",
+                       onDevice: req["on_device"] as? Bool ?? true)
         default:
             return ["error": "知らない頼み：\(op)"]
         }
@@ -100,6 +105,45 @@ final class AppleFeatures {
         #else
         return ["error": "この版は Xcode 26 で組んでいないので、Foundation Models が入っていない"]
         #endif
+    }
+
+    // ---- 音声認識（SFSpeechRecognizer） ----
+    // 中身は音声のファイル（wav・m4a など）。一度ファイルに書いてから読ませる。初めてのときは iPhone の画面で許可が要る
+    private func asr(_ data: Data, lang: String, ext: String, onDevice: Bool) -> [String: Any] {
+        let auth = DispatchSemaphore(value: 0)
+        var status = SFSpeechRecognizer.authorizationStatus()
+        if status == .notDetermined {
+            SFSpeechRecognizer.requestAuthorization { s in status = s; auth.signal() }
+            auth.wait()
+        }
+        guard status == .authorized else { return ["error": "音声認識が許可されていない。iPhone の設定で「計算の受け手」の音声認識を許可する"] }
+        guard let rec = SFSpeechRecognizer(locale: Locale(identifier: lang)), rec.isAvailable else { return ["error": "\(lang) の音声認識が使えない"] }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("asr-\(UUID().uuidString).\(ext)")
+        do { try data.write(to: url) } catch { return ["error": "音声を書けない"] }
+        defer { try? FileManager.default.removeItem(at: url) }
+        let req = SFSpeechURLRecognitionRequest(url: url)
+        req.shouldReportPartialResults = false
+        req.requiresOnDeviceRecognition = onDevice && rec.supportsOnDeviceRecognition
+        req.addsPunctuation = true
+        let t0 = Date()
+        let done = DispatchSemaphore(value: 0)
+        var out: [String: Any] = [:]
+        var task: SFSpeechRecognitionTask?
+        task = rec.recognitionTask(with: req) { result, error in
+            if let result, result.isFinal {
+                out = ["text": result.bestTranscription.formattedString]
+                done.signal()
+            } else if let error {
+                if out.isEmpty { out = ["error": "音声認識が失敗：\(error.localizedDescription)"] }
+                done.signal()
+            }
+        }
+        if done.wait(timeout: .now() + 600) == .timedOut { task?.cancel(); out = ["error": "10 分で終わらなかった"] }
+        let ms = Int(Date().timeIntervalSince(t0) * 1000)
+        out["ms"] = ms
+        out["on_device"] = req.requiresOnDeviceRecognition
+        log("音声認識：\(ms) ms・iPhone の中だけ \(req.requiresOnDeviceRecognition)")
+        return out
     }
 
     // ---- 文字認識（Vision の VNRecognizeTextRequest） ----

@@ -16,10 +16,11 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: 計算の受け手
-        CFBundleShortVersionString: "0.7.14"
-        CFBundleVersion: "22"
+        CFBundleShortVersionString: "0.7.15"
+        CFBundleVersion: "23"
         UILaunchScreen: {}
         NSLocalNetworkUsageDescription: PC からの計算の依頼を受け取るために使います
+        NSSpeechRecognitionUsageDescription: PC から送られた音声を文字にするために使います
         UIRequiredDeviceCapabilities: [metal]
         UIBackgroundModes: [audio]
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]

@@ -11,9 +11,9 @@ on:
   workflow_dispatch:
     inputs:
       xcode:
-        description: "使う Xcode の版（例 26.3）。空なら標準の Xcode"
+        description: "使う Xcode の版（例 26.3）"
         required: false
-        default: ""
+        default: "26.3"
 jobs:
   build:
     runs-on: macos-15
@@ -21,11 +21,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Foundation Models（Apple Intelligence）は Xcode 26 で組んだときだけ入る
+      # Foundation Models（Apple Intelligence）は Xcode 26 で組んだときだけ入る。push のときも 26.3 を使う
       - name: Xcode
         run: |
-          ls -d /Applications/Xcode*.app
-          if [ -n "${{ inputs.xcode }}" ]; then sudo xcode-select -s "/Applications/Xcode_${{ inputs.xcode }}.app"; fi
+          X="${{ inputs.xcode }}"
+          [ -n "$X" ] || X=26.3
+          sudo xcode-select -s "/Applications/Xcode_$X.app"
           xcodebuild -version
 
       # Windows 側の llama.cpp と同じ版にそろえる（RPC の取り決めの版が合わないとつながらない）
