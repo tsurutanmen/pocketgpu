@@ -55,7 +55,8 @@ jobs:
         run: |
           set -o pipefail
           cd pumpkin
-          cargo build -p pumpkin-ios --release --target aarch64-apple-ios 2>&1 | grep -E "^(error|warning: unused)|^\s+-->|Finished" | head -60
+          # 直した nix は手元の部品として扱われ、nix 自身の厳しい lint（使われない物は失敗）がかかる。警告に落とす
+          RUSTFLAGS="--cap-lints warn" cargo build -p pumpkin-ios --release --target aarch64-apple-ios 2>&1 | grep -E "^error|^\s+-->|Finished" | head -60
           ls -la target/aarch64-apple-ios/release/
       - name: collect
         run: |
