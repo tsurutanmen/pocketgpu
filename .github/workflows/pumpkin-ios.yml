@@ -7,6 +7,7 @@ on:
     paths:
       - mc/pumpkin-ios/**
       - mc/patch_nix_ios.py
+      - mc/patch_num_threads_ios.py
       - .github/workflows/pumpkin-ios.yml
 jobs:
   build:
@@ -49,7 +50,12 @@ jobs:
           echo "直す nix：$src"
           mkdir -p patched && rm -rf patched/nix && cp -R "$src" patched/nix
           python3 ../mc/patch_nix_ios.py patched/nix
-          printf '\n[patch.crates-io]\nnix = { path = "patched/nix" }\n' >> Cargo.toml
+          # num_threads も iOS で macOS の数え方を使うが、libc に無い。iOS では「数えられない」版を使わせる
+          src2=$(ls -d ~/.cargo/registry/src/*/num_threads-0.1.* | sort -V | tail -1)
+          echo "直す num_threads：$src2"
+          rm -rf patched/num_threads && cp -R "$src2" patched/num_threads
+          python3 ../mc/patch_num_threads_ios.py patched/num_threads
+          printf '\n[patch.crates-io]\nnix = { path = "patched/nix" }\nnum_threads = { path = "patched/num_threads" }\n' >> Cargo.toml
           tail -3 Cargo.toml
       - name: build
         run: |
