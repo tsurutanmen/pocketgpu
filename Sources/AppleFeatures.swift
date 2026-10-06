@@ -88,7 +88,7 @@ final class AppleFeatures {
             return llm(req, statusOnly: op == "llm_status")
         case "asr":
             return asr(body, lang: req["lang"] as? String ?? "ja-JP", ext: req["ext"] as? String ?? "wav",
-                       onDevice: req["on_device"] as? Bool ?? true)
+                       onDevice: req["on_device"] as? Bool ?? true, engine: req["engine"] as? String ?? "new")
         default:
             return ["error": "知らない頼み：\(op)"]
         }
@@ -107,9 +107,10 @@ final class AppleFeatures {
         #endif
     }
 
-    // ---- 音声認識（SFSpeechRecognizer） ----
-    // 中身は音声のファイル（wav・m4a など）。一度ファイルに書いてから読ませる。初めてのときは iPhone の画面で許可が要る
-    private func asr(_ data: Data, lang: String, ext: String, onDevice: Bool) -> [String: Any] {
+    // ---- 音声認識 ----
+    // 中身は音声のファイル（wav・m4a など）。一度ファイルに書いてから読ませる。初めてのときは iPhone の画面で許可が要る。
+    // engine：new は iOS 26 の SpeechAnalyzer（長い音声向け・標準）、legacy は SFSpeechRecognizer
+    private func asr(_ data: Data, lang: String, ext: String, onDevice: Bool, engine: String) -> [String: Any] {
         let auth = DispatchSemaphore(value: 0)
         var status = SFSpeechRecognizer.authorizationStatus()
         if status == .notDetermined {
@@ -117,33 +118,57 @@ final class AppleFeatures {
             auth.wait()
         }
         guard status == .authorized else { return ["error": "音声認識が許可されていない。iPhone の設定で「計算の受け手」の音声認識を許可する"] }
-        guard let rec = SFSpeechRecognizer(locale: Locale(identifier: lang)), rec.isAvailable else { return ["error": "\(lang) の音声認識が使えない"] }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("asr-\(UUID().uuidString).\(ext)")
         do { try data.write(to: url) } catch { return ["error": "音声を書けない"] }
         defer { try? FileManager.default.removeItem(at: url) }
+        let t0 = Date()
+        var out: [String: Any]
+        #if compiler(>=6.2)
+        if engine != "legacy", #available(iOS 26.0, *) {
+            out = SpeechBridge.transcribe(url: url, lang: lang)
+        } else {
+            out = legacyASR(url: url, lang: lang, onDevice: onDevice)
+        }
+        #else
+        out = legacyASR(url: url, lang: lang, onDevice: onDevice)
+        #endif
+        let ms = Int(Date().timeIntervalSince(t0) * 1000)
+        out["ms"] = ms
+        log("音声認識：\(ms) ms・\(out["engine"] as? String ?? "?")")
+        return out
+    }
+
+    // 長い音声は区切られて、区切りごとに確定が届く。全部つないで、仕事が終わるまで待つ
+    private func legacyASR(url: URL, lang: String, onDevice: Bool) -> [String: Any] {
+        guard let rec = SFSpeechRecognizer(locale: Locale(identifier: lang)), rec.isAvailable else { return ["error": "\(lang) の音声認識が使えない"] }
         let req = SFSpeechURLRecognitionRequest(url: url)
         req.shouldReportPartialResults = false
         req.requiresOnDeviceRecognition = onDevice && rec.supportsOnDeviceRecognition
         req.addsPunctuation = true
-        let t0 = Date()
-        let done = DispatchSemaphore(value: 0)
-        var out: [String: Any] = [:]
-        var task: SFSpeechRecognitionTask?
-        task = rec.recognitionTask(with: req) { result, error in
-            if let result, result.isFinal {
-                out = ["text": result.bestTranscription.formattedString]
-                done.signal()
-            } else if let error {
-                if out.isEmpty { out = ["error": "音声認識が失敗：\(error.localizedDescription)"] }
-                done.signal()
-            }
+        let lock = NSLock()
+        var finals: [String] = []
+        var failure: String?
+        var ended = false
+        let task = rec.recognitionTask(with: req) { result, error in
+            lock.lock()
+            defer { lock.unlock() }
+            if let result, result.isFinal { finals.append(result.bestTranscription.formattedString) }
+            if let error, finals.isEmpty { failure = error.localizedDescription }
+            if error != nil { ended = true }
         }
-        if done.wait(timeout: .now() + 600) == .timedOut { task?.cancel(); out = ["error": "10 分で終わらなかった"] }
-        let ms = Int(Date().timeIntervalSince(t0) * 1000)
-        out["ms"] = ms
-        out["on_device"] = req.requiresOnDeviceRecognition
-        log("音声認識：\(ms) ms・iPhone の中だけ \(req.requiresOnDeviceRecognition)")
-        return out
+        let deadline = Date().addingTimeInterval(600)
+        while Date() < deadline {
+            lock.lock()
+            let stop = ended || task.state == .completed || task.state == .canceling
+            lock.unlock()
+            if stop { break }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if task.state == .running || task.state == .starting { task.cancel() }
+        lock.lock()
+        defer { lock.unlock() }
+        if finals.isEmpty, let failure { return ["error": "音声認識が失敗：\(failure)", "engine": "SFSpeechRecognizer"] }
+        return ["text": finals.joined(), "engine": "SFSpeechRecognizer", "on_device": req.requiresOnDeviceRecognition, "segments": finals.count]
     }
 
     // ---- 文字認識（Vision の VNRecognizeTextRequest） ----
