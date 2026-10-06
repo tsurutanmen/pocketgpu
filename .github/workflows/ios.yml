@@ -14,6 +14,10 @@ on:
         description: "使う Xcode の版（例 26.3）"
         required: false
         default: "26.3"
+      minecraft:
+        description: "マイクラのサーバー（Pumpkin・GPL-3.0）を入れる"
+        required: false
+        default: "false"
 jobs:
   build:
     runs-on: macos-15
@@ -66,6 +70,19 @@ jobs:
           tar xf mvk.tar
           ls -la MoltenVK/MoltenVK/static/MoltenVK.xcframework/ios-arm64
 
+      # マイクラのサーバーを入れるときは、pumpkin-ios の自動ビルドの最新の成果物を取ってくる
+      - name: Pumpkin (optional)
+        if: ${{ inputs.minecraft == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh run list -R ${{ github.repository }} --workflow pumpkin-ios.yml --status success --limit 1 --json databaseId -q '.[0].databaseId')
+          gh run download "$id" -R ${{ github.repository }} -n pumpkin-ios -D pumpkin-lib
+          cp pumpkin-lib/libpumpkin_ios.a libs/
+          cat pumpkin-lib/PUMPKIN_COMMIT.txt
+          echo "PUMPKIN_ARGS=PUMPKIN_LDFLAGS=-lpumpkin_ios -framework Security -framework SystemConfiguration" >> $GITHUB_ENV
+          echo "PUMPKIN_SWIFT=PUMPKIN_SWIFT_FLAG=PUMPKIN" >> $GITHUB_ENV
+
       - name: generate Xcode project
         run: brew install xcodegen && xcodegen generate
 
@@ -74,7 +91,7 @@ jobs:
           set -o pipefail
           xcodebuild -project RpcServer.xcodeproj -scheme RpcServer -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath dd \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build | tail -60
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" ${PUMPKIN_ARGS:+"$PUMPKIN_ARGS"} ${PUMPKIN_SWIFT:+"$PUMPKIN_SWIFT"} build | tail -60
           mkdir -p Payload && cp -R dd/Build/Products/Release-iphoneos/RpcServer.app Payload/
           # メモリの上限を上げる許可を付けて仮の署名をしておく（Sideloadly が署名し直すときに引き継ぐ）
           codesign -f -s - --entitlements Sources/RpcServer.entitlements Payload/RpcServer.app

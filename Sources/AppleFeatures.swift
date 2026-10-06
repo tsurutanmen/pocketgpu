@@ -31,7 +31,7 @@ final class AppleFeatures {
         log("Apple の機能の受け口：127.0.0.1:\(port) で待っている")
     }
 
-    private func log(_ s: String) { s.withCString { rpc_bridge_log_line($0) } }
+    private func log(_ s: String) { (s + "\n").withCString { rpc_bridge_log_line($0) } }
 
     private func serve(_ c: NWConnection) {
         c.start(queue: queue)

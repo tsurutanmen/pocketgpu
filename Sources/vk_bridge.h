@@ -10,6 +10,8 @@ int vkr_serve(const char * host, int port);
 void vkr_set_paused(int on);
 // USB の通り道の速さを測る受け口（vk/remote/bw.c）。戻ってこないので別のスレッドで呼ぶ
 int vkr_bw_serve(const char * host, int port);
+// マイクラのサーバー（mc/pumpkin-ios・Pumpkin・GPL-3.0）。PUMPKIN を付けて組んだときだけ入っている。止まるまで戻らない
+int pumpkin_ios_run(const char * dir);
 
 #ifdef __cplusplus
 }

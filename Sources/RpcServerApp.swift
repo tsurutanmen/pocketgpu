@@ -119,6 +119,7 @@ struct ContentView: View {
     @State private var onCPU = false
     @State private var vkStarted = false
     @State private var vkFailed = false
+    @State private var mcRunning = false
     @Environment(\.scenePhase) private var scenePhase
     private let usbHost = "127.0.0.1"
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -164,6 +165,19 @@ struct ContentView: View {
                         Text("Vulkan：USB の 50060 番で待ち受け中").font(.footnote.monospaced()).textSelection(.enabled)
                     }
                 }
+                #if PUMPKIN
+                Section {
+                    Button(mcRunning ? "動いている（止めるときはアプリを閉じる）" : "マイクラのサーバーを始める") {
+                        MinecraftServer.shared.start()
+                        mcRunning = true
+                    }
+                    .disabled(mcRunning)
+                    if mcRunning, let wifi = addrs.first(where: { $0.name == "en0" })?.ip {
+                        Text("Java 版：\(wifi):25565（同じ Wi-Fi から）").font(.footnote.monospaced()).textSelection(.enabled)
+                    }
+                    Text("中身は Pumpkin（GPL-3.0）。世界は書類の minecraft/ に置く").font(.footnote)
+                } header: { Text("マイクラのサーバー") }
+                #endif
                 Section("記録") {
                     Text(log).font(.caption2.monospaced()).textSelection(.enabled)
                 }
