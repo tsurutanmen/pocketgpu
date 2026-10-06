@@ -262,6 +262,44 @@ typedef struct { uint64_t cb, pool; uint64_t *sets; uint32_t n, cap; idlist *mem
 static cbinfo *g_cbi;
 static size_t g_ncbi, g_capcbi;
 
+// ---- 調べ用（VKR_SYNC=1）：submit ごとに GPU を待ち、GPU を失ったら、その submit で流した命令を書き出す ----
+static int g_dbg = -1;
+static int dbg_on(void) {
+    if (g_dbg < 0) { const char *e = getenv("VKR_SYNC"); g_dbg = e && *e == '1'; }
+    return g_dbg;
+}
+typedef struct { uint64_t cb; vr_buf t; } dbg_trace;
+static dbg_trace *g_tr;
+static size_t g_ntr;
+static vr_buf *trace_of(uint64_t cb) {
+    for (size_t i = 0; i < g_ntr; i++) if (g_tr[i].cb == cb) return &g_tr[i].t;
+    g_tr = realloc(g_tr, (g_ntr + 1) * sizeof *g_tr);
+    g_tr[g_ntr] = (dbg_trace) { cb, { 0 } };
+    return &g_tr[g_ntr++].t;
+}
+static void tracef(cbinfo *ci, const char *fmt, ...) {
+    if (!ci || !dbg_on()) return;
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n >= (int) sizeof line) n = sizeof line - 1;
+    vr_buf *t = trace_of(ci->cb);
+    if (t->n < (4u << 20)) { vr_put(t, line, (size_t) n); vr_put(t, "\n", 1); }
+}
+// descriptor set ごとに、最後に書いた中身（何番に・どのバッファの・どこから・どれだけ）
+typedef struct { uint64_t set; vr_buf t; } dbg_set;
+static dbg_set *g_dset;
+static size_t g_ndset;
+static vr_buf *dset_of(uint64_t set) {
+    for (size_t i = 0; i < g_ndset; i++) if (g_dset[i].set == set) return &g_dset[i].t;
+    g_dset = realloc(g_dset, (g_ndset + 1) * sizeof *g_dset);
+    g_dset[g_ndset] = (dbg_set) { set, { 0 } };
+    return &g_dset[g_ndset++].t;
+}
+
 static cbinfo *cbi(uint64_t cb, int create) {
     for (size_t i = 0; i < g_ncbi; i++) if (g_cbi[i].cb == cb) return &g_cbi[i];
     if (!create) return NULL;
@@ -446,7 +484,9 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
         switch (op) {
         case VR_CMD_BIND_PIPELINE: {
             uint32_t bp = vr_ru32(r);
-            VkPipeline pl = OBJ(VkPipeline, vr_ru64(r));
+            uint64_t pid = vr_ru64(r);
+            VkPipeline pl = OBJ(VkPipeline, pid);
+            tracef(ci, "  pipeline %llu%s", (unsigned long long) pid, pl ? "" : "（無い）");
             if (pl) vkCmdBindPipeline(cb, (VkPipelineBindPoint) bp, pl);
         } break;
         case VR_CMD_BIND_DESCRIPTOR_SETS: {
@@ -457,6 +497,10 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             for (uint32_t i = 0; i < n && i < 32; i++) {
                 uint64_t sid = vr_ru64(r);
                 sets[i] = OBJ(VkDescriptorSet, sid);
+                if (dbg_on() && ci) {
+                    vr_buf *d = dset_of(sid);
+                    tracef(ci, "  set %llu%s：%.*s", (unsigned long long) sid, sets[i] ? "" : "（無い）", (int) d->n, d->p ? (const char *) d->p : "");
+                }
                 if (ci) {
                     cbi_add_set(ci, sid);
                     ent *se = find(sid);
@@ -472,10 +516,16 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             VkPipelineLayout pl = OBJ(VkPipelineLayout, vr_ru64(r));
             uint32_t st = vr_ru32(r), off = vr_ru32(r), sz;
             const void *d = vr_rbytes(r, &sz);
+            if (dbg_on() && d) {
+                char h[200] = "";
+                for (uint32_t i = 0; i < sz / 4 && i < 24; i++) snprintf(h + strlen(h), sizeof h - strlen(h), " %u", ((const uint32_t *) d)[i]);
+                tracef(ci, "  push %u バイト:%s", sz, h);
+            }
             if (d) vkCmdPushConstants(cb, pl, st, off, sz, d);
         } break;
         case VR_CMD_DISPATCH: {
             uint32_t x = vr_ru32(r), y = vr_ru32(r), z = vr_ru32(r);
+            tracef(ci, "  dispatch %u %u %u", x, y, z);
             vkCmdDispatch(cb, x, y, z);
         } break;
         case VR_CMD_DISPATCH_BASE: {
@@ -496,6 +546,13 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             uint32_t n = vr_ru32(r);
             VkBufferCopy *rg = malloc(sizeof *rg * (n ? n : 1));
             for (uint32_t i = 0; i < n; i++) { rg[i].srcOffset = vr_ru64(r); rg[i].dstOffset = vr_ru64(r); rg[i].size = vr_ru64(r); }
+            if (dbg_on()) {
+                ent *se = find(sid), *de = find(did);
+                for (uint32_t i = 0; i < n && i < 4; i++)
+                    tracef(ci, "  copy buffer %llu（%llu バイト）+%llu → %llu（%llu バイト）+%llu・%llu バイト", (unsigned long long) sid,
+                           (unsigned long long) (se ? se->size : 0), (unsigned long long) rg[i].srcOffset, (unsigned long long) did,
+                           (unsigned long long) (de ? de->size : 0), (unsigned long long) rg[i].dstOffset, (unsigned long long) rg[i].size);
+            }
             vkCmdCopyBuffer(cb, src, dst, n, rg);
             free(rg);
         } break;
@@ -504,6 +561,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             use_buffer(ci, bid);
             VkBuffer b = OBJ(VkBuffer, bid);
             uint64_t off = vr_ru64(r), sz = vr_ru64(r);
+            tracef(ci, "  fill buffer %llu +%llu・%llu バイト", (unsigned long long) bid, (unsigned long long) off, (unsigned long long) sz);
             vkCmdFillBuffer(cb, b, off, sz, vr_ru32(r));
         } break;
         case VR_CMD_UPDATE_BUFFER: {
@@ -706,6 +764,20 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
 // ---- 1 つの命令を実行する。返事が要るものは reply する ----
 static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     g_cur_op = op;
+    // 調べ用：VKR_DRAIN=命令の番号,… なら、その命令の前は出した仕事を全部待つ
+    static int drain_ops_ready;
+    static unsigned char drain_ops[256];
+    if (!drain_ops_ready) {
+        drain_ops_ready = 1;
+        const char *e = getenv("VKR_DRAIN");
+        for (const char *q = e; q && *q; q++) {
+            int n = atoi(q);
+            if (n > 0 && n < 256) drain_ops[n] = 1;
+            while (*q && *q != ',') q++;
+            if (!*q) break;
+        }
+    }
+    if (op < 256 && drain_ops[op]) drain();
     // 出した仕事が使っているかもしれない物を変える・調べる命令の前に、出した仕事が全部終わるのを待つ
     switch (op) {
     // （command buffer の記録し直し・command pool の reset・descriptor の書き換え・fence の reset は、
@@ -1146,9 +1218,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_UPDATE_DESCRIPTOR_SETS: {
         VkDevice d = DEV(vr_ru64(r));
         uint32_t nw = vr_ru32(r);
+        uint64_t dbg_prev = 0;
         for (uint32_t i = 0; i < nw; i++) {
             VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
             uint64_t sid = vr_ru64(r);
+            if (dbg_on() && sid != dbg_prev) { dset_of(sid)->n = 0; dbg_prev = sid; }
             drain_upto(last_with_set(sid));
             w.dstSet = OBJ(VkDescriptorSet, sid);
             w.dstBinding = vr_ru32(r);
@@ -1180,6 +1254,14 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 bi[k].offset = vr_ru64(r);
                 bi[k].range = vr_ru64(r);
                 if (se) idlist_add(&se->list, bid);
+                if (dbg_on()) {
+                    ent *be = find(bid);
+                    char t[160];
+                    int tn = snprintf(t, sizeof t, " b%u=%llu（%llu）+%llu/%lld", w.dstBinding + k, (unsigned long long) bid,
+                                      (unsigned long long) (be ? be->size : 0), (unsigned long long) bi[k].offset,
+                                      bi[k].range == VK_WHOLE_SIZE ? -1LL : (long long) bi[k].range);
+                    vr_put(dset_of(sid), t, (size_t) tn);
+                }
             }
             w.pBufferInfo = bi;
             vkUpdateDescriptorSets(d, 1, &w, 0, NULL);
@@ -1250,6 +1332,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         drain_upto(last_with_cb(cid));
         double t0 = t_ms();
         vkResetCommandBuffer(cb, 0);
+        if (dbg_on()) trace_of(cid)->n = 0;
         VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = flags };
         vkBeginCommandBuffer(cb, &bi);
         vr_rd sr = { stream, n, 0, 0 };
@@ -1390,6 +1473,19 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkResult res = g_err ? g_err : vkQueueSubmit(q, ns, si, f);
         g_st.submit_ms += t_ms() - t0;
         g_st.submits++;
+        if (dbg_on() && res == VK_SUCCESS) {
+            VkResult w = vkQueueWaitIdle(q);
+            if (w != VK_SUCCESS) {
+                vlog("submit %llu で GPU を失った (%d)。command buffer %u 本", (unsigned long long) g_st.submits, w, ncid);
+                for (uint32_t k = 0; k < ncid; k++) {
+                    vr_buf *t = trace_of(cids[k]);
+                    printf("-- command buffer %llu\n%.*s", (unsigned long long) cids[k], (int) t->n, t->p ? (const char *) t->p : "");
+                }
+                fflush(stdout);
+                res = w;
+                g_err = w;
+            }
+        }
         if (res == VK_SUCCESS) {
             inflight *e = &g_fl[g_nfl++];
             e->f = f;
