@@ -4,7 +4,12 @@ import os
 
 @main
 struct RpcServerApp: App {
-    init() { rpc_bridge_init() }
+    init() {
+        rpc_bridge_init()
+        // 記録を PC から読めるようにする（USB の 50059 番。PC は app/pc/iphone_applog.py）
+        let t = Thread { rpc_bridge_serve_log(50059) }
+        t.start()
+    }
     var body: some Scene { WindowGroup { ContentView() } }
 }
 
@@ -102,6 +107,7 @@ struct ContentView: View {
     @AppStorage("keepAlive") private var keepAlive = true
     @State private var onCPU = false
     @State private var vkStarted = false
+    @State private var vkFailed = false
     @Environment(\.scenePhase) private var scenePhase
     private let usbHost = "127.0.0.1"
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -140,8 +146,10 @@ struct ContentView: View {
                     if started.contains(usbHost) {
                         Text("USB：usb_forward.py のあと --rpc 127.0.0.1:50053").font(.footnote.monospaced()).textSelection(.enabled)
                     }
-                    if vkStarted {
-                        Text("Vulkan：USB の 50060 番（PC は usb_forward.py --local 50061 --remote 50060）").font(.footnote.monospaced()).textSelection(.enabled)
+                    if vkFailed {
+                        Text("Vulkan：起動に失敗（下の記録の vk: を見る）").font(.footnote)
+                    } else if vkStarted {
+                        Text("Vulkan：USB の 50060 番で待ち受け中").font(.footnote.monospaced()).textSelection(.enabled)
                     }
                 }
                 Section("記録") {
@@ -189,7 +197,11 @@ struct ContentView: View {
         // Vulkan の受け手は USB（iPhone の中の 127.0.0.1）だけで待つ。命令をそのまま GPU に流すので、Wi-Fi には出さない
         if h == usbHost && !vkStarted {
             vkStarted = true
-            let v = Thread { _ = vkr_serve("127.0.0.1", 50060) }
+            let v = Thread {
+                // 待ち受けている間は戻ってこない。戻ってきたら起動に失敗した
+                _ = vkr_serve("127.0.0.1", 50060)
+                DispatchQueue.main.async { vkFailed = true }
+            }
             v.stackSize = 8 << 20
             v.start()
         }

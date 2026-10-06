@@ -25,6 +25,11 @@ static void vlog(const char *fmt, ...) {
     va_end(ap);
 #ifdef __APPLE__
     os_log(OS_LOG_DEFAULT, "vk: %{public}s", line);
+    // アプリの記録にも足す（PC から USB の 50059 番で読める。os_log は USB の記録の中継に出てこない）
+    extern void rpc_bridge_log_line(const char *text);
+    char with_nl[520];
+    snprintf(with_nl, sizeof with_nl, "vk: %s\n", line);
+    rpc_bridge_log_line(with_nl);
 #else
     fputs(line, stdout);
     fputc('\n', stdout);
@@ -141,20 +146,28 @@ static int vk_init(void) {
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "iphone-rpc-vk", .apiVersion = VK_API_VERSION_1_2 };
     const char *ext[] = { "VK_KHR_portability_enumeration" };
     VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
-#ifndef _WIN32
-    ci.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-    ci.enabledExtensionCount = 1;
-    ci.ppEnabledExtensionNames = ext;
-#else
-    (void) ext;
-#endif
-    if (vkCreateInstance(&ci, NULL, &g_inst) != VK_SUCCESS) return 0;
+    // portability_enumeration は Vulkan のローダーが持つ拡張。iPhone のように MoltenVK を直接つなぐと無いので、
+    // あるときだけ有効にする（無いのに頼むと vkCreateInstance が失敗する）
+    PFN_vkEnumerateInstanceExtensionProperties enum_ext = (PFN_vkEnumerateInstanceExtensionProperties) gipa(NULL, "vkEnumerateInstanceExtensionProperties");
+    uint32_t nie = 0;
+    if (enum_ext) enum_ext(NULL, &nie, NULL);
+    VkExtensionProperties *ie = calloc(nie ? nie : 1, sizeof *ie);
+    if (enum_ext) enum_ext(NULL, &nie, ie);
+    for (uint32_t i = 0; i < nie; i++)
+        if (!strcmp(ie[i].extensionName, "VK_KHR_portability_enumeration")) {
+            ci.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+            ci.enabledExtensionCount = 1;
+            ci.ppEnabledExtensionNames = ext;
+        }
+    free(ie);
+    VkResult ir = vkCreateInstance(&ci, NULL, &g_inst);
+    if (ir != VK_SUCCESS) { vlog("vkCreateInstance が失敗 (%d)", ir); return 0; }
 #define LOAD(n) n = (PFN_##n) gipa(g_inst, #n);
     VKFUNCS(LOAD)
 #undef LOAD
     uint32_t n = 1;
     VkResult r = vkEnumeratePhysicalDevices(g_inst, &n, &g_pd);
-    if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || n == 0) return 0;
+    if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || n == 0) { vlog("GPU が見つからない (%d, %u 台)", r, n); return 0; }
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_pd, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);

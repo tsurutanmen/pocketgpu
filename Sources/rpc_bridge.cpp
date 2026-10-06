@@ -6,6 +6,10 @@
 #include "ggml-rpc.h"
 
 #include <os/log.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstring>
@@ -34,6 +38,45 @@ static int copy_out(const std::string & s, char * buf, int len) {
 
 extern "C" void rpc_bridge_init(void) {
     ggml_log_set(on_log, nullptr);
+}
+
+// Vulkan の受け手（vk/remote/server.c）も、ここに記録を足す
+extern "C" void rpc_bridge_log_line(const char * text) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_log += text;
+    if (g_log.size() > 24000) g_log.erase(0, g_log.size() - 16000);
+}
+
+// 記録を PC から読めるようにする。つながったら、ためた記録を全部書いて切る。
+// USB（iPhone の中の 127.0.0.1）だけで待つ。戻ってこないので別のスレッドで呼ぶ
+extern "C" void rpc_bridge_serve_log(int port) {
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t) port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(ls, (sockaddr *) &a, sizeof a) != 0 || listen(ls, 4) != 0) {
+        close(ls);
+        return;
+    }
+    for (;;) {
+        int c = accept(ls, nullptr, nullptr);
+        if (c < 0) continue;
+        setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+        std::string copy;
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            copy = g_log;
+        }
+        for (size_t at = 0; at < copy.size();) {
+            ssize_t k = send(c, copy.data() + at, copy.size() - at, 0);
+            if (k <= 0) break;
+            at += (size_t) k;
+        }
+        close(c);
+    }
 }
 
 extern "C" int rpc_bridge_log(char * buf, int len) {
