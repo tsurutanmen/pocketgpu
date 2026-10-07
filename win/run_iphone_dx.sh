@@ -3,6 +3,7 @@
 #   win/run_iphone_dx.sh [版の名前]
 #   1. 装置の拡張と、BC を読めるか  2. Vulkan の三角形と足し算  3. vkcube：JPEG の先送りあり・なし
 #   4. DirectX 11 の三角形と立方体（BC1 も）  5. DirectX のサンプル（BC は GPU が読めなければドライバがほどく）
+#   6〜8b. DXVK 3・入門・機能 29 場面  9. 本物のゲーム  10. DirectX 12  11. OpenGL（zink）  12. 窓の絵を H.264 で  13. 受け手の記録
 V=${1:-v0723}
 VKB=/d/iphone-rpc/vkbuild
 OUT=$VKB/iphone_runs/$V
@@ -117,3 +118,53 @@ done
 for f in tri tri13 d3d11tri d3d11cube_plain d3d11cube_bc1; do
     [ -f "$OUT/$f.ppm" ] && python -X utf8 /d/iphone-rpc/app/vk/tools/ppm2png.py "$OUT/$f.ppm" "$OUT/$f.png" > /dev/null
 done
+
+echo "== 8b. DirectX 11 の機能 29 場面（新しい DXVK 3.1.1）"
+echo "（10/7 夜の iPhone は vfmt だけ 24.2dB：divisor 0 と開始インスタンス 2 の段が描かれない。ふりは同じ）"
+D3=$VKB/d3d11_dx3
+mkdir -p "$D3" "$OUT/feat_dx3"
+cp -f "$FT" "$D3/" && cp -f "$VKB/dxvk3/d3d11.dll" "$VKB/dxvk3/dxgi.dll" "$D3/"
+for sc in $("$FT" list | tr -d '\r'); do
+    (cd "$D3" && IPHONE_VK_DXVK3=1 DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=none IPHONE_VK_LOG=1 \
+        run 120 "$(cygpath -m "$D3/feat.exe")" "$sc" "$(cygpath -w "$OUT/feat_dx3/$sc.ppm")") > "$OUT/feat_dx3/$sc.txt" 2>&1
+    if [ -s "$OUT/feat_native/$sc.ppm" ] && [ -s "$OUT/feat_dx3/$sc.ppm" ]; then
+        echo "$sc：$(PYTHONIOENCODING=utf-8 python /d/iphone-rpc/app/vk/tools/imgdiff.py "$OUT/feat_native/$sc.ppm" "$OUT/feat_dx3/$sc.ppm" 2>&1 | sed 's/^[^：]*：//')"
+    else
+        echo "$sc：絵が無い（$(grep -a "失敗\|落ちた\|切れた" "$OUT/feat_dx3/$sc.txt" | head -1)）"
+    fi
+done
+
+echo "== 9. 本物のゲーム（vkQuake・GZDoom・Godot・SuperTuxKart）"
+echo "vkQuake：$(bash /d/iphone-rpc/app/win/run_vkquake.sh "$IPHONE_VK" 2>&1 | grep -a -m1 "fps\|結果なし")"
+echo "GZDoom：$(bash /d/iphone-rpc/app/win/run_gzdoom.sh "$IPHONE_VK" MAP01 30 2>&1 | head -1)"
+for d in 3d_squash_the_creeps/squash_the_creeps 3d_truck_town/truck_town 3d_particles/particles; do
+    echo "Godot $(basename "$d")：$(bash /d/iphone-rpc/app/win/run_godot.sh "$IPHONE_VK" "$d" mobile 900 2>&1 | sed -n 2p | grep -o 'Project FPS: [0-9]*' | tail -2 | tr '\n' ' ')"
+done
+echo "SuperTuxKart：$(bash /d/iphone-rpc/app/win/run_stk.sh "$IPHONE_VK" lighthouse 20 2>&1 | grep -a "終わり方")"
+
+echo "== 10. DirectX 12（vkd3d-proton 3.0.1・受け手が VR_CAP_DESC_FLAGS を名乗るとき）"
+D12=$VKB/d3d12/vkd3d
+mkdir -p "$D12" && cp -f "$VKB/d3d12/d3d12test.exe" "$D12/" && cp -f /d/iphone-rpc/dl/vkd3d-proton/vkd3d-proton-3.0.1/x64/d3d12.dll /d/iphone-rpc/dl/vkd3d-proton/vkd3d-proton-3.0.1/x64/d3d12core.dll "$D12/"
+(cd "$D12" && IPHONE_VK_ONLY=1 IPHONE_VK_LOG=1 run 180 "$(cygpath -m "$D12/d3d12test.exe")" all) > "$OUT/d3d12test.txt" 2>&1
+grep -a "情報 機能の段階\|^結果\|失敗" "$OUT/d3d12test.txt" | head -4
+
+echo "== 11. OpenGL（zink・Mesa の opengl32.dll）"
+Z=$VKB/zink_iphone
+(cd "$Z" && GALLIUM_DRIVER=zink IPHONE_VK_ONLY=1 IPHONE_VK_LOG=1 run 120 "$(cygpath -m "$Z/glzt.exe")" -o "$(cygpath -w "$OUT/glzt.ppm")" -ref "$(cygpath -w "$Z/native.ppm")") > "$OUT/glzt.txt" 2>&1
+grep -a "GL_VERSION\|^結果\|作れない\|切れた" "$OUT/glzt.txt" | head -4
+
+echo "== 12. 窓の絵：JPEG と H.264（vkcube 1280x720・3b と同じ 60 コマ/秒の区切りの遅れと、全速・受け手が VR_CAP_H264 を名乗るとき）"
+echo "（10/7 夜の代役：区切りありの H.264 は遅れが平均 50 ms と大きい。JPEG は 5.6 ms）"
+for v in 0 1; do
+    IPHONE_VK_ONLY=1 IPHONE_VK_VIDEO=$v IPHONE_VK_MAX_FPS=60 IPHONE_VK_STATS=1 IPHONE_VK_LOG=1 \
+        run 120 "D:/iphone-rpc/vkcube/vkcube.exe" --gpu_number 0 --c 300 --suppress_popups --present_mode 0 --width 1280 --height 720 > "$OUT/vkcube_video$v.txt" 2>&1
+    echo "VIDEO=$v 区切りあり：$(grep -a "swapchain：.*コマ/秒\|H.264：1 コマ\|JPEG：1 コマ\|present から窓" "$OUT/vkcube_video$v.txt" | head -3 | sed 's/\[iphone-vk\] //' | tr '\n' ' ' | cut -c1-240)"
+    IPHONE_VK_ONLY=1 IPHONE_VK_VIDEO=$v IPHONE_VK_STATS=1 IPHONE_VK_LOG=1 \
+        run 120 "D:/iphone-rpc/vkcube/vkcube.exe" --gpu_number 0 --c 600 --suppress_popups --width 1280 --height 720 > "$OUT/vkcube_video${v}_full.txt" 2>&1
+    echo "VIDEO=$v 全速：$(grep -a "swapchain：.*コマ/秒" "$OUT/vkcube_video${v}_full.txt" | head -1 | sed 's/\[iphone-vk\] //')"
+done
+
+echo "== 13. 受け手の記録（MoltenVK の言い分・飛ばした draw）"
+(cd /d/iphone-rpc/app/pc && PYTHONIOENCODING=utf-8 timeout 20 python iphone_applog.py) > "$OUT/applog.txt" 2>&1
+grep -a "MoltenVK\|飛ばした\|H.264 のエンコーダ" "$OUT/applog.txt" | sort | uniq -c | sort -rn | head -15
+echo "終わり"
