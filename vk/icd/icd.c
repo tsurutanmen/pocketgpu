@@ -1877,10 +1877,24 @@ static VkResult VKAPI_CALL create_fb(VkDevice dv, const VkFramebufferCreateInfo 
 static void VKAPI_CALL destroy_fb(VkDevice dv, VkFramebuffer h, const VkAllocationCallbacks *a) { (void) a; if (h) send_destroy(VR_DESTROY_FRAMEBUFFER, dv, ID(h)); }
 
 // ---- 描画用のパイプライン ----
-static void put_stage(vr_buf *b, const VkPipelineShaderStageCreateInfo *st) {
+static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out);
+static void VKAPI_CALL destroy_shader(VkDevice dv, VkShaderModule h, const VkAllocationCallbacks *a);
+
+// maintenance5 では、module を作らずに stage の pNext に VkShaderModuleCreateInfo を入れてよい（新しい DXVK はこう書く）。
+// 受け手には一時の module を作って送り、pipeline を作り終えたら消す
+static VkShaderModule stage_module(VkDevice dv, const VkPipelineShaderStageCreateInfo *st, VkShaderModule *tmp) {
+    *tmp = VK_NULL_HANDLE;
+    if (st->module) return st->module;
+    for (const VkBaseInStructure *x = st->pNext; x; x = x->pNext)
+        if (x->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO && create_shader(dv, (const VkShaderModuleCreateInfo *) x, NULL, tmp) == VK_SUCCESS)
+            return *tmp;
+    return VK_NULL_HANDLE;
+}
+
+static void put_stage(vr_buf *b, VkDevice dv, const VkPipelineShaderStageCreateInfo *st, VkShaderModule *tmp) {
     vr_u32(b, st->stage);
     vr_u32(b, st->flags);
-    vr_u64(b, ID(st->module));
+    vr_u64(b, ID(stage_module(dv, st, tmp)));
     vr_str(b, st->pName);
     const VkSpecializationInfo *si = st->pSpecializationInfo;
     vr_u32(b, si ? si->mapEntryCount : 0);
@@ -1917,7 +1931,11 @@ static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCach
         vr_u64(&b, ID(c->renderPass));
         vr_u32(&b, c->subpass);
         vr_u32(&b, c->stageCount);
-        for (uint32_t k = 0; k < c->stageCount; k++) put_stage(&b, &c->pStages[k]);
+        VkShaderModule tmps[8] = { 0 }, extra = VK_NULL_HANDLE;
+        for (uint32_t k = 0; k < c->stageCount; k++) {
+            put_stage(&b, dv, &c->pStages[k], k < 8 ? &tmps[k] : &extra);
+            if (extra) { destroy_shader(dv, extra, NULL); extra = VK_NULL_HANDLE; }
+        }
         const VkPipelineVertexInputStateCreateInfo *vi = c->pVertexInputState;
         vr_u32(&b, vi ? 1 : 0);
         if (vi) {

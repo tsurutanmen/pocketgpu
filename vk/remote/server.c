@@ -2554,6 +2554,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             spi[i] = (VkSpecializationInfo) { nm < 32 ? nm : 32, me[i], nd, sd };
             if (nm) st[i].pSpecializationInfo = &spi[i];
         }
+        for (uint32_t i = 0; i < nst; i++)
+            if (!st[i].module) {
+                vlog("shader module の無い段がある（段 0x%x）。pipeline を作らない", st[i].stage);
+                return reply(s, VK_ERROR_INITIALIZATION_FAILED);
+            }
         ci.stageCount = nst;
         ci.pStages = st;
         // 頂点の入力
