@@ -3064,8 +3064,51 @@ int vkr_serve(const char *host, int port) {
 }
 
 #ifdef VR_SERVER_MAIN
+#ifdef _WIN32
+// PC の代役が落ちたときに、どの関数で落ちたかを書く（横に置いた .pdb から dbghelp で名前を引く）
+#include <dbghelp.h>
+static void where(const char *tag, void *addr) {
+    HMODULE m = NULL;
+    char name[MAX_PATH] = "?";
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR) addr, &m)) {
+        fprintf(stderr, "%s %p\n", tag, addr);
+        return;
+    }
+    GetModuleFileNameA(m, name, sizeof name);
+    const char *b = strrchr(name, '\\');
+    static int sym_ready;
+    if (!sym_ready) { sym_ready = 1; SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS); SymInitialize(GetCurrentProcess(), NULL, TRUE); }
+    char sbuf[sizeof(SYMBOL_INFO) + 256];
+    SYMBOL_INFO *si = (SYMBOL_INFO *) sbuf;
+    memset(sbuf, 0, sizeof sbuf);
+    si->SizeOfStruct = sizeof(SYMBOL_INFO);
+    si->MaxNameLen = 255;
+    DWORD64 disp = 0;
+    int named = SymFromAddr(GetCurrentProcess(), (DWORD64) (uintptr_t) addr, &disp, si);
+    fprintf(stderr, "%s %s+0x%llx %s+0x%llx\n", tag, b ? b + 1 : name, (unsigned long long) ((uintptr_t) addr - (uintptr_t) m),
+            named ? si->Name : "?", (unsigned long long) disp);
+}
+
+static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+        code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_ARRAY_BOUNDS_EXCEEDED)
+        return EXCEPTION_CONTINUE_SEARCH;
+    static volatile LONG once;
+    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    fprintf(stderr, "落ちた：例外 0x%08lx・命令 %u\n", code, g_cur_op);
+    where("場所", ep->ExceptionRecord->ExceptionAddress);
+    void *fr[40];
+    USHORT n = RtlCaptureStackBackTrace(0, 40, fr, NULL);
+    for (USHORT i = 0; i < n; i++) where("  呼び出し元", fr[i]);
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
+    AddVectoredExceptionHandler(1, crash_handler);
     SetConsoleOutputCP(CP_UTF8);
     // PC で代役をするときは、画面取り込みなどの部品（暗黙のレイヤー）を挟まない。
     // OBS が起動している間、OBS の部品が vkCreateDevice から戻ってこなかった
