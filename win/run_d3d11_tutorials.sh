@@ -5,7 +5,7 @@
 #   既定は代役の 127.0.0.1:50070 と、iPhone のふりの 127.0.0.1:50072。iPhone で試すなら 2 つ目を usb に
 S=/d/iphone-rpc/vkbuild/d3d11samples/Direct3D11Tutorials
 DX=${DXVK_DIR:-/d/iphone-rpc/vkbuild/d3d11}
-VKCMD=${VKCMD:-D:/iphone-rpc/vkbuild/iphone-vk.cmd}
+VKCMD=${VKCMD:-${IPHONE_VK_CMD:-D:/iphone-rpc/vkbuild/iphone-vk.cmd}}
 REF=${1:-127.0.0.1:50070}
 CMP=${2:-127.0.0.1:50072}
 OUT=/d/iphone-rpc/vkbuild/d3d11samples_runs/tut_$(date +%m%d_%H%M)

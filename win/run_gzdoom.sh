@@ -27,7 +27,7 @@ if [ "$VK" = direct ]; then
     ./gzdoom.exe "${ARGS[@]}" > "$LOG" 2>&1 &
 else
     IPHONE_VK=$VK IPHONE_VK_ONLY=1 IPHONE_VK_VSYNC=0 IPHONE_VK_LOG=1 IPHONE_VK_STATS=1 \
-        cmd.exe //c D:/iphone-rpc/vkbuild/iphone-vk.cmd "$(cygpath -w "$G/gzdoom.exe")" "${ARGS[@]}" > "$LOG" 2>&1 &
+        cmd.exe //c ${IPHONE_VK_CMD:-D:/iphone-rpc/vkbuild/iphone-vk.cmd} "$(cygpath -w "$G/gzdoom.exe")" "${ARGS[@]}" > "$LOG" 2>&1 &
 fi
 sleep "$SECS"
 # 窓を閉じて終わらせる（ドライバが最後にコマ数を書く）。終わらなければ止める

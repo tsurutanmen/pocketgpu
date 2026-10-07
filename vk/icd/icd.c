@@ -2656,6 +2656,10 @@ static VkResult VKAPI_CALL create_graphics_pipelines_raw(VkDevice dv, VkPipeline
     VkResult worst = VK_SUCCESS;
     for (uint32_t i = 0; i < n; i++) {
         const VkGraphicsPipelineCreateInfo *c = &ci[i];
+        // rasterizerDiscard のとき（動的でなければ）、使われない構造体は壊れたポインタのこともあるので読まない（CTS で見つけた）
+        int discard = c->pRasterizationState && c->pRasterizationState->rasterizerDiscardEnable;
+        for (uint32_t k = 0; discard && c->pDynamicState && k < c->pDynamicState->dynamicStateCount; k++)
+            if (c->pDynamicState->pDynamicStates[k] == VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE) discard = 0;
         int gs = 0;
         for (uint32_t k = 0; k < c->stageCount; k++) gs |= c->pStages[k].stage == VK_SHADER_STAGE_GEOMETRY_BIT;
         if (gs && !g_hw.real.geometryShader) {
@@ -2689,7 +2693,7 @@ static VkResult VKAPI_CALL create_graphics_pipelines_raw(VkDevice dv, VkPipeline
         vr_u32(&b, ia ? 1 : 0);
         if (ia) { vr_u32(&b, ia->topology); vr_u32(&b, ia->primitiveRestartEnable); }
         // 描画しないとき（rasterizerDiscard）は viewport などが無いことがある
-        const VkPipelineViewportStateCreateInfo *vp = c->pViewportState;
+        const VkPipelineViewportStateCreateInfo *vp = discard ? NULL : c->pViewportState;
         vr_u32(&b, vp ? 1 : 0);
         if (vp) {
             vr_u32(&b, vp->viewportCount);
@@ -2718,7 +2722,7 @@ static VkResult VKAPI_CALL create_graphics_pipelines_raw(VkDevice dv, VkPipeline
             put_f(&b, rs->depthBiasSlopeFactor);
             put_f(&b, rs->lineWidth);
         }
-        const VkPipelineMultisampleStateCreateInfo *ms = c->pMultisampleState;
+        const VkPipelineMultisampleStateCreateInfo *ms = discard ? NULL : c->pMultisampleState;
         vr_u32(&b, ms ? 1 : 0);
         if (ms) {
             vr_u32(&b, ms->rasterizationSamples);
@@ -2727,7 +2731,7 @@ static VkResult VKAPI_CALL create_graphics_pipelines_raw(VkDevice dv, VkPipeline
             vr_u32(&b, ms->alphaToCoverageEnable);
             vr_u32(&b, ms->alphaToOneEnable);
         }
-        const VkPipelineDepthStencilStateCreateInfo *ds = c->pDepthStencilState;
+        const VkPipelineDepthStencilStateCreateInfo *ds = discard ? NULL : c->pDepthStencilState;
         vr_u32(&b, ds ? 1 : 0);
         if (ds) {
             vr_u32(&b, ds->depthTestEnable);
@@ -2740,7 +2744,7 @@ static VkResult VKAPI_CALL create_graphics_pipelines_raw(VkDevice dv, VkPipeline
             put_f(&b, ds->minDepthBounds);
             put_f(&b, ds->maxDepthBounds);
         }
-        const VkPipelineColorBlendStateCreateInfo *cb = c->pColorBlendState;
+        const VkPipelineColorBlendStateCreateInfo *cb = discard ? NULL : c->pColorBlendState;
         vr_u32(&b, cb ? 1 : 0);
         if (cb) {
             vr_u32(&b, cb->logicOpEnable);
@@ -5720,6 +5724,14 @@ static void cb_note_pipe(struct cb *c, uint64_t id) {
     else c->bpl_over = 1;
 }
 
+// CPU から見えるメモリに置いた画像（linear）へ GPU が書くとき、その画像のメモリを読み戻す範囲に入れる。
+// これまでは buffer にしか付けず、画像に写して CPU で読むアプリ（CTS の draw など）は 0 を読んでいた
+static void cb_img_writes(struct cb *c, VkImage h) {
+    struct img *im = (struct img *) h;
+    if (!im || !im->m || !im->m->host) return;
+    rng_add(&c->r, &c->nr, &c->capr, im->m, im->memoff, im->req.size, 0);
+}
+
 // storage buffer につないだ物を候補として覚える（書く場所かどうかは submit のときに決める）
 static void wr_cand(struct cb *c, uint32_t set, uint32_t binding, struct buf *bf, uint64_t off, uint64_t len) {
     if (!bf || !bf->m || !bf->m->host) return;
@@ -5859,8 +5871,11 @@ static void VKAPI_CALL cmd_fill(VkCommandBuffer cbh, VkBuffer dst, VkDeviceSize 
     vr_u64(&c->s, off);
     vr_u64(&c->s, size);
     vr_u32(&c->s, data);
+    // VK_WHOLE_SIZE の塗りは、残りを 4 の倍数に切り下げた所までしか書かない（そこから先を読み戻しで消さない）
+    struct buf *bf = (struct buf *) dst;
+    if (size == VK_WHOLE_SIZE && bf) size = off < bf->size ? (bf->size - off) & ~(VkDeviceSize) 3 : 0;
     g_wr_why = 2;
-    cb_writes(c, (struct buf *) dst, off, size);
+    cb_writes(c, bf, off, size);
 }
 
 static void VKAPI_CALL cmd_update(VkCommandBuffer cbh, VkBuffer dst, VkDeviceSize off, VkDeviceSize size, const void *data) {
@@ -6107,6 +6122,7 @@ static VkBuffer bc_tmp(struct cb *c, uint64_t size, uint8_t **ptr) {
 
 static void VKAPI_CALL cmd_copy_buffer_to_image(VkCommandBuffer cbh, VkBuffer bb, VkImage im, VkImageLayout l, uint32_t n, const VkBufferImageCopy *rg) {
     struct cb *c = (struct cb *) cbh;
+    cb_img_writes(c, im);
     struct img *ii = (struct img *) im;
     if (ii && ii->bc) {
         // 全部の範囲をほどいて 1 つの一時バッファに並べ、そこから 1 回で写す（一時バッファを作る往復を 1 回にする）
@@ -6146,6 +6162,7 @@ static void VKAPI_CALL cmd_copy_buffer_to_image(VkCommandBuffer cbh, VkBuffer bb
 
 static void VKAPI_CALL cmd_clear_color(VkCommandBuffer cbh, VkImage im, VkImageLayout l, const VkClearColorValue *col, uint32_t n, const VkImageSubresourceRange *rg) {
     struct cb *c = (struct cb *) cbh;
+    cb_img_writes(c, im);
     vr_u32(&c->s, VR_CMD_CLEAR_COLOR_IMAGE);
     vr_u64(&c->s, ID(im));
     vr_u32(&c->s, fix_layout(l));
@@ -6156,6 +6173,7 @@ static void VKAPI_CALL cmd_clear_color(VkCommandBuffer cbh, VkImage im, VkImageL
 
 static void VKAPI_CALL cmd_copy_image(VkCommandBuffer cbh, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageCopy *rg) {
     struct cb *c = (struct cb *) cbh;
+    cb_img_writes(c, d);
     vr_u32(&c->s, VR_CMD_COPY_IMAGE);
     vr_u64(&c->s, ID(s));
     vr_u32(&c->s, fix_layout(sl));
@@ -6167,6 +6185,7 @@ static void VKAPI_CALL cmd_copy_image(VkCommandBuffer cbh, VkImage s, VkImageLay
 
 static void VKAPI_CALL cmd_blit_image(VkCommandBuffer cbh, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageBlit *rg, VkFilter f) {
     struct cb *c = (struct cb *) cbh;
+    cb_img_writes(c, d);
     vr_u32(&c->s, VR_CMD_BLIT_IMAGE);
     vr_u64(&c->s, ID(s));
     vr_u32(&c->s, fix_layout(sl));
@@ -6192,6 +6211,7 @@ static int need_cap(uint32_t cap, const char *what) {
 static void VKAPI_CALL cmd_resolve(VkCommandBuffer cbh, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageResolve *rg) {
     if (!need_cap(VR_CAP_CMD10, "vkCmdResolveImage")) return;
     struct cb *c = (struct cb *) cbh;
+    cb_img_writes(c, d);
     vr_u32(&c->s, VR_CMD_RESOLVE_IMAGE);
     vr_u64(&c->s, ID(s));
     vr_u32(&c->s, fix_layout(sl));
@@ -6204,6 +6224,7 @@ static void VKAPI_CALL cmd_resolve(VkCommandBuffer cbh, VkImage s, VkImageLayout
 static void VKAPI_CALL cmd_clear_ds(VkCommandBuffer cbh, VkImage im, VkImageLayout l, const VkClearDepthStencilValue *v, uint32_t n, const VkImageSubresourceRange *rg) {
     if (!need_cap(VR_CAP_CMD10, "vkCmdClearDepthStencilImage")) return;
     struct cb *c = (struct cb *) cbh;
+    cb_img_writes(c, im);
     vr_u32(&c->s, VR_CMD_CLEAR_DEPTH_STENCIL_IMAGE);
     vr_u64(&c->s, ID(im));
     vr_u32(&c->s, fix_layout(l));
@@ -6745,6 +6766,8 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
             for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
                 struct cb *c = (struct cb *) si[i].pCommandBuffers[j];
                 for (size_t k = 0; k < c->nrd; k++) rng_add(&rd, &nrd, &crd, c->rd[k].m, c->rd[k].off, c->rd[k].len, 0);
+                // GPU が書く範囲でも、アプリが書いたページは先に送る（GPU が書かなかった所を、読み戻しで古い値に戻さないため）
+                for (size_t k = 0; k < c->nr; k++) rng_add(&rd, &nrd, &crd, c->r[k].m, c->r[k].off, c->r[k].len, 0);
             }
         rng_merge(rd, &nrd);
         for (size_t k = 0; k < nrd; k++) send_dirty(rd[k].m, rd[k].off, rd[k].len);

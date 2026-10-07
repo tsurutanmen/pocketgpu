@@ -14,7 +14,7 @@ export IPHONE_VK=${IPHONE_VK_ADDR:-usb} # 代役で試すときは IPHONE_VK_ADD
 export IPHONE_VK_MONITOR=${IPHONE_VK_MONITOR:-sub}
 # 速さを測るので、書き換えに合わせる出し方（FIFO）でも区切らずに全速で回す
 export IPHONE_VK_VSYNC=0
-VKCMD='D:/iphone-rpc/vkbuild/iphone-vk.cmd'
+VKCMD="${IPHONE_VK_CMD:-D:/iphone-rpc/vkbuild/iphone-vk.cmd}"
 run() { timeout "$1" cmd.exe //c "$VKCMD" "${@:2}"; }
 echo "結果は $OUT"
 

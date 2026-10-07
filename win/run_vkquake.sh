@@ -22,7 +22,7 @@ if [ "$VK" = direct ]; then
 else
     # iPhone だけを見せる（vkQuake は最初の GPU を使う）。速さを測るので、画面の書き換えに合わせない
     IPHONE_VK=$VK IPHONE_VK_ONLY=1 IPHONE_VK_VSYNC=0 IPHONE_VK_LOG=1 IPHONE_VK_STATS=1 \
-        cmd.exe //c D:/iphone-rpc/vkbuild/iphone-vk.cmd "$(cygpath -w "$G/vkQuake.exe")" "${ARGS[@]}" > "$LOG" 2>&1 &
+        cmd.exe //c ${IPHONE_VK_CMD:-D:/iphone-rpc/vkbuild/iphone-vk.cmd} "$(cygpath -w "$G/vkQuake.exe")" "${ARGS[@]}" > "$LOG" 2>&1 &
 fi
 for i in $(seq 1 600); do
     grep -aq "frames .* seconds .* fps" "$QLOG" 2> /dev/null && break

@@ -18,7 +18,7 @@ if [ "$VK" = direct ]; then
     timeout 300 ./supertuxkart.exe "${ARGS[@]}" > "$LOG" 2>&1
 else
     IPHONE_VK=$VK IPHONE_VK_ONLY=1 IPHONE_VK_VSYNC=0 IPHONE_VK_LOG=1 IPHONE_VK_STATS=1 \
-        timeout 300 cmd.exe //c D:/iphone-rpc/vkbuild/iphone-vk.cmd "$(cygpath -w "$S/supertuxkart.exe")" "${ARGS[@]}" > "$LOG" 2>&1
+        timeout 300 cmd.exe //c ${IPHONE_VK_CMD:-D:/iphone-rpc/vkbuild/iphone-vk.cmd} "$(cygpath -w "$S/supertuxkart.exe")" "${ARGS[@]}" > "$LOG" 2>&1
 fi
 echo "終わり方 $?・$(grep -a -m1 "Vulkan renderer" "$LOG" | sed 's/.*renderer: //')・$(grep -a "Average FPS" "$LOG" | sed 's/.*profile: //')"
 grep -a -i "\[error\|\[fatal\|失敗\|切れた" "$LOG" | grep -v "まだ無い入口\|入口が無い" | head -5

@@ -22,7 +22,7 @@ if [ "$VK" = direct ]; then
     timeout 300 "$G/Godot_v4.7.2-stable_win64_console.exe" "${ARGS[@]}" > "$LOG" 2>&1
 else
     IPHONE_VK=$VK IPHONE_VK_ONLY=1 IPHONE_VK_VSYNC=0 IPHONE_VK_LOG=1 IPHONE_VK_STATS=1 \
-        timeout 300 cmd.exe //c D:/iphone-rpc/vkbuild/iphone-vk.cmd "$EXE" "${ARGS[@]}" > "$LOG" 2>&1
+        timeout 300 cmd.exe //c ${IPHONE_VK_CMD:-D:/iphone-rpc/vkbuild/iphone-vk.cmd} "$EXE" "${ARGS[@]}" > "$LOG" 2>&1
 fi
 echo "終わり方 $?・$(grep -a -m1 "Vulkan.*- \|Forward\|Mobile" "$LOG" | sed 's/^ *//' | cut -c1-120)"
 grep -a "Project FPS" "$LOG" | tail -5 | tr '\n' ' '; echo

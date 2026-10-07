@@ -7,7 +7,7 @@ OUT=$VKB/iphone_runs/$V
 mkdir -p "$OUT/feat_native" "$OUT/feat_dev" "$VKB/d3d11native"
 export IPHONE_VK=${IPHONE_VK:-usb}
 export IPHONE_VK_MONITOR=${IPHONE_VK_MONITOR:-sub}
-VKCMD='D:/iphone-rpc/vkbuild/iphone-vk.cmd'
+VKCMD="${IPHONE_VK_CMD:-D:/iphone-rpc/vkbuild/iphone-vk.cmd}"
 run() { timeout "$1" cmd.exe //c "$VKCMD" "${@:2}"; }
 echo "受け手 $IPHONE_VK・結果は $OUT"
 for t in vecadd pushdesc copydesc copyimg; do
