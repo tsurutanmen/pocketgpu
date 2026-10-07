@@ -887,8 +887,11 @@ struct cb {
     size_t nev, cev;
     struct pushheld *ph;      // push descriptor に使った set（記録し直すか消すまで持つ）
     size_t nph, cph;
+    struct wrcand *wc;        // storage buffer につないだ物。シェーダーが書く場所かどうかは submit のときに決める
+    size_t nwc, cwc;
 };
 struct pushheld { struct dsl *l; VkDescriptorSet s; };
+struct wrcand { struct buf *b; uint64_t off, len; uint32_t set, binding; int done; };
 static void push_release(struct cb *c);
 struct event;
 struct evact { struct event *e; int val; };
@@ -3284,8 +3287,70 @@ static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi)
 }
 
 // ---- shader・パイプライン ----
+// ---- シェーダーが書く場所 ----
+// GPU が書くかもしれない CPU から見えるメモリは、終わったあと PC に読み戻す。これまでは storage buffer につないだ物を
+// 全部読み戻していて、vkQuake では 1 コマに約 2 MB、USB くらいの通り道ではそれだけで詰まっていた。
+// 作られたシェーダーのどれかが「書く」と宣言した (set, binding) だけを覚え、そこにつないだ物だけを読み戻す。
+// 「読むだけ」（NonWritable）の場所は読み戻さない。読み解けないシェーダーがあれば、今までどおり全部読み戻す。
+// IPHONE_VK_RO_SKIP=0 で前のやり方
+static volatile LONG g_wr[32][8]; // set ごとに binding 256 個までの印
+static volatile LONG g_wr_all;
+static void wr_mark(uint32_t set, uint32_t binding) {
+    if (set >= 32 || binding >= 256) { InterlockedExchange(&g_wr_all, 1); return; }
+    InterlockedOr(&g_wr[set][binding / 32], (LONG) (1u << (binding % 32)));
+}
+static int wr_may(uint32_t set, uint32_t binding) {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("IPHONE_VK_RO_SKIP"); off = e && *e == '0'; }
+    if (off || g_wr_all || set >= 32 || binding >= 256) return 1;
+    return ((uint32_t) g_wr[set][binding / 32] >> (binding % 32)) & 1;
+}
+static void wr_scan(const uint32_t *w, size_t nw) {
+    if (nw < 5 || w[0] != 0x07230203 || w[3] > (1u << 22)) { InterlockedExchange(&g_wr_all, 1); return; }
+    uint32_t bound = w[3];
+    uint32_t *set = calloc(bound, 4), *bnd = calloc(bound, 4), *memnw = calloc(bound, 4), *memn = calloc(bound, 4);
+    uint32_t *ptr_t = calloc(bound, 4), *ptr_sc = calloc(bound, 4), *elem = calloc(bound, 4), *imgw = calloc(bound, 4);
+    uint8_t *fl = calloc(bound, 1); // 1 set・2 binding・4 NonWritable・8 BufferBlock・16 struct
+    uint32_t *vars = calloc(bound, 4), nvars = 0;
+    if (!set || !bnd || !memnw || !memn || !ptr_t || !ptr_sc || !elem || !imgw || !fl || !vars) { InterlockedExchange(&g_wr_all, 1); goto out; }
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > nw) { InterlockedExchange(&g_wr_all, 1); goto out; }
+        const uint32_t *x = &w[i];
+        if (op == 71 && wc >= 3 && x[1] < bound) { // OpDecorate
+            if (x[2] == 34 && wc >= 4) { set[x[1]] = x[3]; fl[x[1]] |= 1; }
+            else if (x[2] == 33 && wc >= 4) { bnd[x[1]] = x[3]; fl[x[1]] |= 2; }
+            else if (x[2] == 24) fl[x[1]] |= 4;
+            else if (x[2] == 3) fl[x[1]] |= 8;
+        } else if (op == 72 && wc >= 4 && x[1] < bound && x[3] == 24) memnw[x[1]]++; // OpMemberDecorate NonWritable
+        else if (op == 30 && wc >= 2 && x[1] < bound) { fl[x[1]] |= 16; memn[x[1]] = wc - 2; } // OpTypeStruct
+        else if (op == 32 && wc >= 4 && x[1] < bound) { ptr_sc[x[1]] = x[2]; ptr_t[x[1]] = x[3]; } // OpTypePointer
+        else if ((op == 28 || op == 29) && wc >= 3 && x[1] < bound) elem[x[1]] = x[2]; // OpTypeArray・OpTypeRuntimeArray
+        else if (op == 25 && wc >= 9 && x[1] < bound) imgw[x[1]] = x[3] == 5 && x[7] == 2; // OpTypeImage：Buffer で storage
+        else if (op == 59 && wc >= 4 && x[2] < bound) vars[nvars++] = i; // OpVariable
+        i += wc;
+    }
+    for (uint32_t k = 0; k < nvars; k++) {
+        const uint32_t *x = &w[vars[k]];
+        uint32_t v = x[2], pt = x[1] < bound ? x[1] : 0, sc = x[3];
+        if (!(fl[v] & 3)) continue;
+        uint32_t t = pt ? ptr_t[pt] : 0;
+        for (int d = 0; d < 4 && t < bound && elem[t]; d++) t = elem[t];
+        if (t >= bound) continue;
+        int writable = 0;
+        if (sc == 12 || (sc == 2 && (fl[t] & 8))) // StorageBuffer、または古い形の BufferBlock
+            writable = !(fl[v] & 4) && !((fl[t] & 16) && memn[t] && memnw[t] >= memn[t]);
+        else if (sc == 0 && imgw[t]) // storage texel buffer
+            writable = !(fl[v] & 4);
+        if (writable) wr_mark(set[v], bnd[v]);
+    }
+out:
+    free(set); free(bnd); free(memnw); free(memn); free(ptr_t); free(ptr_sc); free(elem); free(imgw); free(fl); free(vars);
+}
+
 static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out) {
     (void) a;
+    wr_scan(ci->pCode, ci->codeSize / 4);
     uint64_t id = new_id();
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
@@ -3998,9 +4063,9 @@ static void bct_free(struct cb *c) {
     c->bct = NULL;
 }
 
-static void cb_clear(struct cb *c) { push_release(c); c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
+static void cb_clear(struct cb *c) { push_release(c); c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; c->nwc = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
 
-static void cb_free(struct cb *c) { push_release(c); free(c->ph); gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c->ev); free(c); }
+static void cb_free(struct cb *c) { push_release(c); free(c->ph); free(c->wc); gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c->ev); free(c); }
 
 static void VKAPI_CALL destroy_cpool(VkDevice dv, VkCommandPool pp, const VkAllocationCallbacks *a) {
     (void) a;
@@ -4112,6 +4177,28 @@ static void cb_writes(struct cb *c, struct buf *bf, uint64_t off, uint64_t len) 
     rng_add(&c->r, &c->nr, &c->capr, bf->m, bf->memoff + off, len, 0);
 }
 
+// storage buffer につないだ物を候補として覚える（書く場所かどうかは submit のときに決める）
+static void wr_cand(struct cb *c, uint32_t set, uint32_t binding, struct buf *bf, uint64_t off, uint64_t len) {
+    if (!bf || !bf->m || !bf->m->host) return;
+    if (c->nwc == c->cwc) {
+        size_t cap = c->cwc ? c->cwc * 2 : 16;
+        struct wrcand *p = realloc(c->wc, cap * sizeof *p);
+        if (!p) { cb_writes(c, bf, off, len); return; }
+        c->wc = p;
+        c->cwc = cap;
+    }
+    c->wc[c->nwc++] = (struct wrcand) { bf, off, len, set, binding, 0 };
+}
+
+// submit のとき：作られたシェーダーのどれかが書く場所なら、GPU が書くかもしれない範囲にする
+static void wr_resolve(struct cb *c) {
+    for (size_t k = 0; k < c->nwc; k++)
+        if (!c->wc[k].done && wr_may(c->wc[k].set, c->wc[k].binding)) {
+            cb_writes(c, c->wc[k].b, c->wc[k].off, c->wc[k].len);
+            c->wc[k].done = 1;
+        }
+}
+
 // GPU が読むかもしれない範囲として覚える
 static void cb_reads(struct cb *c, struct buf *bf, uint64_t off, uint64_t len) {
     if (!bf || !bf->m || !bf->m->host) return;
@@ -4144,8 +4231,8 @@ static void VKAPI_CALL cmd_bind_sets(VkCommandBuffer cbh, VkPipelineBindPoint bp
         if (!s) continue;
         for (uint32_t k = 0; k < s->n; k++) {
             struct dent *e = &s->e[k];
-            if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) cb_writes(c, e->b, e->off, e->range);
-            else if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && e->b) cb_writes(c, e->b, 0, e->b->size);
+            if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) wr_cand(c, first + i, e->binding, e->b, e->off, e->range);
+            else if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && e->b) wr_cand(c, first + i, e->binding, e->b, 0, e->b->size);
             if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) cb_reads(c, e->b, e->off, e->range);
             else if (e->b) cb_reads(c, e->b, 0, e->b->size);
         }
@@ -4302,6 +4389,7 @@ static void VKAPI_CALL cmd_exec(VkCommandBuffer cbh, uint32_t n, const VkCommand
         for (size_t k = 0; k < s->nr; k++) rng_add(&c->r, &c->nr, &c->capr, s->r[k].m, s->r[k].off, s->r[k].len, 0);
         for (size_t k = 0; k < s->nrd; k++) rng_add(&c->rd, &c->nrd, &c->caprd, s->rd[k].m, s->rd[k].off, s->rd[k].len, 0);
         for (size_t k = 0; k < s->nev; k++) ev_add(c, s->ev[k].e, s->ev[k].val);
+        for (size_t k = 0; k < s->nwc; k++) wr_cand(c, s->wc[k].set, s->wc[k].binding, s->wc[k].b, s->wc[k].off, s->wc[k].len);
     }
 }
 
@@ -5129,6 +5217,7 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
         for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
             struct cb *c = (struct cb *) si[i].pCommandBuffers[j];
             ev_fire(c);
+            wr_resolve(c);
         }
     AcquireSRWLockExclusive(&d->lock);
     uint64_t serial = ++d->serial;
