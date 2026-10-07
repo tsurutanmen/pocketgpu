@@ -735,6 +735,8 @@ static int hello(void) {
             if ((g_hw.caps & VR_CAP_NEW_MASK) && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_copy_commands2", 1 };
             // ひな形での descriptor の書き込みは、ドライバがふつうの書き込みに直す（zink が名前で確かめる）
             if (g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_descriptor_update_template", 1 };
+            // push descriptor は、ドライバがふつうの set に直す
+            if (g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_push_descriptor", 2 };
             // depth clip は pipeline を作るときに depth clamp に置き換える（DXVK 2 が拡張の無い GPU でしていたのと同じ）
             if (dxvk3() && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_depth_clip_enable", 1 };
             // 空の descriptor は受け手が受ける（GPU が持たなければ代わりの物で）
@@ -819,7 +821,14 @@ struct dent { uint32_t binding, elem, type; struct buf *b; uint64_t off, range; 
 struct dpool;
 // descriptor set の形。pool の残りを数えるため、種類ごとの数を覚えておく。
 // 形を消したあとも、その形で取った set が残っていれば数を使うので、数え札（refs）で持つ
-struct dsl { volatile LONG refs; uint32_t nt; struct { uint32_t type, count; } t[16]; };
+struct dsl {
+    volatile LONG refs;
+    uint32_t nt;
+    struct { uint32_t type, count; } t[16];
+    int push;               // push descriptor 用の形（受け手にはふつうの形として作る）
+    VkDescriptorSet *free;  // push に使い終えて、使い回せる set
+    uint32_t nfree, capfree;
+};
 struct dset { struct dpool *pool; struct dset *next; uint32_t n, cap; struct dent *e; struct dsl *layout; };
 // 受け手に頼まずに set を取るので、pool の残り（set の数と種類ごとの数）はドライバが数える
 struct dpool { struct dset *head; uint32_t max_sets, used_sets, nsz; struct { uint32_t type, total, used; } sz[16]; };
@@ -853,7 +862,11 @@ struct cb {
     struct gs_cbst *gsx;      // GS を真似るための、頂点・index の buffer の覚えと、記録・descriptor の一時の物
     struct evact *ev;         // submit のときに立てる・倒す event（記録した順）
     size_t nev, cev;
+    struct pushheld *ph;      // push descriptor に使った set（記録し直すか消すまで持つ）
+    size_t nph, cph;
 };
+struct pushheld { struct dsl *l; VkDescriptorSet s; };
+static void push_release(struct cb *c);
 struct event;
 struct evact { struct event *e; int val; };
 static void ev_fire(struct cb *c);
@@ -1370,6 +1383,9 @@ static void query_chain(uint32_t op, void *pnext, const stinfo *t, size_t nt, vo
 static void VKAPI_CALL get_props2(VkPhysicalDevice pd, VkPhysicalDeviceProperties2 *p) {
     get_props(pd, &p->properties);
     query_chain(VR_GET_PROPERTIES2, p->pNext, PROP_ST, sizeof PROP_ST / sizeof *PROP_ST, &p->properties, sizeof p->properties);
+    for (VkBaseOutStructure *x = p->pNext; x; x = x->pNext)
+        if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR)
+            ((VkPhysicalDevicePushDescriptorPropertiesKHR *) x)->maxPushDescriptors = 32;
 }
 
 static void VKAPI_CALL get_features2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f) {
@@ -3219,7 +3235,8 @@ static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreate
 DESTROY_SIMPLE(destroy_shader_rpc, VkShaderModule, VR_DESTROY_SHADER_MODULE)
 static void VKAPI_CALL destroy_shader(VkDevice dv, VkShaderModule h, const VkAllocationCallbacks *a) { gs_forget_pipe(VK_NULL_HANDLE, ID(h)); destroy_shader_rpc(dv, h, a); }
 DESTROY_SIMPLE(destroy_playout_rpc, VkPipelineLayout, VR_DESTROY_PIPELINE_LAYOUT)
-static void VKAPI_CALL destroy_playout(VkDevice dv, VkPipelineLayout h, const VkAllocationCallbacks *a) { gs_forget_layout(dv, ID(h)); destroy_playout_rpc(dv, h, a); }
+static void pl_forget(uint64_t id);
+static void VKAPI_CALL destroy_playout(VkDevice dv, VkPipelineLayout h, const VkAllocationCallbacks *a) { gs_forget_layout(dv, ID(h)); pl_forget(ID(h)); destroy_playout_rpc(dv, h, a); }
 DESTROY_SIMPLE(destroy_pipeline_rpc, VkPipeline, VR_DESTROY_PIPELINE)
 static void VKAPI_CALL destroy_pipeline(VkDevice dv, VkPipeline h, const VkAllocationCallbacks *a) { gs_forget_pipe(dv, ID(h)); destroy_pipeline_rpc(dv, h, a); }
 
@@ -3235,10 +3252,11 @@ static VkResult VKAPI_CALL create_dsl(VkDevice dv, const VkDescriptorSetLayoutCr
         if (k < 16) l->t[k].count += ci->pBindings[i].descriptorCount;
     }
     uint64_t id = ID(l);
+    l->push = (ci->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) != 0;
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, id);
-    vr_u32(&b, ci->flags);
+    vr_u32(&b, ci->flags & ~(uint32_t) VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR);
     vr_u32(&b, ci->bindingCount);
     for (uint32_t i = 0; i < ci->bindingCount; i++) {
         vr_u32(&b, ci->pBindings[i].binding);
@@ -3264,6 +3282,7 @@ static void VKAPI_CALL dsl_support(VkDevice dv, const VkDescriptorSetLayoutCreat
     s->supported = VK_TRUE;
 }
 
+static void pl_note(uint64_t id, const VkPipelineLayoutCreateInfo *ci);
 static VkResult VKAPI_CALL create_playout(VkDevice dv, const VkPipelineLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkPipelineLayout *out) {
     (void) a;
     uint64_t id = new_id();
@@ -3281,6 +3300,7 @@ static VkResult VKAPI_CALL create_playout(VkDevice dv, const VkPipelineLayoutCre
     rpc_send(VR_CREATE_PIPELINE_LAYOUT, &b);
     free(b.p);
     gs_note_layout(dv, id, ci);
+    pl_note(id, ci);
     *out = (VkPipelineLayout) (uintptr_t) id;
     return VK_SUCCESS;
 }
@@ -3567,17 +3587,151 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
     free(b.p);
 }
 
+// ---- push descriptor（VK_KHR_push_descriptor） ----
+// 受け手には知らせない。push のたびに、隠しの pool から取った set に書いて、その場でつなぐ。
+// 使った set は、その command buffer を記録し直すか消すまで持つ（同じ記録を何度 submit しても中身が変わらない）。
+// そのあと同じ形の push に使い回す。使っている仕事があれば、書き換えの前に受け手が待つ
+struct plinfo { uint64_t id; uint32_t n; struct dsl *l[32]; };
+static struct plinfo *g_pl;
+static size_t g_npl, g_cappl;
+static SRWLOCK g_pl_lock = SRWLOCK_INIT;
+
+static void pl_note(uint64_t id, const VkPipelineLayoutCreateInfo *ci) {
+    int any = 0;
+    for (uint32_t i = 0; i < ci->setLayoutCount; i++)
+        if (ci->pSetLayouts[i] && ((struct dsl *) ci->pSetLayouts[i])->push) any = 1;
+    if (!any) return;
+    struct plinfo e = { .id = id, .n = ci->setLayoutCount < 32 ? ci->setLayoutCount : 32 };
+    for (uint32_t i = 0; i < e.n; i++) {
+        e.l[i] = (struct dsl *) ci->pSetLayouts[i];
+        if (e.l[i]) InterlockedIncrement(&e.l[i]->refs);
+    }
+    AcquireSRWLockExclusive(&g_pl_lock);
+    if (g_npl == g_cappl) {
+        g_cappl = g_cappl ? g_cappl * 2 : 16;
+        g_pl = realloc(g_pl, g_cappl * sizeof *g_pl);
+    }
+    g_pl[g_npl++] = e;
+    ReleaseSRWLockExclusive(&g_pl_lock);
+}
+
+static struct dsl *pl_set_layout(uint64_t id, uint32_t set) {
+    struct dsl *l = NULL;
+    AcquireSRWLockShared(&g_pl_lock);
+    for (size_t i = 0; i < g_npl; i++)
+        if (g_pl[i].id == id) { l = set < g_pl[i].n ? g_pl[i].l[set] : NULL; break; }
+    ReleaseSRWLockShared(&g_pl_lock);
+    return l;
+}
+
+static void pl_forget(uint64_t id) {
+    struct plinfo e = { 0 };
+    AcquireSRWLockExclusive(&g_pl_lock);
+    for (size_t i = 0; i < g_npl; i++)
+        if (g_pl[i].id == id) { e = g_pl[i]; g_pl[i] = g_pl[--g_npl]; break; }
+    ReleaseSRWLockExclusive(&g_pl_lock);
+    for (uint32_t i = 0; i < e.n; i++) if (e.l[i]) dsl_unref(e.l[i]);
+}
+
+static SRWLOCK g_push_lock = SRWLOCK_INIT;
+static VkDescriptorPool g_push_pool;
+static VkDevice g_push_dev;
+
+static VkResult VKAPI_CALL alloc_dsets(VkDevice dv, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out);
+static VkResult VKAPI_CALL create_dpool(VkDevice dv, const VkDescriptorPoolCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorPool *out);
+
+// push 用の set を 1 つ取る（使い回せる物があればそれ、無ければ隠しの pool から。pool がいっぱいなら新しく作る）
+static VkDescriptorSet push_take(VkDevice dv, struct dsl *l) {
+    VkDescriptorSet s = VK_NULL_HANDLE;
+    AcquireSRWLockExclusive(&g_pools_lock);
+    if (l->nfree) s = l->free[--l->nfree];
+    ReleaseSRWLockExclusive(&g_pools_lock);
+    if (s) return s;
+    AcquireSRWLockExclusive(&g_push_lock);
+    for (int tries = 0; tries < 2 && !s; tries++) {
+        if (!g_push_pool || g_push_dev != dv) {
+            VkDescriptorPoolSize ps[11];
+            for (uint32_t t = 0; t < 11; t++) ps[t] = (VkDescriptorPoolSize) { (VkDescriptorType) t, 2048 };
+            VkDescriptorPoolCreateInfo pc = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 256, .poolSizeCount = 11, .pPoolSizes = ps };
+            if (create_dpool(dv, &pc, NULL, &g_push_pool) != VK_SUCCESS) break;
+            g_push_dev = dv;
+            say("push descriptor 用の pool を作った");
+        }
+        VkDescriptorSetLayout lh = (VkDescriptorSetLayout) l;
+        VkDescriptorSetAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_push_pool,
+                                           .descriptorSetCount = 1, .pSetLayouts = &lh };
+        if (alloc_dsets(dv, &ai, &s) != VK_SUCCESS) { s = VK_NULL_HANDLE; g_push_pool = VK_NULL_HANDLE; }
+    }
+    ReleaseSRWLockExclusive(&g_push_lock);
+    return s;
+}
+
+static void push_hold(struct cb *c, struct dsl *l, VkDescriptorSet s) {
+    if (c->nph == c->cph) {
+        size_t cap = c->cph ? c->cph * 2 : 8;
+        struct pushheld *p = realloc(c->ph, cap * sizeof *p);
+        if (!p) return;
+        c->ph = p;
+        c->cph = cap;
+    }
+    c->ph[c->nph++] = (struct pushheld) { l, s };
+}
+
+static void push_release(struct cb *c) {
+    if (!c->nph) return;
+    AcquireSRWLockExclusive(&g_pools_lock);
+    for (size_t i = 0; i < c->nph; i++) {
+        struct dsl *l = c->ph[i].l;
+        if (l->nfree == l->capfree) {
+            uint32_t cap = l->capfree ? l->capfree * 2 : 8;
+            VkDescriptorSet *p = realloc(l->free, cap * sizeof *p);
+            if (!p) continue;
+            l->free = p;
+            l->capfree = cap;
+        }
+        l->free[l->nfree++] = c->ph[i].s;
+    }
+    c->nph = 0;
+    ReleaseSRWLockExclusive(&g_pools_lock);
+}
+
+static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c);
+static void VKAPI_CALL cmd_bind_sets(VkCommandBuffer cbh, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t first, uint32_t n, const VkDescriptorSet *sets, uint32_t nd, const uint32_t *dyn);
+
+// push に使う set を取って持つ。取れなければ NULL
+static VkDescriptorSet push_set_for(struct cb *c, VkPipelineLayout layout, uint32_t set) {
+    struct dsl *l = pl_set_layout(ID(layout), set);
+    if (!l) { say("push descriptor：pipeline layout の %u 番の形が分からない", set); return VK_NULL_HANDLE; }
+    VkDescriptorSet s = push_take((VkDevice) c->d, l);
+    if (!s) { say("push descriptor の set を取れない"); return VK_NULL_HANDLE; }
+    push_hold(c, l, s);
+    return s;
+}
+
+static void VKAPI_CALL cmd_push_desc(VkCommandBuffer cbh, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set, uint32_t nw,
+                                     const VkWriteDescriptorSet *w) {
+    struct cb *c = (struct cb *) cbh;
+    VkDescriptorSet s = push_set_for(c, layout, set);
+    if (!s) return;
+    VkWriteDescriptorSet *ww = malloc((nw ? nw : 1) * sizeof *ww);
+    if (!ww) return;
+    for (uint32_t i = 0; i < nw; i++) { ww[i] = w[i]; ww[i].dstSet = s; }
+    update_dsets((VkDevice) c->d, nw, ww, 0, NULL);
+    free(ww);
+    cmd_bind_sets(cbh, bp, layout, set, 1, &s, 0, NULL);
+}
+
 // ---- descriptor の書き込みの型紙（update template） ----
 // 受け手には送らない。使うたびに、型紙と中身から普通の書き込み（update_dsets）を組み立てる
-struct dtmpl { uint32_t n; VkDescriptorUpdateTemplateEntry *e; };
+struct dtmpl { uint32_t n; VkDescriptorUpdateTemplateEntry *e; VkPipelineBindPoint bp; };
 
 static VkResult VKAPI_CALL create_dtmpl(VkDevice dv, const VkDescriptorUpdateTemplateCreateInfo *ci, const VkAllocationCallbacks *a,
                                         VkDescriptorUpdateTemplate *out) {
     (void) dv; (void) a;
-    if (ci->templateType != VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET) { say("push descriptor の型紙はまだ扱わない"); return VK_ERROR_FEATURE_NOT_PRESENT; }
     struct dtmpl *t = calloc(1, sizeof *t);
     if (!t) return VK_ERROR_OUT_OF_HOST_MEMORY;
     t->n = ci->descriptorUpdateEntryCount;
+    t->bp = ci->templateType == VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_PUSH_DESCRIPTORS_KHR ? ci->pipelineBindPoint : VK_PIPELINE_BIND_POINT_GRAPHICS;
     t->e = malloc((t->n ? t->n : 1) * sizeof *t->e);
     if (t->n) memcpy(t->e, ci->pDescriptorUpdateEntries, t->n * sizeof *t->e);
     *out = (VkDescriptorUpdateTemplate) t;
@@ -3590,6 +3744,30 @@ static void VKAPI_CALL destroy_dtmpl(VkDevice dv, VkDescriptorUpdateTemplate h, 
     if (!t) return;
     free(t->e);
     free(t);
+}
+
+static void VKAPI_CALL update_dset_tmpl(VkDevice dv, VkDescriptorSet set, VkDescriptorUpdateTemplate h, const void *data);
+
+// 型紙で push する。型紙の中身の並びはふつうの型紙と同じなので、push 用の set に書いてつなぐ
+static void VKAPI_CALL cmd_push_desc_tmpl(VkCommandBuffer cbh, VkDescriptorUpdateTemplate h, VkPipelineLayout layout, uint32_t set, const void *data) {
+    struct cb *c = (struct cb *) cbh;
+    struct dtmpl *t = (struct dtmpl *) h;
+    if (!t) return;
+    VkDescriptorSet s = push_set_for(c, layout, set);
+    if (!s) return;
+    update_dset_tmpl((VkDevice) c->d, s, h, data);
+    cmd_bind_sets(cbh, t->bp, layout, set, 1, &s, 0, NULL);
+}
+
+static void VKAPI_CALL cmd_push_desc2(VkCommandBuffer cbh, const VkPushDescriptorSetInfoKHR *i) {
+    if (i->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS)
+        cmd_push_desc(cbh, VK_PIPELINE_BIND_POINT_GRAPHICS, i->layout, i->set, i->descriptorWriteCount, i->pDescriptorWrites);
+    if (i->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)
+        cmd_push_desc(cbh, VK_PIPELINE_BIND_POINT_COMPUTE, i->layout, i->set, i->descriptorWriteCount, i->pDescriptorWrites);
+}
+
+static void VKAPI_CALL cmd_push_desc_tmpl2(VkCommandBuffer cbh, const VkPushDescriptorSetWithTemplateInfoKHR *i) {
+    cmd_push_desc_tmpl(cbh, i->descriptorUpdateTemplate, i->layout, i->set, i->pData);
 }
 
 static void VKAPI_CALL update_dset_tmpl(VkDevice dv, VkDescriptorSet set, VkDescriptorUpdateTemplate h, const void *data) {
@@ -3656,9 +3834,9 @@ static void bct_free(struct cb *c) {
     c->bct = NULL;
 }
 
-static void cb_clear(struct cb *c) { c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
+static void cb_clear(struct cb *c) { push_release(c); c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
 
-static void cb_free(struct cb *c) { gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c->ev); free(c); }
+static void cb_free(struct cb *c) { push_release(c); free(c->ph); gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c->ev); free(c); }
 
 static void VKAPI_CALL destroy_cpool(VkDevice dv, VkCommandPool pp, const VkAllocationCallbacks *a) {
     (void) a;
@@ -5447,6 +5625,14 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkDestroyDescriptorUpdateTemplateKHR", destroy_dtmpl);
     F("vkUpdateDescriptorSetWithTemplate", update_dset_tmpl);
     F("vkUpdateDescriptorSetWithTemplateKHR", update_dset_tmpl);
+    F("vkCmdPushDescriptorSetKHR", cmd_push_desc);
+    F("vkCmdPushDescriptorSet", cmd_push_desc);
+    F("vkCmdPushDescriptorSetWithTemplateKHR", cmd_push_desc_tmpl);
+    F("vkCmdPushDescriptorSetWithTemplate", cmd_push_desc_tmpl);
+    F("vkCmdPushDescriptorSet2KHR", cmd_push_desc2);
+    F("vkCmdPushDescriptorSet2", cmd_push_desc2);
+    F("vkCmdPushDescriptorSetWithTemplate2KHR", cmd_push_desc_tmpl2);
+    F("vkCmdPushDescriptorSetWithTemplate2", cmd_push_desc_tmpl2);
 #define NY_F(n) F(#n, ny_##n);
     NOT_YET(NY_F)
 #undef NY_F

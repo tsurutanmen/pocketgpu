@@ -32,11 +32,11 @@ for w in $WHAT; do
         echo "道具：stackdump・vklist"
         ;;
     tests)
-        for t in tri tri13 vecadd extlist; do $CC $VKH tests/$t.c -o "$OUT/$t.exe" $VKLIB; done
+        for t in tri tri13 vecadd pushdesc extlist; do $CC $VKH tests/$t.c -o "$OUT/$t.exe" $VKLIB; done
         for t in d3d11tri d3d11cube d3d11event; do $CC -Wall -Wno-unused-parameter tests/$t.c -o "$OUT/d3d11/$t.exe" -ld3d11 -ldxguid -luuid -luser32 -lgdi32; done
         # geometry shader の真似の試験（場面と比べ方は tests/gs/gstest.c と cmp.py）
         $CC -Wall -Wno-unused-parameter tests/gs/gstest.c -o "$OUT/d3d11/gstest.exe" -ld3d11 -ldxguid -luuid -luser32 -lgdi32
-        echo "試験：tri・tri13・vecadd・extlist・d3d11/d3d11tri・d3d11/d3d11cube・d3d11/d3d11event・d3d11/gstest"
+        echo "試験：tri・tri13・vecadd・pushdesc・extlist・d3d11/d3d11tri・d3d11/d3d11cube・d3d11/d3d11event・d3d11/gstest"
         ;;
     *) echo "知らない名前：$w"; exit 2 ;;
     esac

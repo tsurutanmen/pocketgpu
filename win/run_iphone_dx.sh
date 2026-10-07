@@ -27,7 +27,7 @@ IPHONE_VK_LOG=1 run 120 "D:/iphone-rpc/vkbuild/extlist.exe" iPhone > "$OUT/extli
 grep -a "受け手の GPU\|caps\|BC の\|: [0-9]*$" "$OUT/extlist.txt" | head -5
 
 echo "== 2. Vulkan の三角形と足し算"
-for t in tri tri13 vecadd; do
+for t in tri tri13 vecadd pushdesc; do
     (cd "$OUT" && IPHONE_VK_LOG=1 run 120 "D:/iphone-rpc/vkbuild/$t.exe") > "$OUT/$t.txt" 2>&1
     echo "$t：$(grep -a -v '^\[iphone-vk\]' "$OUT/$t.txt" | tail -1)"
     # 1 回目だけ GPU を失ったと出たことがある（10/7）。ドライバが何を見たかを出す
