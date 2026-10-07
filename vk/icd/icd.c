@@ -595,6 +595,7 @@ static const struct { const char *name; uint32_t cap; } CAP_EXT[] = {
     { "VK_KHR_dynamic_rendering", VR_CAP_DYNAMIC_RENDERING }, { "VK_KHR_synchronization2", VR_CAP_SYNC2 },
     { "VK_KHR_create_renderpass2", VR_CAP_RENDER_PASS2 }, { "VK_EXT_extended_dynamic_state", VR_CAP_EXT_DYNAMIC_STATE },
     { "VK_EXT_extended_dynamic_state2", VR_CAP_EXT_DYNAMIC_STATE }, { "VK_EXT_host_query_reset", VR_CAP_QUERY },
+    { "VK_EXT_vertex_attribute_divisor", VR_CAP_DIVISOR },
 };
 
 static int allowed_ext(const char *name) {
@@ -1247,6 +1248,7 @@ static const stinfo FEAT_ST[] = {
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES, sizeof(VkPhysicalDeviceHostQueryResetFeatures) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES, sizeof(VkPhysicalDeviceMaintenance5Features) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES, sizeof(VkPhysicalDeviceMaintenance6Features) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT, sizeof(VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT) },
 };
 
 // 1.3 に向けて足した機能の構造体。装置を作るときは、中継できない機能を 0 にしてから送る
@@ -1275,6 +1277,7 @@ static const stinfo PROP_ST[] = {
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_PROPERTIES, sizeof(VkPhysicalDeviceMaintenance5Properties) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_PROPERTIES, sizeof(VkPhysicalDeviceMaintenance6Properties) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT, sizeof(VkPhysicalDeviceRobustness2PropertiesEXT) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT, sizeof(VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT) },
 };
 
 static uint32_t st_size(const stinfo *t, size_t n, VkStructureType st) {
@@ -2491,6 +2494,20 @@ static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCach
             vr_u32(&t, ts->patchControlPoints);
             vr_u32(&t, origin);
             vr_u32(&b, VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO);
+            vr_bytes(&b, t.p, (uint32_t) t.n);
+            free(t.p);
+        }
+        // 末尾：頂点の step rate（インスタンスごとの頂点データを何個おきに進めるか）。古い受け手は読み飛ばす
+        for (const VkBaseInStructure *x = c->pVertexInputState ? c->pVertexInputState->pNext : NULL; x; x = x->pNext) {
+            if (x->sType != VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT) continue;
+            const VkPipelineVertexInputDivisorStateCreateInfoEXT *dv2 = (const VkPipelineVertexInputDivisorStateCreateInfoEXT *) x;
+            vr_buf t = { 0 };
+            vr_u32(&t, dv2->vertexBindingDivisorCount);
+            for (uint32_t k = 0; k < dv2->vertexBindingDivisorCount; k++) {
+                vr_u32(&t, dv2->pVertexBindingDivisors[k].binding);
+                vr_u32(&t, dv2->pVertexBindingDivisors[k].divisor);
+            }
+            vr_u32(&b, VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT);
             vr_bytes(&b, t.p, (uint32_t) t.n);
             free(t.p);
         }

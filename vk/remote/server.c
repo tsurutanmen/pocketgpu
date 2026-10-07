@@ -109,6 +109,7 @@ static uint32_t g_caps = VR_CAP_DELTA; // 受け手ができること（あい�
 // 空の descriptor（robustness2 の nullDescriptor）を GPU が持つか。持てば装置を作るときに有効にする。
 // 持たなければ（MoltenVK）、空の頂点バッファだけは 0 で埋めた代わりのバッファに差し替える
 static int g_nulldesc_gpu;
+static int g_divisor; // GPU が VK_EXT_vertex_attribute_divisor を持つ
 // 調べ用：VKR_LIKE_IOS=1 で、PC の代役が iPhone の GPU のふりをする（BC・geometry shader・cull distance・空の descriptor を持たない）。
 // 持たない機能を有効にして装置を作ろうとすると、MoltenVK と同じように断る
 static int like_ios(void) {
@@ -314,6 +315,17 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     g_fmt3 = (v13 || has_ext(ep, ne, "VK_KHR_format_feature_flags2")) && vkGetPhysicalDeviceFormatProperties2;
     caps |= VR_CAP_D3D; // buffer view と画像の並び方は 1.0 の入口なので、どの GPU でも使える
     caps |= VR_CAP_PACK | VR_CAP_ASYNC_CREATE | VR_CAP_STATUS;
+    // 頂点の step rate：GPU が拡張を持てば、pipeline の末尾を読んでつなぐ（MoltenVK も持つ）
+    {
+        uint32_t ne = 0;
+        vkEnumerateDeviceExtensionProperties(g_pd, NULL, &ne, NULL);
+        VkExtensionProperties *ex = calloc(ne ? ne : 1, sizeof *ex);
+        vkEnumerateDeviceExtensionProperties(g_pd, NULL, &ne, ex);
+        for (uint32_t i = 0; i < ne; i++)
+            if (!strcmp(ex[i].extensionName, "VK_EXT_vertex_attribute_divisor")) g_divisor = 1;
+        free(ex);
+        if (g_divisor) caps |= VR_CAP_DIVISOR;
+    }
 #if defined(__APPLE__) || defined(_WIN32)
     caps |= VR_CAP_JPEG | VR_CAP_JPEG_PIPE; // 窓に出すコマを JPEG に縮められる（iPhone は ImageIO、PC の代役は WIC）
 #endif
@@ -2737,6 +2749,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkPipelineRenderingCreateInfo pri = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
         VkPipelineTessellationStateCreateInfo tsi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO };
         VkPipelineTessellationDomainOriginStateCreateInfo tdo = { .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO };
+        VkPipelineVertexInputDivisorStateCreateInfoEXT vdi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT };
+        VkVertexInputBindingDivisorDescriptionEXT vdd[32];
         VkFormat cfmt[16];
         while (!r->bad && r->at + 8 <= r->n) {
             uint32_t st = vr_ru32(r), len;
@@ -2753,6 +2767,16 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 pri.depthAttachmentFormat = (VkFormat) vr_ru32(&br);
                 pri.stencilAttachmentFormat = (VkFormat) vr_ru32(&br);
                 if (!br.bad) { pri.pNext = ci.pNext; ci.pNext = &pri; }
+            } else if (st == VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT) {
+                // 頂点の step rate：インスタンスごとの頂点データを何個おきに進めるか
+                uint32_t nd = vr_ru32(&br);
+                for (uint32_t i = 0; i < nd; i++) {
+                    uint32_t bnd = vr_ru32(&br), dvs = vr_ru32(&br);
+                    if (i < 32) vdd[i] = (VkVertexInputBindingDivisorDescriptionEXT) { bnd, dvs };
+                }
+                vdi.vertexBindingDivisorCount = nd < 32 ? nd : 32;
+                vdi.pVertexBindingDivisors = vdd;
+                if (!br.bad && g_divisor && ci.pVertexInputState) { vdi.pNext = vi.pNext; vi.pNext = &vdi; }
             } else if (st == VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO) {
                 // テッセレーション：1 つのパッチの点の数と、面の向きの原点
                 tsi.patchControlPoints = vr_ru32(&br);

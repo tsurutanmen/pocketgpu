@@ -22,6 +22,7 @@
 #define VR_CAP_JPEG 256u             // VR_READ_JPEG：窓に出すコマを受け手が JPEG に縮めて返す
 #define VR_CAP_JPEG_PIPE 1024u       // VR_READ_JPEG_PIPE：今のコマを後ろで縮め始めて、ひとつ前のコマの JPEG を返す
 #define VR_CAP_ASYNC_CREATE 16384u  // VR_CREATE_BUFFER_NR：返事を待たずに buffer を作る。必要なメモリの量はドライバが前に聞いた物から計算する
+#define VR_CAP_DIVISOR 65536u       // 頂点の step rate（VK_EXT_vertex_attribute_divisor）：pipeline の末尾の VkPipelineVertexInputDivisorStateCreateInfoEXT を読む
 #define VR_CAP_STATUS 32768u        // VR_GET_STATUS：iPhone の熱の状態を返す
 #define VR_CAP_PACK 8192u           // VR_PACKED：いくつもの命令をまとめて LZ4 で縮めた物を受けて、ほどいて順に処理する
 #define VR_CAP_BDA 4096u            // buffer device address：VR_GET_BUFFER_ADDRESS と、VR_ALLOC_MEMORY の末尾の flags（VkMemoryAllocateFlagsInfo）
