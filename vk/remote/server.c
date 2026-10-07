@@ -2694,6 +2694,13 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 }
             }
         }
+        // iPhone のふり：MoltenVK はテッセレーションの設定が無いと何も描かない。代役でも同じに見えるよう、作らずに断る
+        if (like_ios() && !ci.pTessellationState)
+            for (uint32_t i = 0; i < nst; i++)
+                if (st[i].stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT || st[i].stage == VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) {
+                    vlog("iPhone のふり：テッセレーションの設定が無いので pipeline を作らない");
+                    return reply(s, VK_ERROR_INITIALIZATION_FAILED);
+                }
         VkPipeline pp;
         VkResult res = r->bad ? VK_ERROR_INITIALIZATION_FAILED : vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &ci, NULL, &pp);
         if (res == VK_SUCCESS) put(id, (uint64_t) pp, K_PIPELINE);
