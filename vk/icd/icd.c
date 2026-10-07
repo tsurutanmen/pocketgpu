@@ -137,6 +137,7 @@ static struct {
     double wait_ms[VR_OP_COUNT];
     uint64_t bytes_in, flushes;
     uint64_t ww_calls, ww_pages;   // 書き込み監視を見た回数・見つかった書いたページ
+    uint64_t wdiff_pages, wdiff_sent; // 違う所だけ送ったページの数と、送ったバイト
     uint64_t skipped;              // 往復せずに済ませた待ち
     double ww_ms, rb_ms;           // 書き込み監視にかかった時間・引き取りにかかった時間
 } g_stat;
@@ -164,6 +165,9 @@ static void print_stats(void) {
     fprintf(stderr, "  書き込み監視 %llu 回 %.1f ms 書いたページ %llu / 引き取り %.1f ms\n", (unsigned long long) g_stat.ww_calls, g_stat.ww_ms,
             (unsigned long long) g_stat.ww_pages, g_stat.rb_ms);
     fprintf(stderr, "  往復せずに済ませた待ち %llu\n", (unsigned long long) g_stat.skipped);
+    if (g_stat.wdiff_pages)
+        fprintf(stderr, "  違う所だけ送ったページ %llu・送ったバイト %llu・丸ごとなら %llu\n", (unsigned long long) g_stat.wdiff_pages,
+                (unsigned long long) g_stat.wdiff_sent, (unsigned long long) g_stat.wdiff_pages * PAGE);
 }
 
 // ---- 受け手との通り道 ----
@@ -612,6 +616,8 @@ struct mem {
     uint8_t *dirty;    // ページごとの「まだ送っていない」印
     int delta;         // 窓に出すコマ用：受け手に前回との違いだけを送ってもらう（VR_MEM_READ_DELTA）
     int jpeg;          // 窓に出すコマ用：引き取らずに、受け手に JPEG に縮めて送ってもらう（VR_READ_JPEG）
+    uint8_t *sent;     // 受け手が持っている中身の写し。書かれたページは、これと比べて変わった所だけ送る
+    uint8_t *known;    // ページごとの「受け手の中身を知っている」印。知らないページは丸ごと送る
     struct mem *prev, *next;
 };
 
@@ -725,6 +731,52 @@ static void collect_dirty(struct mem *m, size_t p0, size_t p1) {
     for (ULONG_PTR i = 0; i < count; i++) m->dirty[(size_t) ((uint8_t *) m->addrs[i] - m->shadow) / PAGE] = 1;
 }
 
+// 書いたページの中で、受け手の中身と違う所だけを送るか（IPHONE_VK_WDIFF=0 で、今までどおりページを丸ごと送る）
+static int wdiff_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_WDIFF"); v = !(e && *e == '0'); }
+    return v;
+}
+
+static void send_write(vr_buf *b, struct mem *m, uint64_t off, uint64_t len) {
+    vr_u64(b, ID(m));
+    vr_u64(b, off);
+    vr_bytes(b, m->shadow + off, (uint32_t) len);
+    rpc_send(VR_MEM_WRITE, b);
+    b->n = 0;
+}
+
+// 1 ページを、受け手の中身の写しと 8 バイトずつ比べ、違う所だけを送る。64 バイト未満のすき間はまとめて送る
+static void send_page_diff(vr_buf *b, struct mem *m, size_t pg) {
+    uint64_t base = (uint64_t) pg * PAGE;
+    size_t plen = (size_t) (m->size - base < PAGE ? m->size - base : PAGE);
+    const uint8_t *cur = m->shadow + base;
+    uint8_t *old = m->sent + base;
+    size_t a = 0;
+    while (a < plen) {
+        size_t w = plen - a < 8 ? plen - a : 8;
+        if (!memcmp(cur + a, old + a, w)) { a += w; continue; }
+        size_t e = a + w;
+        while (e < plen) {
+            size_t g = e;
+            while (g < plen) {
+                size_t w2 = plen - g < 8 ? plen - g : 8;
+                if (memcmp(cur + g, old + g, w2)) break;
+                g += w2;
+            }
+            if (g >= plen || g - e >= 64) break;
+            size_t w3 = plen - g < 8 ? plen - g : 8;
+            e = g + w3;
+        }
+        if (e > plen) e = plen;
+        send_write(b, m, base + a, e - a);
+        memcpy(old + a, cur + a, e - a);
+        g_stat.wdiff_sent += e - a;
+        a = e;
+    }
+    g_stat.wdiff_pages++;
+}
+
 // off から len バイトのうち、アプリが書いたページを受け手へ送る
 static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
     if (off >= m->size) return;
@@ -734,10 +786,29 @@ static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
     collect_dirty(m, p0, p1);
     const size_t chunk = (16u << 20) / PAGE;
     vr_buf b = { 0 };
+    if (wdiff_on() && !m->sent && !m->delta && !m->jpeg) {
+        m->sent = malloc(m->npages * PAGE);
+        m->known = calloc(m->npages, 1);
+        if (!m->sent || !m->known) { free(m->sent); free(m->known); m->sent = m->known = NULL; }
+    }
     for (size_t i = p0; i < p1;) {
         if (!m->dirty[i]) { i++; continue; }
+        // 受け手の中身を知っているページは、違う所だけを送る
+        if (m->sent && m->known[i]) {
+            m->dirty[i] = 0;
+            send_page_diff(&b, m, i);
+            i++;
+            continue;
+        }
         size_t j = i;
-        while (j < p1 && m->dirty[j] && j - i < chunk) m->dirty[j++] = 0;
+        while (j < p1 && m->dirty[j] && j - i < chunk && !(m->sent && m->known[j])) m->dirty[j++] = 0;
+        if (m->sent) {
+            // 初めて送るページは丸ごと送り、写しを取っておく
+            uint64_t o = (uint64_t) i * PAGE, l = (uint64_t) (j - i) * PAGE;
+            if (o + l > m->size) l = m->size - o;
+            memcpy(m->sent + o, m->shadow + o, (size_t) l);
+            memset(m->known + i, 1, j - i);
+        }
         uint64_t off = (uint64_t) i * PAGE, len = (uint64_t) (j - i) * PAGE;
         if (off + len > m->size) len = m->size - off;
         vr_u64(&b, ID(m));
@@ -815,11 +886,13 @@ static void read_back_many(rng *r, size_t n) {
                     g_dead = 1;
                 }
                 if (g_dead) say("違いの読み出しが壊れていた。この先は全部失敗にする");
+                else if (r[i].m->sent) memcpy(r[i].m->sent + at, r[i].m->shadow + at, (size_t) k);
                 free(buf);
                 continue;
             }
             if ((int32_t) h[0] == VK_SUCCESS && h[1] == k) {
                 if (!vr_recv_all(g_sock, r[i].m->shadow + at, k)) { ok = 0; g_dead = 1; break; }
+                if (r[i].m->sent) memcpy(r[i].m->sent + at, r[i].m->shadow + at, (size_t) k);
             } else {
                 // 読めなかった：中身は捨てる
                 uint8_t tmp[4096];
@@ -1469,6 +1542,8 @@ static void VKAPI_CALL free_memory(VkDevice dv, VkDeviceMemory mm, const VkAlloc
     if (m->shadow) VirtualFree(m->shadow, 0, MEM_RELEASE);
     free(m->addrs);
     free(m->dirty);
+    free(m->sent);
+    free(m->known);
     free(m);
 }
 
