@@ -25,6 +25,9 @@ grep -a "MB/s\|見つからない" "$OUT/usb_bw.txt" | head -8
 echo "== 1. 装置の拡張"
 IPHONE_VK_LOG=1 run 120 "D:/iphone-rpc/vkbuild/extlist.exe" iPhone > "$OUT/extlist.txt" 2>&1
 grep -a "受け手の GPU\|caps\|BC の\|: [0-9]*$" "$OUT/extlist.txt" | head -5
+# iPhone の上限と機能を全部残す（PC の代役の「iPhone のふり」を合わせるのに使う）
+IPHONE_VK_ONLY=1 run 120 "D:/iphone-rpc/vk-apps/vulkaninfo/vulkaninfo.exe" > "$OUT/vulkaninfo_full.txt" 2>&1
+echo "vulkaninfo：$(wc -l < "$OUT/vulkaninfo_full.txt") 行・$(grep -a -m1 "deviceName" "$OUT/vulkaninfo_full.txt" | sed 's/^ *//')"
 
 echo "== 2. Vulkan の三角形と足し算"
 for t in tri tri13 vecadd pushdesc; do
