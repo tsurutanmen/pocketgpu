@@ -187,6 +187,13 @@ static void like_ios_props2(VkBaseOutStructure *x) {
 static VkBuffer g_dummy_vb;
 static VkDeviceMemory g_dummy_mem;
 static VkSampler g_dummy_smp; // 空の sampler の代わり（ドライバの取りこぼしで、アプリごと落ちないように）
+// 空の画像・texel buffer の見え方の代わり（GPU が空の descriptor を持たないとき。DXVK 3・vkd3d・zink が書く）
+static VkImage g_dummy_img;
+static VkImageView g_dummy_iview;
+static VkDeviceMemory g_dummy_img_mem;
+static VkBuffer g_dummy_tb;
+static VkBufferView g_dummy_bview;
+static VkDeviceMemory g_dummy_tb_mem;
 static VkBuffer dummy_vb(void);
 static int g_fmt3;                     // VkFormatProperties3 を答えられる
 
@@ -839,8 +846,20 @@ static void cleanup(void) {
         if (g_dummy_vb) vkDestroyBuffer(dev, g_dummy_vb, NULL);
         if (g_dummy_mem) vkFreeMemory(dev, g_dummy_mem, NULL);
         if (g_dummy_smp) vkDestroySampler(dev, g_dummy_smp, NULL);
+        if (g_dummy_iview) vkDestroyImageView(dev, g_dummy_iview, NULL);
+        if (g_dummy_img) vkDestroyImage(dev, g_dummy_img, NULL);
+        if (g_dummy_img_mem) vkFreeMemory(dev, g_dummy_img_mem, NULL);
+        if (g_dummy_bview) vkDestroyBufferView(dev, g_dummy_bview, NULL);
+        if (g_dummy_tb) vkDestroyBuffer(dev, g_dummy_tb, NULL);
+        if (g_dummy_tb_mem) vkFreeMemory(dev, g_dummy_tb_mem, NULL);
         vkDestroyDevice(dev, NULL);
     }
+    g_dummy_img = VK_NULL_HANDLE;
+    g_dummy_iview = VK_NULL_HANDLE;
+    g_dummy_img_mem = VK_NULL_HANDLE;
+    g_dummy_tb = VK_NULL_HANDLE;
+    g_dummy_bview = VK_NULL_HANDLE;
+    g_dummy_tb_mem = VK_NULL_HANDLE;
     g_dummy_vb = VK_NULL_HANDLE;
     g_dummy_mem = VK_NULL_HANDLE;
     g_dummy_smp = VK_NULL_HANDLE;
@@ -1505,6 +1524,82 @@ done:
 
 // ---- 空の頂点バッファの代わり ----
 // 空の descriptor を持たない GPU（MoltenVK）に、空の頂点バッファを渡すと落ちる。0 で埋めた 1 MiB のバッファに差し替える
+// d が持つメモリの種類から、bits の中で GPU の手元の物を選ぶ（無ければ bits の最初）
+static uint32_t dummy_mem_type(uint32_t bits) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_pd, &mp);
+    for (uint32_t t = 0; t < mp.memoryTypeCount; t++)
+        if ((bits & (1u << t)) && (mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return t;
+    for (uint32_t t = 0; t < mp.memoryTypeCount; t++) if (bits & (1u << t)) return t;
+    return 0;
+}
+
+// 空の画像の見え方の代わり：1 x 1 の画像を 0 で塗り、GENERAL に移して置いておく
+static VkImageView dummy_iview(VkDevice d) {
+    if (g_dummy_iview || !d) return g_dummy_iview;
+    if (g_paused) return VK_NULL_HANDLE; // 後ろに回っている間は GPU に仕事を出せないので、今は作らない
+    VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+                             .extent = { 1, 1, 1 }, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    if (vkCreateImage(d, &ic, NULL, &g_dummy_img) != VK_SUCCESS) { g_dummy_img = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(d, g_dummy_img, &req);
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = dummy_mem_type(req.memoryTypeBits) };
+    if (vkAllocateMemory(d, &ai, NULL, &g_dummy_img_mem) != VK_SUCCESS || vkBindImageMemory(d, g_dummy_img, g_dummy_img_mem, 0) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkImageViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_dummy_img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                 .format = VK_FORMAT_R8G8B8A8_UNORM, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    VkImageView v;
+    if (vkCreateImageView(d, &vc, NULL, &v) != VK_SUCCESS) return VK_NULL_HANDLE;
+    // GENERAL に移して 0 で塗る。1 回だけなので、出して終わりまで待つ
+    VkCommandPoolCreateInfo pc = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = 0 };
+    VkCommandPool pool;
+    if (vkCreateCommandPool(d, &pc, NULL, &pool) == VK_SUCCESS) {
+        VkCommandBufferAllocateInfo ca = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+        VkCommandBuffer cb;
+        if (vkAllocateCommandBuffers(d, &ca, &cb) == VK_SUCCESS) {
+            VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+            vkBeginCommandBuffer(cb, &bi);
+            VkImageMemoryBarrier ib = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                        .image = g_dummy_img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+            VkClearColorValue zero = { 0 };
+            vkCmdClearColorImage(cb, g_dummy_img, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ib.subresourceRange);
+            ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            ib.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+            vkEndCommandBuffer(cb);
+            VkQueue q;
+            vkGetDeviceQueue(d, 0, 0, &q);
+            VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
+            if (vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) vkQueueWaitIdle(q);
+        }
+        vkDestroyCommandPool(d, pool, NULL);
+    }
+    g_dummy_iview = v;
+    vlog("空の画像の代わりを作った");
+    return v;
+}
+
+// 空の texel buffer の見え方の代わり
+static VkBufferView dummy_bview(VkDevice d) {
+    if (g_dummy_bview || !d) return g_dummy_bview;
+    VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 65536,
+                              .usage = VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT };
+    if (vkCreateBuffer(d, &bc, NULL, &g_dummy_tb) != VK_SUCCESS) { g_dummy_tb = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(d, g_dummy_tb, &req);
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = dummy_mem_type(req.memoryTypeBits) };
+    if (vkAllocateMemory(d, &ai, NULL, &g_dummy_tb_mem) != VK_SUCCESS || vkBindBufferMemory(d, g_dummy_tb, g_dummy_tb_mem, 0) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkBufferViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = g_dummy_tb, .format = VK_FORMAT_R32_UINT, .range = VK_WHOLE_SIZE };
+    if (vkCreateBufferView(d, &vc, NULL, &g_dummy_bview) != VK_SUCCESS) { g_dummy_bview = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+    vlog("空の texel buffer の代わりを作った");
+    return g_dummy_bview;
+}
+
 static VkBuffer dummy_vb(void) {
     if (g_dummy_vb || !g_dev) return g_dummy_vb;
     VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 1u << 20,
@@ -2884,6 +2979,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 for (uint32_t k = 0; k < w.descriptorCount; k++) {
                     uint64_t vid = vr_ru64(r);
                     tv[k] = OBJ(VkBufferView, vid);
+                    if (!tv[k] && !g_nulldesc_gpu) tv[k] = dummy_bview(d); // 空の見え方は代わりの物に
                     ent *ve = find(vid);
                     if (se && ve && ve->aux) idlist_add(&se->list, ve->aux); // 見え方の aux はもとの buffer
                 }
@@ -2910,6 +3006,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     uint64_t vid = vr_ru64(r);
                     ii[k].imageView = OBJ(VkImageView, vid);
                     ii[k].imageLayout = (VkImageLayout) vr_ru32(r);
+                    // 画像の要る種類で空なら、代わりの画像を入れる（GPU が空の descriptor を持たないとき）
+                    if (!ii[k].imageView && !g_nulldesc_gpu && w.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLER) {
+                        ii[k].imageView = dummy_iview(d);
+                        ii[k].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    }
                     if (se && vid) idlist_add(&se->list, vid); // 見え方の aux はもとの画像のメモリ
                 }
                 w.pImageInfo = ii;
