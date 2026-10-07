@@ -15,7 +15,7 @@
 - [x] iPhone の Apple の機能を Windows から呼べる（文字認識・音声認識・Apple Intelligence・翻訳・読み上げ）
 - [ ] テッセレーションの直しを iPhone に入れる（受け手の組み直し待ち）
 - [x] geometry shader の真似：点を広げる形（流体の粒）。iPhone のふりの代役で同じ絵。iPhone の実機はこれから
-- [ ] geometry shader の真似：三角を受ける形（影・草・cube map）
+- [x] geometry shader の真似：三角・線を受ける形、番号つき・インスタンスつきの描画、層への描き分け。iPhone のふりで試験 6 場面がふつうの DirectX と同じ。間接の描画と transform feedback はまだ・iPhone の実機はこれから
 
 ### Lv 10〜30 正しさと広さ
 - [ ] Vulkan の公式の適合試験（CTS）の合格率を数字で出す（代役と iPhone）
