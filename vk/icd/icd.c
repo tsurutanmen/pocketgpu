@@ -678,13 +678,33 @@ static const struct { const char *name; uint32_t cap; } CAP_EXT[] = {
     { "VK_EXT_vertex_attribute_divisor", VR_CAP_DIVISOR },
 };
 
+static int has_ext(const char *name);
+static int g_khr_div_native = -1; // 受け手が KHR の divisor を自分で持つか（あいさつで決める）
+static int g_hw_ext_khr_div(void) { return g_khr_div_native > 0; }
 static int allowed_ext(const char *name) {
+    if (!strcmp(name, "VK_KHR_vertex_attribute_divisor")) return (g_hw.caps & VR_CAP_DIVISOR) != 0;
     if (dxvk3() && (!strcmp(name, "VK_KHR_maintenance5") || !strcmp(name, "VK_KHR_maintenance6"))) return 1;
     for (size_t i = 0; i < sizeof ALLOWED_EXT / sizeof *ALLOWED_EXT; i++)
         if (!strcmp(name, ALLOWED_EXT[i])) return 1;
     for (size_t i = 0; i < sizeof CAP_EXT / sizeof *CAP_EXT; i++)
         if (!strcmp(name, CAP_EXT[i].name)) return (g_hw.caps & CAP_EXT[i].cap) != 0;
     return 0;
+}
+
+static int has_ext(const char *name) {
+    for (uint32_t i = 0; i < g_hw.ne; i++)
+        if (!strcmp(g_hw.ext[i].extensionName, name)) return 1;
+    return 0;
+}
+
+// 受け手に渡す拡張の名前（KHR の divisor は、受け手が持つ EXT の名前に替える）。重ねて頼まないように、替えた結果が重なれば NULL
+static const char *fwd_ext(const char *name, const char *const *all, uint32_t n) {
+    if (!strcmp(name, "VK_KHR_vertex_attribute_divisor") && !g_hw_ext_khr_div()) {
+        for (uint32_t k = 0; k < n; k++)
+            if (!strcmp(all[k], "VK_EXT_vertex_attribute_divisor")) return NULL;
+        return "VK_EXT_vertex_attribute_divisor";
+    }
+    return name;
 }
 
 // 1.3 と名乗っているか（受け手が VR_CAP_VK13 を名乗った）
@@ -818,6 +838,7 @@ static int hello(void) {
                 VkExtensionProperties x;
                 vr_rcopy(&rd, &x, sizeof x);
                 if (allowed_ext(x.extensionName) && g_hw.ne < 62) g_hw.ext[g_hw.ne++] = x;
+                if (!strcmp(x.extensionName, "VK_KHR_vertex_attribute_divisor")) g_khr_div_native = 1;
             }
             if (g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_swapchain", 70 };
             // ドライバの中だけで済む拡張（受け手には送らない）
@@ -830,6 +851,9 @@ static int hello(void) {
             if (dxvk3() && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_depth_clip_enable", 1 };
             // 空の descriptor は受け手が受ける（GPU が持たなければ代わりの物で）
             if (dxvk3() && (g_hw.caps & VR_CAP_NULL_DESC) && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_robustness2", 1 };
+            // 頂点の step rate：DXVK 3 は KHR の名前で探す。中身は EXT と同じなので、受け手には EXT として渡す
+            if ((g_hw.caps & VR_CAP_DIVISOR) && !has_ext("VK_KHR_vertex_attribute_divisor") && has_ext("VK_EXT_vertex_attribute_divisor") && g_hw.ne < 64)
+                g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_vertex_attribute_divisor", 1 };
             if (!rd.bad) {
                 char real[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
                 memcpy(real, g_hw.props.deviceName, sizeof real);
@@ -1503,6 +1527,15 @@ static void VKAPI_CALL get_props2(VkPhysicalDevice pd, VkPhysicalDevicePropertie
     for (VkBaseOutStructure *x = p->pNext; x; x = x->pNext)
         if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR)
             ((VkPhysicalDevicePushDescriptorPropertiesKHR *) x)->maxPushDescriptors = 32;
+        else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES) {
+            // 受け手に渡す表には KHR の性質の形が無いので、EXT の性質を聞いて写す。最初の instance が 0 でないときの step rate は名乗らない
+            VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT e = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT };
+            VkPhysicalDeviceProperties dummy;
+            query_chain(VR_GET_PROPERTIES2, &e, PROP_ST, sizeof PROP_ST / sizeof *PROP_ST, &dummy, sizeof dummy);
+            VkPhysicalDeviceVertexAttributeDivisorPropertiesKHR *k = (void *) x;
+            k->maxVertexAttribDivisor = e.maxVertexAttribDivisor;
+            k->supportsNonZeroFirstInstance = VK_FALSE;
+        }
 }
 
 static void VKAPI_CALL get_features2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f) {
@@ -1755,10 +1788,13 @@ static VkResult VKAPI_CALL create_device(VkPhysicalDevice pd, const VkDeviceCrea
         vr_u32(&b, ci->pQueueCreateInfos[i].queueCount);
     }
     uint32_t ne = 0;
-    for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) if (allowed_ext(ci->ppEnabledExtensionNames[i])) ne++;
-    vr_u32(&b, ne);
     for (uint32_t i = 0; i < ci->enabledExtensionCount; i++)
-        if (allowed_ext(ci->ppEnabledExtensionNames[i])) vr_str(&b, ci->ppEnabledExtensionNames[i]);
+        if (allowed_ext(ci->ppEnabledExtensionNames[i]) && fwd_ext(ci->ppEnabledExtensionNames[i], ci->ppEnabledExtensionNames, ci->enabledExtensionCount)) ne++;
+    vr_u32(&b, ne);
+    for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
+        const char *nm = allowed_ext(ci->ppEnabledExtensionNames[i]) ? fwd_ext(ci->ppEnabledExtensionNames[i], ci->ppEnabledExtensionNames, ci->enabledExtensionCount) : NULL;
+        if (nm) vr_str(&b, nm);
+    }
     // 機能：pEnabledFeatures か、鎖の中の VkPhysicalDeviceFeatures2
     const VkPhysicalDeviceFeatures *base = ci->pEnabledFeatures;
     const VkBaseInStructure *chain[32];
