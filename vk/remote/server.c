@@ -2388,6 +2388,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         vkSignalSemaphore(d, &si);
         return 1;
     }
+    case VR_CREATE_IMAGE_NR:
     case VR_CREATE_IMAGE: {
         VkDevice d = DEV(vr_ru64(r));
         uint64_t id = vr_ru64(r);
@@ -2412,6 +2413,10 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (res == VK_SUCCESS) {
             put(id, (uint64_t) im, K_IMAGE);
             vkGetImageMemoryRequirements(d, im, &req);
+        }
+        if (op == VR_CREATE_IMAGE_NR) {
+            if (res != VK_SUCCESS) vlog("image を作れない (%d)", res);
+            return 1;
         }
         vr_put(&g_out, &req, sizeof req);
         return reply(s, res);

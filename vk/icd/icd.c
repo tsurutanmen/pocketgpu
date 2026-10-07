@@ -131,7 +131,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_RESET_QUERY_POOL] = "RESET_QUERY_POOL", [VR_CREATE_BUFFER_VIEW] = "CREATE_BUFFER_VIEW",
     [VR_DESTROY_BUFFER_VIEW] = "DESTROY_BUFFER_VIEW", [VR_GET_IMAGE_SUBRESOURCE_LAYOUT] = "GET_IMAGE_SUBRESOURCE_LAYOUT",
     [VR_READ_JPEG_PIPE] = "READ_JPEG_PIPE", [VR_GET_BUFFER_ADDRESS] = "GET_BUFFER_ADDRESS",
-    [VR_PACKED] = "PACKED", [VR_CREATE_BUFFER_NR] = "CREATE_BUFFER_NR",
+    [VR_PACKED] = "PACKED", [VR_CREATE_BUFFER_NR] = "CREATE_BUFFER_NR", [VR_CREATE_IMAGE_NR] = "CREATE_IMAGE_NR",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -1868,8 +1868,30 @@ static VkResult VKAPI_CALL create_image(VkDevice dv, const VkImageCreateInfo *ci
     vr_u32(&b, ci->tiling);
     vr_u32(&b, ci->usage);
     vr_u32(&b, ci->initialLayout);
+    // まったく同じ条件の画像を前に作っていれば、必要なメモリの量は同じ。覚えている答えを使い、返事を待たずに作る
+    uint32_t key[6];
+    {
+        uint32_t h1 = 2166136261u, h2 = 0x9747b28cu;
+        const uint8_t *k = b.p + 16; // device と id の後ろ。作る条件だけ
+        for (size_t i = 0; i + 16 < b.n; i++) { h1 = (h1 ^ k[i]) * 16777619u; h2 = (h2 ^ k[i]) * 0x01000193u + 0x5bd1e995u; }
+        key[0] = 3; key[1] = h1; key[2] = h2; key[3] = ci->format; key[4] = ci->extent.width; key[5] = ci->extent.height;
+    }
+    uint8_t cached[64];
+    uint32_t cn = 0;
+    VkResult cr;
+    if ((g_hw.caps & VR_CAP_ASYNC_CREATE) && qc_get(key, &cr, cached, &cn) && cr == VK_SUCCESS && cn >= sizeof im->req) {
+        memcpy(&im->req, cached, sizeof im->req);
+        rpc_send(VR_CREATE_IMAGE_NR, &b);
+        free(b.p);
+        free(o.p);
+        *out = (VkImage) im;
+        return VK_SUCCESS;
+    }
     VkResult r = rpc_call(VR_CREATE_IMAGE, &b, &o);
-    if (r == VK_SUCCESS && o.n >= sizeof im->req) memcpy(&im->req, o.p, sizeof im->req);
+    if (r == VK_SUCCESS && o.n >= sizeof im->req) {
+        memcpy(&im->req, o.p, sizeof im->req);
+        qc_put(key, r, o.p, (uint32_t) sizeof im->req);
+    }
     free(b.p);
     free(o.p);
     if (r != VK_SUCCESS) { free(im); return r; }

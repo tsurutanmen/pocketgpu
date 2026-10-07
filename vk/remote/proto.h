@@ -109,6 +109,7 @@ enum vr_op {
     VR_GET_BUFFER_ADDRESS,       // [同期] device・buffer → GPU の中のアドレス（u64）（VR_CAP_BDA）
     VR_PACKED,                   // 元の長さ（u32）・LZ4 で縮めた「命令の並び」。中の命令の返事は、ふつうに順に返す（VR_CAP_PACK）
     VR_CREATE_BUFFER_NR,         // VR_CREATE_BUFFER と同じ中身で、返事をしない（VR_CAP_ASYNC_CREATE）
+    VR_CREATE_IMAGE_NR,          // VR_CREATE_IMAGE と同じ中身で、返事をしない（VR_CAP_ASYNC_CREATE）
     VR_OP_COUNT
 };
 
