@@ -2042,6 +2042,7 @@ static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCach
         }
         VkResult r = rpc_call(VR_CREATE_GRAPHICS_PIPELINE, &b, NULL);
         free(b.p);
+        for (uint32_t k = 0; k < 8; k++) if (tmps[k]) destroy_shader(dv, tmps[k], NULL); // 一時のシェーダーは作り終えたら消す
         if (r != VK_SUCCESS) { say("graphics pipeline を作れない (%d)", r); out[i] = VK_NULL_HANDLE; worst = r; continue; }
         out[i] = (VkPipeline) (uintptr_t) id;
     }
@@ -2582,7 +2583,9 @@ static VkResult VKAPI_CALL create_compute_pipelines(VkDevice dv, VkPipelineCache
         vr_u32(&b, ci[i].flags);
         vr_u64(&b, ID(ci[i].layout));
         vr_u32(&b, st->flags);
-        vr_u64(&b, ID(st->module));
+        // 新しい DXVK は compute でも、シェーダーを段の pNext に直接入れてくる
+        VkShaderModule tmp;
+        vr_u64(&b, ID(stage_module(dv, st, &tmp)));
         vr_str(&b, st->pName);
         const VkSpecializationInfo *si = st->pSpecializationInfo;
         vr_u32(&b, si ? si->mapEntryCount : 0);
@@ -2600,6 +2603,7 @@ static VkResult VKAPI_CALL create_compute_pipelines(VkDevice dv, VkPipelineCache
         // 作れたかどうかは返事で確かめる（iPhone では SPIR-V を Metal に直すときに失敗することがある）
         VkResult r = rpc_call(VR_CREATE_COMPUTE_PIPELINE, &b, NULL);
         free(b.p);
+        if (tmp) destroy_shader(dv, tmp, NULL);
         if (r != VK_SUCCESS) { say("compute pipeline を作れない (%d)", r); out[i] = VK_NULL_HANDLE; worst = r; continue; }
         out[i] = (VkPipeline) (uintptr_t) id;
     }

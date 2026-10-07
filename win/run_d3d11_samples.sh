@@ -8,7 +8,7 @@
 # 絵は DXUT の -screenshotexit で撮る（最初のコマ・-constantframetime で動きを決める）。
 # DXUT でない Tutorial は、ドライバの IPHONE_VK_DUMP で 60 コマ目を撮る（icd だけ）
 S=/d/iphone-rpc/vkbuild/d3d11samples
-DX=/d/iphone-rpc/vkbuild/d3d11
+DX=${DXVK_DIR:-/d/iphone-rpc/vkbuild/d3d11} # 新しい DXVK で試すときは DXVK_DIR=/d/iphone-rpc/vkbuild/dxvk3 と IPHONE_VK_DXVK3=1
 VKCMD='D:/iphone-rpc/vkbuild/iphone-vk.cmd'
 OUT=/d/iphone-rpc/vkbuild/d3d11samples_runs/$(date +%m%d_%H%M)
 VK=${1:-127.0.0.1:50070}

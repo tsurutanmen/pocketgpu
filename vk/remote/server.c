@@ -1897,6 +1897,10 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t req_subgroup = vr_ru32(r);
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = req_subgroup };
         if (req_subgroup) ci.stage.pNext = &rs;
+        if (!ci.stage.module || r->bad) {
+            vlog("compute pipeline の shader module が無い。作らない");
+            return reply(s, VK_ERROR_INITIALIZATION_FAILED);
+        }
         VkPipeline p;
         VkResult res = vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &ci, NULL, &p);
         if (res == VK_SUCCESS) put(id, (uint64_t) p, K_PIPELINE);
