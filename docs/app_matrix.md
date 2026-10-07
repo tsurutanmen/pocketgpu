@@ -8,7 +8,7 @@
 
 最終更新 2026-10-07
 
-数（10/7 夜）：代役か iPhone のふりで動いた物 39 本（Vulkan 19・DirectX 11 20）。iPhone の実機で動いた物 23 本（Vulkan 10・DirectX 11 13）。目標は 50 本
+数（10/7 夜）：代役か iPhone のふりで動いた物 41 本（Vulkan 20・DirectX 11 20・DirectX 12 1）。iPhone の実機で動いた物 23 本（Vulkan 10・DirectX 11 13）。目標は 50 本
 
 ## Vulkan のアプリ
 | アプリ | 代役 | iPhone | 数字（iPhone） |
@@ -25,6 +25,7 @@
 | Godot 4.7.2 の公式の見本 8 本（Forward Mobile） | ✅ ふり：squash_the_creeps 191・truck_town 174・dodge_the_creeps 171・lights_and_shadows 152・volumetric_fog 149・platformer 135・compute_texture 175・particles 23 | 未 | particles は GPU が書く粒の buffer を毎回読み戻すので遅い |
 | Godot 4.7.2 の Forward+（机の上の PC 向けの描き方） | ✅ ふり：squash_the_creeps 174・volumetric_fog 148 | 未 | |
 | SuperTuxKart 1.5（Vulkan・本物のゲーム） | ✅ ふり 110 コマ/秒（RTX 直 107.9）・lighthouse を 4 台で自動走行 | 未 | 22 本の糸で command buffer を捨てる順のずれを直して落ちなくなった |
+| Veloren（ボクセルの RPG・wgpu の Vulkan） | ✅ ふり：最初のメニュー画面 49.7 コマ/秒 | 未 | 遊ぶところまでは試していない |
 
 ## DirectX 11（DXVK-macOS 1.10.3 と DXVK 3.1.1）
 | アプリ | 代役 | iPhone のふり | iPhone | 数字（iPhone） |
