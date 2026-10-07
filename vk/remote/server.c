@@ -132,6 +132,7 @@ static void like_ios_mask(VkPhysicalDeviceFeatures *f) {
 }
 static VkBuffer g_dummy_vb;
 static VkDeviceMemory g_dummy_mem;
+static VkSampler g_dummy_smp; // 空の sampler の代わり（ドライバの取りこぼしで、アプリごと落ちないように）
 static VkBuffer dummy_vb(void);
 static int g_fmt3;                     // VkFormatProperties3 を答えられる
 
@@ -712,10 +713,12 @@ static void cleanup(void) {
             }
         if (g_dummy_vb) vkDestroyBuffer(dev, g_dummy_vb, NULL);
         if (g_dummy_mem) vkFreeMemory(dev, g_dummy_mem, NULL);
+        if (g_dummy_smp) vkDestroySampler(dev, g_dummy_smp, NULL);
         vkDestroyDevice(dev, NULL);
     }
     g_dummy_vb = VK_NULL_HANDLE;
     g_dummy_mem = VK_NULL_HANDLE;
+    g_dummy_smp = VK_NULL_HANDLE;
     for (size_t i = 0; i < g_cap; i++) if (g_tab[i].id) { idlist_free(&g_tab[i].list); free(g_tab[i].last); }
     free(g_tab);
     g_tab = NULL;
@@ -2096,6 +2099,17 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 VkDescriptorImageInfo *ii = calloc(w.descriptorCount ? w.descriptorCount : 1, sizeof *ii);
                 for (uint32_t k = 0; k < w.descriptorCount; k++) {
                     ii[k].sampler = OBJ(VkSampler, vr_ru64(r));
+                    // sampler の要る種類で空なら、代わりの sampler を入れる（空のままだと GPU のドライバの中で落ちることがある）
+                    if (!ii[k].sampler && (w.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || w.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)) {
+                        if (!g_dummy_smp) {
+                            VkSamplerCreateInfo sc = { .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+                                                       .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                                       .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = VK_LOD_CLAMP_NONE };
+                            if (vkCreateSampler(d, &sc, NULL, &g_dummy_smp) != VK_SUCCESS) g_dummy_smp = VK_NULL_HANDLE;
+                            vlog("空の sampler が届いたので、代わりの sampler を入れる（ドライバの取りこぼし）");
+                        }
+                        ii[k].sampler = g_dummy_smp;
+                    }
                     uint64_t vid = vr_ru64(r);
                     ii[k].imageView = OBJ(VkImageView, vid);
                     ii[k].imageLayout = (VkImageLayout) vr_ru32(r);
