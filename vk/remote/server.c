@@ -364,6 +364,25 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
 }
 
 // ---- 起動 ----
+// MoltenVK の言い分（なぜ pipeline を作れないかなど）を受け手の記録に流す。iPhone では MoltenVK の記録が USB に出てこないため。
+// 1 つの接続で 300 件まで（あふれて受け手が遅くならないように）
+static VkDebugUtilsMessengerEXT g_dbg_mess;
+static PFN_vkDestroyDebugUtilsMessengerEXT g_dbg_destroy;
+static volatile int g_dbg_msgs;
+static VKAPI_ATTR VkBool32 VKAPI_CALL dbg_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
+                                             const VkDebugUtilsMessengerCallbackDataEXT *d, void *u) {
+    (void) type; (void) u;
+    if (g_dbg_msgs < 300 && d && d->pMessage) {
+        g_dbg_msgs++;
+        vlog("MoltenVK（%s）：%.440s", sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "誤り" : "注意", d->pMessage);
+    }
+    return VK_FALSE;
+}
+static void dbg_stop(void) {
+    if (g_dbg_mess && g_dbg_destroy) g_dbg_destroy(g_inst, g_dbg_mess, NULL);
+    g_dbg_mess = VK_NULL_HANDLE;
+}
+
 static int vk_init(void) {
 #ifdef _WIN32
     HMODULE lib = LoadLibraryA("vulkan-1.dll");
@@ -380,8 +399,9 @@ static int vk_init(void) {
     if (eiv) eiv(&iv);
     uint32_t want = VK_API_VERSION_MAJOR(iv) > 1 || VK_API_VERSION_MINOR(iv) >= 3 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_2;
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "iphone-rpc-vk", .apiVersion = want };
-    const char *ext[] = { "VK_KHR_portability_enumeration" };
-    VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app };
+    const char *ext[2];
+    int want_dbg = 0;
+    VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app, .ppEnabledExtensionNames = ext };
     // portability_enumeration は Vulkan のローダーが持つ拡張。iPhone のように MoltenVK を直接つなぐと無いので、
     // あるときだけ有効にする（無いのに頼むと vkCreateInstance が失敗する）
 #ifdef _WIN32
@@ -394,15 +414,30 @@ static int vk_init(void) {
     if (enum_ext) enum_ext(NULL, &nie, NULL);
     VkExtensionProperties *ie = calloc(nie ? nie : 1, sizeof *ie);
     if (enum_ext) enum_ext(NULL, &nie, ie);
-    for (uint32_t i = 0; i < nie; i++)
+    for (uint32_t i = 0; i < nie; i++) {
         if (!strcmp(ie[i].extensionName, "VK_KHR_portability_enumeration")) {
             ci.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-            ci.enabledExtensionCount = 1;
-            ci.ppEnabledExtensionNames = ext;
+            ext[ci.enabledExtensionCount++] = "VK_KHR_portability_enumeration";
+        } else if (!strcmp(ie[i].extensionName, "VK_EXT_debug_utils")) {
+            ext[ci.enabledExtensionCount++] = "VK_EXT_debug_utils";
+            want_dbg = 1;
         }
+    }
     free(ie);
     VkResult ir = vkCreateInstance(&ci, NULL, &g_inst);
     if (ir != VK_SUCCESS) { vlog("vkCreateInstance が失敗 (%d)", ir); return 0; }
+    if (want_dbg) {
+        PFN_vkCreateDebugUtilsMessengerEXT mk = (PFN_vkCreateDebugUtilsMessengerEXT) gipa(g_inst, "vkCreateDebugUtilsMessengerEXT");
+        g_dbg_destroy = (PFN_vkDestroyDebugUtilsMessengerEXT) gipa(g_inst, "vkDestroyDebugUtilsMessengerEXT");
+        VkDebugUtilsMessengerCreateInfoEXT mi = {
+            .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+            .pfnUserCallback = dbg_cb,
+        };
+        if (!mk || mk(g_inst, &mi, NULL, &g_dbg_mess) != VK_SUCCESS) g_dbg_mess = VK_NULL_HANDLE;
+        if (g_dbg_mess) vlog("MoltenVK の言い分を記録に流す");
+    }
 #define LOAD(n) n = (PFN_##n) gipa(g_inst, #n);
     VKFUNCS(LOAD)
 #undef LOAD
@@ -3184,6 +3219,7 @@ static void serve_client(vr_sock c) {
 static void serve_one(vr_sock c, int remote) {
     serve_lock();
     g_cur_remote = remote;
+    g_dbg_msgs = 0;
     vlog(remote ? "つながった（インターネット共有の口）" : "つながった");
     g_clients = 1;
     serve_client(c);
@@ -3198,6 +3234,7 @@ static void serve_one(vr_sock c, int remote) {
 #endif
         // GPU を失ったあとは、同じ Vulkan のままだと次の装置が作れないことがある
         vlog("GPU を失ったので、Vulkan を作り直す");
+        dbg_stop();
         vkDestroyInstance(g_inst, NULL);
         g_inst = VK_NULL_HANDLE;
         g_lost = 0;
