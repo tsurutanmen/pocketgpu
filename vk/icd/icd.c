@@ -835,13 +835,28 @@ struct dsl {
     int push;               // push descriptor 用の形（受け手にはふつうの形として作る）
     VkDescriptorSet *free;  // push に使い終えて、使い回せる set
     uint32_t nfree, capfree;
+    // immutable sampler を持つ binding。受け手の形には送らないので、書き込みのときにドライバが差し込む
+    uint32_t nimm;
+    struct { uint32_t binding, type, count; VkSampler *s; } *imm;
 };
 struct dset { struct dpool *pool; struct dset *next; uint32_t n, cap; struct dent *e; struct dsl *layout; };
 // 受け手に頼まずに set を取るので、pool の残り（set の数と種類ごとの数）はドライバが数える
 struct dpool { struct dset *head; uint32_t max_sets, used_sets, nsz; struct { uint32_t type, total, used; } sz[16]; };
 
 static void dsl_unref(struct dsl *l) {
-    if (l && InterlockedDecrement(&l->refs) == 0) free(l);
+    if (l && InterlockedDecrement(&l->refs) == 0) {
+        for (uint32_t i = 0; i < l->nimm; i++) free(l->imm[i].s);
+        free(l->imm);
+        free(l);
+    }
+}
+
+// 形の binding の elem 番目に決まった sampler（immutable sampler）があれば返す。無ければ VK_NULL_HANDLE
+static VkSampler dsl_imm(const struct dsl *l, uint32_t binding, uint32_t elem) {
+    if (!l) return VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < l->nimm; i++)
+        if (l->imm[i].binding == binding) return elem < l->imm[i].count ? l->imm[i].s[elem] : VK_NULL_HANDLE;
+    return VK_NULL_HANDLE;
 }
 
 static int pool_slot(struct dpool *p, uint32_t type) {
@@ -1978,6 +1993,19 @@ static VkResult VKAPI_CALL create_image(VkDevice dv, const VkImageCreateInfo *ci
         bci.flags &= ~(VkImageCreateFlags) VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
         im->bc = ci->format;
         ci = &bci;
+    }
+    // DXVK 1.10 は深度とステンシルの画像を SAMPLED なしで作り、ステージングへ写すときに view の側だけ SAMPLED にして読む。
+    // view の印（pNext）は受け手に運ばないので、受け手では読めない view になり 0 が返る。読める形式なら画像に SAMPLED を足す
+    VkImageCreateInfo dci;
+    if ((ci->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) && !(ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+        (ci->format == VK_FORMAT_D16_UNORM_S8_UINT || ci->format == VK_FORMAT_D24_UNORM_S8_UINT || ci->format == VK_FORMAT_D32_SFLOAT_S8_UINT)) {
+        VkFormatProperties fp;
+        get_format_ex(ci->format, &fp, NULL);
+        if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) {
+            dci = *ci;
+            dci.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+            ci = &dci;
+        }
     }
     vr_buf b = { 0 }, o = { 0 };
     vr_u64(&b, ID(dv));
@@ -3282,6 +3310,22 @@ static VkResult VKAPI_CALL create_dsl(VkDevice dv, const VkDescriptorSetLayoutCr
         if (k == l->nt && l->nt < 16) l->t[l->nt++].type = t;
         if (k < 16) l->t[k].count += ci->pBindings[i].descriptorCount;
     }
+    for (uint32_t i = 0; i < ci->bindingCount; i++) {
+        const VkDescriptorSetLayoutBinding *bb = &ci->pBindings[i];
+        if (!bb->pImmutableSamplers || !bb->descriptorCount ||
+            (bb->descriptorType != VK_DESCRIPTOR_TYPE_SAMPLER && bb->descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER))
+            continue;
+        void *p = realloc(l->imm, (l->nimm + 1) * sizeof *l->imm);
+        VkSampler *s = malloc(bb->descriptorCount * sizeof *s);
+        if (!p || !s) { if (p) l->imm = p; free(s); break; }
+        l->imm = p;
+        memcpy(s, bb->pImmutableSamplers, bb->descriptorCount * sizeof *s);
+        l->imm[l->nimm].binding = bb->binding;
+        l->imm[l->nimm].type = bb->descriptorType;
+        l->imm[l->nimm].count = bb->descriptorCount;
+        l->imm[l->nimm].s = s;
+        l->nimm++;
+    }
     uint64_t id = ID(l);
     l->push = (ci->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) != 0;
     vr_buf b = { 0 };
@@ -3468,6 +3512,7 @@ static VkResult VKAPI_CALL reset_dpool(VkDevice dv, VkDescriptorPool pp, VkDescr
     return VK_SUCCESS;
 }
 
+static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c);
 static VkResult VKAPI_CALL alloc_dsets(VkDevice dv, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out) {
     struct dpool *p = (struct dpool *) ai->descriptorPool;
     // pool の残りが足りなければ、受け手に頼まずに「足りない」と返す（DXVK などは、それを見て新しい pool を作る）
@@ -3513,6 +3558,20 @@ static VkResult VKAPI_CALL alloc_dsets(VkDevice dv, const VkDescriptorSetAllocat
     }
     rpc_send(VR_ALLOC_DESCRIPTOR_SETS, &b);
     free(b.p);
+    // immutable sampler だけの binding（SAMPLER）は、アプリが書かない。受け手の set は空のままなので、ここで書いておく
+    for (uint32_t i = 0; i < ai->descriptorSetCount; i++) {
+        struct dsl *l = ((struct dset *) out[i])->layout;
+        for (uint32_t k = 0; k < l->nimm; k++) {
+            if (l->imm[k].type != VK_DESCRIPTOR_TYPE_SAMPLER) continue;
+            VkDescriptorImageInfo *ii = calloc(l->imm[k].count, sizeof *ii);
+            if (!ii) continue;
+            for (uint32_t e = 0; e < l->imm[k].count; e++) ii[e].sampler = l->imm[k].s[e];
+            VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = out[i], .dstBinding = l->imm[k].binding,
+                                       .descriptorCount = l->imm[k].count, .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER, .pImageInfo = ii };
+            update_dsets(dv, 1, &w, 0, NULL);
+            free(ii);
+        }
+    }
     return VK_SUCCESS;
 }
 
@@ -3640,7 +3699,9 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
         if (is_image_desc(w[i].descriptorType)) {
             for (uint32_t k = 0; k < w[i].descriptorCount; k++) {
                 const VkDescriptorImageInfo *ii = &w[i].pImageInfo[k];
-                uint64_t smp = w[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || w[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? ID(ii->sampler) : 0;
+                // 形に決まった sampler があれば、それが正（アプリが書いた sampler は無視される決まり。DXVK は VK_NULL_HANDLE を書く）
+                VkSampler imm = dsl_imm(s ? s->layout : NULL, w[i].dstBinding, w[i].dstArrayElement + k);
+                uint64_t smp = w[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || w[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? ID(imm ? imm : ii->sampler) : 0;
                 uint64_t view = w[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ? 0 : ID(ii->imageView);
                 vr_u64(&b, smp);
                 vr_u64(&b, view);
@@ -5603,6 +5664,7 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkCmdCopyImageToBuffer2KHR", cmd_copy_i2b2);
     F("vkCmdBlitImage2", cmd_blit2);
     F("vkCmdBlitImage2KHR", cmd_blit2);
+    F("vkCmdResolveImage", cmd_resolve);
     F("vkCmdResolveImage2", cmd_resolve2);
     F("vkCmdResolveImage2KHR", cmd_resolve2);
     F("vkCmdSetLineWidth", cmd_set_line_width);

@@ -36,7 +36,9 @@ for w in $WHAT; do
         for t in d3d11tri d3d11cube d3d11event; do $CC -Wall -Wno-unused-parameter tests/$t.c -o "$OUT/d3d11/$t.exe" -ld3d11 -ldxguid -luuid -luser32 -lgdi32; done
         # geometry shader の真似の試験（場面と比べ方は tests/gs/gstest.c と cmp.py）
         $CC -Wall -Wno-unused-parameter tests/gs/gstest.c -o "$OUT/d3d11/gstest.exe" -ld3d11 -ldxguid -luuid -luser32 -lgdi32
-        echo "試験：tri・tri13・vecadd・pushdesc・copydesc・copyimg・extlist・d3d11/d3d11tri・d3d11/d3d11cube・d3d11/d3d11event・d3d11/gstest"
+        # DirectX 11 の機能を 1 つずつ試す 29 の場面（feat.exe list・比べ方は tests/feat/cmp_all.py）
+        $CC -Wall -Wno-unused-parameter tests/feat/feat.c -o "$OUT/d3d11/feat.exe" -ld3d11 -ldxguid -luuid -luser32 -lgdi32
+        echo "試験：tri・tri13・vecadd・pushdesc・copydesc・copyimg・extlist・d3d11/d3d11tri・d3d11/d3d11cube・d3d11/d3d11event・d3d11/gstest・d3d11/feat"
         ;;
     *) echo "知らない名前：$w"; exit 2 ;;
     esac
