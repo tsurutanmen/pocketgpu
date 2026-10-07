@@ -2526,8 +2526,9 @@ static VkResult VKAPI_CALL surface_caps(VkPhysicalDevice pd, VkSurfaceKHR s, VkS
     c->maxImageCount = 8;
     c->currentExtent.width = rc.right - rc.left > 0 ? (uint32_t) (rc.right - rc.left) : 1;
     c->currentExtent.height = rc.bottom - rc.top > 0 ? (uint32_t) (rc.bottom - rc.top) : 1;
-    c->minImageExtent.width = c->minImageExtent.height = 1;
-    c->maxImageExtent.width = c->maxImageExtent.height = 4096;
+    // 本物の Windows のドライバと同じく、作れる大きさは窓の今の大きさだけにする。
+    // 幅を持たせると、DXVK は描く大きさで作り、窓と違うので毎コマ作り直しになっていた
+    c->minImageExtent = c->maxImageExtent = c->currentExtent;
     c->maxImageArrayLayers = 1;
     c->supportedTransforms = c->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     c->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -2590,6 +2591,7 @@ struct swapchain {
     uint64_t lat_n;
     // present の区切り（書き換えに合わせる出し方・IPHONE_VK_MAX_FPS）。0 なら区切らない
     double gap, next_t, last_end;
+    uint32_t asked_w, asked_h; // 作り直しを頼んだ（または作ったときの）窓の大きさ
     // 区切りの待ちがあるときは、今のコマの JPEG をその場で受け取る（遅れが少ない）。間に合わなくなったら先送りに戻す
     int low, slow_run;
     VkImage img[8];
@@ -2708,6 +2710,12 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
     sc->hwnd = surface_hwnd(ci->surface);
     move_to_monitor(sc->hwnd);
     g_stall_hwnd = sc->hwnd;
+    {
+        RECT rc0 = { 0 };
+        if (sc->hwnd) GetClientRect(sc->hwnd, &rc0);
+        sc->asked_w = (uint32_t) (rc0.right - rc0.left);
+        sc->asked_h = (uint32_t) (rc0.bottom - rc0.top);
+    }
     sc->w = ci->imageExtent.width;
     sc->h = ci->imageExtent.height;
     sc->fmt = ci->imageFormat;
@@ -3010,6 +3018,16 @@ static void dump_frame(struct swapchain *sc, const uint8_t *px) {
     }
 }
 
+// 窓の大きさが swapchain と違い、しかもその窓の大きさでまだ頼んでいなければ、作り直しを 1 回だけ頼む。
+// DXVK-macOS は窓でなく描く大きさで作るので、毎コマ頼むと作り直しが止まらない（違う大きさのままでも、窓に合わせて伸ばして描く）
+static int ask_resize(struct swapchain *sc, const RECT *rc) {
+    uint32_t w = (uint32_t) (rc->right - rc->left), h = (uint32_t) (rc->bottom - rc->top);
+    if (!w || !h || (w == sc->w && h == sc->h) || (w == sc->asked_w && h == sc->asked_h)) return 0;
+    sc->asked_w = w;
+    sc->asked_h = h;
+    return 1;
+}
+
 // JPEG を表示の糸に渡す（out の中身は入れ替わる）
 static void disp_give(struct swapchain *sc, vr_buf *out, uint64_t serial) {
     if (!sc->disp.thr) {
@@ -3050,7 +3068,7 @@ static VkResult blit_now(struct swapchain *sc, uint32_t j, uint64_t serial) {
     if (r != VK_SUCCESS) return r;
     RECT rc;
     GetClientRect(sc->hwnd, &rc);
-    if ((uint32_t) (rc.right - rc.left) != sc->w || (uint32_t) (rc.bottom - rc.top) != sc->h) return VK_SUBOPTIMAL_KHR;
+    if (ask_resize(sc, &rc)) return VK_SUBOPTIMAL_KHR;
     return VK_SUCCESS;
 }
 
@@ -3066,7 +3084,7 @@ static VkResult blit(struct swapchain *sc, uint32_t j, uint64_t serial) {
         free(out.p);
         RECT rc;
         GetClientRect(sc->hwnd, &rc);
-        if ((uint32_t) (rc.right - rc.left) != sc->w || (uint32_t) (rc.bottom - rc.top) != sc->h) return VK_SUBOPTIMAL_KHR;
+        if (ask_resize(sc, &rc)) return VK_SUBOPTIMAL_KHR;
         return VK_SUCCESS;
     }
     // JPEG で受け取ったときは、もう B・G・R・A の並びになっている
@@ -3094,7 +3112,7 @@ static VkResult blit(struct swapchain *sc, uint32_t j, uint64_t serial) {
     sc->frames++;
     dump_frame(sc, px);
     // 窓の大きさが変わったら、作り直してもらう
-    if ((uint32_t) (rc.right - rc.left) != sc->w || (uint32_t) (rc.bottom - rc.top) != sc->h) return VK_SUBOPTIMAL_KHR;
+    if (ask_resize(sc, &rc)) return VK_SUBOPTIMAL_KHR;
     return VK_SUCCESS;
 }
 
