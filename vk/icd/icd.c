@@ -131,6 +131,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_RESET_QUERY_POOL] = "RESET_QUERY_POOL", [VR_CREATE_BUFFER_VIEW] = "CREATE_BUFFER_VIEW",
     [VR_DESTROY_BUFFER_VIEW] = "DESTROY_BUFFER_VIEW", [VR_GET_IMAGE_SUBRESOURCE_LAYOUT] = "GET_IMAGE_SUBRESOURCE_LAYOUT",
     [VR_READ_JPEG_PIPE] = "READ_JPEG_PIPE", [VR_GET_BUFFER_ADDRESS] = "GET_BUFFER_ADDRESS",
+    [VR_PACKED] = "PACKED", [VR_CREATE_BUFFER_NR] = "CREATE_BUFFER_NR",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -1318,6 +1319,44 @@ static void VKAPI_CALL get_mem2(VkPhysicalDevice pd, VkPhysicalDeviceMemoryPrope
 }
 
 // p3 があれば 1.3 の 64 ビットの形も埋める（受け手が後ろに付けていればそれを、無ければ 1.0 の形を広げる）
+// ---- 問い合わせの答えを覚えておく ----
+// 形式の性質などは、同じことを聞けば毎回同じ答え。USB を往復せずに、前の答えを返す
+#define QC_SIZE 4096
+static struct qcache { int used; uint32_t key[6]; VkResult r; uint32_t n; uint8_t data[64]; } g_qc[QC_SIZE];
+static SRWLOCK g_qc_lock = SRWLOCK_INIT;
+
+static int qc_get(const uint32_t key[6], VkResult *r, uint8_t *data, uint32_t *n) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 6; i++) h = (h ^ key[i]) * 16777619u;
+    int hit = 0;
+    AcquireSRWLockShared(&g_qc_lock);
+    for (uint32_t k = 0; k < 16; k++) {
+        struct qcache *e = &g_qc[(h + k) & (QC_SIZE - 1)];
+        if (!e->used) break;
+        if (!memcmp(e->key, key, sizeof e->key)) { *r = e->r; *n = e->n; memcpy(data, e->data, e->n); hit = 1; break; }
+    }
+    ReleaseSRWLockShared(&g_qc_lock);
+    return hit;
+}
+
+static void qc_put(const uint32_t key[6], VkResult r, const void *data, uint32_t n) {
+    if (n > 64) return;
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 6; i++) h = (h ^ key[i]) * 16777619u;
+    AcquireSRWLockExclusive(&g_qc_lock);
+    for (uint32_t k = 0; k < 16; k++) {
+        struct qcache *e = &g_qc[(h + k) & (QC_SIZE - 1)];
+        if (e->used && memcmp(e->key, key, sizeof e->key)) continue;
+        e->used = 1;
+        memcpy(e->key, key, sizeof e->key);
+        e->r = r;
+        e->n = n;
+        memcpy(e->data, data, n);
+        break;
+    }
+    ReleaseSRWLockExclusive(&g_qc_lock);
+}
+
 static void get_format_ex(VkFormat f, VkFormatProperties *p, VkFormatProperties3 *p3) {
     // ほどく BC は、置き換えた形式でできることのうち、BC の画像に許されること（読む・写す）だけを見せる
     VkFormat bcf = g_bc ? bc_sub(f) : VK_FORMAT_UNDEFINED;
@@ -1336,7 +1375,22 @@ static void get_format_ex(VkFormat f, VkFormatProperties *p, VkFormatProperties3
     vr_buf b = { 0 }, out = { 0 };
     vr_u32(&b, (uint32_t) f);
     memset(p, 0, sizeof *p);
-    int ok = rpc_call(VR_GET_FORMAT_PROPS, &b, &out) == VK_SUCCESS && out.n >= sizeof *p;
+    // 前に聞いた形式なら、覚えている答えを使う
+    uint32_t key[6] = { 1, (uint32_t) f, 0, 0, 0, 0 };
+    uint8_t cached[64];
+    uint32_t cn = 0;
+    VkResult cr;
+    int ok;
+    if (qc_get(key, &cr, cached, &cn)) {
+        vr_reserve(&out, cn);
+        memcpy(out.p, cached, cn);
+        out.n = cn;
+        ok = cr == VK_SUCCESS && out.n >= sizeof *p;
+    } else {
+        cr = rpc_call(VR_GET_FORMAT_PROPS, &b, &out);
+        if (!g_dead) qc_put(key, cr, out.p, (uint32_t) out.n);
+        ok = cr == VK_SUCCESS && out.n >= sizeof *p;
+    }
     if (ok) memcpy(p, out.p, sizeof *p);
     // 線形（linear）の画像を CPU から直接書かれると、写しの同期で追えないので見せない（アプリは受け渡し用のバッファから写す）
     p->linearTilingFeatures = 0;
@@ -1406,7 +1460,17 @@ static VkResult VKAPI_CALL get_image_format(VkPhysicalDevice pd, VkFormat f, VkI
     vr_u32(&b, u);
     vr_u32(&b, fl);
     memset(p, 0, sizeof *p);
-    VkResult r = rpc_call(VR_GET_IMAGE_FORMAT_PROPS, &b, &out);
+    uint32_t key[6] = { 2, (uint32_t) f, (uint32_t) t, (uint32_t) ti, (uint32_t) u, (uint32_t) fl };
+    uint8_t cached[64];
+    uint32_t cn = 0;
+    VkResult r;
+    if (qc_get(key, &r, cached, &cn)) {
+        if (cn >= sizeof *p) memcpy(p, cached, sizeof *p);
+        free(b.p);
+        return r;
+    }
+    r = rpc_call(VR_GET_IMAGE_FORMAT_PROPS, &b, &out);
+    if (!g_dead) qc_put(key, r, out.p, (uint32_t) out.n);
     if (out.n >= sizeof *p) memcpy(p, out.p, sizeof *p);
     free(b.p);
     free(out.p);
@@ -1655,6 +1719,42 @@ static VkResult VKAPI_CALL flush_ranges(VkDevice dv, uint32_t n, const VkMappedM
 static void VKAPI_CALL get_commitment(VkDevice dv, VkDeviceMemory mm, VkDeviceSize *c) { (void) dv; *c = ((struct mem *) mm)->size; }
 
 // ---- バッファ ----
+// buffer の必要なメモリの量は、flags と使い道が同じなら、大きさを並びの単位に切り上げただけになる GPU が多い。
+// 最初の 1 回は受け手に聞いて、そうなっていると確かめられたら、次からは手元で計算して返事を待たない（先例 Venus と同じ考え方）
+static struct bufreq { int used, linear; uint32_t flags, usage; VkMemoryRequirements req; } g_brq[256];
+static SRWLOCK g_brq_lock = SRWLOCK_INIT;
+
+static int brq_find(uint32_t flags, uint32_t usage, VkDeviceSize size, VkMemoryRequirements *req) {
+    int hit = 0;
+    AcquireSRWLockShared(&g_brq_lock);
+    for (int i = 0; i < 256 && g_brq[i].used; i++)
+        if (g_brq[i].flags == flags && g_brq[i].usage == usage && g_brq[i].linear) {
+            *req = g_brq[i].req;
+            VkDeviceSize al = req->alignment ? req->alignment : 1;
+            req->size = (size + al - 1) / al * al;
+            hit = 1;
+            break;
+        }
+    ReleaseSRWLockShared(&g_brq_lock);
+    return hit;
+}
+
+static void brq_learn(uint32_t flags, uint32_t usage, VkDeviceSize size, const VkMemoryRequirements *req) {
+    VkDeviceSize al = req->alignment ? req->alignment : 1;
+    int linear = req->size == (size + al - 1) / al * al;
+    AcquireSRWLockExclusive(&g_brq_lock);
+    int i = 0;
+    while (i < 256 && g_brq[i].used && !(g_brq[i].flags == flags && g_brq[i].usage == usage)) i++;
+    if (i < 256 && !g_brq[i].used) {
+        g_brq[i].used = 1;
+        g_brq[i].flags = flags;
+        g_brq[i].usage = usage;
+        g_brq[i].req = *req;
+        g_brq[i].linear = linear;
+    }
+    ReleaseSRWLockExclusive(&g_brq_lock);
+}
+
 static VkResult VKAPI_CALL create_buffer(VkDevice dv, const VkBufferCreateInfo *ci, const VkAllocationCallbacks *a, VkBuffer *out) {
     (void) a;
     struct buf *bf = calloc(1, sizeof *bf);
@@ -1670,8 +1770,17 @@ static VkResult VKAPI_CALL create_buffer(VkDevice dv, const VkBufferCreateInfo *
     for (const VkBaseInStructure *x = ci->pNext; x; x = x->pNext)
         if (x->sType == VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO) usage = (uint32_t) ((const VkBufferUsageFlags2CreateInfo *) x)->usage;
     vr_u32(&b, usage);
+    if ((g_hw.caps & VR_CAP_ASYNC_CREATE) && brq_find(ci->flags, usage, ci->size, &bf->req)) {
+        rpc_send(VR_CREATE_BUFFER_NR, &b);
+        free(b.p);
+        *out = (VkBuffer) bf;
+        return VK_SUCCESS;
+    }
     VkResult r = rpc_call(VR_CREATE_BUFFER, &b, &o);
-    if (r == VK_SUCCESS && o.n >= sizeof bf->req) memcpy(&bf->req, o.p, sizeof bf->req);
+    if (r == VK_SUCCESS && o.n >= sizeof bf->req) {
+        memcpy(&bf->req, o.p, sizeof bf->req);
+        brq_learn(ci->flags, usage, ci->size, &bf->req);
+    }
     free(b.p);
     free(o.p);
     if (r != VK_SUCCESS) { free(bf); return r; }

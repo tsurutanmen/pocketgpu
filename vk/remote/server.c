@@ -300,7 +300,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     if (v13 && (caps & need13) == need13) caps |= VR_CAP_VK13;
     g_fmt3 = (v13 || has_ext(ep, ne, "VK_KHR_format_feature_flags2")) && vkGetPhysicalDeviceFormatProperties2;
     caps |= VR_CAP_D3D; // buffer view と画像の並び方は 1.0 の入口なので、どの GPU でも使える
-    caps |= VR_CAP_PACK;
+    caps |= VR_CAP_PACK | VR_CAP_ASYNC_CREATE;
 #if defined(__APPLE__) || defined(_WIN32)
     caps |= VR_CAP_JPEG | VR_CAP_JPEG_PIPE; // 窓に出すコマを JPEG に縮められる（iPhone は ImageIO、PC の代役は WIC）
 #endif
@@ -1621,6 +1621,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         put(vr_ru64(r), (uint64_t) (uintptr_t) q, K_QUEUE);
         return 1;
     }
+    case VR_CREATE_BUFFER_NR:
     case VR_CREATE_BUFFER: {
         VkDevice d = DEV(vr_ru64(r));
         uint64_t id = vr_ru64(r);
@@ -1636,6 +1637,10 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (res == VK_SUCCESS) {
             put(id, (uint64_t) b, K_BUFFER);
             vkGetBufferMemoryRequirements(d, b, &req);
+        }
+        if (op == VR_CREATE_BUFFER_NR) {
+            if (res != VK_SUCCESS) vlog("buffer を作れない (%d)", res);
+            return 1;
         }
         vr_put(&g_out, &req, sizeof req);
         return reply(s, res);
