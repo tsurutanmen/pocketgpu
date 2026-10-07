@@ -186,6 +186,7 @@ static SRWLOCK g_lock = SRWLOCK_INIT;
 static vr_sock g_sock = VR_BAD_SOCK;
 static int g_dead;
 static vr_buf g_q; // まだ送っていない命令
+static void conn_lost(const char *what);
 static volatile LONG64 g_next_id;
 
 // 数字だけの物（shader module など）の番号。ポインタと重ならないように上の方の桁を使う
@@ -223,12 +224,12 @@ static int flush_locked(void) {
             memcpy(pk.p, h, 12);
             g_stat.pack_in += g_q.n;
             g_stat.pack_out += (uint64_t) cl + 12;
-            if (!vr_send_all(g_sock, pk.p, (size_t) cl + 12)) { g_dead = 1; say("送れない：切れた"); }
+            if (!vr_send_all(g_sock, pk.p, (size_t) cl + 12)) conn_lost("送る所");
             g_q.n = 0;
             return !g_dead;
         }
     }
-    if (g_q.n && !vr_send_all(g_sock, g_q.p, g_q.n)) { g_dead = 1; say("送れない：切れた"); }
+    if (g_q.n && !vr_send_all(g_sock, g_q.p, g_q.n)) conn_lost("送る所");
     g_q.n = 0;
     return !g_dead;
 }
@@ -261,6 +262,76 @@ static void rpc_flush(void) {
 // 返事は頼んだ順にしか届かないので、ほかの命令が返事を読む前に、先にこれを読んで取っておく
 static struct { int active, ready; VkResult r; vr_buf out; } g_defer;
 
+// つながりが切れたことにする。最初の 1 回だけ書く（IPHONE_VK_LOG が無くても書く）
+static void banner(const wchar_t *t);
+static void conn_lost(const char *what) {
+    if (!g_dead) {
+        fprintf(stderr, "[iphone-vk] 受け手とのつながりが切れた（%s）。この先は全部失敗にする\n", what);
+        banner(L"iPhone とのつながりが切れました");
+    }
+    g_dead = 1;
+}
+
+// 受け手が止まって返事が来ない間（iPhone の受け手のアプリが後ろに回ったなど）、黙って固まらずに記録と窓に出す。
+// 受け手が戻れば、つながりは生きているので続きから動く。IPHONE_VK_GIVEUP=秒 を決めると、その長さで諦めて切れたことにする
+static HWND g_stall_hwnd; // 帯を出す窓（いちばん新しい swapchain の窓）
+static int g_stalled;
+
+static void banner(const wchar_t *t) {
+    HWND w = g_stall_hwnd;
+    if (!w || !IsWindow(w)) return;
+    RECT rc;
+    GetClientRect(w, &rc);
+    RECT band = { rc.left, rc.top, rc.right, rc.top + 32 };
+    HDC dc = GetDC(w);
+    if (!dc) return;
+    HBRUSH br = CreateSolidBrush(RGB(24, 24, 24));
+    FillRect(dc, &band, br);
+    DeleteObject(br);
+    HGDIOBJ old = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(240, 240, 240));
+    DrawTextW(dc, t, -1, &band, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, old);
+    ReleaseDC(w, dc);
+}
+
+// 帯の文は仮。画面の文章は CEO が書く
+static void stall_banner(double sec) {
+    wchar_t t[128];
+    swprintf(t, 128, L"iPhone の返事を待っています（%.0f 秒）", sec);
+    banner(t);
+}
+
+static int recv_head(uint32_t h[2], uint32_t op) {
+    static double giveup = -1;
+    if (giveup < 0) { const char *e = getenv("IPHONE_VK_GIVEUP"); giveup = e ? atof(e) : 0; }
+    WSAPOLLFD pf = { .fd = g_sock, .events = POLLRDNORM };
+    double t0 = 0, warned = 0;
+    while (WSAPoll(&pf, 1, 1000) == 0) {
+        if (!t0) t0 = now_ms() - 1000;
+        double sec = (now_ms() - t0) / 1000;
+        if (sec >= 3 && (!warned || sec - warned >= 10)) {
+            fprintf(stderr, "[iphone-vk] 受け手の返事が %.0f 秒ない（命令 %u）。iPhone の受け手のアプリが前に出ているか確かめる\n", sec, op);
+            warned = sec;
+            g_stalled = 1;
+        }
+        if (g_stalled) stall_banner(sec);
+        if (giveup > 0 && sec >= giveup) {
+            conn_lost("返事を待ちきれなかった");
+            return 0;
+        }
+    }
+    int ok = vr_recv_all(g_sock, h, 8);
+    if (g_stalled) {
+        g_stalled = 0;
+        fprintf(stderr, "[iphone-vk] 受け手の返事が戻った（%.1f 秒止まっていた）\n", (now_ms() - t0) / 1000);
+        if (g_stall_hwnd) InvalidateRect(g_stall_hwnd, NULL, FALSE);
+    }
+    if (!ok) conn_lost("返事を待っている所");
+    return ok;
+}
+
 // g_lock の中で、送り終えたあとに呼ぶ
 static void read_deferred_locked(void) {
     if (!g_defer.active) return;
@@ -269,9 +340,9 @@ static void read_deferred_locked(void) {
     g_defer.r = VK_ERROR_DEVICE_LOST;
     g_defer.out.n = 0;
     uint32_t h[2];
-    if (!vr_recv_all(g_sock, h, 8)) { g_dead = 1; return; }
+    if (!recv_head(h, VR_READ_JPEG_PIPE)) return;
     vr_reserve(&g_defer.out, h[1]);
-    if (h[1] && !vr_recv_all(g_sock, g_defer.out.p, h[1])) { g_dead = 1; return; }
+    if (h[1] && !vr_recv_all(g_sock, g_defer.out.p, h[1])) { conn_lost("窓の絵の返事の途中"); return; }
     g_defer.out.n = h[1];
     g_defer.r = (VkResult) (int32_t) h[0];
     g_stat.bytes_in += 8 + h[1];
@@ -316,7 +387,7 @@ static VkResult rpc_call(uint32_t op, vr_buf *b, vr_buf *out) {
     if (flush_locked()) {
         read_deferred_locked();
         uint32_t h[2];
-        if (vr_recv_all(g_sock, h, 8)) {
+        if (recv_head(h, op)) {
             vr_buf tmp = { 0 }, *dst = out ? out : &tmp;
             dst->n = 0;
             vr_reserve(dst, h[1]);
@@ -325,12 +396,9 @@ static VkResult rpc_call(uint32_t op, vr_buf *b, vr_buf *out) {
                 res = (VkResult) (int32_t) h[0];
                 g_stat.bytes_in += 8 + h[1];
             } else {
-                g_dead = 1;
+                conn_lost("返事の途中");
             }
             free(tmp.p);
-        } else {
-            g_dead = 1;
-            say("返事が来ない：切れた（命令 %u）", op);
         }
     }
     if (op < VR_OP_COUNT) g_stat.wait_ms[op] += now_ms() - t0;
@@ -952,7 +1020,7 @@ static void read_back_many(rng *r, size_t n) {
         for (uint64_t at = r[i].off; at < r[i].off + r[i].len && ok; at += piece) {
             uint64_t k = r[i].off + r[i].len - at < piece ? r[i].off + r[i].len - at : piece;
             uint32_t h[2];
-            if (!vr_recv_all(g_sock, h, 8)) { ok = 0; g_dead = 1; break; }
+            if (!recv_head(h, VR_MEM_READ)) { ok = 0; break; }
             if ((int32_t) h[0] < 0) {
                 if (!g_dead) say("受け手が失敗を返した (%d)。この先は全部失敗にする", (int32_t) h[0]);
                 g_dead = 1;
@@ -960,7 +1028,7 @@ static void read_back_many(rng *r, size_t n) {
             if ((int32_t) h[0] == VK_SUCCESS && r[i].m->delta && (g_hw.caps & VR_CAP_DELTA)) {
                 // 形（0 そのまま・1 違い）を読んでから中身
                 uint8_t *buf = malloc(h[1] ? h[1] : 1);
-                if (!buf || (h[1] && !vr_recv_all(g_sock, buf, h[1]))) { free(buf); ok = 0; g_dead = 1; break; }
+                if (!buf || (h[1] && !vr_recv_all(g_sock, buf, h[1]))) { free(buf); ok = 0; conn_lost("読み出しの途中"); break; }
                 g_stat.bytes_in += 8 + h[1];
                 uint32_t mode = 2;
                 if (h[1] >= 4) memcpy(&mode, buf, 4);
@@ -992,14 +1060,14 @@ static void read_back_many(rng *r, size_t n) {
                 continue;
             }
             if ((int32_t) h[0] == VK_SUCCESS && h[1] == k) {
-                if (!vr_recv_all(g_sock, r[i].m->shadow + at, k)) { ok = 0; g_dead = 1; break; }
+                if (!vr_recv_all(g_sock, r[i].m->shadow + at, k)) { ok = 0; conn_lost("読み出しの途中"); break; }
                 if (r[i].m->sent) memcpy(r[i].m->sent + at, r[i].m->shadow + at, (size_t) k);
             } else {
                 // 読めなかった：中身は捨てる
                 uint8_t tmp[4096];
                 for (uint32_t left = h[1]; left;) {
                     uint32_t c = left < sizeof tmp ? left : (uint32_t) sizeof tmp;
-                    if (!vr_recv_all(g_sock, tmp, c)) { ok = 0; g_dead = 1; break; }
+                    if (!vr_recv_all(g_sock, tmp, c)) { ok = 0; conn_lost("読み出しの途中"); break; }
                     left -= c;
                 }
             }
@@ -2520,6 +2588,7 @@ static void VKAPI_CALL destroy_swapchain(VkDevice dv, VkSwapchainKHR h, const Vk
     if (!sc) return;
     if (sc->pend >= 0 && sc->fence[sc->pend]) wait_fences(dv, 1, &sc->fence[sc->pend], VK_TRUE, UINT64_MAX);
     disp_stop(sc);
+    if (g_stall_hwnd == sc->hwnd) g_stall_hwnd = NULL;
     if (sc->pool) destroy_cpool(dv, sc->pool, NULL);
     for (uint32_t i = 0; i < sc->n; i++) {
         if (sc->fence[i]) destroy_fence(dv, sc->fence[i], NULL);
@@ -2574,6 +2643,7 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
     sc->d = (struct dev *) dv;
     sc->hwnd = surface_hwnd(ci->surface);
     move_to_monitor(sc->hwnd);
+    g_stall_hwnd = sc->hwnd;
     sc->w = ci->imageExtent.width;
     sc->h = ci->imageExtent.height;
     sc->fmt = ci->imageFormat;
