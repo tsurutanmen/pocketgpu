@@ -14,7 +14,8 @@
 - [x] DirectX 11 が DXVK を通して iPhone で描ける（DXVK-macOS と DXVK 3.1.1）
 - [x] iPhone の Apple の機能を Windows から呼べる（文字認識・音声認識・Apple Intelligence・翻訳・読み上げ）
 - [ ] テッセレーションの直しを iPhone に入れる（受け手の組み直し待ち）
-- [ ] geometry shader の真似（流体の粒・草・影など）
+- [x] geometry shader の真似：点を広げる形（流体の粒）。iPhone のふりの代役で同じ絵。iPhone の実機はこれから
+- [ ] geometry shader の真似：三角を受ける形（影・草・cube map）
 
 ### Lv 10〜30 正しさと広さ
 - [ ] Vulkan の公式の適合試験（CTS）の合格率を数字で出す（代役と iPhone）

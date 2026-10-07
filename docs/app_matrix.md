@@ -31,7 +31,7 @@
 | CascadedShadowMaps11 | ✅ 58dB | ✅ 56.5dB | ✅ 47.6dB | 99 |
 | VarianceShadows11 | ✅ 58dB | ✅ 56.5dB | 未 | |
 | HDRToneMappingCS11 | ✅ 同じ | ✅ 同じ | ✅ 56.5dB | 156 |
-| FluidCS11 | ✅ 同じ | ❌ 粒が消える | ❌ 粒が消える | geometry shader。真似る作りを設計中 |
+| FluidCS11 | ✅ 同じ | ✅ geometry shader を真似て同じ | ❌ 粒が消える（0.7.23） | 真似る作りはドライバだけなので、次に iPhone で試す |
 | SimpleBezier11 | ✅ 同じ | ✅ 直したドライバで同じ | ❌ 曲面が消える | テッセレーションの点の数の送り忘れ。直し済みで受け手の組み直し待ち |
 | OIT11 | ✅ 同じ | ✅ 同じ | ✅ 64.2dB | 11.4 |
 | NBodyGravityCS11 | ✅ 粒の置き方は毎回違う | ✅ | 未 | |
