@@ -76,6 +76,15 @@ grep -a -h "not supported\|Failed\|err:" "$OUT"/d3d11*.txt | sort | uniq -c | he
 
 echo "== 5. DirectX のサンプル"
 bash /d/iphone-rpc/app/win/run_d3d11_samples.sh "$IPHONE_VK" EmptyProject11 SimpleSample11 BasicHLSL11 CascadedShadowMaps11 FluidCS11 HDRToneMappingCS11 SimpleBezier11 OIT11 2>&1 | tee "$OUT/samples.txt"
+echo "== 5b. 窓の無い計算のサンプル BasicCompute11（CPU の答えと比べる）"
+BC=$VKB/d3d11samples/BasicCompute11
+for dx in d3d11 dxvk3; do
+    mkdir -p "$BC/x64/$dx" && cp -f "$BC/x64/Release/BasicCompute11.exe" "$BC/x64/$dx/" && cp -f "$VKB/$dx/d3d11.dll" "$VKB/$dx/dxgi.dll" "$BC/x64/$dx/"
+    flag=""; [ $dx = dxvk3 ] && flag=1
+    (cd "$BC" && IPHONE_VK_DXVK3=$flag IPHONE_VK_ONLY=1 IPHONE_VK_LOG=1 DXVK_LOG_LEVEL=none \
+        run 120 "$(cygpath -m "$BC/x64/$dx/BasicCompute11.exe")") > "$OUT/basiccompute_$dx.txt" 2>&1
+    echo "BasicCompute11 $dx：$(grep -a 'Verifying\|受け手の GPU' "$OUT/basiccompute_$dx.txt" | sed 's/\[iphone-vk\] //' | tr '\n' ' ')"
+done
 echo "== 6. DirectX のサンプル（新しい DXVK 3.1.1）"
 DXVK_DIR=$VKB/dxvk3 IPHONE_VK_DXVK3=1 bash /d/iphone-rpc/app/win/run_d3d11_samples.sh "$IPHONE_VK" BasicHLSL11 CascadedShadowMaps11 FluidCS11 SimpleBezier11 2>&1 | tee "$OUT/samples_dxvk3.txt"
 echo "== 7. 入門サンプル Tutorial01〜07（代役と iPhone の絵を比べる・代役の受け手が 50070 に要る）"

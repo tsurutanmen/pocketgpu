@@ -36,7 +36,7 @@
 | OIT11 | ✅ 同じ | ✅ 同じ | ✅ 64.2dB | 11.4 |
 | NBodyGravityCS11 | ✅ 粒の置き方は毎回違う | ✅ | 未 | |
 | Tutorial01〜07 | ✅ | ✅ 同じ（04・07 は時刻で回るぶん） | 未 | |
-| BasicCompute11 | 窓の無い計算だけのサンプル。未 | | | |
+| BasicCompute11（窓の無い計算） | ✅ CPU の答えと同じ | ✅ DXVK 2 種類とも同じ | 未 | |
 | DynamicShaderLinkage11 | ふつうの DirectX でも動かない | | | |
 | MultithreadedRendering11 | 素材が足りない | | | |
 
