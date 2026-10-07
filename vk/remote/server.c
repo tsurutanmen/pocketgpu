@@ -116,6 +116,13 @@ static int like_ios(void) {
     if (v < 0) { const char *e = getenv("VKR_LIKE_IOS"); v = e && *e == '1'; }
     return v;
 }
+
+// iPhone のふりで隠す機能。10/7 の iPhone 17 Pro（MoltenVK 1.4.2）の DXVK の記録と比べて、iPhone に無かった物
+static void like_ios_mask(VkPhysicalDeviceFeatures *f) {
+    if (!like_ios()) return;
+    f->textureCompressionBC = f->geometryShader = f->shaderCullDistance = VK_FALSE;
+    f->logicOp = f->shaderFloat64 = f->variableMultisampleRate = VK_FALSE;
+}
 static VkBuffer g_dummy_vb;
 static VkDeviceMemory g_dummy_mem;
 static VkBuffer dummy_vb(void);
@@ -1493,7 +1500,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkPhysicalDeviceMemoryProperties m;
         vkGetPhysicalDeviceProperties(g_pd, &p);
         vkGetPhysicalDeviceFeatures(g_pd, &f);
-        if (like_ios()) f.textureCompressionBC = f.geometryShader = f.shaderCullDistance = VK_FALSE;
+        like_ios_mask(&f);
         vkGetPhysicalDeviceMemoryProperties(g_pd, &m);
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         // iPhone では、iOS がこのアプリに許すメモリのほうが、MoltenVK の答える量よりずっと小さい（超えるとアプリが止められる）。
@@ -1513,6 +1520,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         vkGetPhysicalDeviceQueueFamilyProperties(g_pd, &nq, NULL);
         VkQueueFamilyProperties *q = calloc(nq ? nq : 1, sizeof *q);
         vkGetPhysicalDeviceQueueFamilyProperties(g_pd, &nq, q);
+        if (like_ios() && nq > 1) nq = 1;
         vr_u32(&g_out, nq);
         vr_put(&g_out, q, sizeof *q * nq);
         free(q);
@@ -1536,6 +1544,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (op == VR_GET_FEATURES2) {
             VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = chain };
             vkGetPhysicalDeviceFeatures2(g_pd, &f2);
+            like_ios_mask(&f2.features);
             vr_put(&g_out, &f2.features, sizeof f2.features);
         } else {
             VkPhysicalDeviceProperties2 p2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = chain };
@@ -1585,9 +1594,13 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkPhysicalDeviceFeatures feats;
         memset(&feats, 0, sizeof feats);
         if (has_f) vr_rcopy(r, &feats, sizeof feats);
-        if (like_ios() && (feats.textureCompressionBC || feats.geometryShader || feats.shaderCullDistance)) {
-            vlog("iPhone のふり：持たない機能（BC・geometry shader・cull distance）を有効にしようとしたので断る");
-            return reply(s, VK_ERROR_FEATURE_NOT_PRESENT);
+        if (like_ios()) {
+            VkPhysicalDeviceFeatures m = feats;
+            like_ios_mask(&m);
+            if (memcmp(&m, &feats, sizeof m)) {
+                vlog("iPhone のふり：iPhone に無い機能を有効にしようとしたので断る");
+                return reply(s, VK_ERROR_FEATURE_NOT_PRESENT);
+            }
         }
         // 機能の鎖（Vulkan11Features など）は中身ごと届く
         uint32_t nc = vr_ru32(r);

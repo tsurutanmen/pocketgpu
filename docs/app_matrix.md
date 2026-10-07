@@ -2,7 +2,7 @@
 
 ドライバ越しに動かした Windows のアプリと結果。改造はしていない（DXUT のサンプルだけ、横の DXVK を読むよう 1 か所直して組んだ）。
 - 代役：PC の RTX 3060 を受け手にしたもの
-- iPhone のふり：代役の受け手に `VKR_LIKE_IOS=1`（BC・geometry shader・cull distance・空の descriptor を持たないふり、テッセレーションの設定が無い pipeline を作らない）
+- iPhone のふり：代役の受け手に `VKR_LIKE_IOS=1`（BC・geometry shader・cull distance・logicOp・shaderFloat64・variableMultisampleRate・空の descriptor を持たないふり、キューの種類は 1 つ、テッセレーションの設定が無い pipeline を作らない。10/7 から DXVK が記録する機能 52 項目が iPhone 17 Pro と同じ）
 - iPhone：iPhone 17 Pro（A19 Pro）・アプリ 0.7.23・USB
 - 絵の比べ方：ふつうの DirectX か RTX 直との差。PSNR 40dB 以上なら見た目では区別できない
 
