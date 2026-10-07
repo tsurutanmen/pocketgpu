@@ -1001,9 +1001,11 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
                     if (se && se->list) for (uint32_t k = 0; k < se->list->n; k++) use_buffer(ci, se->list->ids[k]);
                 }
             }
+            for (uint32_t i = 32; i < n && !r->bad; i++) (void) vr_ru64(r); // 上限を超えた分は読み捨てる（並びをずらさない）
             uint32_t nd = vr_ru32(r);
             uint32_t dyn[64];
             for (uint32_t i = 0; i < nd && i < 64; i++) dyn[i] = vr_ru32(r);
+            for (uint32_t i = 64; i < nd && !r->bad; i++) (void) vr_ru32(r);
             vkCmdBindDescriptorSets(cb, (VkPipelineBindPoint) bp, pl, first, n < 32 ? n : 32, sets, nd < 64 ? nd : 64, dyn);
         } break;
         case VR_CMD_PUSH_CONSTANTS: {
@@ -3201,40 +3203,53 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_QUEUE_SUBMIT: {
         VkQueue q = (VkQueue) (uintptr_t) H(vr_ru64(r));
         uint32_t ns = vr_ru32(r);
-        if (ns > 8) ns = 8; // ドライバが 8 ずつに分けて送ってくる
-        VkSubmitInfo si[8];
-        VkTimelineSemaphoreSubmitInfo tl[8];
-        VkSemaphore ws[8][9], ss[8][9];
-        uint64_t wv[8][9], sv[8][9];
-        VkPipelineStageFlags wst[8][9];
-        VkCommandBuffer cbs[8][64];
+        if (ns > r->n - r->at) return 1; // 1 つの submit は 12 バイト以上あるので、残りより多いことはない
+        // 数どおりに確保して全部読む（上限で切って残りを読まずにいると、9 個目からの semaphore が次の項目として読まれ、
+        // でたらめなハンドルで vkQueueSubmit を呼んでいた。CTS の synchronization で見つかった）。
+        // semaphore の並びは、つなぎの印（chain）のために 1 つ多く取る
+        typedef struct { VkSemaphore *ws, *ss; uint64_t *wv, *sv; VkPipelineStageFlags *wst; VkCommandBuffer *cbs; } subm;
+        VkSubmitInfo *si = calloc(ns ? ns : 1, sizeof *si);
+        VkTimelineSemaphoreSubmitInfo *tl = calloc(ns ? ns : 1, sizeof *tl);
+        subm *sm = calloc(ns ? ns : 1, sizeof *sm);
         uint64_t cids[64];
-        uint32_t ncid = 0;
-        for (uint32_t i = 0; i < ns; i++) {
+        uint32_t ncid = 0, ncb_all = 0;
+        for (uint32_t i = 0; i < ns && !r->bad; i++) {
             si[i] = (VkSubmitInfo) { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &tl[i] };
             tl[i] = (VkTimelineSemaphoreSubmitInfo) { .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
             uint32_t nw = vr_ru32(r);
-            if (nw > 8) nw = 8;
-            for (uint32_t k = 0; k < nw; k++) { ws[i][k] = OBJ(VkSemaphore, vr_ru64(r)); wst[i][k] = vr_ru32(r); wv[i][k] = vr_ru64(r); }
+            if (nw > r->n - r->at) { r->bad = 1; break; }
+            sm[i].ws = calloc(nw + 1, sizeof *sm[i].ws);
+            sm[i].wst = calloc(nw + 1, sizeof *sm[i].wst);
+            sm[i].wv = calloc(nw + 1, sizeof *sm[i].wv);
+            for (uint32_t k = 0; k < nw; k++) { sm[i].ws[k] = OBJ(VkSemaphore, vr_ru64(r)); sm[i].wst[k] = vr_ru32(r); sm[i].wv[k] = vr_ru64(r); }
             si[i].waitSemaphoreCount = tl[i].waitSemaphoreValueCount = nw;
-            si[i].pWaitSemaphores = ws[i];
-            si[i].pWaitDstStageMask = wst[i];
-            tl[i].pWaitSemaphoreValues = wv[i];
+            si[i].pWaitSemaphores = sm[i].ws;
+            si[i].pWaitDstStageMask = sm[i].wst;
+            tl[i].pWaitSemaphoreValues = sm[i].wv;
             uint32_t nc = vr_ru32(r);
-            if (nc > 64) nc = 64;
+            if (nc > r->n - r->at) { r->bad = 1; break; }
+            sm[i].cbs = calloc(nc ? nc : 1, sizeof *sm[i].cbs);
             for (uint32_t k = 0; k < nc; k++) {
                 uint64_t cid = vr_ru64(r);
-                cbs[i][k] = (VkCommandBuffer) (uintptr_t) H(cid);
+                sm[i].cbs[k] = (VkCommandBuffer) (uintptr_t) H(cid);
                 if (ncid < 64) cids[ncid++] = cid;
+                ncb_all++;
             }
             si[i].commandBufferCount = nc;
-            si[i].pCommandBuffers = cbs[i];
+            si[i].pCommandBuffers = sm[i].cbs;
             uint32_t nsg = vr_ru32(r);
-            if (nsg > 8) nsg = 8;
-            for (uint32_t k = 0; k < nsg; k++) { ss[i][k] = OBJ(VkSemaphore, vr_ru64(r)); sv[i][k] = vr_ru64(r); }
+            if (nsg > r->n - r->at) { r->bad = 1; break; }
+            sm[i].ss = calloc(nsg + 1, sizeof *sm[i].ss);
+            sm[i].sv = calloc(nsg + 1, sizeof *sm[i].sv);
+            for (uint32_t k = 0; k < nsg; k++) { sm[i].ss[k] = OBJ(VkSemaphore, vr_ru64(r)); sm[i].sv[k] = vr_ru64(r); }
             si[i].signalSemaphoreCount = tl[i].signalSemaphoreValueCount = nsg;
-            si[i].pSignalSemaphores = ss[i];
-            tl[i].pSignalSemaphoreValues = sv[i];
+            si[i].pSignalSemaphores = sm[i].ss;
+            tl[i].pSignalSemaphoreValues = sm[i].sv;
+        }
+        if (r->bad) {
+            for (uint32_t i = 0; i < ns; i++) { free(sm[i].ws); free(sm[i].wst); free(sm[i].wv); free(sm[i].cbs); free(sm[i].ss); free(sm[i].sv); }
+            free(si); free(tl); free(sm);
+            return 1;
         }
         VkFence f = OBJ(VkFence, vr_ru64(r));
         // 同時に走らせる submit は 64 本まで（VKR_MAXFL=n で変える・0 なら上限なし）。
@@ -3258,15 +3273,15 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             for (uint32_t i = 0; i < ns; i++) {
                 if (g_chain_last >= 0) {
                     uint32_t k = si[i].waitSemaphoreCount;
-                    ws[i][k] = g_chain[g_chain_last];
-                    wst[i][k] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-                    wv[i][k] = 0;
+                    sm[i].ws[k] = g_chain[g_chain_last];
+                    sm[i].wst[k] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                    sm[i].wv[k] = 0;
                     si[i].waitSemaphoreCount = tl[i].waitSemaphoreValueCount = k + 1;
                 }
                 int next = (g_chain_last + 1) & 3;
                 uint32_t k = si[i].signalSemaphoreCount;
-                ss[i][k] = g_chain[next];
-                sv[i][k] = 0;
+                sm[i].ss[k] = g_chain[next];
+                sm[i].sv[k] = 0;
                 si[i].signalSemaphoreCount = tl[i].signalSemaphoreValueCount = k + 1;
                 g_chain_last = next;
             }
@@ -3321,6 +3336,10 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             if (res < 0) g_err = res;
             if (own && g_nfpool < 64) g_fpool[g_nfpool++] = f;
         }
+        // 64 本を超える command buffer は走っているかを覚えきれないので、終わるまで待つ（同じ物を走っている間に出し直さないため）
+        if (res == VK_SUCCESS && ncb_all > 64) drain();
+        for (uint32_t i = 0; i < ns; i++) { free(sm[i].ws); free(sm[i].wst); free(sm[i].wv); free(sm[i].cbs); free(sm[i].ss); free(sm[i].sv); }
+        free(si); free(tl); free(sm);
         return 1;
     }
     case VR_WAIT_SEMAPHORES: {
@@ -3328,14 +3347,17 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkSemaphoreWaitInfo wi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
         wi.flags = vr_ru32(r);
         uint32_t n = vr_ru32(r);
-        if (n > 64) n = 64;
-        VkSemaphore sm[64];
-        uint64_t v[64];
+        if (n > r->n - r->at) return reply(s, VK_ERROR_INITIALIZATION_FAILED);
+        VkSemaphore *sm = calloc(n ? n : 1, sizeof *sm);
+        uint64_t *v = calloc(n ? n : 1, sizeof *v);
         for (uint32_t i = 0; i < n; i++) { sm[i] = OBJ(VkSemaphore, vr_ru64(r)); v[i] = vr_ru64(r); }
         wi.semaphoreCount = n;
         wi.pSemaphores = sm;
         wi.pValues = v;
-        return reply(s, vkWaitSemaphores(d, &wi, vr_ru64(r)));
+        VkResult wr = vkWaitSemaphores(d, &wi, vr_ru64(r));
+        free(sm);
+        free(v);
+        return reply(s, wr);
     }
     case VR_GET_SEMAPHORE_COUNTER: {
         VkDevice d = DEV(vr_ru64(r));
