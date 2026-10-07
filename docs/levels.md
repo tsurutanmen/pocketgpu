@@ -19,7 +19,7 @@
 
 ### Lv 10〜30 正しさと広さ
 - [ ] Vulkan の公式の適合試験（CTS）の合格率を数字で出す（代役と iPhone）
-- [x] DirectX 11 の機能 29 場面の自前の試験（vk/tests/feat）：DXVK 1.10 で RTX 直と違うのは、任意のボーダー色（iPhone の Metal の限界）と stream output（未対応）だけ。見つかった不具合 5 つを直した
+- [x] DirectX 11 の機能 29 場面の自前の試験（vk/tests/feat）：DXVK 1.10 で RTX 直と違うのは、任意のボーダー色（iPhone の Metal の限界）と stream output（未対応）だけ。見つかったドライバの不具合 3 つと、運んでいなかった頂点の step rate を直した
 - [x] DirectX 12 の下ごしらえ：push descriptor と descriptor の写しをドライバの中で直す（vkd3d-proton はほかに、空の descriptor と大きな descriptor の数が要る）
 - [ ] 試すアプリの表を 50 本にして、動く・動かないを毎回測る
 - [ ] DirectX 11 のゲームを 10 本
