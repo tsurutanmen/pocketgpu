@@ -20,7 +20,7 @@ echo "結果は $OUT"
 echo "== 0. USB の速さ：つなぎを 1・2・4 本同時に"
 # usbmux はつなぎごとに受け取りの窓を持つらしいので、本数で足し算になるかを見る（先例 Backburner の調べから）
 (cd /d/iphone-rpc/app/pc && PYTHONIOENCODING=utf-8 timeout 300 python usb_bw.py --mb 128) > "$OUT/usb_bw.txt" 2>&1
-grep -a "MB/s" "$OUT/usb_bw.txt" | head -8
+grep -a "MB/s\|見つからない" "$OUT/usb_bw.txt" | head -8
 
 echo "== 1. 装置の拡張"
 IPHONE_VK_LOG=1 run 120 "D:/iphone-rpc/vkbuild/extlist.exe" iPhone > "$OUT/extlist.txt" 2>&1
@@ -70,6 +70,13 @@ for m in plain bc1; do
     (cd "$D3" && IPHONE_VK_DXVK3=1 DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=info DXVK_LOG_PATH=none IPHONE_VK_LOG=1 \
         run 300 "D:/iphone-rpc/vkbuild/dxvk3/d3d11cube.exe" 300 "$WOUT\\dxvk3cube_$m.ppm" $arg) > "$OUT/d3d11dxvk3_$m.txt" 2>&1
     echo "DXVK 3 の立方体 $m：$(grep -a 'コマ/秒\|検算\|失敗' "$OUT/d3d11dxvk3_$m.txt" | grep -av '^\[iphone-vk\]' | tr '\n' ' ')"
+done
+# EVENT のクエリが返るか（10/7 まで DXVK-macOS ではドライバ越しに返らなかった。ゲームが固まる原因になる）
+for dx in d3d11 dxvk3; do
+    [ -f "$VKB/$dx/d3d11event.exe" ] || cp -f "$VKB/d3d11/d3d11event.exe" "$VKB/$dx/"
+    flag=""; [ $dx = dxvk3 ] && flag=1
+    (cd "$VKB/$dx" && IPHONE_VK_DXVK3=$flag DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=none run 120 "D:/iphone-rpc/vkbuild/$dx/d3d11event.exe" 20) > "$OUT/event_$dx.txt" 2>&1
+    echo "EVENT のクエリ $dx：$(tail -1 "$OUT/event_$dx.txt")"
 done
 # DXVK が「足りない」と言った機能を拾う
 grep -a -h "not supported\|Failed\|err:" "$OUT"/d3d11*.txt | sort | uniq -c | head -10

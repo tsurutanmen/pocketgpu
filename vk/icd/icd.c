@@ -851,7 +851,12 @@ struct cb {
     uint32_t app_topo;        // アプリが vkCmdSetPrimitiveTopology で決めた形
     int app_topo_set;
     struct gs_cbst *gsx;      // GS を真似るための、頂点・index の buffer の覚えと、記録・descriptor の一時の物
+    struct evact *ev;         // submit のときに立てる・倒す event（記録した順）
+    size_t nev, cev;
 };
+struct event;
+struct evact { struct event *e; int val; };
+static void ev_fire(struct cb *c);
 struct bctmp { VkBuffer b; VkDeviceMemory m; struct bctmp *next; };
 
 struct fence { uint64_t serial; struct queue *q; double last_poll; };
@@ -3651,9 +3656,9 @@ static void bct_free(struct cb *c) {
     c->bct = NULL;
 }
 
-static void cb_clear(struct cb *c) { c->s.n = 0; c->nr = 0; c->nrd = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
+static void cb_clear(struct cb *c) { c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
 
-static void cb_free(struct cb *c) { gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c); }
+static void cb_free(struct cb *c) { gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c->ev); free(c); }
 
 static void VKAPI_CALL destroy_cpool(VkDevice dv, VkCommandPool pp, const VkAllocationCallbacks *a) {
     (void) a;
@@ -3945,6 +3950,7 @@ static void VKAPI_CALL cmd_end_rp2(VkCommandBuffer cbh, const VkSubpassEndInfo *
 // ---- 2 次の command buffer：中身を呼んだ側に写す ----
 // 受け手では 2 次の command buffer を使わない（記録に引き継ぎの情報が要り、render pass の中身の扱いも変わるため）。
 // 2 次の記録は呼ばれるたびに 1 次の記録へ写すので、GPU が読み書きする範囲も一緒に写す
+static void ev_add(struct cb *c, struct event *e, int val);
 static void VKAPI_CALL cmd_exec(VkCommandBuffer cbh, uint32_t n, const VkCommandBuffer *sec) {
     struct cb *c = (struct cb *) cbh;
     for (uint32_t i = 0; i < n; i++) {
@@ -3953,6 +3959,7 @@ static void VKAPI_CALL cmd_exec(VkCommandBuffer cbh, uint32_t n, const VkCommand
         vr_put(&c->s, s->s.p, s->s.n);
         for (size_t k = 0; k < s->nr; k++) rng_add(&c->r, &c->nr, &c->capr, s->r[k].m, s->r[k].off, s->r[k].len, 0);
         for (size_t k = 0; k < s->nrd; k++) rng_add(&c->rd, &c->nrd, &c->caprd, s->rd[k].m, s->rd[k].off, s->rd[k].len, 0);
+        for (size_t k = 0; k < s->nev; k++) ev_add(c, s->ev[k].e, s->ev[k].val);
     }
 }
 
@@ -4776,6 +4783,11 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
         if (n == 0) break;
     }
     rpc_flush();
+    for (uint32_t i = 0; i < n; i++)
+        for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
+            struct cb *c = (struct cb *) si[i].pCommandBuffers[j];
+            ev_fire(c);
+        }
     AcquireSRWLockExclusive(&d->lock);
     uint64_t serial = ++d->serial;
     for (uint32_t i = 0; i < n; i++) {
@@ -4834,8 +4846,25 @@ static VkResult VKAPI_CALL device_wait_idle(VkDevice dv) {
 // ---- VkEvent ----
 // 受け手には送らない。待つ側（vkCmdWaitEvents）を、全部の仕切り（vkCmdPipelineBarrier）に置き換える。
 // event は同じキューの中だけで使う物なので、仕切りで submit の順に従わせれば、少し広く待つだけで同じ意味になる。
-// llama.cpp は GPU を 2 つ使うとき、GPU どうしの待ち合わせに使う
+// llama.cpp は GPU を 2 つ使うとき、GPU どうしの待ち合わせに使う。
+// GPU が立てる・倒すのは submit のときにする（fence と同じく、出した仕事は終わったものとして扱う）。
+// 記録の時点で立てると、DXVK の「記録してから手元で倒す」順で倒れたままになり、DirectX 11 の EVENT のクエリが返らない
 struct event { int set; };
+static void ev_add(struct cb *c, struct event *e, int val) {
+    if (!e) return;
+    if (c->nev == c->cev) {
+        size_t cap = c->cev ? c->cev * 2 : 8;
+        struct evact *p = realloc(c->ev, cap * sizeof *p);
+        if (!p) return;
+        c->ev = p;
+        c->cev = cap;
+    }
+    c->ev[c->nev++] = (struct evact) { e, val };
+}
+// submit のときに、記録した順に立てる・倒す
+static void ev_fire(struct cb *c) {
+    for (size_t k = 0; k < c->nev; k++) c->ev[k].e->set = c->ev[k].val;
+}
 static VkResult VKAPI_CALL create_event(VkDevice dv, const VkEventCreateInfo *ci, const VkAllocationCallbacks *a, VkEvent *out) {
     (void) dv; (void) ci; (void) a;
     struct event *e = calloc(1, sizeof *e);
@@ -4847,8 +4876,8 @@ static void VKAPI_CALL destroy_event(VkDevice dv, VkEvent ev, const VkAllocation
 static VkResult VKAPI_CALL get_event_status(VkDevice dv, VkEvent ev) { (void) dv; return ((struct event *) ev)->set ? VK_EVENT_SET : VK_EVENT_RESET; }
 static VkResult VKAPI_CALL set_event(VkDevice dv, VkEvent ev) { (void) dv; ((struct event *) ev)->set = 1; return VK_SUCCESS; }
 static VkResult VKAPI_CALL reset_event(VkDevice dv, VkEvent ev) { (void) dv; ((struct event *) ev)->set = 0; return VK_SUCCESS; }
-static void VKAPI_CALL cmd_set_event(VkCommandBuffer cbh, VkEvent ev, VkPipelineStageFlags st) { (void) cbh; (void) st; ((struct event *) ev)->set = 1; }
-static void VKAPI_CALL cmd_reset_event(VkCommandBuffer cbh, VkEvent ev, VkPipelineStageFlags st) { (void) cbh; (void) ev; (void) st; }
+static void VKAPI_CALL cmd_set_event(VkCommandBuffer cbh, VkEvent ev, VkPipelineStageFlags st) { (void) st; ev_add((struct cb *) cbh, (struct event *) ev, 1); }
+static void VKAPI_CALL cmd_reset_event(VkCommandBuffer cbh, VkEvent ev, VkPipelineStageFlags st) { (void) st; ev_add((struct cb *) cbh, (struct event *) ev, 0); }
 static void VKAPI_CALL cmd_wait_events(VkCommandBuffer cbh, uint32_t n, const VkEvent *evs, VkPipelineStageFlags src, VkPipelineStageFlags dst,
                                        uint32_t nm, const VkMemoryBarrier *mb, uint32_t nb, const VkBufferMemoryBarrier *bb,
                                        uint32_t ni, const VkImageMemoryBarrier *ib) {
@@ -5078,8 +5107,8 @@ out:
 }
 
 // Event2：今の VkEvent と同じく、待つ所を仕切りに置き換える。仕切りは dependency info をそのまま使う（画像の layout の変更も含む）
-static void VKAPI_CALL cmd_set_event2(VkCommandBuffer cbh, VkEvent ev, const VkDependencyInfo *d) { (void) cbh; (void) d; ((struct event *) ev)->set = 1; }
-static void VKAPI_CALL cmd_reset_event2(VkCommandBuffer cbh, VkEvent ev, VkPipelineStageFlags2 st) { (void) cbh; (void) ev; (void) st; }
+static void VKAPI_CALL cmd_set_event2(VkCommandBuffer cbh, VkEvent ev, const VkDependencyInfo *d) { (void) d; ev_add((struct cb *) cbh, (struct event *) ev, 1); }
+static void VKAPI_CALL cmd_reset_event2(VkCommandBuffer cbh, VkEvent ev, VkPipelineStageFlags2 st) { (void) st; ev_add((struct cb *) cbh, (struct event *) ev, 0); }
 static void VKAPI_CALL cmd_wait_events2(VkCommandBuffer cbh, uint32_t n, const VkEvent *evs, const VkDependencyInfo *d) {
     (void) evs;
     for (uint32_t i = 0; i < n; i++) cmd_barrier2(cbh, &d[i]);
