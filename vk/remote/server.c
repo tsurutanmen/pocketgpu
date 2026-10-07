@@ -124,6 +124,16 @@ static int like_ios_no_format(VkFormat f) {
     return like_ios() && (f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_X8_D24_UNORM_PACK32 || f == VK_FORMAT_D16_UNORM_S8_UINT);
 }
 
+// iPhone のふりで頂点に使えない形式。10/7 の iPhone 17 Pro の一覧で bufferFeatures に VERTEX_BUFFER が無かった物
+// （DirectX の R10G10B10A2_UINT＝A2B10G10R10_UINT、BGRA の SNORM・SCALED・整数、A2R10G10B10、3 成分の BGR、64 ビット）。
+// iPhone の vfmt の場面では、この形式の属性がある pipeline を作れなかった（-3）。ふりでも作らない
+static int like_ios_no_vertex(VkFormat f) {
+    return like_ios() && ((f >= VK_FORMAT_B8G8R8_UNORM && f <= VK_FORMAT_B8G8R8_SINT) || (f >= VK_FORMAT_B8G8R8A8_SNORM && f <= VK_FORMAT_B8G8R8A8_SINT) ||
+                          (f >= VK_FORMAT_A2R10G10B10_UNORM_PACK32 && f <= VK_FORMAT_A2R10G10B10_SINT_PACK32) ||
+                          (f >= VK_FORMAT_A2B10G10R10_USCALED_PACK32 && f <= VK_FORMAT_A2B10G10R10_SINT_PACK32) ||
+                          (f >= VK_FORMAT_R64_UINT && f <= VK_FORMAT_R64G64B64A64_SFLOAT));
+}
+
 // iPhone のふりで隠す機能。10/7 の iPhone 17 Pro（MoltenVK 1.4.2）の DXVK の記録と比べて、iPhone に無かった物
 static void like_ios_mask(VkPhysicalDeviceFeatures *f) {
     if (!like_ios()) return;
@@ -1620,6 +1630,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(g_pd, fmt, &fp);
         if (like_ios_no_format(fmt)) memset(&fp, 0, sizeof fp);
+        if (like_ios_no_vertex(fmt)) fp.bufferFeatures &= ~(VkFormatFeatureFlags) VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
         vr_put(&g_out, &fp, sizeof fp);
         if (g_fmt3) {
             // 1.3 の 64 ビットの形（STORAGE_READ_WITHOUT_FORMAT など 1.0 の形に無い印がある）を後ろに付ける
@@ -1627,6 +1638,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             VkFormatProperties2 f2 = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &f3 };
             vkGetPhysicalDeviceFormatProperties2(g_pd, fmt, &f2);
             if (like_ios_no_format(fmt)) f3.linearTilingFeatures = f3.optimalTilingFeatures = f3.bufferFeatures = 0;
+            if (like_ios_no_vertex(fmt)) f3.bufferFeatures &= ~(VkFormatFeatureFlags2) VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
             vr_u64(&g_out, f3.linearTilingFeatures);
             vr_u64(&g_out, f3.optimalTilingFeatures);
             vr_u64(&g_out, f3.bufferFeatures);
@@ -2866,6 +2878,12 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             }
         }
         // iPhone のふり：MoltenVK はテッセレーションの設定が無いと何も描かない。代役でも同じに見えるよう、作らずに断る
+        // iPhone のふり：iPhone が頂点に使えない形式の属性があれば、iPhone と同じく作らない
+        for (uint32_t i = 0; like_ios() && ci.pVertexInputState && i < vi.vertexAttributeDescriptionCount; i++)
+            if (like_ios_no_vertex(va[i].format)) {
+                vlog("iPhone のふり：頂点の形式 %u は iPhone では頂点に使えないので pipeline を作らない", va[i].format);
+                return reply(s, VK_ERROR_INITIALIZATION_FAILED);
+            }
         if (like_ios() && !ci.pTessellationState)
             for (uint32_t i = 0; i < nst; i++)
                 if (st[i].stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT || st[i].stage == VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) {

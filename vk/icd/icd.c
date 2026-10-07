@@ -1635,9 +1635,11 @@ static void get_format_ex(VkFormat f, VkFormatProperties *p, VkFormatProperties3
     free(out.p);
 }
 
+static void vf_fix_format(VkFormat f, VkFormatProperties *p, VkFormatProperties3 *p3); // 頂点の形式の真似（create_graphics_pipelines のそば）
 static void VKAPI_CALL get_format(VkPhysicalDevice pd, VkFormat f, VkFormatProperties *p) {
     (void) pd;
     get_format_ex(f, p, NULL);
+    vf_fix_format(f, p, NULL);
 }
 
 static void VKAPI_CALL get_format2(VkPhysicalDevice pd, VkFormat f, VkFormatProperties2 *p) {
@@ -1646,6 +1648,7 @@ static void VKAPI_CALL get_format2(VkPhysicalDevice pd, VkFormat f, VkFormatProp
     for (VkBaseOutStructure *s = p->pNext; s; s = s->pNext)
         if (s->sType == VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3) p3 = (VkFormatProperties3 *) s;
     get_format_ex(f, &p->formatProperties, p3);
+    vf_fix_format(f, &p->formatProperties, p3);
 }
 
 // 道具（レイヤーなど）の一覧。ドライバとしては何も無い
@@ -2453,7 +2456,7 @@ static void put_stage(vr_buf *b, VkDevice dv, const VkPipelineShaderStageCreateI
 
 static void put_f(vr_buf *b, float f) { vr_put(b, &f, 4); }
 
-static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
+static VkResult VKAPI_CALL create_graphics_pipelines_raw(VkDevice dv, VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
     (void) cache; (void) a;
     VkResult worst = VK_SUCCESS;
     for (uint32_t i = 0; i < n; i++) {
@@ -2602,6 +2605,406 @@ static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCach
         for (uint32_t k = 0; k < 8; k++) if (tmps[k]) destroy_shader(dv, tmps[k], NULL); // 一時のシェーダーは作り終えたら消す
         if (r != VK_SUCCESS) { say("graphics pipeline を作れない (%d)", r); out[i] = VK_NULL_HANDLE; worst = r; continue; }
         out[i] = (VkPipeline) (uintptr_t) id;
+    }
+    return worst;
+}
+
+// ---- 受け手が頂点に使えない形式を真似る ----
+// iPhone の GPU（MoltenVK）は、DirectX 11 で頂点に必須の R10G10B10A2_UINT（VK_FORMAT_A2B10G10R10_UINT_PACK32）などを
+// 頂点の buffer に使えない。そのまま pipeline を作ると断られ、その描画が丸ごと消える。
+// 32 ビットに詰めた 4 成分の形式なら、属性を R32_UINT で読ませて、頂点シェーダーの頭でほどけば同じ値になる。
+// SPIR-V の書き換え：その Location の入力の変数を Private にし、同じ Location に uint の入力を足す。
+// 入口の関数の最初の block の頭で uint を読んでほどき、Private の変数に書く。ほかの読み書きはそのまま（access chain の型だけ Private に直す）。
+// 受け手が形式を持てば何もしない。IPHONE_VK_VFMT=0 で止める
+
+// ほどける形式：32 ビットに詰めた 4 成分（8・8・8・8 と 10・10・10・2 の UNORM・SNORM・USCALED・SSCALED・UINT・SINT）
+static int vf_fmt(uint32_t f, fmti *o) {
+    static const uint8_t k[6] = { K_UNORM, K_SNORM, K_USCALED, K_SSCALED, K_UINT, K_SINT };
+    memset(o, 0, sizeof *o);
+    if (f >= VK_FORMAT_R8G8B8A8_UNORM && f <= VK_FORMAT_R8G8B8A8_SINT) *o = (fmti) { 4, 1, k[f - VK_FORMAT_R8G8B8A8_UNORM], 0, 0 };
+    else if (f >= VK_FORMAT_B8G8R8A8_UNORM && f <= VK_FORMAT_B8G8R8A8_SINT) *o = (fmti) { 4, 1, k[f - VK_FORMAT_B8G8R8A8_UNORM], 1, 0 };
+    else if (f >= VK_FORMAT_A8B8G8R8_UNORM_PACK32 && f <= VK_FORMAT_A8B8G8R8_SINT_PACK32) *o = (fmti) { 4, 1, k[f - VK_FORMAT_A8B8G8R8_UNORM_PACK32], 0, 0 };
+    else if (f >= VK_FORMAT_A2R10G10B10_UNORM_PACK32 && f <= VK_FORMAT_A2R10G10B10_SINT_PACK32) *o = (fmti) { 4, 4, k[f - VK_FORMAT_A2R10G10B10_UNORM_PACK32], 1, 1 };
+    else if (f >= VK_FORMAT_A2B10G10R10_UNORM_PACK32 && f <= VK_FORMAT_A2B10G10R10_SINT_PACK32) *o = (fmti) { 4, 4, k[f - VK_FORMAT_A2B10G10R10_UNORM_PACK32], 0, 1 };
+    else return 0;
+    return 1;
+}
+
+// 受け手がその形式を頂点に使えず、R32_UINT なら使えるか。受け手の答えを覚えておく
+static int8_t g_vf_need[VK_FORMAT_A2B10G10R10_SINT_PACK32 + 1]; // 0 まだ聞いていない・1 真似る・2 要らない
+static int vf_need(uint32_t f) {
+    fmti fi;
+    if (f > VK_FORMAT_A2B10G10R10_SINT_PACK32 || !vf_fmt(f, &fi)) return 0;
+    if (!g_vf_need[f]) {
+        VkFormatProperties p, q;
+        get_format_ex((VkFormat) f, &p, NULL);
+        get_format_ex(VK_FORMAT_R32_UINT, &q, NULL);
+        g_vf_need[f] = !(p.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) && (q.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) ? 1 : 2;
+    }
+    return g_vf_need[f] == 1;
+}
+
+// 真似るか：受け手が頂点に使えない形式が 1 つでもあれば
+static int vf_on(void) {
+    static int v = -1;
+    if (v >= 0) return v;
+    const char *e = getenv("IPHONE_VK_VFMT");
+    char list[256] = "";
+    int on = 0;
+    for (uint32_t f = VK_FORMAT_R8G8B8A8_UNORM; !(e && *e == '0') && f <= VK_FORMAT_A2B10G10R10_SINT_PACK32; f++)
+        if (vf_need(f)) {
+            size_t l = strlen(list);
+            snprintf(list + l, sizeof list - l, " %u", f);
+            on = 1;
+        }
+    if (on) say("受け手が頂点に使えない形式（%s）は、R32_UINT で読ませて頂点シェーダーでほどく", list + 1);
+    v = on;
+    return v;
+}
+
+// アプリには、真似る形式も頂点に使えると見せる
+static void vf_fix_format(VkFormat f, VkFormatProperties *p, VkFormatProperties3 *p3) {
+    if (!vf_on() || !vf_need(f)) return;
+    p->bufferFeatures |= VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+    if (p3) p3->bufferFeatures |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+}
+
+// VS の SPIR-V を覚えておく。受け手が GS を持たなければ GS の真似が覚えるので、そのときは覚えない
+struct vf_mod { uint64_t id; uint32_t *code; size_t words; struct vf_mod *next; };
+static struct vf_mod *g_vfmods;
+static SRWLOCK g_vf_lock = SRWLOCK_INIT;
+
+static void vf_keep(uint64_t id, const uint32_t *code, size_t bytes) {
+    if (bytes < 20 || gs_on() || spv_model(code, bytes / 4) != 0 || !vf_on()) return;
+    struct vf_mod *e = calloc(1, sizeof *e);
+    if (!e || !(e->code = malloc(bytes))) { free(e); return; }
+    e->id = id;
+    e->words = bytes / 4;
+    memcpy(e->code, code, bytes);
+    AcquireSRWLockExclusive(&g_vf_lock);
+    e->next = g_vfmods;
+    g_vfmods = e;
+    ReleaseSRWLockExclusive(&g_vf_lock);
+}
+
+static void vf_forget(uint64_t id) {
+    if (!g_vfmods) return;
+    AcquireSRWLockExclusive(&g_vf_lock);
+    for (struct vf_mod **p = &g_vfmods; *p; p = &(*p)->next)
+        if ((*p)->id == id) { struct vf_mod *e = *p; *p = e->next; free(e->code); free(e); break; }
+    ReleaseSRWLockExclusive(&g_vf_lock);
+}
+
+// 段の SPIR-V の写し（free で返す）。pNext の物、GS の真似が覚えた物、ここで覚えた物の順に探す
+static uint32_t *vf_code(const VkPipelineShaderStageCreateInfo *st, size_t *words) {
+    size_t n = 0;
+    const uint32_t *p = gs_code(st, &n);
+    uint32_t *r = NULL;
+    if (p && n) {
+        if ((r = malloc(n * 4))) { memcpy(r, p, n * 4); *words = n; }
+        return r;
+    }
+    AcquireSRWLockShared(&g_vf_lock);
+    for (struct vf_mod *e = g_vfmods; e; e = e->next)
+        if (e->id == ID(st->module)) {
+            if ((r = malloc(e->words * 4))) { memcpy(r, e->code, e->words * 4); *words = e->words; }
+            break;
+        }
+    ReleaseSRWLockShared(&g_vf_lock);
+    return r;
+}
+
+// 32 ビットの x を形式 f の 4 成分にほどく。*vt に vec4 の型。符号つきは BitFieldSExtract で上の位を符号で埋める
+static uint32_t vf_unpack(ctx *c, const fmti *f, uint32_t x, uint32_t *vt) {
+    int sgn = f->kind == K_SNORM || f->kind == K_SINT || f->kind == K_SSCALED;
+    uint32_t ct = f->kind == K_UINT ? c->t_u32 : f->kind == K_SINT ? c->t_i32 : c->t_f32, comp[4];
+    uint32_t xs = sgn ? op1(c, OP_Bitcast, c->t_i32, x) : 0;
+    for (uint32_t i = 0; i < 4; i++) {
+        uint32_t bits = f->pack ? (i == 3 ? 2 : 10) : 8, shift = ku(c, f->pack ? i * 10 : i * 8), raw = 0, sraw = 0, val;
+        if (sgn) sraw = op3(c, OP_BitFieldSExtract, c->t_i32, xs, shift, ku(c, bits));
+        else raw = op3(c, OP_BitFieldUExtract, c->t_u32, x, shift, ku(c, bits));
+        switch (f->kind) {
+        case K_UNORM: val = op2(c, OP_FDiv, c->t_f32, op1(c, OP_ConvertUToF, c->t_f32, raw), kf(c, (float) ((1u << bits) - 1))); break;
+        case K_SNORM:
+            val = op2(c, OP_FDiv, c->t_f32, op1(c, OP_ConvertSToF, c->t_f32, sraw), kf(c, (float) ((1u << (bits - 1)) - 1)));
+            val = ext2(c, c->t_f32, GLSL_FMax, val, kf(c, -1.0f));
+            break;
+        case K_USCALED: val = op1(c, OP_ConvertUToF, c->t_f32, raw); break;
+        case K_SSCALED: val = op1(c, OP_ConvertSToF, c->t_f32, sraw); break;
+        case K_UINT: val = raw; break;
+        default: val = sraw; break;
+        }
+        comp[i] = val;
+    }
+    if (f->bgra) { uint32_t t = comp[0]; comp[0] = comp[2]; comp[2] = t; }
+    *vt = ty_vec(c, ct, 4);
+    uint32_t r = spv_new_id(c);
+    OPW(&c->fn, OP_CompositeConstruct, *vt, r, comp[0], comp[1], comp[2], comp[3]);
+    return r;
+}
+
+// 入力の変数が使う Location の数
+static uint32_t vf_locs(ctx *c, uint32_t t) {
+    uint32_t *d = D(c, t);
+    if (d && OPC(d) == OP_TypeArray) return const_value(c, d[3]) * vf_locs(c, d[2]);
+    if (d && OPC(d) == OP_TypeMatrix) return d[3];
+    return 1;
+}
+
+// 入口の関数の頭：足した uint の入力を読んでほどき、Private にした変数に書く
+static void vf_prologue(ctx *c, const iovar *in, int nin, const uint32_t *newin, const uint32_t *locfmt) {
+    for (int i = 0; i < nin && !c->bad; i++) {
+        const iovar *v = &in[i];
+        if (!c->conv[v->var]) continue;
+        fmti f;
+        vf_fmt(locfmt[v->loc], &f);
+        uint32_t v4t = 0, v4 = vf_unpack(c, &f, load(c, c->t_u32, newin[v->loc]), &v4t);
+        uint32_t n, st = scalar_of(c, v->type, &n), n4, s4 = scalar_of(c, v4t, &n4), x;
+        (void) n4;
+        if (n == 1) x = op2(c, OP_CompositeExtract, s4, v4, v->comp);
+        else {
+            uint32_t w[10] = { ty_vec(c, s4, n), spv_new_id(c), v4, v4 };
+            for (uint32_t k = 0; k < n; k++) w[4 + k] = v->comp + k;
+            wb_op(&c->fn, OP_VectorShuffle, 4 + n, w);
+            x = w[1];
+        }
+        if (st != s4) x = op1(c, OP_Bitcast, v->type, x);
+        OPW(&c->fn, OP_Store, v->var, x);
+    }
+}
+
+// VS の入口 entry で、Location L の入力を形式 locfmt[L] からほどく SPIR-V を作る（0 ならそのまま）。
+// 作れたら 1。書き換える入力が無ければ *out は NULL のまま。ほかの入口は落とす
+static int vf_build(const uint32_t *vs, size_t words, const char *entry, const uint32_t *locfmt, uint32_t nloc,
+                    uint32_t **out, size_t *out_words, gs_emu_info *info) {
+    ctx cc = { 0 }, *c = &cc;
+    iovar in[MAX_IO];
+    uint32_t newin[64] = { 0 }, *ep = NULL, if_at = 0;
+    int nin = 0, nconv = 0, need_glsl = 0;
+    memset(info, 0, sizeof *info);
+    c->info = info;
+    *out = NULL;
+    *out_words = 0;
+    if (!split(&c->g, vs, words)) { snprintf(info->why, sizeof info->why, "VS の SPIR-V が読めない"); return 0; }
+    c->ver = c->g.ver;
+    c->next = c->g.bound;
+    c->cap = c->next + 65536;
+    c->def = calloc(c->cap, sizeof *c->def);
+    c->conv = calloc(c->cap, 1);
+    c->plainmap = calloc(c->cap, 4);
+    c->sel = calloc(c->cap, 4);
+    c->root = calloc(c->cap, 4);
+    if (!c->def || !c->conv || !c->plainmap || !c->sel || !c->root) { fail(c, "メモリが足りない"); goto done; }
+    for (int s = 0; s < S_N; s++)
+        for (size_t i = 0; i < c->g.s[s].n; i++) {
+            set_def(c, c->g.s[s].v[i]);
+            if (s == S_GLOB && is_type_op(OPC(c->g.s[s].v[i]))) il_push(&c->types, c->g.s[s].v[i]);
+        }
+    // 入口：Vertex で名前が entry の物
+    for (size_t i = 0; i < c->g.s[S_EP].n; i++) {
+        uint32_t *e = c->g.s[S_EP].v[i], k = 3;
+        while (k < WC(e)) {
+            uint32_t x = e[k++];
+            if (!(x & 0xff) || !(x & 0xff00) || !(x & 0xff0000) || !(x & 0xff000000)) break;
+        }
+        if (e[1] == 0 && strlen(entry) < (k - 3) * 4 && !strcmp((const char *) (e + 3), entry)) { ep = e; if_at = k; }
+    }
+    if (!ep) { fail(c, "頂点の入口 %s が無い", entry); goto done; }
+    // 書き換える入力の変数（スカラーかベクトルで、32 ビットの数）
+    collect_io(c, &c->g, SC_Input, in, &nin, MAX_IO);
+    for (int i = 0; i < nin && !c->bad; i++) {
+        iovar *v = &in[i];
+        if (v->builtin != ~0u || v->loc == ~0u) continue;
+        uint32_t nl = vf_locs(c, v->type), hit = 0, n = 0, st = scalar_of(c, v->type, &n), *sd = D(c, st);
+        for (uint32_t L = v->loc; L < v->loc + nl && L < nloc; L++) if (locfmt[L]) hit = 1;
+        if (!hit) continue;
+        if (nl != 1 || !sd || (OPC(sd) != OP_TypeInt && OPC(sd) != OP_TypeFloat) || sd[2] != 32 || v->comp + n > 4) {
+            fail(c, "Location %u の入力の型が読めない", v->loc);
+            break;
+        }
+        fmti f;
+        vf_fmt(locfmt[v->loc], &f);
+        need_glsl |= f.kind == K_SNORM;
+        c->conv[v->var] = 1;
+        nconv++;
+    }
+    if (c->bad || !nconv) goto done;
+    compute_roots(c);
+    if (c->bad) goto done;
+    { uint32_t w[2] = { 32, 0 }; c->t_u32 = get_type(c, OP_TypeInt, 2, w); }
+    { uint32_t w[2] = { 32, 1 }; c->t_i32 = get_type(c, OP_TypeInt, 2, w); }
+    { uint32_t w[1] = { 32 }; c->t_f32 = get_type(c, OP_TypeFloat, 1, w); }
+    if (need_glsl) {
+        static const char nm[] = "GLSL.std.450";
+        uint32_t w[8] = { 0 };
+        memcpy(w + 1, nm, sizeof nm);
+        for (size_t i = 0; i < c->g.s[S_IMP].n && !c->glsl; i++)
+            if (str_eq(c->g.s[S_IMP].v[i] + 2, w + 1, WC(c->g.s[S_IMP].v[i]) - 2, 4)) c->glsl = c->g.s[S_IMP].v[i][1];
+        if (!c->glsl) {
+            w[0] = c->glsl = spv_new_id(c);
+            il_push(&c->newimp, make_ins(OP_ExtInstImport, 5, w));
+        }
+    }
+    // 変える変数を Private にして、宣言を後ろへ移す（新しいポインターの型より後に置くため）
+    for (size_t i = 0; i < c->g.s[S_GLOB].n; i++) {
+        uint32_t *d = c->g.s[S_GLOB].v[i];
+        if (OPC(d) != OP_Variable || !c->conv[d[2]]) continue;
+        uint32_t w[3] = { ty_ptr(c, SC_Private, plain(c, ptr_pointee(c, d[1]))), d[2], SC_Private };
+        uint32_t *x = make_ins(OP_Variable, 3, w);
+        il_push(&c->convvars, x);
+        c->def[d[2]] = x;
+    }
+    // 足す入力：Location ごとに uint を 1 つ
+    {
+        uint32_t pin = ty_ptr(c, SC_Input, c->t_u32);
+        for (int i = 0; i < nin; i++) {
+            uint32_t L = in[i].loc;
+            if (!c->conv[in[i].var] || newin[L]) continue;
+            char nm[32];
+            snprintf(nm, sizeof nm, "vf_packed%u", L);
+            newin[L] = new_var(c, pin, SC_Input, nm);
+            add_deco(c, newin[L], DEC_Location, L);
+        }
+    }
+    // 関数：入口の関数の最初の block の頭（Function の変数の後ろ）でほどく
+    {
+        int in_main = 0, need_pro = 0, pro_done = 0;
+        for (size_t i = 0; i < c->g.s[S_FUNC].n && !c->bad; i++) {
+            uint32_t *ins = c->g.s[S_FUNC].v[i], op = OPC(ins);
+            if (op == OP_Function) in_main = ins[2] == ep[2];
+            if (need_pro && op != OP_Variable && op != OP_Line && op != OP_NoLine) {
+                vf_prologue(c, in, nin, newin, locfmt);
+                need_pro = 0;
+            }
+            if (op == OP_Label && in_main && !pro_done) { wb_ins(&c->fn, ins); need_pro = pro_done = 1; continue; }
+            if (chain_op(op) && ins[3] < c->cap && c->root[ins[3]] && c->conv[c->root[ins[3]]]) {
+                uint32_t *x = dup_ins(ins);
+                x[1] = ty_ptr(c, SC_Private, plain(c, ptr_pointee(c, ins[1])));
+                wb_ins(&c->fn, x);
+                free(x);
+                continue;
+            }
+            wb_ins(&c->fn, ins);
+        }
+        if (!pro_done) fail(c, "入口の関数が見つからない");
+    }
+    if (c->bad) goto done;
+    // 組み立て
+    {
+        wbuf o = { 0 }, e = { 0 };
+        uint32_t hdr[5] = { 0x07230203u, c->ver, c->g.gen, 0, 0 };
+        for (int i = 0; i < 5; i++) wb_put(&o, hdr[i]);
+        int secs[4] = { S_CAP, S_EXT, S_IMP, S_MM };
+        for (int s = 0; s < 4; s++) {
+            for (size_t i = 0; i < c->g.s[secs[s]].n; i++) wb_ins(&o, c->g.s[secs[s]].v[i]);
+            if (secs[s] == S_IMP) for (size_t i = 0; i < c->newimp.n; i++) wb_ins(&o, c->newimp.v[i]);
+        }
+        // 入口は 1 つ。1.4 より前の interface は Input・Output だけなので、Private にした変数を外す
+        for (uint32_t k = 1; k < if_at; k++) wb_put(&e, ep[k]);
+        for (uint32_t k = if_at; k < WC(ep); k++)
+            if (!(ep[k] < c->cap && c->conv[ep[k]] && c->ver < 0x10400)) wb_put(&e, ep[k]);
+        for (uint32_t L = 0; L < 64; L++) if (newin[L]) wb_put(&e, newin[L]);
+        wb_op(&o, OP_EntryPoint, (uint32_t) e.n, e.p);
+        free(e.p);
+        for (size_t i = 0; i < c->g.s[S_EM].n; i++) if (c->g.s[S_EM].v[i][1] == ep[2]) wb_ins(&o, c->g.s[S_EM].v[i]);
+        for (size_t i = 0; i < c->g.s[S_DBG].n; i++) wb_ins(&o, c->g.s[S_DBG].v[i]);
+        for (size_t i = 0; i < c->newdbg.n; i++) wb_ins(&o, c->newdbg.v[i]);
+        // 飾り：Private にした変数の物（Location など）は落とす
+        for (size_t i = 0; i < c->g.s[S_ANN].n && !c->bad; i++) {
+            uint32_t *a = c->g.s[S_ANN].v[i], op = OPC(a);
+            if (op == OP_DecorationGroup || op == OP_GroupDecorate || op == OP_GroupMemberDecorate) { fail(c, "decoration group がある"); break; }
+            if ((op == OP_Decorate || op == OP_DecorateId || op == OP_DecorateString) && a[1] < c->cap && c->conv[a[1]]) continue;
+            wb_ins(&o, a);
+        }
+        for (size_t i = 0; i < c->newann.n; i++) wb_ins(&o, c->newann.v[i]);
+        for (size_t i = 0; i < c->g.s[S_GLOB].n; i++) {
+            uint32_t *d = c->g.s[S_GLOB].v[i];
+            if (OPC(d) == OP_Variable && c->conv[d[2]]) continue;
+            wb_ins(&o, d);
+        }
+        for (size_t i = 0; i < c->newglob.n; i++) wb_ins(&o, c->newglob.v[i]);
+        for (size_t i = 0; i < c->convvars.n; i++) wb_ins(&o, c->convvars.v[i]);
+        for (size_t i = 0; i < c->newvars.n; i++) wb_ins(&o, c->newvars.v[i]);
+        for (size_t i = 0; i < c->fn.n; i++) wb_put(&o, c->fn.p[i]);
+        o.p[3] = c->next;
+        if (!c->bad) { *out = o.p; *out_words = o.n; } else free(o.p);
+    }
+done:;
+    int ok = !c->bad;
+    smod_free(&c->g);
+    ilist *ls[6] = { &c->newglob, &c->convvars, &c->newvars, &c->newann, &c->newdbg, &c->newimp };
+    for (int m = 0; m < 6; m++) {
+        for (size_t i = 0; i < ls[m]->n; i++) free(ls[m]->v[i]);
+        free(ls[m]->v);
+    }
+    free(c->types.v);
+    free(c->fn.p);
+    free(c->def);
+    free(c->conv);
+    free(c->plainmap);
+    free(c->sel);
+    free(c->root);
+    return ok;
+}
+
+// 真似るときの pipeline の作り方（vf_pipeline が書く）
+struct vf_pipe {
+    VkGraphicsPipelineCreateInfo ci;
+    VkPipelineShaderStageCreateInfo st[8];
+    VkPipelineVertexInputStateCreateInfo vi;
+    VkVertexInputAttributeDescription at[32];
+    VkShaderModule mod; // 作った VS。pipeline を作り終えたら消す
+};
+
+// 受け手が頂点に使えない形式の属性があれば、R32_UINT にして、ほどく VS に替えた作り方を返す。要らなければ c のまま
+static const VkGraphicsPipelineCreateInfo *vf_pipeline(VkDevice dv, const VkGraphicsPipelineCreateInfo *c, struct vf_pipe *t) {
+    t->mod = VK_NULL_HANDLE;
+    const VkPipelineVertexInputStateCreateInfo *vi = c->pVertexInputState;
+    if (!vi || !vi->vertexAttributeDescriptionCount || vi->vertexAttributeDescriptionCount > 32 || c->stageCount > 8) return c;
+    uint32_t locfmt[64] = { 0 }, nv = 0, vs = ~0u, loc0 = 0;
+    for (uint32_t i = 0; i < vi->vertexAttributeDescriptionCount; i++) {
+        const VkVertexInputAttributeDescription *d = &vi->pVertexAttributeDescriptions[i];
+        if (d->location < 64 && vf_need(d->format)) { locfmt[d->location] = d->format; if (!nv++) loc0 = d->location; }
+    }
+    if (!nv) return c;
+    for (uint32_t k = 0; k < c->stageCount; k++) if (c->pStages[k].stage == VK_SHADER_STAGE_VERTEX_BIT) vs = k;
+    if (vs == ~0u) return c;
+    size_t words = 0, ow = 0;
+    uint32_t *code = vf_code(&c->pStages[vs], &words), *o = NULL;
+    gs_emu_info info;
+    if (!code) { say("頂点の形式を真似る：VS の SPIR-V が見つからない"); return c; }
+    int ok = vf_build(code, words, c->pStages[vs].pName, locfmt, 64, &o, &ow, &info);
+    free(code);
+    if (!ok) { say("頂点の形式を真似られない：%s", info.why); return c; }
+    if (o) {
+        VkShaderModuleCreateInfo smi = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = ow * 4, .pCode = o };
+        VkResult r = create_shader(dv, &smi, NULL, &t->mod);
+        free(o);
+        if (r != VK_SUCCESS) { t->mod = VK_NULL_HANDLE; return c; }
+    }
+    t->ci = *c;
+    memcpy(t->st, c->pStages, c->stageCount * sizeof *t->st);
+    if (t->mod) { t->st[vs].module = t->mod; t->st[vs].pNext = NULL; }
+    t->ci.pStages = t->st;
+    t->vi = *vi;
+    memcpy(t->at, vi->pVertexAttributeDescriptions, vi->vertexAttributeDescriptionCount * sizeof *t->at);
+    for (uint32_t i = 0; i < vi->vertexAttributeDescriptionCount; i++)
+        if (t->at[i].location < 64 && locfmt[t->at[i].location]) t->at[i].format = VK_FORMAT_R32_UINT;
+    t->vi.pVertexAttributeDescriptions = t->at;
+    t->ci.pVertexInputState = &t->vi;
+    say("頂点の形式を真似た：属性 %u 個（Location %u の形式 %u など）を R32_UINT で読ませる%s", nv, loc0, locfmt[loc0],
+        t->mod ? "・VS でほどく" : "・VS は読まない");
+    return &t->ci;
+}
+
+static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
+    if (!vf_on()) return create_graphics_pipelines_raw(dv, cache, n, ci, a, out);
+    VkResult worst = VK_SUCCESS;
+    for (uint32_t i = 0; i < n; i++) {
+        struct vf_pipe t;
+        VkResult r = create_graphics_pipelines_raw(dv, cache, 1, vf_pipeline(dv, &ci[i], &t), a, &out[i]);
+        if (t.mod) destroy_shader(dv, t.mod, NULL);
+        if (r != VK_SUCCESS) worst = r;
     }
     return worst;
 }
@@ -3491,6 +3894,7 @@ static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreate
     rpc_send(VR_CREATE_SHADER_MODULE, &b);
     free(b.p);
     gs_keep(id, ci->pCode, ci->codeSize);
+    vf_keep(id, ci->pCode, ci->codeSize);
     *out = (VkShaderModule) (uintptr_t) id;
     return VK_SUCCESS;
 }
@@ -3506,7 +3910,7 @@ static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreate
         free(b.p); \
     }
 DESTROY_SIMPLE(destroy_shader_rpc, VkShaderModule, VR_DESTROY_SHADER_MODULE)
-static void VKAPI_CALL destroy_shader(VkDevice dv, VkShaderModule h, const VkAllocationCallbacks *a) { gs_forget_pipe(VK_NULL_HANDLE, ID(h)); destroy_shader_rpc(dv, h, a); }
+static void VKAPI_CALL destroy_shader(VkDevice dv, VkShaderModule h, const VkAllocationCallbacks *a) { gs_forget_pipe(VK_NULL_HANDLE, ID(h)); vf_forget(ID(h)); destroy_shader_rpc(dv, h, a); }
 DESTROY_SIMPLE(destroy_playout_rpc, VkPipelineLayout, VR_DESTROY_PIPELINE_LAYOUT)
 static void pl_forget(uint64_t id);
 static void VKAPI_CALL destroy_playout(VkDevice dv, VkPipelineLayout h, const VkAllocationCallbacks *a) { gs_forget_layout(dv, ID(h)); pl_forget(ID(h)); destroy_playout_rpc(dv, h, a); }
