@@ -8,7 +8,7 @@
 
 最終更新 2026-10-07
 
-数（10/7 夜）：代役か iPhone のふりで動いた物 39 本（Vulkan 19・DirectX 11 20）。iPhone の実機で動いた物 23 本（Vulkan 10・DirectX 11 13）。目標は 50 本
+数（10/7 夜）：代役か iPhone のふりで動いた物 38 本（Vulkan 18・DirectX 11 20）。iPhone の実機で動いた物 23 本（Vulkan 10・DirectX 11 13）。目標は 50 本
 
 ## Vulkan のアプリ
 | アプリ | 代役 | iPhone | 数字（iPhone） |
