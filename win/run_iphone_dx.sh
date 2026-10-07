@@ -15,6 +15,11 @@ VKCMD='D:/iphone-rpc/vkbuild/iphone-vk.cmd'
 run() { timeout "$1" cmd.exe //c "$VKCMD" "${@:2}"; }
 echo "結果は $OUT"
 
+echo "== 0. USB の速さ：つなぎを 1・2・4 本同時に"
+# usbmux はつなぎごとに受け取りの窓を持つらしいので、本数で足し算になるかを見る（先例 Backburner の調べから）
+(cd /d/iphone-rpc/app/pc && PYTHONIOENCODING=utf-8 timeout 300 python usb_bw.py --mb 128) > "$OUT/usb_bw.txt" 2>&1
+grep -a "MB/s" "$OUT/usb_bw.txt" | head -8
+
 echo "== 1. 装置の拡張"
 IPHONE_VK_LOG=1 run 120 "D:/iphone-rpc/vkbuild/extlist.exe" iPhone > "$OUT/extlist.txt" 2>&1
 grep -a "受け手の GPU\|caps\|BC の\|: [0-9]*$" "$OUT/extlist.txt" | head -5
