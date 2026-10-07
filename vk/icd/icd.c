@@ -655,16 +655,22 @@ static SRWLOCK g_hw_lock = SRWLOCK_INIT;
 static int g_engine_dxvk2;
 // アプリのエンジンが Mesa の zink（OpenGL を Vulkan に直す部品）
 static int g_engine_zink;
+// アプリのエンジンが vkd3d-proton（DirectX 12 を Vulkan に直す部品）。DXVK 3 の名乗りに加えて、
+// transform feedback・画像の範囲の外・1 要素の揃え・descriptor indexing を名乗る（vkd3d() を見る所）
+static int g_engine_vkd3d;
 static int dxvk3(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("IPHONE_VK_DXVK3");
-        v = e && *e ? *e == '1' : g_engine_dxvk2 || g_engine_zink;
+        v = e && *e ? *e == '1' : g_engine_dxvk2 || g_engine_zink || g_engine_vkd3d;
         // zink（Mesa 26）も nullDescriptor と maintenance5 が無いと装置を断る
-        if (v && !(e && *e)) say(g_engine_zink ? "zink なので、DXVK 3 と同じ名乗りを入れる" : "新しい DXVK なので、DXVK 3 のための名乗りを入れる");
+        if (v && !(e && *e))
+            say(g_engine_zink ? "zink なので、DXVK 3 と同じ名乗りを入れる"
+                : g_engine_vkd3d ? "vkd3d-proton なので、DXVK 3 と DirectX 12 のための名乗りを入れる" : "新しい DXVK なので、DXVK 3 のための名乗りを入れる");
     }
     return v;
 }
+static int vkd3d(void) { return g_engine_vkd3d && dxvk3(); }
 
 // 中継するだけで済む（新しい入口が要らない）拡張だけを見せる
 static const char *const ALLOWED_EXT[] = {
@@ -693,9 +699,14 @@ static const struct { const char *name; uint32_t cap; } CAP_EXT[] = {
 static int has_ext(const char *name);
 static int g_khr_div_native = -1; // 受け手が KHR の divisor を自分で持つか（あいさつで決める）
 static int g_hw_ext_khr_div(void) { return g_khr_div_native > 0; }
+// 受け手の GPU が VK_EXT_dynamic_rendering_unused_attachments を持つ（持てば vkd3d-proton のときだけ見せて、受け手でも有効にする）。
+// vkd3d-proton は無くても装置を作る（注意を出すだけ）ので、持たない GPU（iPhone は未確認）には名乗らない
+static int g_srv_unused_att;
+
 static int allowed_ext(const char *name) {
     if (!strcmp(name, "VK_KHR_vertex_attribute_divisor")) return (g_hw.caps & VR_CAP_DIVISOR) != 0;
     if (dxvk3() && (!strcmp(name, "VK_KHR_maintenance5") || !strcmp(name, "VK_KHR_maintenance6"))) return 1;
+    if (!strcmp(name, "VK_EXT_dynamic_rendering_unused_attachments")) return g_srv_unused_att && vkd3d();
     for (size_t i = 0; i < sizeof ALLOWED_EXT / sizeof *ALLOWED_EXT; i++)
         if (!strcmp(name, ALLOWED_EXT[i])) return 1;
     for (size_t i = 0; i < sizeof CAP_EXT / sizeof *CAP_EXT; i++)
@@ -849,6 +860,7 @@ static int hello(void) {
             for (uint32_t i = 0; i < ne; i++) {
                 VkExtensionProperties x;
                 vr_rcopy(&rd, &x, sizeof x);
+                if (!strcmp(x.extensionName, "VK_EXT_dynamic_rendering_unused_attachments")) g_srv_unused_att = 1;
                 if (allowed_ext(x.extensionName) && g_hw.ne < 62) g_hw.ext[g_hw.ne++] = x;
                 if (!strcmp(x.extensionName, "VK_KHR_vertex_attribute_divisor")) g_khr_div_native = 1;
             }
@@ -866,6 +878,9 @@ static int hello(void) {
             // 頂点の step rate：DXVK 3 は KHR の名前で探す。中身は EXT と同じなので、受け手には EXT として渡す
             if ((g_hw.caps & VR_CAP_DIVISOR) && !has_ext("VK_KHR_vertex_attribute_divisor") && has_ext("VK_EXT_vertex_attribute_divisor") && g_hw.ne < 64)
                 g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_vertex_attribute_divisor", 1 };
+            // vkd3d-proton が必須にする物で、ドライバの中で済ませる物（受け手には送らない）。
+            // transform feedback は名乗りだけ（記録の命令は飛ばす。stream output を使う pipeline が作れるかは受け手の GPU しだい）
+            if (vkd3d() && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_transform_feedback", 1 };
             if (!rd.bad) {
                 char real[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
                 memcpy(real, g_hw.props.deviceName, sizeof real);
@@ -961,8 +976,13 @@ struct dsl {
     // immutable sampler を持つ binding。受け手の形には送らないので、書き込みのときにドライバが差し込む
     uint32_t nimm;
     struct { uint32_t binding, type, count; VkSampler *s; } *imm;
+    // 数を確保のときに決める binding（VARIABLE_DESCRIPTOR_COUNT）。var_max は形の数（上限）
+    int var;
+    uint32_t var_type, var_max;
 };
-struct dset { struct dpool *pool; struct dset *next; uint32_t n, cap; struct dent *e; struct dsl *layout; };
+// var_count：数を確保のときに決めた set の、その binding の数（pool の残りを数えるのに使う）
+// hx：(binding, 番号) から e の位置（+1）を引く表（hcap は 2 の累乗）。vkd3d-proton の set は 100 万個の大きさなので、並びを頭から探すと遅い
+struct dset { struct dpool *pool; struct dset *next; uint32_t n, cap; struct dent *e; struct dsl *layout; uint32_t var_count; uint32_t *hx, hcap; };
 // 受け手に頼まずに set を取るので、pool の残り（set の数と種類ごとの数）はドライバが数える
 struct dpool { struct dset *head; uint32_t max_sets, used_sets, nsz; struct { uint32_t type, total, used; } sz[16]; };
 
@@ -985,6 +1005,13 @@ static VkSampler dsl_imm(const struct dsl *l, uint32_t binding, uint32_t elem) {
 static int pool_slot(struct dpool *p, uint32_t type) {
     for (uint32_t j = 0; j < p->nsz; j++) if (p->sz[j].type == type) return (int) j;
     return -1;
+}
+
+// 形の k 番目の種類を、set 1 つでいくつ使うか（数を確保のときに決める binding は、その数で数える）
+static uint32_t dsl_type_count(const struct dsl *l, uint32_t k, uint32_t var_count) {
+    uint32_t c = l->t[k].count;
+    if (l->var && l->t[k].type == l->var_type) c = c - l->var_max + var_count;
+    return c;
 }
 
 struct cpool { uint32_t fam; struct cb *head; };
@@ -1296,6 +1323,7 @@ static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *ci, const
         say("アプリのエンジン：%s %u.%u.%u", ai->pEngineName, major, (ai->engineVersion >> 12) & 0x3FF, ai->engineVersion & 0xFFF);
         if (!strcmp(ai->pEngineName, "DXVK") && major >= 2) g_engine_dxvk2 = 1;
         if (!strcmp(ai->pEngineName, "mesa zink")) g_engine_zink = 1;
+        if (!strcmp(ai->pEngineName, "vkd3d")) g_engine_vkd3d = 1;
     }
     struct inst *i = calloc(1, sizeof *i);
     if (!i) return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1338,9 +1366,16 @@ static VkResult VKAPI_CALL enum_phys(VkInstance inst, uint32_t *n, VkPhysicalDev
     return VK_SUCCESS;
 }
 
+// vkd3d-proton で、同時につなげる set が 9 個に足りない GPU（iPhone は 8 個）
+static int sets8(void) { return vkd3d() && g_hw.props.limits.maxBoundDescriptorSets < 9 && g_hw.props.limits.minStorageBufferOffsetAlignment < 64; }
+
 static void VKAPI_CALL get_props(VkPhysicalDevice pd, VkPhysicalDeviceProperties *p) {
     (void) pd;
     *p = g_hw.props;
+    // vkd3d-proton は storage buffer の揃えが 16 バイト以下だと、raw buffer 用の set を 1 つ足す（static sampler があると全部で 9 個）。
+    // 同時につなげる set が 8 個の GPU（iPhone）では root signature を作れないので、揃えを 64 と名乗って 8 個に収める
+    // （raw buffer は texel buffer で読む。揃えを大きく名乗るのは、アプリに厳しくするだけなので安全）
+    if (sets8()) p->limits.minStorageBufferOffsetAlignment = 64;
 }
 
 static void VKAPI_CALL get_features(VkPhysicalDevice pd, VkPhysicalDeviceFeatures *f) {
@@ -1377,6 +1412,7 @@ static const stinfo FEAT_ST[] = {
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES, sizeof(VkPhysicalDeviceMaintenance5Features) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES, sizeof(VkPhysicalDeviceMaintenance6Features) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT, sizeof(VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT, sizeof(VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT) },
 };
 
 // 1.3 に向けて足した機能の構造体。装置を作るときは、中継できない機能を 0 にしてから送る
@@ -1406,6 +1442,7 @@ static const stinfo PROP_ST[] = {
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_PROPERTIES, sizeof(VkPhysicalDeviceMaintenance6Properties) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT, sizeof(VkPhysicalDeviceRobustness2PropertiesEXT) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT, sizeof(VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES, sizeof(VkPhysicalDeviceTexelBufferAlignmentProperties) },
 };
 
 static uint32_t st_size(const stinfo *t, size_t n, VkStructureType st) {
@@ -1451,6 +1488,35 @@ static void mask_ext_features(VkBaseOutStructure *s) {
             f->runtimeDescriptorArray = k.runtimeDescriptorArray;
             // アドレスは受け手の本物を返す。shader がアドレスでたどって書いた中身は、ドライバの写しの見張りに入らない
             if (g_hw.caps & VR_CAP_BDA) f->bufferDeviceAddress = k.bufferDeviceAddress;
+        }
+        if (vkd3d()) {
+            // vkd3d-proton は descriptor heap を、種類ごとの大きな set（update after bind・数は確保のときに決める）で作る。
+            // シェーダーの印は受け手の GPU の答えのまま。binding の flags と確保の数は受け手に運ぶ（VR_CAP_DESC_FLAGS）
+            f->shaderInputAttachmentArrayDynamicIndexing = k.shaderInputAttachmentArrayDynamicIndexing;
+            f->shaderUniformTexelBufferArrayDynamicIndexing = k.shaderUniformTexelBufferArrayDynamicIndexing;
+            f->shaderStorageTexelBufferArrayDynamicIndexing = k.shaderStorageTexelBufferArrayDynamicIndexing;
+            f->shaderUniformBufferArrayNonUniformIndexing = k.shaderUniformBufferArrayNonUniformIndexing;
+            f->shaderSampledImageArrayNonUniformIndexing = k.shaderSampledImageArrayNonUniformIndexing;
+            f->shaderStorageBufferArrayNonUniformIndexing = k.shaderStorageBufferArrayNonUniformIndexing;
+            f->shaderStorageImageArrayNonUniformIndexing = k.shaderStorageImageArrayNonUniformIndexing;
+            f->shaderInputAttachmentArrayNonUniformIndexing = k.shaderInputAttachmentArrayNonUniformIndexing;
+            f->shaderUniformTexelBufferArrayNonUniformIndexing = k.shaderUniformTexelBufferArrayNonUniformIndexing;
+            f->shaderStorageTexelBufferArrayNonUniformIndexing = k.shaderStorageTexelBufferArrayNonUniformIndexing;
+            f->descriptorBindingUniformBufferUpdateAfterBind = k.descriptorBindingUniformBufferUpdateAfterBind;
+            f->descriptorBindingStorageImageUpdateAfterBind = k.descriptorBindingStorageImageUpdateAfterBind;
+            f->descriptorBindingStorageBufferUpdateAfterBind = k.descriptorBindingStorageBufferUpdateAfterBind;
+            f->descriptorBindingUniformTexelBufferUpdateAfterBind = k.descriptorBindingUniformTexelBufferUpdateAfterBind;
+            f->descriptorBindingStorageTexelBufferUpdateAfterBind = k.descriptorBindingStorageTexelBufferUpdateAfterBind;
+            // 数を確保のときに決める set は、受け手が数を読めないと取れない（古い受け手は 100 万個の set を取ろうとして失敗する）。
+            // そのときは名乗らない。vkd3d-proton は「descriptor indexing が足りない」と言って装置を作らない（受け手の組み直しが要る）
+            f->descriptorBindingVariableDescriptorCount = (g_hw.caps & VR_CAP_DESC_FLAGS) ? k.descriptorBindingVariableDescriptorCount : VK_FALSE;
+            if (!(g_hw.caps & VR_CAP_DESC_FLAGS)) {
+                static LONG once;
+                if (!InterlockedExchange(&once, 1)) say("受け手が descriptor の数を読めない（古い受け手）ので、DirectX 12 は動かせない。受け手の組み直しが要る");
+            }
+            f->shaderOutputViewportIndex = k.shaderOutputViewportIndex;
+            f->shaderOutputLayer = k.shaderOutputLayer;
+            f->separateDepthStencilLayouts = k.separateDepthStencilLayouts;
         }
     } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES) {
         VkPhysicalDeviceVulkan13Features k = *(VkPhysicalDeviceVulkan13Features *) s, *f = (void *) s;
@@ -1539,6 +1605,38 @@ static void query_chain(uint32_t op, void *pnext, const stinfo *t, size_t nt, vo
     free(out.p);
 }
 
+// vkd3d-proton のときに直す性質
+static void vkd3d_props(VkBaseOutStructure *x) {
+    // vkd3d-proton は NVIDIA のドライバだと storage buffer の揃えを 4 に戻す（速さのため）。set が 8 個の受け手
+    // （iPhone のふりの代役の RTX）では、iPhone と同じ道を通すため MoltenVK と名乗る。iPhone は元から MoltenVK
+    if (sets8() && x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES)
+        ((VkPhysicalDeviceVulkan12Properties *) x)->driverID = VK_DRIVER_ID_MOLTENVK;
+    else if (sets8() && x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES)
+        ((VkPhysicalDeviceDriverProperties *) x)->driverID = VK_DRIVER_ID_MOLTENVK;
+    if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES) {
+        // 1 要素の揃えで texel buffer の見え方を作れると名乗る（vkd3d-proton は持たないと装置を作らない）。
+        // 受け手の GPU が持たないとき（iPhone は 64 バイト）、揃っていない見え方を作ったら記録に出す
+        VkPhysicalDeviceVulkan13Properties *p = (void *) x;
+        p->storageTexelBufferOffsetSingleTexelAlignment = p->uniformTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
+    } else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES) {
+        VkPhysicalDeviceTexelBufferAlignmentProperties *p = (void *) x;
+        p->storageTexelBufferOffsetSingleTexelAlignment = p->uniformTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
+    } else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT) {
+        // 名乗りだけ。数は DirectX 12 の stream output の上限に合わせる
+        VkPhysicalDeviceTransformFeedbackPropertiesEXT *p = (void *) x;
+        p->maxTransformFeedbackStreams = 4;
+        p->maxTransformFeedbackBuffers = 4;
+        p->maxTransformFeedbackBufferSize = 0xFFFFFFFFull;
+        p->maxTransformFeedbackStreamDataSize = 512;
+        p->maxTransformFeedbackBufferDataSize = 512;
+        p->maxTransformFeedbackBufferDataStride = 2048;
+        p->transformFeedbackQueries = VK_TRUE;
+        p->transformFeedbackStreamsLinesTriangles = VK_TRUE;
+        p->transformFeedbackRasterizationStreamSelect = VK_FALSE;
+        p->transformFeedbackDraw = VK_TRUE;
+    }
+}
+
 static void VKAPI_CALL get_props2(VkPhysicalDevice pd, VkPhysicalDeviceProperties2 *p) {
     get_props(pd, &p->properties);
     query_chain(VR_GET_PROPERTIES2, p->pNext, PROP_ST, sizeof PROP_ST / sizeof *PROP_ST, &p->properties, sizeof p->properties);
@@ -1554,6 +1652,7 @@ static void VKAPI_CALL get_props2(VkPhysicalDevice pd, VkPhysicalDevicePropertie
             k->maxVertexAttribDivisor = e.maxVertexAttribDivisor;
             k->supportsNonZeroFirstInstance = VK_FALSE;
         }
+        else if (vkd3d()) vkd3d_props(x);
 }
 
 static void VKAPI_CALL get_features2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f) {
@@ -1568,7 +1667,15 @@ static void VKAPI_CALL get_features2(VkPhysicalDevice pd, VkPhysicalDeviceFeatur
             VkPhysicalDeviceRobustness2FeaturesEXT *r2 = (void *) x;
             VkBool32 on = dxvk3() && (g_hw.caps & VR_CAP_NULL_DESC) ? VK_TRUE : VK_FALSE;
             r2->robustBufferAccess2 = r2->nullDescriptor = on;
-            r2->robustImageAccess2 = VK_FALSE;
+            // vkd3d-proton は画像の範囲の外も 0 と名乗らないと装置を作らない。GPU の robustImageAccess に任せる（名乗りだけ）
+            r2->robustImageAccess2 = vkd3d() && on ? VK_TRUE : VK_FALSE;
+        } else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT) {
+            // 名乗りだけ（vkd3d-proton は持たないと装置を作らない）。stream output の命令は飛ばす
+            VkPhysicalDeviceTransformFeedbackFeaturesEXT *t = (void *) x;
+            t->transformFeedback = t->geometryStreams = vkd3d() ? VK_TRUE : VK_FALSE;
+        } else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT && !(vkd3d() && g_srv_unused_att)) {
+            // 受け手の答えのまま。vkd3d-proton のとき以外と、受け手の GPU が持たないときは「無い」
+            ((VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT *) x)->dynamicRenderingUnusedAttachments = VK_FALSE;
         }
 }
 
@@ -2294,6 +2401,14 @@ static VkResult VKAPI_CALL create_bview(VkDevice dv, const VkBufferViewCreateInf
     v->b = (struct buf *) ci->buffer;
     v->off = ci->offset;
     v->range = ci->range == VK_WHOLE_SIZE && v->b ? v->b->size - ci->offset : ci->range;
+    // vkd3d-proton には 1 要素の揃えで作れると名乗っている。受け手の GPU の揃え（iPhone は 64 バイト）に合わない見え方を数える
+    uint64_t al = g_hw.props.limits.minTexelBufferOffsetAlignment;
+    if (vkd3d() && al > 1 && ci->offset % al) {
+        static volatile LONG n;
+        LONG k = InterlockedIncrement(&n);
+        if (k <= 3 || (k & (k - 1)) == 0) say("受け手の揃え（%llu バイト）に合わない texel buffer の見え方 %ld 個目（offset %llu・形式 %d）", (unsigned long long) al, k,
+                                                (unsigned long long) ci->offset, ci->format);
+    }
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, ID(v));
@@ -4118,6 +4233,17 @@ static VkResult VKAPI_CALL create_dsl(VkDevice dv, const VkDescriptorSetLayoutCr
     }
     uint64_t id = ID(l);
     l->push = (ci->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) != 0;
+    // binding ごとの flags（descriptor indexing：update after bind・partially bound・数を確保のときに決める）
+    const VkDescriptorSetLayoutBindingFlagsCreateInfo *bfl = NULL;
+    for (const VkBaseInStructure *x = ci->pNext; x; x = x->pNext)
+        if (x->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO) bfl = (const void *) x;
+    if (bfl && (bfl->bindingCount != ci->bindingCount || !vkd3d())) bfl = NULL; // DXVK・zink には今まで通り運ばない
+    for (uint32_t i = 0; bfl && i < ci->bindingCount; i++)
+        if (bfl->pBindingFlags[i] & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) {
+            l->var = 1;
+            l->var_type = ci->pBindings[i].descriptorType;
+            l->var_max = ci->pBindings[i].descriptorCount;
+        }
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, id);
@@ -4128,6 +4254,14 @@ static VkResult VKAPI_CALL create_dsl(VkDevice dv, const VkDescriptorSetLayoutCr
         vr_u32(&b, ci->pBindings[i].descriptorType);
         vr_u32(&b, ci->pBindings[i].descriptorCount);
         vr_u32(&b, gs_stages(ci->pBindings[i].stageFlags));
+    }
+    // 受け手が読めるときだけ、末尾に flags を付ける（古い受け手は flags の無い形を作る）
+    if (bfl && (g_hw.caps & VR_CAP_DESC_FLAGS)) {
+        vr_u32(&b, ci->bindingCount);
+        for (uint32_t i = 0; i < ci->bindingCount; i++) vr_u32(&b, bfl->pBindingFlags[i]);
+    } else if (bfl && l->var) {
+        static LONG once;
+        if (!InterlockedExchange(&once, 1)) say("受け手が binding の flags を読めない（組み直しが要る）。数を確保のときに決める set は取れないかもしれない");
     }
     rpc_send(VR_CREATE_DSL, &b);
     free(b.p);
@@ -4282,7 +4416,7 @@ static VkResult VKAPI_CALL create_dpool(VkDevice dv, const VkDescriptorPoolCreat
 
 static void free_sets_of(struct dpool *p) {
     AcquireSRWLockExclusive(&g_pools_lock);
-    for (struct dset *s = p->head, *nx; s; s = nx) { nx = s->next; dsl_unref(s->layout); free(s->e); free(s); }
+    for (struct dset *s = p->head, *nx; s; s = nx) { nx = s->next; dsl_unref(s->layout); free(s->e); free(s->hx); free(s); }
     p->head = NULL;
     p->used_sets = 0;
     for (uint32_t j = 0; j < p->nsz; j++) p->sz[j].used = 0;
@@ -4319,6 +4453,11 @@ static VkResult VKAPI_CALL reset_dpool(VkDevice dv, VkDescriptorPool pp, VkDescr
 static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c);
 static VkResult VKAPI_CALL alloc_dsets(VkDevice dv, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out) {
     struct dpool *p = (struct dpool *) ai->descriptorPool;
+    // 数を確保のときに決める set（VkDescriptorSetVariableDescriptorCountAllocateInfo）
+    const VkDescriptorSetVariableDescriptorCountAllocateInfo *vc = NULL;
+    for (const VkBaseInStructure *x = ai->pNext; x; x = x->pNext)
+        if (x->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO) vc = (const void *) x;
+    if (vc && (vc->descriptorSetCount != ai->descriptorSetCount || !vkd3d())) vc = NULL;
     // pool の残りが足りなければ、受け手に頼まずに「足りない」と返す（DXVK などは、それを見て新しい pool を作る）
     uint32_t need[16] = { 0 };
     int short_of = 0;
@@ -4327,10 +4466,11 @@ static VkResult VKAPI_CALL alloc_dsets(VkDevice dv, const VkDescriptorSetAllocat
     for (uint32_t i = 0; i < ai->descriptorSetCount && !short_of; i++) {
         const struct dsl *l = (const struct dsl *) ai->pSetLayouts[i];
         for (uint32_t k = 0; k < l->nt; k++) {
-            if (!l->t[k].count) continue;
+            uint32_t cnt = dsl_type_count(l, k, vc ? vc->pDescriptorCounts[i] : 0);
+            if (!cnt) continue;
             int j = pool_slot(p, l->t[k].type);
             if (j < 0) { short_of = 1; break; }
-            need[j] += l->t[k].count;
+            need[j] += cnt;
         }
     }
     for (uint32_t j = 0; j < p->nsz && !short_of; j++) if (p->sz[j].used + need[j] > p->sz[j].total) short_of = 1;
@@ -4351,6 +4491,7 @@ static VkResult VKAPI_CALL alloc_dsets(VkDevice dv, const VkDescriptorSetAllocat
         struct dset *s = calloc(1, sizeof *s);
         s->pool = p;
         s->layout = (struct dsl *) ai->pSetLayouts[i];
+        s->var_count = vc ? vc->pDescriptorCounts[i] : 0;
         InterlockedIncrement(&s->layout->refs);
         AcquireSRWLockExclusive(&g_pools_lock);
         s->next = p->head;
@@ -4360,6 +4501,9 @@ static VkResult VKAPI_CALL alloc_dsets(VkDevice dv, const VkDescriptorSetAllocat
         vr_u64(&b, ID(ai->pSetLayouts[i]));
         vr_u64(&b, ID(s));
     }
+    // 数を確保のときに決める set の数は、受け手が読めるときだけ末尾に付ける
+    if (vc && (g_hw.caps & VR_CAP_DESC_FLAGS))
+        for (uint32_t i = 0; i < ai->descriptorSetCount; i++) vr_u32(&b, vc->pDescriptorCounts[i]);
     rpc_send(VR_ALLOC_DESCRIPTOR_SETS, &b);
     free(b.p);
     // immutable sampler だけの binding（SAMPLER）は、アプリが書かない。受け手の set は空のままなので、ここで書いておく
@@ -4399,11 +4543,13 @@ static VkResult VKAPI_CALL free_dsets(VkDevice dv, VkDescriptorPool pp, uint32_t
             if (p->used_sets) p->used_sets--;
             for (uint32_t k = 0; k < s->layout->nt; k++) {
                 int j = pool_slot(p, s->layout->t[k].type);
-                if (j >= 0) p->sz[j].used = p->sz[j].used > s->layout->t[k].count ? p->sz[j].used - s->layout->t[k].count : 0;
+                uint32_t cnt = dsl_type_count(s->layout, k, s->var_count);
+                if (j >= 0) p->sz[j].used = p->sz[j].used > cnt ? p->sz[j].used - cnt : 0;
             }
             dsl_unref(s->layout);
         }
         free(s->e);
+        free(s->hx);
         free(s);
         ReleaseSRWLockExclusive(&g_pools_lock);
     }
@@ -4426,11 +4572,39 @@ static int is_texel_desc(VkDescriptorType t) {
     return t == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || t == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
 }
 
+// (binding, 番号) の入る表の場所
+static uint32_t *dset_slot(const struct dset *s, uint32_t binding, uint32_t elem) {
+    uint32_t h = (binding * 0x9E3779B1u) ^ (elem * 0x85EBCA77u);
+    h ^= h >> 15;
+    for (uint32_t i = h & (s->hcap - 1);; i = (i + 1) & (s->hcap - 1)) {
+        uint32_t k = s->hx[i];
+        if (!k || (s->e[k - 1].binding == binding && s->e[k - 1].elem == elem)) return &s->hx[i];
+    }
+}
+
+static int dset_rehash(struct dset *s, uint32_t cap) {
+    uint32_t *nh = calloc(cap, sizeof *nh);
+    if (!nh) return 0;
+    free(s->hx);
+    s->hx = nh;
+    s->hcap = cap;
+    for (uint32_t i = 0; i < s->n; i++) *dset_slot(s, s->e[i].binding, s->e[i].elem) = i + 1;
+    return 1;
+}
+
 static void dset_put_full(struct dset *s, struct dent d) {
-    for (uint32_t i = 0; i < s->n; i++)
-        if (s->e[i].binding == d.binding && s->e[i].elem == d.elem) { s->e[i] = d; return; }
-    if (s->n == s->cap) { s->cap = s->cap ? s->cap * 2 : 8; s->e = realloc(s->e, s->cap * sizeof *s->e); }
+    if ((!s->hx || (s->n + 1) * 2 > s->hcap) && !dset_rehash(s, s->hcap ? s->hcap * 2 : 16)) return;
+    uint32_t *slot = dset_slot(s, d.binding, d.elem);
+    if (*slot) { s->e[*slot - 1] = d; return; }
+    if (s->n == s->cap) {
+        uint32_t nc = s->cap ? s->cap * 2 : 8;
+        struct dent *ne = realloc(s->e, nc * sizeof *s->e);
+        if (!ne) return;
+        s->e = ne;
+        s->cap = nc;
+    }
     s->e[s->n++] = d;
+    *slot = s->n;
 }
 
 static void dset_put(struct dset *s, uint32_t binding, uint32_t elem, uint32_t type, struct buf *bf, uint64_t off, uint64_t range) {
@@ -4438,9 +4612,9 @@ static void dset_put(struct dset *s, uint32_t binding, uint32_t elem, uint32_t t
 }
 
 static const struct dent *dset_get(const struct dset *s, uint32_t binding, uint32_t elem) {
-    for (uint32_t i = 0; i < s->n; i++)
-        if (s->e[i].binding == binding && s->e[i].elem == elem) return &s->e[i];
-    return NULL;
+    if (!s->hx) return NULL;
+    uint32_t k = *dset_slot(s, binding, elem);
+    return k ? &s->e[k - 1] : NULL;
 }
 
 static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c);
@@ -4485,6 +4659,14 @@ static void copy_dsets(VkDevice dv, uint32_t nc, const VkCopyDescriptorSet *c) {
     free(w); free(ii); free(bi); free(tv);
 }
 
+// 空の descriptor を書いたら、種類ごとに 1 回だけ記録に出す（iPhone の GPU は空の descriptor を持たないので、受け手が代わりの物を入れる）
+static void note_null_desc(uint32_t type) {
+    static volatile LONG seen;
+    if (type >= 32 || !vkd3d()) return;
+    LONG bit = (LONG) 1 << type;
+    if (!(InterlockedOr(&seen, bit) & bit)) say("空の descriptor を書いた（種類 %u）", type);
+}
+
 static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c) {
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
@@ -4507,6 +4689,7 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
                 VkSampler imm = dsl_imm(s ? s->layout : NULL, w[i].dstBinding, w[i].dstArrayElement + k);
                 uint64_t smp = w[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || w[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? ID(imm ? imm : ii->sampler) : 0;
                 uint64_t view = w[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ? 0 : ID(ii->imageView);
+                if (w[i].descriptorType != VK_DESCRIPTOR_TYPE_SAMPLER && !view) note_null_desc(w[i].descriptorType);
                 vr_u64(&b, smp);
                 vr_u64(&b, view);
                 vr_u32(&b, fix_layout(ii->imageLayout));
@@ -4517,6 +4700,7 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
         if (is_texel_desc(w[i].descriptorType)) {
             for (uint32_t k = 0; k < w[i].descriptorCount; k++) {
                 struct bview *v = (struct bview *) w[i].pTexelBufferView[k];
+                if (!v) note_null_desc(w[i].descriptorType);
                 vr_u64(&b, ID(v));
                 if (v) dset_put_full(s, (struct dent) { w[i].dstBinding, w[i].dstArrayElement + k, w[i].descriptorType, v->b, v->off, v->range, ID(v), 0, 0 });
             }
@@ -4526,6 +4710,7 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
             const VkDescriptorBufferInfo *bi = &w[i].pBufferInfo[k];
             struct buf *bf = (struct buf *) bi->buffer;
             uint64_t range = bi->range == VK_WHOLE_SIZE && bf ? bf->size - bi->offset : bi->range;
+            if (!bf) note_null_desc(w[i].descriptorType);
             vr_u64(&b, ID(bi->buffer));
             vr_u64(&b, bi->offset);
             vr_u64(&b, bi->range);
@@ -6215,6 +6400,37 @@ static void VKAPI_CALL cmd_end_query(VkCommandBuffer cbh, VkQueryPool qp, uint32
     vr_u32(&c->s, q);
 }
 
+// ---- transform feedback（VK_EXT_transform_feedback）：vkd3d-proton のための名乗りだけ ----
+// stream output（DirectX の SO）は運ばない。命令は飛ばし、最初の 1 回だけ記録に出す（SO の buffer には何も書かれない）
+static void xfb_note(const char *what) {
+    static LONG once;
+    if (!InterlockedExchange(&once, 1)) say("transform feedback の命令（%s）は飛ばす（名乗りだけ）", what);
+}
+static void VKAPI_CALL cmd_bind_xfb(VkCommandBuffer cbh, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *o, const VkDeviceSize *s) {
+    (void) cbh; (void) first; (void) n; (void) b; (void) o; (void) s;
+    xfb_note("つなぐ");
+}
+static void VKAPI_CALL cmd_begin_xfb(VkCommandBuffer cbh, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *o) {
+    (void) cbh; (void) first; (void) n; (void) b; (void) o;
+    xfb_note("始める");
+}
+static void VKAPI_CALL cmd_end_xfb(VkCommandBuffer cbh, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *o) {
+    (void) cbh; (void) first; (void) n; (void) b; (void) o;
+    xfb_note("終える");
+}
+// 番号つきの query：0 番の stream はふつうの query と同じ。ほかの stream は飛ばす
+static void VKAPI_CALL cmd_begin_query_indexed(VkCommandBuffer cbh, VkQueryPool qp, uint32_t q, VkQueryControlFlags flags, uint32_t index) {
+    if (index == 0) cmd_begin_query(cbh, qp, q, flags);
+    else xfb_note("番号つきの query");
+}
+static void VKAPI_CALL cmd_end_query_indexed(VkCommandBuffer cbh, VkQueryPool qp, uint32_t q, uint32_t index) {
+    if (index == 0) cmd_end_query(cbh, qp, q);
+}
+static void VKAPI_CALL cmd_draw_xfb_count(VkCommandBuffer cbh, uint32_t ninst, uint32_t first, VkBuffer b, VkDeviceSize off, uint32_t coff, uint32_t stride) {
+    (void) cbh; (void) ninst; (void) first; (void) b; (void) off; (void) coff; (void) stride;
+    xfb_note("書いた数で描く");
+}
+
 static void VKAPI_CALL cmd_write_timestamp(VkCommandBuffer cbh, VkPipelineStageFlagBits st, VkQueryPool qp, uint32_t q) {
     struct cb *c = (struct cb *) cbh;
     vr_u32(&c->s, VR_CMD_WRITE_TIMESTAMP);
@@ -6649,6 +6865,12 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkCmdPushDescriptorSet2", cmd_push_desc2);
     F("vkCmdPushDescriptorSetWithTemplate2KHR", cmd_push_desc_tmpl2);
     F("vkCmdPushDescriptorSetWithTemplate2", cmd_push_desc_tmpl2);
+    F("vkCmdBindTransformFeedbackBuffersEXT", cmd_bind_xfb);
+    F("vkCmdBeginTransformFeedbackEXT", cmd_begin_xfb);
+    F("vkCmdEndTransformFeedbackEXT", cmd_end_xfb);
+    F("vkCmdBeginQueryIndexedEXT", cmd_begin_query_indexed);
+    F("vkCmdEndQueryIndexedEXT", cmd_end_query_indexed);
+    F("vkCmdDrawIndirectByteCountEXT", cmd_draw_xfb_count);
 #define NY_F(n) F(#n, ny_##n);
     NOT_YET(NY_F)
 #undef NY_F

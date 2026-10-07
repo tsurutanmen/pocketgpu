@@ -140,6 +140,46 @@ static void like_ios_mask(VkPhysicalDeviceFeatures *f) {
     f->textureCompressionBC = f->geometryShader = f->shaderCullDistance = VK_FALSE;
     f->logicOp = f->shaderFloat64 = f->variableMultisampleRate = VK_FALSE;
 }
+
+// iPhone のふりで合わせる上限。10/7 の iPhone 17 Pro の vulkaninfo（iphone_runs/v0724）の値。
+// DirectX 12（vkd3d-proton）が見る物：同時につなぐ set の数・update after bind の数・texel buffer の揃え
+#define IOS_MIN(x, v) do { if ((x) > (v)) (x) = (v); } while (0)
+#define IOS_MAX(x, v) do { if ((x) < (v)) (x) = (v); } while (0)
+static void like_ios_limits(VkPhysicalDeviceLimits *l) {
+    if (!like_ios()) return;
+    IOS_MIN(l->maxBoundDescriptorSets, 8);
+    IOS_MAX(l->minTexelBufferOffsetAlignment, 64);
+}
+static void like_ios_props2(VkBaseOutStructure *x) {
+    if (!like_ios()) return;
+    if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES) {
+        VkPhysicalDeviceVulkan12Properties *p = (void *) x;
+        IOS_MIN(p->maxUpdateAfterBindDescriptorsInAllPools, 1073741824u);
+        IOS_MIN(p->maxPerStageDescriptorUpdateAfterBindSamplers, 500000);
+        IOS_MIN(p->maxPerStageDescriptorUpdateAfterBindUniformBuffers, 1000000);
+        IOS_MIN(p->maxPerStageDescriptorUpdateAfterBindStorageBuffers, 1000000);
+        IOS_MIN(p->maxPerStageDescriptorUpdateAfterBindSampledImages, 1000000);
+        IOS_MIN(p->maxPerStageDescriptorUpdateAfterBindStorageImages, 1000000);
+        IOS_MIN(p->maxPerStageDescriptorUpdateAfterBindInputAttachments, 256);
+        IOS_MIN(p->maxPerStageUpdateAfterBindResources, 1000000);
+        IOS_MIN(p->maxDescriptorSetUpdateAfterBindSamplers, 500000);
+        IOS_MIN(p->maxDescriptorSetUpdateAfterBindUniformBuffers, 1000000);
+        IOS_MIN(p->maxDescriptorSetUpdateAfterBindStorageBuffers, 1000000);
+        IOS_MIN(p->maxDescriptorSetUpdateAfterBindSampledImages, 1000000);
+        IOS_MIN(p->maxDescriptorSetUpdateAfterBindStorageImages, 1000000);
+        IOS_MIN(p->maxDescriptorSetUpdateAfterBindInputAttachments, 1280);
+    } else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES) {
+        VkPhysicalDeviceVulkan13Properties *p = (void *) x;
+        IOS_MAX(p->storageTexelBufferOffsetAlignmentBytes, 64);
+        IOS_MAX(p->uniformTexelBufferOffsetAlignmentBytes, 64);
+        p->storageTexelBufferOffsetSingleTexelAlignment = p->uniformTexelBufferOffsetSingleTexelAlignment = VK_FALSE;
+    } else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES) {
+        VkPhysicalDeviceTexelBufferAlignmentProperties *p = (void *) x;
+        IOS_MAX(p->storageTexelBufferOffsetAlignmentBytes, 64);
+        IOS_MAX(p->uniformTexelBufferOffsetAlignmentBytes, 64);
+        p->storageTexelBufferOffsetSingleTexelAlignment = p->uniformTexelBufferOffsetSingleTexelAlignment = VK_FALSE;
+    }
+}
 static VkBuffer g_dummy_vb;
 static VkDeviceMemory g_dummy_mem;
 static VkSampler g_dummy_smp; // 空の sampler の代わり（ドライバの取りこぼしで、アプリごと落ちないように）
@@ -364,6 +404,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
         g_nulldesc_gpu = r2.nullDescriptor == VK_TRUE && !like_ios();
     }
     caps |= VR_CAP_NULL_DESC;
+    caps |= VR_CAP_DESC_FLAGS; // binding の flags と set ごとの数を読む（vkd3d-proton）
     // 調べ用：VKR_CAPS=数 で名乗る印を絞る（古い受け手のふりをする）
     const char *mask = getenv("VKR_CAPS");
     if (mask && *mask) caps &= (uint32_t) strtoul(mask, NULL, 0);
@@ -1628,6 +1669,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         vkGetPhysicalDeviceProperties(g_pd, &p);
         vkGetPhysicalDeviceFeatures(g_pd, &f);
         like_ios_mask(&f);
+        like_ios_limits(&p.limits);
         vkGetPhysicalDeviceMemoryProperties(g_pd, &m);
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         // iPhone では、iOS がこのアプリに許すメモリのほうが、MoltenVK の答える量よりずっと小さい（超えるとアプリが止められる）。
@@ -1676,6 +1718,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         } else {
             VkPhysicalDeviceProperties2 p2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = chain };
             vkGetPhysicalDeviceProperties2(g_pd, &p2);
+            like_ios_limits(&p2.properties.limits);
+            for (uint32_t i = 0; i < n; i++) like_ios_props2(blocks[i]);
             vr_put(&g_out, &p2.properties, sizeof p2.properties);
         }
         for (uint32_t i = 0; i < n; i++) {
@@ -2016,9 +2060,23 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             b[i].stageFlags = vr_ru32(r);
         }
         VkDescriptorSetLayoutCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .flags = flags, .bindingCount = n, .pBindings = b };
+        // 末尾に binding ごとの flags（VR_CAP_DESC_FLAGS・vkd3d-proton の update after bind と、数を確保のときに決める binding）
+        VkDescriptorBindingFlags *bf = NULL;
+        VkDescriptorSetLayoutBindingFlagsCreateInfo bfi = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO };
+        if (!r->bad && r->at + 4 <= r->n && vr_ru32(r) == n && n && (bf = calloc(n, sizeof *bf))) {
+            for (uint32_t i = 0; i < n; i++) bf[i] = vr_ru32(r);
+            if (!r->bad) {
+                bfi.bindingCount = n;
+                bfi.pBindingFlags = bf;
+                ci.pNext = &bfi;
+            }
+        }
         VkDescriptorSetLayout l;
-        if (vkCreateDescriptorSetLayout(d, &ci, NULL, &l) == VK_SUCCESS) put(id, (uint64_t) l, K_DSL);
+        VkResult res = vkCreateDescriptorSetLayout(d, &ci, NULL, &l);
+        if (res == VK_SUCCESS) put(id, (uint64_t) l, K_DSL);
+        else vlog("descriptor set の形を作れない (%d)", res);
         free(b);
+        free(bf);
         return 1;
     }
     case VR_DESTROY_DSL: {
@@ -2125,10 +2183,20 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t pid = vr_ru64(r);
         VkDescriptorPool pool = OBJ(VkDescriptorPool, pid);
         uint32_t n = vr_ru32(r);
+        // 末尾に set ごとの数（VR_CAP_DESC_FLAGS・数を確保のときに決める binding）。1 つ 16 バイトの組の後ろにある
+        uint32_t *vcount = NULL;
+        if (n <= (r->n - r->at) / 16 && r->at + (size_t) n * 20 <= r->n && (vcount = calloc(n ? n : 1, sizeof *vcount))) {
+            vr_rd t = *r;
+            t.at += (size_t) n * 16;
+            for (uint32_t i = 0; i < n; i++) vcount[i] = vr_ru32(&t);
+        }
         for (uint32_t i = 0; i < n; i++) {
             VkDescriptorSetLayout l = OBJ(VkDescriptorSetLayout, vr_ru64(r));
             uint64_t id = vr_ru64(r);
             VkDescriptorSetAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &l };
+            VkDescriptorSetVariableDescriptorCountAllocateInfo vai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO,
+                                                                      .descriptorSetCount = 1, .pDescriptorCounts = vcount ? &vcount[i] : NULL };
+            if (vcount) ai.pNext = &vai;
             VkDescriptorSet ds;
             VkResult res = vkAllocateDescriptorSets(d, &ai, &ds);
             if (res == VK_SUCCESS) {
@@ -2137,6 +2205,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 if (se) se->aux = pid; // どの pool から取ったか
             } else vlog("descriptor set を取れない (%d)", res);
         }
+        free(vcount);
         return 1;
     }
     case VR_FREE_DESCRIPTOR_SETS: {
@@ -3148,6 +3217,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         ci.format = (VkFormat) vr_ru32(r);
         ci.offset = vr_ru64(r);
         ci.range = vr_ru64(r);
+        // iPhone の GPU は texel buffer の見え方の始まりを 64 バイトに揃える必要がある（MoltenVK の答え）。ふりでは記録に出すだけ
+        if (like_ios() && ci.offset % 64) vlog("iPhone のふり：64 バイトに揃っていない texel buffer の見え方（offset %llu）。iPhone では作れないかもしれない", (unsigned long long) ci.offset);
         VkBufferView v;
         VkResult res = r->bad ? VK_ERROR_INITIALIZATION_FAILED : vkCreateBufferView(d, &ci, NULL, &v);
         if (res == VK_SUCCESS) {

@@ -46,6 +46,11 @@
 | DynamicShaderLinkage11 | ふつうの DirectX でも動かない | | | |
 | MultithreadedRendering11 | 素材が足りない | | | |
 
+## DirectX 12（vkd3d-proton 3.0.1・10/7 夜）
+| アプリ | 代役 | iPhone のふり | iPhone | 数字 |
+|---|---|---|---|---|
+| d3d12test（自作・三角形・足し算・root signature・テクスチャ・buffer の見え方の 5 場面） | ✅ ふつうの DirectX 12 と同じ値・機能の段階 11_1 | ✅ 同じ・11_0 | 未 | 受け手の組み直しが要る（VR_CAP_DESC_FLAGS） |
+
 ## DirectX 11 の機能 29 場面（iPhone・10/7 夜）
 代役のふりと同じ数字の物と、JPEG で運んだぶん 53〜65dB に下がった物を除くと、違いは 2 つ。
 - vfmt 11.5dB（ふりは同じ）：頂点の形式 A2B10G10R10_UINT（DirectX の R10G10B10A2_UINT）が、iPhone では頂点に使えない（MoltenVK が VERTEX_BUFFER を付けない）。ほかの 12 形式は使える。DirectX 11 では必須の形式なので、ドライバで R32_UINT として読ませ、シェーダーの頭でほどく作りが要る

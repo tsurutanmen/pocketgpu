@@ -30,6 +30,7 @@
 #define VR_CAP_BDA 4096u            // buffer device address：VR_GET_BUFFER_ADDRESS と、VR_ALLOC_MEMORY の末尾の flags（VkMemoryAllocateFlagsInfo）
 #define VR_CAP_NULL_DESC 2048u      // 空（VK_NULL_HANDLE）の descriptor と頂点バッファを受ける。GPU が持たなければ受け手が代わりの物を使う
 #define VR_CAP_D3D 512u              // DirectX（DXVK）の土台：VR_CREATE_BUFFER_VIEW・texel buffer の descriptor・VR_GET_IMAGE_SUBRESOURCE_LAYOUT
+#define VR_CAP_DESC_FLAGS 262144u   // VR_CREATE_DSL の末尾の binding ごとの flags と、VR_ALLOC_DESCRIPTOR_SETS の末尾の set ごとの数（variable descriptor count）を読む
 #define VR_CAP_NEW_MASK (VR_CAP_VK13 | VR_CAP_DYNAMIC_RENDERING | VR_CAP_SYNC2 | VR_CAP_RENDER_PASS2 | VR_CAP_CMD10 | VR_CAP_EXT_DYNAMIC_STATE | VR_CAP_QUERY)
 // 1.3 の受け手は、VR_GET_FORMAT_PROPS の返事の後ろに VkFormatProperties3 の 3 つの値（u64）を付ける。古いドライバは読まない
 

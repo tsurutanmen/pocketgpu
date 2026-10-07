@@ -23,7 +23,7 @@
 - [x] DirectX 12 の下ごしらえ：push descriptor と descriptor の写しをドライバの中で直す（vkd3d-proton はほかに、空の descriptor と大きな descriptor の数が要る）
 - [ ] 試すアプリの表を 50 本にして、動く・動かないを毎回測る
 - [ ] DirectX 11 のゲームを 10 本
-- [ ] DirectX 12（vkd3d-proton）
+- [ ] DirectX 12（vkd3d-proton）：自作の 5 場面が代役（11_1）と iPhone のふり（11_0）でふつうの DirectX 12 と同じ値。iPhone は受け手の組み直しが要る。12_0 には tiled resources が要る
 - [ ] OpenGL（Zink）：OpenGL 2.1 が RTX 直・ドライバ越し・iPhone のふりの 3 つで同じ絵。iPhone の実機はこれから。3.0 より上は transform feedback が要る
 - [ ] 本物のゲーム：vkQuake は iPhone で 1280×720 149.6 コマ/秒。GZDoom は iPhone で 225.9 コマ/秒（シェーダーの中で書かない storage buffer を読み戻さない・buffer の量を手元で出す）。Godot・SuperTuxKart はこれから
 

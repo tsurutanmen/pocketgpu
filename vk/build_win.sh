@@ -38,7 +38,10 @@ for w in $WHAT; do
         $CC -Wall -Wno-unused-parameter tests/gs/gstest.c -o "$OUT/d3d11/gstest.exe" -ld3d11 -ldxguid -luuid -luser32 -lgdi32
         # DirectX 11 の機能を 1 つずつ試す 29 の場面（feat.exe list・比べ方は tests/feat/cmp_all.py）
         $CC -Wall -Wno-unused-parameter tests/feat/feat.c -o "$OUT/d3d11/feat.exe" -ld3d11 -ldxguid -luuid -luser32 -lgdi32
-        echo "試験：tri・tri13・vecadd・pushdesc・copydesc・copyimg・extlist・d3d11/d3d11tri・d3d11/d3d11cube・d3d11/d3d11event・d3d11/gstest・d3d11/feat"
+        # DirectX 12 の小さな試験（tests/d3d12/d3d12test.c）。横に vkd3d-proton の d3d12.dll と d3d12core.dll を置けばドライバ越し、無ければふつうの DirectX 12
+        mkdir -p "$OUT/d3d12"
+        $CC -Wall -Wextra -Wno-unused-parameter tests/d3d12/d3d12test.c -o "$OUT/d3d12/d3d12test.exe"
+        echo "試験：tri・tri13・vecadd・pushdesc・copydesc・copyimg・extlist・d3d11/d3d11tri・d3d11/d3d11cube・d3d11/d3d11event・d3d11/gstest・d3d11/feat・d3d12/d3d12test"
         ;;
     *) echo "知らない名前：$w"; exit 2 ;;
     esac
