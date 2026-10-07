@@ -67,6 +67,10 @@ grep -a -h "not supported\|Failed\|err:" "$OUT"/d3d11*.txt | sort | uniq -c | he
 
 echo "== 5. DirectX のサンプル"
 bash /d/iphone-rpc/app/win/run_d3d11_samples.sh "$IPHONE_VK" EmptyProject11 SimpleSample11 BasicHLSL11 CascadedShadowMaps11 FluidCS11 HDRToneMappingCS11 SimpleBezier11 OIT11 2>&1 | tee "$OUT/samples.txt"
+echo "== 6. DirectX のサンプル（新しい DXVK 3.1.1）"
+DXVK_DIR=$VKB/dxvk3 IPHONE_VK_DXVK3=1 bash /d/iphone-rpc/app/win/run_d3d11_samples.sh "$IPHONE_VK" BasicHLSL11 CascadedShadowMaps11 FluidCS11 SimpleBezier11 2>&1 | tee "$OUT/samples_dxvk3.txt"
+echo "== 7. 入門サンプル Tutorial01〜07（代役と iPhone の絵を比べる・代役の受け手が 50070 に要る）"
+bash /d/iphone-rpc/app/win/run_d3d11_tutorials.sh 127.0.0.1:50070 "$IPHONE_VK" 2>&1 | tee "$OUT/tutorials.txt"
 for f in tri tri13 d3d11tri d3d11cube_plain d3d11cube_bc1; do
     [ -f "$OUT/$f.ppm" ] && python -X utf8 /d/iphone-rpc/app/vk/tools/ppm2png.py "$OUT/$f.ppm" "$OUT/$f.png" > /dev/null
 done
