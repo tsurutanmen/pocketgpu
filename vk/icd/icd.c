@@ -700,6 +700,9 @@ static const char *const ALLOWED_EXT[] = {
     "VK_EXT_shader_stencil_export", "VK_EXT_shader_viewport_index_layer",
     // attachment の読み書きをしない印（値を運ぶだけ）
     "VK_KHR_load_store_op_none", "VK_EXT_load_store_op_none",
+    // 1.1・1.2 の核に入った拡張の名前。新しい入口は無く、中身（dynamic rendering の resolve・render pass 2）はもう運んでいる。
+    // VK_KHR_dynamic_rendering を有効にするアプリは、依存の名前としてこの 3 つも頼む（Sascha Willems の dynamicrendering など）
+    "VK_KHR_maintenance2", "VK_KHR_multiview", "VK_KHR_depth_stencil_resolve",
 };
 
 // 受け手が caps で名乗ったときだけ見せる拡張（受け手の装置でも有効にする）

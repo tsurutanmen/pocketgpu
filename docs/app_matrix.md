@@ -48,6 +48,11 @@
 | DynamicShaderLinkage11 | ふつうの DirectX でも動かない | | | |
 | MultithreadedRendering11 | 素材が足りない | | | |
 
+## Sascha Willems の Vulkan の見本 99 本（10/8・zig で組んだ）
+- RTX 直 99 本・代役 71 本・iPhone のふり 68 本が動いた（KHR の名前を足して dynamicrendering 2 本が増えた）。落ちた物は 0 本
+- 動かない物のうち 19 本は iPhone の MoltenVK にも無い拡張（ray tracing・mesh shader・descriptor buffer など）なので対象外
+- ほかはドライバが名乗っていない拡張（buffer device address・descriptor indexing・multiview など 7 本）と、geometry shader の真似が DXVK だけの物（3 本・ふり）
+
 ## DirectX 12（vkd3d-proton 3.0.1・10/7 夜）
 | アプリ | 代役 | iPhone のふり | iPhone | 数字 |
 |---|---|---|---|---|
