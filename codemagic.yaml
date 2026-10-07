@@ -1,0 +1,22 @@
+# Codemagic で iPhone のアプリを組む。GitHub Actions の Mac は非公開の置き場だと 10 倍で数えられるので、こちらを使う。
+# 個人の無料枠は毎月 Mac mini M2 を 500 分。自動では走らせず、Codemagic の画面か API から手で始める
+workflows:
+  ios-app:
+    name: iPhone アプリ（署名なしの IPA）
+    instance_type: mac_mini_m2
+    max_build_duration: 45
+    environment:
+      xcode: 26.3
+      vars:
+        # true にするとマイクラのサーバー Pumpkin も組んで入れる。初回は 15 分ほどかかる
+        MINECRAFT: "false"
+    cache:
+      cache_paths:
+        - $HOME/.cargo/registry
+        - $HOME/.cargo/git
+        - $CM_BUILD_DIR/pumpkin/target
+    scripts:
+      - name: 組む
+        script: bash ci/build_ios.sh
+    artifacts:
+      - RpcServer.ipa
