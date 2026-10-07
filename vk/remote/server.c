@@ -229,8 +229,18 @@ static void del(uint64_t id) {
     }
 }
 
-#define DEV(id) ((VkDevice) (uintptr_t) H(id))
-#define OBJ(T, id) ((T) (uintptr_t) H(id))
+// 番号を引くときは種類も確かめる。違う種類の番号や消した番号なら 0 にして、ドライバに渡さない
+// （64 ビットでは Vulkan のハンドルの型がそれぞれ別の型なので、型から種類を決められる）
+#define KIND_OF(T) _Generic((T) 0, VkBuffer: K_BUFFER, VkBufferView: K_BVIEW, VkCommandPool: K_CPOOL, VkDescriptorPool: K_DPOOL, \
+    VkDescriptorSet: K_DSET, VkDescriptorSetLayout: K_DSL, VkDeviceMemory: K_MEMORY, VkFence: K_FENCE, VkFramebuffer: K_FB, \
+    VkImage: K_IMAGE, VkImageView: K_VIEW, VkPipeline: K_PIPELINE, VkPipelineLayout: K_PLAYOUT, VkQueryPool: K_QPOOL, \
+    VkRenderPass: K_RPASS, VkSampler: K_SAMPLER, VkSemaphore: K_SEM, VkShaderModule: K_SHADER, default: 0)
+static uint64_t HK(uint64_t id, uint32_t kind) {
+    ent *e = find(id);
+    return e && (!kind || e->kind == kind) ? e->h : 0;
+}
+#define DEV(id) ((VkDevice) (uintptr_t) HK(id, K_DEVICE))
+#define OBJ(T, id) ((T) (uintptr_t) HK(id, KIND_OF(T)))
 
 // ---- 受け手ができることを調べる ----
 // 本物の GPU が持っているか（版・拡張・機能）を見て、入口を読めたものだけを caps で名乗る。
@@ -890,6 +900,10 @@ static void set_dynamic(VkCommandBuffer cb, uint32_t st, uint32_t n, const uint3
 
 // ---- command buffer に積まれた命令を実行する ----
 static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
+    // 有効な描き方・計算の仕方がつながっていない draw と dispatch は飛ばす
+    // （作れなかった pipeline のまま描くと、iPhone の MoltenVK は描く所で落ちる。10/7 に zink で起きた）
+    int gfx = 0, cmp = 0;
+    uint32_t skipped = 0;
     while (r->at < r->n && !r->bad) {
         uint32_t op = vr_ru32(r);
         switch (op) {
@@ -899,6 +913,8 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             VkPipeline pl = OBJ(VkPipeline, pid);
             tracef(ci, "  pipeline %llu%s", (unsigned long long) pid, pl ? "" : "（無い）");
             if (pl) vkCmdBindPipeline(cb, (VkPipelineBindPoint) bp, pl);
+            if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) gfx = pl != VK_NULL_HANDLE;
+            else if (bp == VK_PIPELINE_BIND_POINT_COMPUTE) cmp = pl != VK_NULL_HANDLE;
         } break;
         case VR_CMD_BIND_DESCRIPTOR_SETS: {
             uint32_t bp = vr_ru32(r);
@@ -937,17 +953,21 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
         case VR_CMD_DISPATCH: {
             uint32_t x = vr_ru32(r), y = vr_ru32(r), z = vr_ru32(r);
             tracef(ci, "  dispatch %u %u %u", x, y, z);
+            if (!cmp) { skipped++; break; }
             vkCmdDispatch(cb, x, y, z);
         } break;
         case VR_CMD_DISPATCH_BASE: {
             uint32_t a = vr_ru32(r), b = vr_ru32(r), c = vr_ru32(r), x = vr_ru32(r), y = vr_ru32(r), z = vr_ru32(r);
+            if (!cmp) { skipped++; break; }
             vkCmdDispatchBase(cb, a, b, c, x, y, z);
         } break;
         case VR_CMD_DISPATCH_INDIRECT: {
             uint64_t bid = vr_ru64(r);
             use_buffer(ci, bid);
             VkBuffer b = OBJ(VkBuffer, bid);
-            vkCmdDispatchIndirect(cb, b, vr_ru64(r));
+            uint64_t off = vr_ru64(r);
+            if (!cmp || !b) { skipped++; break; }
+            vkCmdDispatchIndirect(cb, b, off);
         } break;
         case VR_CMD_COPY_BUFFER: {
             uint64_t sid = vr_ru64(r), did = vr_ru64(r);
@@ -1065,12 +1085,14 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
         case VR_CMD_NEXT_SUBPASS: vkCmdNextSubpass(cb, (VkSubpassContents) vr_ru32(r)); break;
         case VR_CMD_DRAW: {
             uint32_t a = vr_ru32(r), b = vr_ru32(r), c = vr_ru32(r), d = vr_ru32(r);
+            if (!gfx) { skipped++; break; }
             vkCmdDraw(cb, a, b, c, d);
         } break;
         case VR_CMD_DRAW_INDEXED: {
             uint32_t a = vr_ru32(r), b = vr_ru32(r), c = vr_ru32(r);
             int32_t d = (int32_t) vr_ru32(r);
             uint32_t e = vr_ru32(r);
+            if (!gfx) { skipped++; break; }
             vkCmdDrawIndexed(cb, a, b, c, d, e);
         } break;
         case VR_CMD_DRAW_INDIRECT:
@@ -1080,6 +1102,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             VkBuffer b = OBJ(VkBuffer, bid);
             uint64_t off = vr_ru64(r);
             uint32_t n = vr_ru32(r), stride = vr_ru32(r);
+            if (!gfx || !b) { skipped++; break; }
             if (op == VR_CMD_DRAW_INDIRECT) vkCmdDrawIndirect(cb, b, off, n, stride);
             else vkCmdDrawIndexedIndirect(cb, b, off, n, stride);
         } break;
@@ -1337,6 +1360,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             r->bad = 1;
         }
     }
+    if (skipped) vlog("描き方か計算の仕方がつながっていないので、draw・dispatch を %u 回飛ばした", skipped);
 }
 
 // ---- 窓に出すコマを JPEG に縮める（VR_READ_JPEG） ----
