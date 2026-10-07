@@ -8,7 +8,7 @@
 
 最終更新 2026-10-07
 
-数（10/7 午後）：代役か iPhone のふりで動いた物 28 本（Vulkan 8・DirectX 11 20）。iPhone の実機で動いた物 16 本（Vulkan 8・DirectX 11 8）。目標は 50 本
+数（10/7 夜）：代役か iPhone のふりで動いた物 29 本（Vulkan 9・DirectX 11 20）。iPhone の実機で動いた物 17 本（Vulkan 9・DirectX 11 8）。目標は 50 本
 
 ## Vulkan のアプリ
 | アプリ | 代役 | iPhone | 数字（iPhone） |
@@ -20,6 +20,7 @@
 | llama.cpp（Qwen3 0.6B〜8B） | ✅ | ✅ | 0.6B 67 t/s・8B 12.3 t/s |
 | whisper.cpp | ✅ | ✅ | 2 分の音声 43.8 秒 |
 | stable-diffusion.cpp | ✅ | ✅ | 1 枚 66.5 秒 |
+| vkQuake 1.36.0＋LibreQuake（本物のゲーム） | ✅ RTX 直 584.9・ふり 159.6 | ✅ 1280×720 timedemo demo1 | 149.6 コマ/秒（10/7） |
 
 ## DirectX 11（DXVK-macOS 1.10.3 と DXVK 3.1.1）
 | アプリ | 代役 | iPhone のふり | iPhone | 数字（iPhone） |
@@ -43,7 +44,6 @@
 | MultithreadedRendering11 | 素材が足りない | | | |
 
 ## 組んであるがまだ試していない物
-- vkQuake 1.36.0（データは無料の LibreQuake〈BSD-3〉か Quake のシェアウェア。取ってくる許可待ち）
 - WebDriverAgent（iPhone のアプリを Windows から操作する⑥用）
 - マイクラのサーバー Pumpkin（アプリ 0.7.23 に入っている）
 
