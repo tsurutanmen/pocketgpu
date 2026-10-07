@@ -340,6 +340,12 @@ static int recv_head(uint32_t h[2], uint32_t op) {
         if (g_stall_hwnd) InvalidateRect(g_stall_hwnd, NULL, FALSE);
     }
     if (!ok) conn_lost("返事を待っている所");
+    // 返事の長さは受け手の言うまま確保するので、ありえない大きさなら切る（読み出しは 64 MB ずつ・窓の絵は数 MB）
+    if (ok && h[1] > (512u << 20)) {
+        say("受け手の返事が大きすぎる（%u バイト）", h[1]);
+        conn_lost("返事の長さ");
+        ok = 0;
+    }
     return ok;
 }
 

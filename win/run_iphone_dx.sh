@@ -20,7 +20,7 @@ echo "結果は $OUT"
 echo "== 0. USB の速さ：つなぎを 1・2・4 本同時に"
 # usbmux はつなぎごとに受け取りの窓を持つらしいので、本数で足し算になるかを見る（先例 Backburner の調べから）
 (cd /d/iphone-rpc/app/pc && PYTHONIOENCODING=utf-8 timeout 300 python usb_bw.py --mb 128) > "$OUT/usb_bw.txt" 2>&1
-grep -a "MB/s\|見つからない" "$OUT/usb_bw.txt" | head -8
+grep -a "往復\|iPhone→PC\|見つからない" "$OUT/usb_bw.txt" | head -10
 
 echo "== 1. 装置の拡張"
 IPHONE_VK_LOG=1 run 120 "D:/iphone-rpc/vkbuild/extlist.exe" iPhone > "$OUT/extlist.txt" 2>&1
