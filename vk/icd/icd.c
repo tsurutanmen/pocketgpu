@@ -850,6 +850,7 @@ struct cb {
     const struct gs_pipe *gs; // いまつないでいる、GS を真似た pipeline（無ければ NULL）
     uint32_t app_topo;        // アプリが vkCmdSetPrimitiveTopology で決めた形
     int app_topo_set;
+    struct gs_cbst *gsx;      // GS を真似るための、頂点・index の buffer の覚えと、記録・descriptor の一時の物
 };
 struct bctmp { VkBuffer b; VkDeviceMemory m; struct bctmp *next; };
 
@@ -1844,6 +1845,7 @@ static void brq_learn(uint32_t flags, uint32_t usage, VkDeviceSize size, const V
     ReleaseSRWLockExclusive(&g_brq_lock);
 }
 
+static uint32_t gs_buffer_usage(uint32_t usage);
 static VkResult VKAPI_CALL create_buffer(VkDevice dv, const VkBufferCreateInfo *ci, const VkAllocationCallbacks *a, VkBuffer *out) {
     (void) a;
     struct buf *bf = calloc(1, sizeof *bf);
@@ -1858,6 +1860,7 @@ static VkResult VKAPI_CALL create_buffer(VkDevice dv, const VkBufferCreateInfo *
     uint32_t usage = ci->usage;
     for (const VkBaseInStructure *x = ci->pNext; x; x = x->pNext)
         if (x->sType == VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO) usage = (uint32_t) ((const VkBufferUsageFlags2CreateInfo *) x)->usage;
+    usage = gs_buffer_usage(usage); // GS を真似る VS が storage buffer として読む
     vr_u32(&b, usage);
     if ((g_hw.caps & VR_CAP_ASYNC_CREATE) && brq_find(ci->flags, usage, ci->size, &bf->req)) {
         rpc_send(VR_CREATE_BUFFER_NR, &b);
@@ -3209,10 +3212,11 @@ static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreate
         free(b.p); \
     }
 DESTROY_SIMPLE(destroy_shader_rpc, VkShaderModule, VR_DESTROY_SHADER_MODULE)
-static void VKAPI_CALL destroy_shader(VkDevice dv, VkShaderModule h, const VkAllocationCallbacks *a) { gs_forget(ID(h)); destroy_shader_rpc(dv, h, a); }
-DESTROY_SIMPLE(destroy_playout, VkPipelineLayout, VR_DESTROY_PIPELINE_LAYOUT)
+static void VKAPI_CALL destroy_shader(VkDevice dv, VkShaderModule h, const VkAllocationCallbacks *a) { gs_forget_pipe(VK_NULL_HANDLE, ID(h)); destroy_shader_rpc(dv, h, a); }
+DESTROY_SIMPLE(destroy_playout_rpc, VkPipelineLayout, VR_DESTROY_PIPELINE_LAYOUT)
+static void VKAPI_CALL destroy_playout(VkDevice dv, VkPipelineLayout h, const VkAllocationCallbacks *a) { gs_forget_layout(dv, ID(h)); destroy_playout_rpc(dv, h, a); }
 DESTROY_SIMPLE(destroy_pipeline_rpc, VkPipeline, VR_DESTROY_PIPELINE)
-static void VKAPI_CALL destroy_pipeline(VkDevice dv, VkPipeline h, const VkAllocationCallbacks *a) { gs_forget(ID(h)); destroy_pipeline_rpc(dv, h, a); }
+static void VKAPI_CALL destroy_pipeline(VkDevice dv, VkPipeline h, const VkAllocationCallbacks *a) { gs_forget_pipe(dv, ID(h)); destroy_pipeline_rpc(dv, h, a); }
 
 static VkResult VKAPI_CALL create_dsl(VkDevice dv, const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorSetLayout *out) {
     (void) a;
@@ -3271,6 +3275,7 @@ static VkResult VKAPI_CALL create_playout(VkDevice dv, const VkPipelineLayoutCre
     }
     rpc_send(VR_CREATE_PIPELINE_LAYOUT, &b);
     free(b.p);
+    gs_note_layout(dv, id, ci);
     *out = (VkPipelineLayout) (uintptr_t) id;
     return VK_SUCCESS;
 }
@@ -3646,9 +3651,9 @@ static void bct_free(struct cb *c) {
     c->bct = NULL;
 }
 
-static void cb_clear(struct cb *c) { c->s.n = 0; c->nr = 0; c->nrd = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; }
+static void cb_clear(struct cb *c) { c->s.n = 0; c->nr = 0; c->nrd = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
 
-static void cb_free(struct cb *c) { bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c); }
+static void cb_free(struct cb *c) { gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c); }
 
 static void VKAPI_CALL destroy_cpool(VkDevice dv, VkCommandPool pp, const VkAllocationCallbacks *a) {
     (void) a;
@@ -3785,6 +3790,7 @@ static void VKAPI_CALL cmd_bind_sets(VkCommandBuffer cbh, VkPipelineBindPoint bp
     for (uint32_t i = 0; i < n; i++) vr_u64(&c->s, ID(sets[i]));
     vr_u32(&c->s, nd);
     for (uint32_t i = 0; i < nd; i++) vr_u32(&c->s, dyn[i]);
+    gs_track_sets(c, bp, l, first, n, sets, nd, dyn);
     // storage buffer は GPU が書くかもしれない
     for (uint32_t i = 0; i < n; i++) {
         struct dset *s = (struct dset *) sets[i];
@@ -3962,7 +3968,7 @@ static void VKAPI_CALL cmd_draw(VkCommandBuffer cbh, uint32_t vc, uint32_t ic, u
 
 static void VKAPI_CALL cmd_draw_indexed(VkCommandBuffer cbh, uint32_t n, uint32_t ic, uint32_t first, int32_t vo, uint32_t fi) {
     struct cb *c = (struct cb *) cbh;
-    if (gs_skip(c, "番号つき")) return;
+    if (gs_draw_indexed(c, n, ic, first, vo, fi)) return;
     vr_u32(&c->s, VR_CMD_DRAW_INDEXED);
     vr_u32(&c->s, n);
     vr_u32(&c->s, ic);
@@ -4000,6 +4006,7 @@ static void VKAPI_CALL cmd_bind_vbs(VkCommandBuffer cbh, uint32_t first, uint32_
         vr_u64(&c->s, offs[i]);
         cb_reads(c, (struct buf *) bs[i], offs[i], VK_WHOLE_SIZE);
     }
+    gs_track_vb(c, first, n, bs, offs, NULL);
 }
 
 static void VKAPI_CALL cmd_bind_ib(VkCommandBuffer cbh, VkBuffer bb, VkDeviceSize off, VkIndexType t) {
@@ -4009,6 +4016,7 @@ static void VKAPI_CALL cmd_bind_ib(VkCommandBuffer cbh, VkBuffer bb, VkDeviceSiz
     vr_u64(&c->s, off);
     vr_u32(&c->s, t);
     cb_reads(c, (struct buf *) bb, off, VK_WHOLE_SIZE);
+    gs_track_ib(c, bb, off, t);
 }
 
 static void VKAPI_CALL cmd_set_viewport(VkCommandBuffer cbh, uint32_t first, uint32_t n, const VkViewport *v) {
@@ -4344,6 +4352,7 @@ static void VKAPI_CALL cmd_bind_vbs2(VkCommandBuffer cbh, uint32_t first, uint32
         vr_u64(&c->s, strides ? strides[i] : 0);
         cb_reads(c, (struct buf *) bs[i], offs[i], sizes ? sizes[i] : VK_WHOLE_SIZE);
     }
+    gs_track_vb(c, first, n, bs, offs, strides);
 }
 
 // ---- dynamic rendering ----
