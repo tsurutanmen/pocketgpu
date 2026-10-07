@@ -761,6 +761,9 @@ struct cb {
     rng *rd;           // GPU が読むかもしれない範囲（submit の前に、ここだけ送る）
     size_t nrd, caprd;
     struct bctmp *bct; // BC をほどいた中身を入れた一時バッファ（記録し直すときに消す）
+    const struct gs_pipe *gs; // いまつないでいる、GS を真似た pipeline（無ければ NULL）
+    uint32_t app_topo;        // アプリが vkCmdSetPrimitiveTopology で決めた形
+    int app_topo_set;
 };
 struct bctmp { VkBuffer b; VkDeviceMemory m; struct bctmp *next; };
 
@@ -2174,6 +2177,10 @@ static VkResult VKAPI_CALL create_fb(VkDevice dv, const VkFramebufferCreateInfo 
 
 static void VKAPI_CALL destroy_fb(VkDevice dv, VkFramebuffer h, const VkAllocationCallbacks *a) { (void) a; if (h) send_destroy(VR_DESTROY_FRAMEBUFFER, dv, ID(h)); }
 
+// geometry shader を頂点シェーダーで真似る。受け手の GPU が持たないときだけ働く
+#include "gs/gs_emu.c"
+#include "gs/gs_icd.inc"
+
 // ---- 描画用のパイプライン ----
 static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out);
 static void VKAPI_CALL destroy_shader(VkDevice dv, VkShaderModule h, const VkAllocationCallbacks *a);
@@ -2214,10 +2221,8 @@ static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCach
         int gs = 0;
         for (uint32_t k = 0; k < c->stageCount; k++) gs |= c->pStages[k].stage == VK_SHADER_STAGE_GEOMETRY_BIT;
         if (gs && !g_hw.real.geometryShader) {
-            static int once;
-            if (!once++) say("geometry shader を使う pipeline は、受け手の GPU が持たないので作らない");
-            out[i] = VK_NULL_HANDLE;
-            worst = VK_ERROR_UNKNOWN;
+            VkResult r2 = gs_emu_pipeline(dv, cache, c, a, &out[i]);
+            if (r2 != VK_SUCCESS) worst = r2;
             continue;
         }
         uint64_t id = new_id();
@@ -2791,6 +2796,7 @@ static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreate
     vr_bytes(&b, ci->pCode, (uint32_t) ci->codeSize);
     rpc_send(VR_CREATE_SHADER_MODULE, &b);
     free(b.p);
+    gs_keep(id, ci->pCode, ci->codeSize);
     *out = (VkShaderModule) (uintptr_t) id;
     return VK_SUCCESS;
 }
@@ -2805,9 +2811,11 @@ static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreate
         rpc_send(op, &b); \
         free(b.p); \
     }
-DESTROY_SIMPLE(destroy_shader, VkShaderModule, VR_DESTROY_SHADER_MODULE)
+DESTROY_SIMPLE(destroy_shader_rpc, VkShaderModule, VR_DESTROY_SHADER_MODULE)
+static void VKAPI_CALL destroy_shader(VkDevice dv, VkShaderModule h, const VkAllocationCallbacks *a) { gs_forget(ID(h)); destroy_shader_rpc(dv, h, a); }
 DESTROY_SIMPLE(destroy_playout, VkPipelineLayout, VR_DESTROY_PIPELINE_LAYOUT)
-DESTROY_SIMPLE(destroy_pipeline, VkPipeline, VR_DESTROY_PIPELINE)
+DESTROY_SIMPLE(destroy_pipeline_rpc, VkPipeline, VR_DESTROY_PIPELINE)
+static void VKAPI_CALL destroy_pipeline(VkDevice dv, VkPipeline h, const VkAllocationCallbacks *a) { gs_forget(ID(h)); destroy_pipeline_rpc(dv, h, a); }
 
 static VkResult VKAPI_CALL create_dsl(VkDevice dv, const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorSetLayout *out) {
     (void) a;
@@ -2830,7 +2838,7 @@ static VkResult VKAPI_CALL create_dsl(VkDevice dv, const VkDescriptorSetLayoutCr
         vr_u32(&b, ci->pBindings[i].binding);
         vr_u32(&b, ci->pBindings[i].descriptorType);
         vr_u32(&b, ci->pBindings[i].descriptorCount);
-        vr_u32(&b, ci->pBindings[i].stageFlags);
+        vr_u32(&b, gs_stages(ci->pBindings[i].stageFlags));
     }
     rpc_send(VR_CREATE_DSL, &b);
     free(b.p);
@@ -2860,7 +2868,7 @@ static VkResult VKAPI_CALL create_playout(VkDevice dv, const VkPipelineLayoutCre
     for (uint32_t i = 0; i < ci->setLayoutCount; i++) vr_u64(&b, ID(ci->pSetLayouts[i]));
     vr_u32(&b, ci->pushConstantRangeCount);
     for (uint32_t i = 0; i < ci->pushConstantRangeCount; i++) {
-        vr_u32(&b, ci->pPushConstantRanges[i].stageFlags);
+        vr_u32(&b, gs_stages(ci->pPushConstantRanges[i].stageFlags));
         vr_u32(&b, ci->pPushConstantRanges[i].offset);
         vr_u32(&b, ci->pPushConstantRanges[i].size);
     }
@@ -3241,7 +3249,7 @@ static void bct_free(struct cb *c) {
     c->bct = NULL;
 }
 
-static void cb_clear(struct cb *c) { c->s.n = 0; c->nr = 0; c->nrd = 0; bct_free(c); }
+static void cb_clear(struct cb *c) { c->s.n = 0; c->nr = 0; c->nrd = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; }
 
 static void cb_free(struct cb *c) { bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c); }
 
@@ -3367,6 +3375,7 @@ static void VKAPI_CALL cmd_bind_pipeline(VkCommandBuffer cbh, VkPipelineBindPoin
     vr_u32(&c->s, VR_CMD_BIND_PIPELINE);
     vr_u32(&c->s, bp);
     vr_u64(&c->s, ID(p));
+    gs_bind(c, bp, p);
 }
 
 static void VKAPI_CALL cmd_bind_sets(VkCommandBuffer cbh, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t first, uint32_t n, const VkDescriptorSet *sets, uint32_t nd, const uint32_t *dyn) {
@@ -3397,7 +3406,7 @@ static void VKAPI_CALL cmd_push(VkCommandBuffer cbh, VkPipelineLayout l, VkShade
     struct cb *c = (struct cb *) cbh;
     vr_u32(&c->s, VR_CMD_PUSH_CONSTANTS);
     vr_u64(&c->s, ID(l));
-    vr_u32(&c->s, st);
+    vr_u32(&c->s, gs_stages(st));
     vr_u32(&c->s, off);
     vr_bytes(&c->s, v, size);
 }
@@ -3546,6 +3555,7 @@ static void VKAPI_CALL cmd_exec(VkCommandBuffer cbh, uint32_t n, const VkCommand
 
 static void VKAPI_CALL cmd_draw(VkCommandBuffer cbh, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) {
     struct cb *c = (struct cb *) cbh;
+    if (gs_draw(c, vc, ic, fv, fi)) return;
     vr_u32(&c->s, VR_CMD_DRAW);
     vr_u32(&c->s, vc);
     vr_u32(&c->s, ic);
@@ -3555,6 +3565,7 @@ static void VKAPI_CALL cmd_draw(VkCommandBuffer cbh, uint32_t vc, uint32_t ic, u
 
 static void VKAPI_CALL cmd_draw_indexed(VkCommandBuffer cbh, uint32_t n, uint32_t ic, uint32_t first, int32_t vo, uint32_t fi) {
     struct cb *c = (struct cb *) cbh;
+    if (gs_skip(c, "番号つき")) return;
     vr_u32(&c->s, VR_CMD_DRAW_INDEXED);
     vr_u32(&c->s, n);
     vr_u32(&c->s, ic);
@@ -3565,6 +3576,7 @@ static void VKAPI_CALL cmd_draw_indexed(VkCommandBuffer cbh, uint32_t n, uint32_
 
 static void draw_indirect(VkCommandBuffer cbh, uint32_t op, VkBuffer bb, VkDeviceSize off, uint32_t n, uint32_t stride) {
     struct cb *c = (struct cb *) cbh;
+    if (gs_skip(c, "間接")) return;
     vr_u32(&c->s, op);
     vr_u64(&c->s, ID(bb));
     vr_u64(&c->s, off);
@@ -3897,7 +3909,7 @@ static void VKAPI_CALL cmd_set_stencil_ref(VkCommandBuffer c, VkStencilFaceFlags
 // extended dynamic state 1・2（1.3 で本体入り）
 static void VKAPI_CALL cmd_set_cull_mode(VkCommandBuffer c, VkCullModeFlags m) { dyn1(c, VK_DYNAMIC_STATE_CULL_MODE, m); }
 static void VKAPI_CALL cmd_set_front_face(VkCommandBuffer c, VkFrontFace f) { dyn1(c, VK_DYNAMIC_STATE_FRONT_FACE, f); }
-static void VKAPI_CALL cmd_set_topology(VkCommandBuffer c, VkPrimitiveTopology t) { dyn1(c, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, t); }
+static void VKAPI_CALL cmd_set_topology(VkCommandBuffer c, VkPrimitiveTopology t) { gs_set_topology((struct cb *) c, t); }
 static void VKAPI_CALL cmd_set_depth_test(VkCommandBuffer c, VkBool32 v) { dyn1(c, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, v); }
 static void VKAPI_CALL cmd_set_depth_write(VkCommandBuffer c, VkBool32 v) { dyn1(c, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, v); }
 static void VKAPI_CALL cmd_set_depth_compare(VkCommandBuffer c, VkCompareOp v) { dyn1(c, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, v); }
