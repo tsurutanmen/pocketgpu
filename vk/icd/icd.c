@@ -641,6 +641,10 @@ static int connect_locked(void) {
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *) &to, sizeof to);
     g_sock = s;
     say("%s:%s につないだ", host, port);
+    // つないだら、このドライバの DLL をプロセスが終わるまで外させない。最後の instance を壊すとローダーが DLL を外して読み直すが、
+    // 外れるときにつながりを閉じないので古いつながりが残り、受け手（一度に 1 人の相手）が 2 本目のあいさつに答えず固まった（CTS で見つかった）
+    HMODULE self;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR) (void *) &connect_locked, &self);
     return 1;
 }
 
