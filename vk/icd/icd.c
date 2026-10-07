@@ -141,6 +141,8 @@ static struct {
     uint64_t wdiff_pages, wdiff_sent; // 違う所だけ送ったページの数と、送ったバイト
     uint64_t pack_in, pack_out;    // LZ4 で縮める前と後のバイト
     double pack_ms;
+    double blit_ms, present_ms, record_ms; // 窓に描く（JPEG をほどく・描く）・present 全体・command buffer を閉じて送る
+    uint64_t blits, presents, records;
     uint64_t skipped;              // 往復せずに済ませた待ち
     double ww_ms, rb_ms;           // 書き込み監視にかかった時間・引き取りにかかった時間
 } g_stat;
@@ -168,6 +170,9 @@ static void print_stats(void) {
     fprintf(stderr, "  書き込み監視 %llu 回 %.1f ms 書いたページ %llu / 引き取り %.1f ms\n", (unsigned long long) g_stat.ww_calls, g_stat.ww_ms,
             (unsigned long long) g_stat.ww_pages, g_stat.rb_ms);
     fprintf(stderr, "  往復せずに済ませた待ち %llu\n", (unsigned long long) g_stat.skipped);
+    if (g_stat.presents)
+        fprintf(stderr, "  present %llu 回 %.1f ms（うち窓に描く %llu 回 %.1f ms）\n", (unsigned long long) g_stat.presents, g_stat.present_ms,
+                (unsigned long long) g_stat.blits, g_stat.blit_ms);
     if (g_stat.pack_in)
         fprintf(stderr, "  LZ4 で縮めた：%llu バイトを %llu バイトに・%.1f ms\n", (unsigned long long) g_stat.pack_in,
                 (unsigned long long) g_stat.pack_out, g_stat.pack_ms);
@@ -2462,6 +2467,15 @@ struct swapchain {
     VkFormat fmt;
     int use_jpeg;        // 受け手に JPEG に縮めてもらう
     uint64_t jpeg_bytes; // 受け取った JPEG の合計
+    // 窓に描く糸。アプリの糸は JPEG を渡してすぐ戻り、この糸が最新の 1 枚だけをほどいて描く（間に合わない絵は飛ばす）
+    struct {
+        HANDLE thr;
+        SRWLOCK lk;
+        CONDITION_VARIABLE cv;
+        vr_buf jpg;
+        int has, quit;
+        uint64_t dropped;
+    } disp;
     VkImage img[8];
     VkDeviceMemory imem[8];
     VkBuffer rb[8];         // 持ち帰り用（CPU から見えるメモリ）
@@ -2498,11 +2512,14 @@ static void VKAPI_CALL cmd_barrier(VkCommandBuffer cbh, VkPipelineStageFlags src
 static void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cbh, VkImage im, VkImageLayout l, VkBuffer bb, uint32_t n, const VkBufferImageCopy *rg);
 static void VKAPI_CALL get_queue(VkDevice dv, uint32_t fam, uint32_t idx, VkQueue *out);
 
+static void disp_stop(struct swapchain *sc);
+
 static void VKAPI_CALL destroy_swapchain(VkDevice dv, VkSwapchainKHR h, const VkAllocationCallbacks *a) {
     (void) a;
     struct swapchain *sc = (struct swapchain *) h;
     if (!sc) return;
     if (sc->pend >= 0 && sc->fence[sc->pend]) wait_fences(dv, 1, &sc->fence[sc->pend], VK_TRUE, UINT64_MAX);
+    disp_stop(sc);
     if (sc->pool) destroy_cpool(dv, sc->pool, NULL);
     for (uint32_t i = 0; i < sc->n; i++) {
         if (sc->fence[i]) destroy_fence(dv, sc->fence[i], NULL);
@@ -2658,12 +2675,36 @@ static VkResult VKAPI_CALL acquire_image2(VkDevice dv, const VkAcquireNextImageI
 
 // 持ち帰った画像 j を窓に描き写す
 // 受け手に JPEG にしてもらったコマを、WIC でほどいて写し（BGRA）に書く。失敗したら 0
-static int jpeg_fetch(struct swapchain *sc, uint32_t j) {
-    static IWICImagingFactory *fac;
-    if (!fac) {
-        CoInitializeEx(NULL, COINIT_MULTITHREADED);
-        if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **) &fac))) return 0;
-    }
+// JPEG をほどいて、w×h の B・G・R・A の並びにする。1 ほどけた・-1 大きさが違う（窓の大きさが変わる前の絵）・0 失敗
+static int jpeg_decode(IWICImagingFactory *fac, const uint8_t *data, size_t n, uint32_t w, uint32_t h, uint8_t *px) {
+    int ok = 0;
+    UINT jw = 0, jh = 0;
+    IWICStream *st = NULL;
+    IWICBitmapDecoder *dec = NULL;
+    IWICBitmapFrameDecode *fr = NULL;
+    IWICFormatConverter *cv = NULL;
+    if (!n) return 0;
+    if (FAILED(IWICImagingFactory_CreateStream(fac, &st))) goto done;
+    if (FAILED(IWICStream_InitializeFromMemory(st, (BYTE *) data, (DWORD) n))) goto done;
+    if (FAILED(IWICImagingFactory_CreateDecoderFromStream(fac, (IStream *) st, NULL, WICDecodeMetadataCacheOnDemand, &dec))) goto done;
+    if (FAILED(IWICBitmapDecoder_GetFrame(dec, 0, &fr))) goto done;
+    // 先送りでは、窓の大きさが変わる前のコマが届くことがある。大きさが違えば出さない
+    if (FAILED(IWICBitmapFrameDecode_GetSize(fr, &jw, &jh))) goto done;
+    if (jw != w || jh != h) { ok = -1; goto done; }
+    if (FAILED(IWICImagingFactory_CreateFormatConverter(fac, &cv))) goto done;
+    if (FAILED(IWICFormatConverter_Initialize(cv, (IWICBitmapSource *) fr, &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom))) goto done;
+    if (FAILED(IWICFormatConverter_CopyPixels(cv, NULL, w * 4, w * 4 * h, px))) goto done;
+    ok = 1;
+done:
+    if (cv) IWICFormatConverter_Release(cv);
+    if (fr) IWICBitmapFrameDecode_Release(fr);
+    if (dec) IWICBitmapDecoder_Release(dec);
+    if (st) IWICStream_Release(st);
+    return ok;
+}
+
+// 受け手に縮めてもらった JPEG を取ってくる。1 取れた・-1 まだ出す物が無い（先送りの最初）・0 失敗
+static int jpeg_request(struct swapchain *sc, uint32_t j, vr_buf *out) {
     static int q = -1, pipe = -1;
     if (q < 0) { const char *e = getenv("IPHONE_VK_JPEG_Q"); q = e && atoi(e) > 0 ? atoi(e) : 80; }
     // 先送り：受け手は今のコマを後ろで縮め、ひとつ前のコマの JPEG を返す（窓に出るのは 1 コマ遅れる）
@@ -2672,7 +2713,7 @@ static int jpeg_fetch(struct swapchain *sc, uint32_t j) {
     // IPHONE_VK_ASYNC_PRESENT=0 で、今までどおり待つ
     static int async = -1;
     if (async < 0) { const char *e = getenv("IPHONE_VK_ASYNC_PRESENT"); async = pipe && !(e && *e == '0'); }
-    vr_buf b = { 0 }, out = { 0 };
+    vr_buf b = { 0 };
     vr_u64(&b, ID(sc->rbmem[j]));
     vr_u64(&b, 0);
     vr_u32(&b, sc->w);
@@ -2681,46 +2722,140 @@ static int jpeg_fetch(struct swapchain *sc, uint32_t j) {
     vr_u32(&b, sc->fmt == VK_FORMAT_B8G8R8A8_UNORM || sc->fmt == VK_FORMAT_B8G8R8A8_SRGB ? 1 : 0);
     vr_u32(&b, (uint32_t) q);
     VkResult r;
+    out->n = 0;
     if (async) {
-        r = rpc_take_deferred(&out); // 前のコマで頼んだ返事
+        r = rpc_take_deferred(out); // 前のコマで頼んだ返事
         rpc_call_deferred(VR_READ_JPEG_PIPE, &b);
         if (r == VK_NOT_READY) r = VK_SUCCESS; // 最初のコマ：まだ出す物が無い
     } else {
-        r = rpc_call(pipe ? VR_READ_JPEG_PIPE : VR_READ_JPEG, &b, &out);
+        r = rpc_call(pipe ? VR_READ_JPEG_PIPE : VR_READ_JPEG, &b, out);
     }
     free(b.p);
-    int ok = 0;
-    UINT jw = 0, jh = 0;
-    IWICStream *st = NULL;
-    IWICBitmapDecoder *dec = NULL;
-    IWICBitmapFrameDecode *fr = NULL;
-    IWICFormatConverter *cv = NULL;
-    if (r == VK_SUCCESS && !out.n && pipe) { ok = -1; goto done; } // 先送りの最初のコマ：まだ出す物が無い
-    if (r != VK_SUCCESS || !out.n) goto done;
-    sc->jpeg_bytes += out.n;
-    if (FAILED(IWICImagingFactory_CreateStream(fac, &st))) goto done;
-    if (FAILED(IWICStream_InitializeFromMemory(st, out.p, (DWORD) out.n))) goto done;
-    if (FAILED(IWICImagingFactory_CreateDecoderFromStream(fac, (IStream *) st, NULL, WICDecodeMetadataCacheOnDemand, &dec))) goto done;
-    if (FAILED(IWICBitmapDecoder_GetFrame(dec, 0, &fr))) goto done;
-    // 先送りでは、窓の大きさが変わる前のコマが届くことがある。大きさが違えば出さない
-    if (FAILED(IWICBitmapFrameDecode_GetSize(fr, &jw, &jh))) goto done;
-    if (jw != sc->w || jh != sc->h) { ok = -1; goto done; }
-    if (FAILED(IWICImagingFactory_CreateFormatConverter(fac, &cv))) goto done;
-    if (FAILED(IWICFormatConverter_Initialize(cv, (IWICBitmapSource *) fr, &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom))) goto done;
-    if (FAILED(IWICFormatConverter_CopyPixels(cv, NULL, sc->w * 4, sc->w * 4 * sc->h, sc->px[j]))) goto done;
-    ok = 1;
-done:
-    if (cv) IWICFormatConverter_Release(cv);
-    if (fr) IWICBitmapFrameDecode_Release(fr);
-    if (dec) IWICBitmapDecoder_Release(dec);
-    if (st) IWICStream_Release(st);
+    if (r == VK_SUCCESS && !out->n && pipe) return -1;
+    if (r != VK_SUCCESS || !out->n) return 0;
+    sc->jpeg_bytes += out->n;
+    return 1;
+}
+
+static int jpeg_fetch(struct swapchain *sc, uint32_t j) {
+    static IWICImagingFactory *fac;
+    if (!fac) {
+        CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **) &fac))) return 0;
+    }
+    vr_buf out = { 0 };
+    int k = jpeg_request(sc, j, &out);
+    if (k == 1) k = jpeg_decode(fac, out.p, out.n, sc->w, sc->h, sc->px[j]);
     free(out.p);
-    return ok;
+    return k;
+}
+
+static void dump_frame(struct swapchain *sc, const uint8_t *px);
+
+// 窓に描く糸：渡された最新の JPEG をほどいて描く
+static DWORD WINAPI disp_thread(LPVOID arg) {
+    struct swapchain *sc = (struct swapchain *) arg;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    IWICImagingFactory *fac = NULL;
+    CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **) &fac);
+    uint8_t *px = malloc((size_t) sc->w * sc->h * 4);
+    vr_buf mine = { 0 };
+    BITMAPINFO bmi = { 0 };
+    bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
+    bmi.bmiHeader.biWidth = (LONG) sc->w;
+    bmi.bmiHeader.biHeight = -(LONG) sc->h; // 上から下へ
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    for (;;) {
+        AcquireSRWLockExclusive(&sc->disp.lk);
+        while (!sc->disp.has && !sc->disp.quit) SleepConditionVariableSRW(&sc->disp.cv, &sc->disp.lk, INFINITE, 0);
+        if (!sc->disp.has) { ReleaseSRWLockExclusive(&sc->disp.lk); break; }
+        vr_buf t = mine;
+        mine = sc->disp.jpg;
+        sc->disp.jpg = t;
+        sc->disp.has = 0;
+        ReleaseSRWLockExclusive(&sc->disp.lk);
+        if (!fac || !px || jpeg_decode(fac, mine.p, mine.n, sc->w, sc->h, px) != 1) continue;
+        RECT rc;
+        GetClientRect(sc->hwnd, &rc);
+        HDC dc = GetDC(sc->hwnd);
+        SetStretchBltMode(dc, COLORONCOLOR);
+        StretchDIBits(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, 0, 0, (int) sc->w, (int) sc->h, px, &bmi, DIB_RGB_COLORS, SRCCOPY);
+        ReleaseDC(sc->hwnd, dc);
+        sc->frames++;
+        dump_frame(sc, px);
+    }
+    free(px);
+    free(mine.p);
+    if (fac) IWICImagingFactory_Release(fac);
+    CoUninitialize();
+    return 0;
+}
+
+// 表示の糸を使うか（IPHONE_VK_DISPLAY_THREAD=0 で、今までどおりアプリの糸で描く）
+static int disp_thread_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_DISPLAY_THREAD"); v = !(e && *e == '0'); }
+    return v;
+}
+
+static void disp_stop(struct swapchain *sc) {
+    if (!sc->disp.thr) return;
+    AcquireSRWLockExclusive(&sc->disp.lk);
+    sc->disp.quit = 1;
+    WakeConditionVariable(&sc->disp.cv);
+    ReleaseSRWLockExclusive(&sc->disp.lk);
+    WaitForSingleObject(sc->disp.thr, 5000);
+    CloseHandle(sc->disp.thr);
+    sc->disp.thr = NULL;
+    free(sc->disp.jpg.p);
+    sc->disp.jpg.p = NULL;
+    if (sc->disp.dropped) say("窓に描く糸が間に合わず飛ばした絵：%llu 枚", (unsigned long long) sc->disp.dropped);
+}
+
+// IPHONE_VK_DUMP=コマ番号:ファイル名 で、そのコマを PPM に書く（絵が正しいかを確かめる用）
+static void dump_frame(struct swapchain *sc, const uint8_t *px) {
+    const char *dump = getenv("IPHONE_VK_DUMP");
+    if (dump && (uint64_t) atoi(dump) == sc->frames && strchr(dump, ':')) {
+        FILE *fp = fopen(strchr(dump, ':') + 1, "wb");
+        if (fp) {
+            fprintf(fp, "P6\n%u %u\n255\n", sc->w, sc->h);
+            for (size_t p = 0; p < (size_t) sc->w * sc->h; p++) { uint8_t rgb[3] = { px[p * 4 + 2], px[p * 4 + 1], px[p * 4] }; fwrite(rgb, 1, 3, fp); }
+            fclose(fp);
+            say("%llu コマ目を %s に書いた", (unsigned long long) sc->frames, strchr(dump, ':') + 1);
+        }
+    }
 }
 
 static VkResult blit(struct swapchain *sc, uint32_t j) {
     if (!sc->hwnd) return VK_SUCCESS;
     uint8_t *px = sc->px[j];
+    if (sc->use_jpeg && disp_thread_on()) {
+        // JPEG を取ってきて表示の糸に渡し、ほどいて描くのを待たずに戻る
+        vr_buf out = { 0 };
+        int k = jpeg_request(sc, j, &out);
+        if (k == 1) {
+            if (!sc->disp.thr) {
+                InitializeSRWLock(&sc->disp.lk);
+                InitializeConditionVariable(&sc->disp.cv);
+                sc->disp.thr = CreateThread(NULL, 0, disp_thread, sc, 0, NULL);
+            }
+            AcquireSRWLockExclusive(&sc->disp.lk);
+            if (sc->disp.has) sc->disp.dropped++;
+            vr_buf t = sc->disp.jpg;
+            sc->disp.jpg = out;
+            out = t;
+            sc->disp.has = 1;
+            WakeConditionVariable(&sc->disp.cv);
+            ReleaseSRWLockExclusive(&sc->disp.lk);
+        }
+        free(out.p);
+        RECT rc;
+        GetClientRect(sc->hwnd, &rc);
+        if ((uint32_t) (rc.right - rc.left) != sc->w || (uint32_t) (rc.bottom - rc.top) != sc->h) return VK_SUBOPTIMAL_KHR;
+        return VK_SUCCESS;
+    }
     // JPEG で受け取ったときは、もう B・G・R・A の並びになっている
     int is_bgra = 0;
     if (sc->use_jpeg) {
@@ -2744,17 +2879,7 @@ static VkResult blit(struct swapchain *sc, uint32_t j) {
     StretchDIBits(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, 0, 0, (int) sc->w, (int) sc->h, px, &bmi, DIB_RGB_COLORS, SRCCOPY);
     ReleaseDC(sc->hwnd, dc);
     sc->frames++;
-    // IPHONE_VK_DUMP=コマ番号:ファイル名 で、そのコマを PPM に書く（絵が正しいかを確かめる用）
-    const char *dump = getenv("IPHONE_VK_DUMP");
-    if (dump && (uint64_t) atoi(dump) == sc->frames && strchr(dump, ':')) {
-        FILE *fp = fopen(strchr(dump, ':') + 1, "wb");
-        if (fp) {
-            fprintf(fp, "P6\n%u %u\n255\n", sc->w, sc->h);
-            for (size_t p = 0; p < (size_t) sc->w * sc->h; p++) { uint8_t rgb[3] = { px[p * 4 + 2], px[p * 4 + 1], px[p * 4] }; fwrite(rgb, 1, 3, fp); }
-            fclose(fp);
-            say("%llu コマ目を %s に書いた", (unsigned long long) sc->frames, strchr(dump, ':') + 1);
-        }
-    }
+    dump_frame(sc, px);
     // 窓の大きさが変わったら、作り直してもらう
     if ((uint32_t) (rc.right - rc.left) != sc->w || (uint32_t) (rc.bottom - rc.top) != sc->h) return VK_SUBOPTIMAL_KHR;
     return VK_SUCCESS;
@@ -2762,6 +2887,8 @@ static VkResult blit(struct swapchain *sc, uint32_t j) {
 
 static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi) {
     VkResult worst = VK_SUCCESS;
+    double tp = now_ms();
+    g_stat.presents++;
     for (uint32_t i = 0; i < pi->swapchainCount; i++) {
         struct swapchain *sc = (struct swapchain *) pi->pSwapchains[i];
         uint32_t idx = pi->pImageIndices[i];
@@ -2777,12 +2904,16 @@ static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi)
             uint32_t j = (uint32_t) sc->pend;
             r = wait_fences(dv, 1, &sc->fence[j], VK_TRUE, UINT64_MAX);
             reset_fences(dv, 1, &sc->fence[j]);
+            double tb = now_ms();
             if (r == VK_SUCCESS) r = blit(sc, j);
+            g_stat.blit_ms += now_ms() - tb;
+            g_stat.blits++;
         }
         sc->pend = (int) idx;
         if (pi->pResults) pi->pResults[i] = r;
         if (r < 0 || (worst == VK_SUCCESS && r != VK_SUCCESS)) worst = r;
     }
+    g_stat.present_ms += now_ms() - tp;
     return worst;
 }
 
