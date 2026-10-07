@@ -75,7 +75,7 @@ done
 grep -a -h "not supported\|Failed\|err:" "$OUT"/d3d11*.txt | sort | uniq -c | head -10
 
 echo "== 5. DirectX のサンプル"
-bash /d/iphone-rpc/app/win/run_d3d11_samples.sh "$IPHONE_VK" EmptyProject11 SimpleSample11 BasicHLSL11 CascadedShadowMaps11 FluidCS11 HDRToneMappingCS11 SimpleBezier11 OIT11 2>&1 | tee "$OUT/samples.txt"
+bash /d/iphone-rpc/app/win/run_d3d11_samples.sh "$IPHONE_VK" EmptyProject11 SimpleSample11 BasicHLSL11 CascadedShadowMaps11 VarianceShadows11 FluidCS11 NBodyGravityCS11 HDRToneMappingCS11 SimpleBezier11 OIT11 2>&1 | tee "$OUT/samples.txt"
 echo "== 5b. 窓の無い計算のサンプル BasicCompute11（CPU の答えと比べる）"
 BC=$VKB/d3d11samples/BasicCompute11
 for dx in d3d11 dxvk3; do
