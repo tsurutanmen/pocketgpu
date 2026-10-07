@@ -11,6 +11,8 @@ mkdir -p "$OUT"
 export IPHONE_VK=${IPHONE_VK_ADDR:-usb} # 代役で試すときは IPHONE_VK_ADDR=127.0.0.1:50070
 # 窓はサブモニターに出す（メインは CEO が使う）
 export IPHONE_VK_MONITOR=${IPHONE_VK_MONITOR:-sub}
+# 速さを測るので、書き換えに合わせる出し方（FIFO）でも区切らずに全速で回す
+export IPHONE_VK_VSYNC=0
 VKCMD='D:/iphone-rpc/vkbuild/iphone-vk.cmd'
 run() { timeout "$1" cmd.exe //c "$VKCMD" "${@:2}"; }
 echo "結果は $OUT"
@@ -40,6 +42,13 @@ for p in 1 0; do
             run 300 "D:/iphone-rpc/vkcube/vkcube.exe" --gpu_number 1 --c 300 --suppress_popups --width $1 --height $2 > "$OUT/vkcube_${1}_pipe$p.txt" 2>&1
         echo "vkcube ${1}x${2} 先送り $p：$(grep -a -o '[0-9.]* コマ/秒' "$OUT/vkcube_${1}_pipe$p.txt" | head -1)"
     done
+done
+
+echo "== 3b. 窓に出るまでの遅れ：60 コマ/秒で区切り、前のやり方（PEND=1）と新しいやり方（10/7 午後）"
+for p in 1 0; do
+    IPHONE_VK_MAX_FPS=60 IPHONE_VK_PEND=$p IPHONE_VK_LOG=1 \
+        run 120 "D:/iphone-rpc/vkcube/vkcube.exe" --gpu_number 1 --c 300 --suppress_popups --present_mode 0 > "$OUT/latency_pend$p.txt" 2>&1
+    echo "PEND=$p：$(grep -a '窓に出るまで\|切り替え' "$OUT/latency_pend$p.txt" | sed 's/\[iphone-vk\] //' | tr '\n' ' ')"
 done
 
 echo "== 4. DirectX 11（DXVK-macOS）"
