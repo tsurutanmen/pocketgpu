@@ -212,6 +212,56 @@ static void rpc_flush(void) {
 }
 
 // 返事を待つ。返事の中身は out に入る（要らなければ NULL）
+// あとで受け取る返事。窓に出す絵を頼んだら返事を待たずにアプリを先へ進め、次のコマで受け取る。
+// 返事は頼んだ順にしか届かないので、ほかの命令が返事を読む前に、先にこれを読んで取っておく
+static struct { int active, ready; VkResult r; vr_buf out; } g_defer;
+
+// g_lock の中で、送り終えたあとに呼ぶ
+static void read_deferred_locked(void) {
+    if (!g_defer.active) return;
+    g_defer.active = 0;
+    g_defer.ready = 1;
+    g_defer.r = VK_ERROR_DEVICE_LOST;
+    g_defer.out.n = 0;
+    uint32_t h[2];
+    if (!vr_recv_all(g_sock, h, 8)) { g_dead = 1; return; }
+    vr_reserve(&g_defer.out, h[1]);
+    if (h[1] && !vr_recv_all(g_sock, g_defer.out.p, h[1])) { g_dead = 1; return; }
+    g_defer.out.n = h[1];
+    g_defer.r = (VkResult) (int32_t) h[0];
+    g_stat.bytes_in += 8 + h[1];
+}
+
+// 頼んで、返事は待たない。返事は rpc_take_deferred で受け取る（受け取る前に頼めるのは 1 つだけ）
+static void rpc_call_deferred(uint32_t op, vr_buf *b) {
+    AcquireSRWLockExclusive(&g_lock);
+    if (op < VR_OP_COUNT) g_stat.calls[op]++;
+    if (g_defer.active) { flush_locked(); read_deferred_locked(); }
+    put_msg_locked(op, b);
+    if (flush_locked()) { g_defer.active = 1; g_defer.ready = 0; }
+    ReleaseSRWLockExclusive(&g_lock);
+    b->n = 0;
+}
+
+// あとで受け取る返事を受け取る。まだ届いていなければ待つ。頼んでいなければ VK_NOT_READY
+static VkResult rpc_take_deferred(vr_buf *out) {
+    AcquireSRWLockExclusive(&g_lock);
+    double t0 = now_ms();
+    if (g_defer.active && flush_locked()) read_deferred_locked();
+    VkResult r = VK_NOT_READY;
+    if (g_defer.ready) {
+        g_defer.ready = 0;
+        r = g_defer.r;
+        out->n = 0;
+        vr_reserve(out, g_defer.out.n);
+        if (g_defer.out.n) memcpy(out->p, g_defer.out.p, g_defer.out.n);
+        out->n = g_defer.out.n;
+    }
+    g_stat.wait_ms[VR_READ_JPEG_PIPE] += now_ms() - t0;
+    ReleaseSRWLockExclusive(&g_lock);
+    return r;
+}
+
 static VkResult rpc_call(uint32_t op, vr_buf *b, vr_buf *out) {
     VkResult res = VK_ERROR_DEVICE_LOST;
     AcquireSRWLockExclusive(&g_lock);
@@ -219,6 +269,7 @@ static VkResult rpc_call(uint32_t op, vr_buf *b, vr_buf *out) {
     double t0 = now_ms();
     put_msg_locked(op, b);
     if (flush_locked()) {
+        read_deferred_locked();
         uint32_t h[2];
         if (vr_recv_all(g_sock, h, 8)) {
             vr_buf tmp = { 0 }, *dst = out ? out : &tmp;
@@ -847,6 +898,7 @@ static void read_back_many(rng *r, size_t n) {
         }
     double t0 = now_ms();
     int ok = flush_locked();
+    if (ok) read_deferred_locked();
     for (size_t i = 0; i < n && ok; i++)
         for (uint64_t at = r[i].off; at < r[i].off + r[i].len && ok; at += piece) {
             uint64_t k = r[i].off + r[i].len - at < piece ? r[i].off + r[i].len - at : piece;
@@ -2440,6 +2492,10 @@ static int jpeg_fetch(struct swapchain *sc, uint32_t j) {
     if (q < 0) { const char *e = getenv("IPHONE_VK_JPEG_Q"); q = e && atoi(e) > 0 ? atoi(e) : 80; }
     // 先送り：受け手は今のコマを後ろで縮め、ひとつ前のコマの JPEG を返す（窓に出るのは 1 コマ遅れる）
     if (pipe < 0) { const char *e = getenv("IPHONE_VK_JPEG_PIPE"); pipe = (g_hw.caps & VR_CAP_JPEG_PIPE) && !(e && *e == '0'); }
+    // 返事も待たない：頼んだら次のコマで受け取る。そのあいだにアプリは次のコマを作れる（窓に出るのはもう 1 コマ遅れる）。
+    // IPHONE_VK_ASYNC_PRESENT=0 で、今までどおり待つ
+    static int async = -1;
+    if (async < 0) { const char *e = getenv("IPHONE_VK_ASYNC_PRESENT"); async = pipe && !(e && *e == '0'); }
     vr_buf b = { 0 }, out = { 0 };
     vr_u64(&b, ID(sc->rbmem[j]));
     vr_u64(&b, 0);
@@ -2448,7 +2504,14 @@ static int jpeg_fetch(struct swapchain *sc, uint32_t j) {
     vr_u32(&b, sc->w * 4);
     vr_u32(&b, sc->fmt == VK_FORMAT_B8G8R8A8_UNORM || sc->fmt == VK_FORMAT_B8G8R8A8_SRGB ? 1 : 0);
     vr_u32(&b, (uint32_t) q);
-    VkResult r = rpc_call(pipe ? VR_READ_JPEG_PIPE : VR_READ_JPEG, &b, &out);
+    VkResult r;
+    if (async) {
+        r = rpc_take_deferred(&out); // 前のコマで頼んだ返事
+        rpc_call_deferred(VR_READ_JPEG_PIPE, &b);
+        if (r == VK_NOT_READY) r = VK_SUCCESS; // 最初のコマ：まだ出す物が無い
+    } else {
+        r = rpc_call(pipe ? VR_READ_JPEG_PIPE : VR_READ_JPEG, &b, &out);
+    }
     free(b.p);
     int ok = 0;
     UINT jw = 0, jh = 0;
