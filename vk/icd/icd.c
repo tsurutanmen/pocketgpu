@@ -560,11 +560,17 @@ static struct {
 } g_hw;
 static SRWLOCK g_hw_lock = SRWLOCK_INIT;
 
-// IPHONE_VK_DXVK3=1 のとき、新しい DXVK（3.x）が必須にする物のうち、ドライバがまだ全部は運べない物も名乗る
-// （descriptor indexing の 5 つ・inline uniform block・maintenance5 と 6）。確かめ終わったら外す
+// 新しい DXVK（2 以上）が必須にする物のうち、ドライバがまだ全部は運べない物も名乗る
+// （descriptor indexing の 5 つ・inline uniform block・maintenance5 と 6）。確かめ終わったら外す。
+// アプリの情報のエンジンの名前が DXVK で版が 2 以上なら自動で名乗る。IPHONE_VK_DXVK3=1 で必ず・=0 で名乗らない
+static int g_engine_dxvk2;
 static int dxvk3(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("IPHONE_VK_DXVK3"); v = e && *e == '1'; }
+    if (v < 0) {
+        const char *e = getenv("IPHONE_VK_DXVK3");
+        v = e && *e ? *e == '1' : g_engine_dxvk2;
+        if (v && !(e && *e)) say("新しい DXVK なので、DXVK 3 のための名乗りを入れる");
+    }
     return v;
 }
 
@@ -1139,7 +1145,13 @@ static void complete(struct dev *d, struct queue *q, uint64_t upto) {
 
 // ---- インスタンスと装置の性質 ----
 static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *a, VkInstance *out) {
-    (void) ci; (void) a;
+    (void) a;
+    const VkApplicationInfo *ai = ci ? ci->pApplicationInfo : NULL;
+    if (ai && ai->pEngineName) {
+        uint32_t major = (ai->engineVersion >> 22) & 0x7F; // VK_MAKE_VERSION の形
+        say("アプリのエンジン：%s %u.%u.%u", ai->pEngineName, major, (ai->engineVersion >> 12) & 0x3FF, ai->engineVersion & 0xFFF);
+        if (!strcmp(ai->pEngineName, "DXVK") && major >= 2) g_engine_dxvk2 = 1;
+    }
     struct inst *i = calloc(1, sizeof *i);
     if (!i) return VK_ERROR_OUT_OF_HOST_MEMORY;
     set_loader_magic_value(i);
