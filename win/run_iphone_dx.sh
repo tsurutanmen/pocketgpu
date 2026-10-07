@@ -154,7 +154,7 @@ Z=$VKB/zink_iphone
 grep -a "GL_VERSION\|^結果\|作れない\|切れた" "$OUT/glzt.txt" | head -4
 
 echo "== 12. 窓の絵：JPEG と H.264（vkcube 1280x720・3b と同じ 60 コマ/秒の区切りの遅れと、全速・受け手が VR_CAP_H264 を名乗るとき）"
-echo "（10/7 夜の代役：区切りありの H.264 は遅れが平均 50 ms と大きい。JPEG は 5.6 ms）"
+echo "（10/7 夜の代役：IMMEDIATE で区切ると H.264 7.2 ms・JPEG 6.6 ms。FIFO（IPHONE_VK_VSYNC=1）で区切ると H.264 だけ 50 ms と大きい）"
 for v in 0 1; do
     IPHONE_VK_ONLY=1 IPHONE_VK_VIDEO=$v IPHONE_VK_MAX_FPS=60 IPHONE_VK_STATS=1 IPHONE_VK_LOG=1 \
         run 120 "D:/iphone-rpc/vkcube/vkcube.exe" --gpu_number 0 --c 300 --suppress_popups --present_mode 0 --width 1280 --height 720 > "$OUT/vkcube_video$v.txt" 2>&1
