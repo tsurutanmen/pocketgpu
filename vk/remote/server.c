@@ -22,6 +22,8 @@
 #ifdef __APPLE__
 #include <CoreGraphics/CoreGraphics.h>
 #include <ImageIO/ImageIO.h>
+// 窓に出すコマを H.264 に縮める（VideoToolbox・CoreMedia・CoreVideo）
+#include <VideoToolbox/VideoToolbox.h>
 #include <os/log.h>
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
@@ -35,6 +37,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #endif
+#include "video.h"
 
 // 記録。iPhone ではアプリの中の printf が見えないので os_log に出す（PC から USB で読める）
 static void vlog(const char *fmt, ...) {
@@ -106,6 +109,7 @@ VKFUNCS_OPT(DECL)
 #undef DECL
 
 static uint32_t g_caps = VR_CAP_DELTA; // 受け手ができること（あいさつで名乗る）
+static int vid_probe(void);            // 窓に出すコマを H.264 に縮められるか（下の VR_READ_H264 のところ）
 // 空の descriptor（robustness2 の nullDescriptor）を GPU が持つか。持てば装置を作るときに有効にする。
 // 持たなければ（MoltenVK）、空の頂点バッファだけは 0 で埋めた代わりのバッファに差し替える
 static int g_nulldesc_gpu;
@@ -390,6 +394,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
 #if defined(__APPLE__) || defined(_WIN32)
     caps |= VR_CAP_JPEG | VR_CAP_JPEG_PIPE; // 窓に出すコマを JPEG に縮められる（iPhone は ImageIO、PC の代役は WIC）
 #endif
+    if (vid_probe()) caps |= VR_CAP_H264; // 窓に出すコマを H.264 に縮められる（iPhone は VideoToolbox、PC の代役は Media Foundation）
     // buffer device address（GPU の中のバッファのアドレス）
     if (fbda.bufferDeviceAddress && (v12 || e_bda)) {
         vkGetBufferDeviceAddress = (PFN_vkGetBufferDeviceAddress) load_opt(v12, "vkGetBufferDeviceAddress", e_bda ? "KHR" : NULL);
@@ -783,9 +788,11 @@ static int chain_ready(void) {
 
 // ---- 1 つの接続の間に作った物を、切れたときに片づける ----
 static void jp_reset(void);
+static void vid_reset(void);
 static void cleanup(void) {
     drain();
     jp_reset();
+    vid_reset();
     for (size_t i = 0; i < g_ncbi; i++) { free(g_cbi[i].sets); idlist_free(&g_cbi[i].mems); }
     g_ncbi = 0;
     if (g_err == VK_ERROR_DEVICE_LOST) g_lost = 1;
@@ -1604,6 +1611,557 @@ static int jp_start(const uint8_t *src) {
 static void jp_reset(void) {}
 #endif
 
+// ---- 窓に出すコマを H.264 に縮める（VR_READ_H264） ----
+// 遅れを小さくする設定：B フレームなし（並べ替えない）・1 コマ入れたら 1 コマ出るまで待つ・レートは低遅延の物。
+// キーフレームは最初と、ドライバが頼んだとき（ほどき直し）と、決めた間隔ごと。
+// 機械ごとの中身は vid_probe・vid_open・vid_encode・vid_close の 4 つ。絵は BGRA のまま渡し、中で NV12 にする
+#if defined(_WIN32)
+// ---- PC の代役：Media Foundation の H.264 エンコーダ ----
+// GPU の物（NVIDIA などの非同期の MFT）を先に試し、だめならソフトの物（Microsoft の同期の MFT）。VKR_VIDEO_HW=0 でソフトだけ
+typedef struct {
+    IMFActivate *act;
+    IMFTransform *t;
+    ICodecAPI *api;
+    IMFMediaEventGenerator *ev; // 非同期の MFT だけ
+    int need, have;             // 非同期：受け取れる入力の数・受け取れる出力の数
+    int provides;               // 出力の sample を MFT が用意する
+    DWORD outsz;
+    uint32_t ew, eh, fps;
+    int hw;
+    char name[96];
+} mf_enc;
+static int g_vid_hw_bad; // GPU のエンコーダが途中で動かなくなった。この先はソフトの物を使う
+
+static void mf_free(mf_enc *e) {
+    if (!e) return;
+    if (e->t) {
+        IMFTransform_ProcessMessage(e->t, MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+        IMFTransform_ProcessMessage(e->t, MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+    }
+    if (e->ev) IMFMediaEventGenerator_Release(e->ev);
+    if (e->api) ICodecAPI_Release(e->api);
+    if (e->t) IMFTransform_Release(e->t);
+    if (e->act) { IMFActivate_ShutdownObject(e->act); IMFActivate_Release(e->act); }
+    free(e);
+}
+
+// 非同期の MFT の知らせを読む。want が 0 なら入力を受け取れるまで、1 なら出力が出るまで。1 秒で諦める
+static int mf_pump(mf_enc *e, int want) {
+    double t0 = t_ms();
+    while (want ? e->have <= 0 : e->need <= 0) {
+        IMFMediaEvent *ev = NULL;
+        HRESULT hr = IMFMediaEventGenerator_GetEvent(e->ev, MF_EVENT_FLAG_NO_WAIT, &ev);
+        if (hr == MF_E_NO_EVENTS_AVAILABLE) {
+            double dt = t_ms() - t0;
+            if (dt > 1000) return 0;
+            if (dt > 2) Sleep(1);
+            else SwitchToThread();
+            continue;
+        }
+        if (FAILED(hr) || !ev) return 0;
+        MediaEventType ty = 0;
+        IMFMediaEvent_GetType(ev, &ty);
+        IMFMediaEvent_Release(ev);
+        if (ty == METransformNeedInput) e->need++;
+        else if (ty == METransformHaveOutput) e->have++;
+    }
+    return 1;
+}
+
+static int mf_setup(mf_enc *e, uint32_t kbps, uint32_t fps, uint32_t gop) {
+    IMFAttributes *at = NULL;
+    UINT32 async = 0;
+    if (SUCCEEDED(IMFTransform_GetAttributes(e->t, &at)) && at) {
+        IMFAttributes_GetUINT32(at, &VG_ASYNC, &async);
+        if (async) IMFAttributes_SetUINT32(at, &VG_ASYNC_UNLOCK, TRUE);
+        IMFAttributes_SetUINT32(at, &VG_LOW_LATENCY, TRUE);
+        IMFAttributes_Release(at);
+    }
+    if (async && FAILED(IMFTransform_QueryInterface(e->t, &VG_IID_EVENTGEN, (void **) &e->ev))) return 0;
+    // レートの決め方：既定は CBR（0）。VKR_VIDEO_RC で変える（4 は低遅延の VBR）
+    const char *rc = getenv("VKR_VIDEO_RC");
+    if (SUCCEEDED(IMFTransform_QueryInterface(e->t, &VG_IID_CODECAPI, (void **) &e->api)) && e->api) {
+        vid_api_bool(e->api, &VG_LOW_LATENCY, 1);
+        vid_api_u32(e->api, &VG_RC_MODE, rc && *rc ? (UINT32) atoi(rc) : 0);
+        vid_api_u32(e->api, &VG_MEAN_BITRATE, kbps * 1000);
+        vid_api_u32(e->api, &VG_GOP, gop);
+        vid_api_u32(e->api, &VG_BFRAMES, 0);
+        if (!e->hw) vid_api_u32(e->api, &VG_QUALITY_SPEED, 0); // ソフトの物は速さを取る
+    }
+    // 出す形を先に決める（エンコーダはこの順でないと断る）。High・Main・Baseline の順に試す
+    static const uint32_t prof[] = { 100, 77, 66 };
+    HRESULT hr = E_FAIL;
+    for (int i = 0; i < 3 && FAILED(hr); i++) {
+        IMFMediaType *o = vid_type(&VG_H264, e->ew, e->eh, fps, kbps * 1000, prof[i]);
+        if (!o) return 0;
+        hr = IMFTransform_SetOutputType(e->t, 0, o, 0);
+        IMFMediaType_Release(o);
+    }
+    if (FAILED(hr)) return 0;
+    IMFMediaType *in = vid_type(&VG_NV12, e->ew, e->eh, fps, 0, 0);
+    if (!in) return 0;
+    hr = IMFTransform_SetInputType(e->t, 0, in, 0);
+    IMFMediaType_Release(in);
+    if (FAILED(hr)) return 0;
+    MFT_OUTPUT_STREAM_INFO si;
+    memset(&si, 0, sizeof si);
+    if (FAILED(IMFTransform_GetOutputStreamInfo(e->t, 0, &si))) return 0;
+    e->provides = (si.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
+    e->outsz = si.cbSize > e->ew * e->eh * 3 / 2 ? si.cbSize : e->ew * e->eh * 3 / 2 + 65536;
+    IMFTransform_ProcessMessage(e->t, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    IMFTransform_ProcessMessage(e->t, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    return 1;
+}
+
+static int vid_probe(void) {
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    const vid_mf_api *mf = vid_mf();
+    if (!mf) return 0;
+    MFT_REGISTER_TYPE_INFO in = { VG_VIDEO, VG_NV12 }, out = { VG_VIDEO, VG_H264 };
+    IMFActivate **act = NULL;
+    UINT32 n = 0;
+    if (FAILED(mf->TEnumEx(VG_CAT_ENCODER, MFT_ENUM_FLAG_ALL | MFT_ENUM_FLAG_SORTANDFILTER, &in, &out, &act, &n))) n = 0;
+    for (UINT32 i = 0; i < n; i++) IMFActivate_Release(act[i]);
+    if (act) CoTaskMemFree(act);
+    return n > 0;
+}
+
+static void *vid_open(uint32_t ew, uint32_t eh, uint32_t kbps, uint32_t fps, uint32_t gop) {
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    const vid_mf_api *mf = vid_mf();
+    if (!mf) return NULL;
+    MFT_REGISTER_TYPE_INFO in = { VG_VIDEO, VG_NV12 }, out = { VG_VIDEO, VG_H264 };
+    const char *hwe = getenv("VKR_VIDEO_HW");
+    mf_enc *got = NULL;
+    for (int pass = (hwe && *hwe == '0') || g_vid_hw_bad ? 1 : 0; pass < 2 && !got; pass++) {
+        IMFActivate **act = NULL;
+        UINT32 n = 0;
+        UINT32 fl = (pass == 0 ? MFT_ENUM_FLAG_HARDWARE : MFT_ENUM_FLAG_SYNCMFT) | MFT_ENUM_FLAG_SORTANDFILTER;
+        if (FAILED(mf->TEnumEx(VG_CAT_ENCODER, fl, &in, &out, &act, &n))) n = 0;
+        for (UINT32 i = 0; i < n; i++) {
+            mf_enc *e = got ? NULL : calloc(1, sizeof *e);
+            if (e) {
+                e->ew = ew, e->eh = eh, e->fps = fps, e->hw = pass == 0;
+                WCHAR wn[96] = { 0 };
+                if (SUCCEEDED(IMFActivate_GetString(act[i], &VG_FRIENDLY_NAME, wn, 96, NULL)))
+                    WideCharToMultiByte(CP_UTF8, 0, wn, -1, e->name, sizeof e->name - 1, NULL, NULL);
+                if (SUCCEEDED(IMFActivate_ActivateObject(act[i], &VG_IID_TRANSFORM, (void **) &e->t))) {
+                    e->act = act[i];
+                    IMFActivate_AddRef(act[i]);
+                }
+                if (e->t && mf_setup(e, kbps, fps, gop)) got = e;
+                else {
+                    vlog("H.264 のエンコーダ %s は使えない", e->name[0] ? e->name : "?");
+                    mf_free(e);
+                }
+            }
+            IMFActivate_Release(act[i]);
+        }
+        if (act) CoTaskMemFree(act);
+    }
+    if (got)
+        vlog("H.264 のエンコーダ：%s（%s）・%u x %u・%u kbps・%u コマ/秒・キーフレームは %u コマごと", got->name, got->hw ? "GPU" : "ソフト",
+             ew, eh, kbps, fps, gop);
+    return got;
+}
+
+static int mf_encode(mf_enc *e, const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, int bgra, uint64_t idx, int key, vr_buf *out, int *iskey) {
+    const DWORD n = e->ew * e->eh * 3 / 2;
+    IMFSample *s = vid_sample(n);
+    if (!s) return 0;
+    IMFMediaBuffer *b = NULL;
+    BYTE *p = NULL;
+    if (FAILED(IMFSample_GetBufferByIndex(s, 0, &b)) || FAILED(IMFMediaBuffer_Lock(b, &p, NULL, NULL))) {
+        if (b) IMFMediaBuffer_Release(b);
+        IMFSample_Release(s);
+        return 0;
+    }
+    vid_rgb_to_nv12(px, w, h, stride, bgra, p, e->ew, p + (size_t) e->ew * e->eh, e->ew);
+    IMFMediaBuffer_Unlock(b);
+    IMFMediaBuffer_SetCurrentLength(b, n);
+    IMFMediaBuffer_Release(b);
+    IMFSample_SetSampleTime(s, (LONGLONG) (idx * 10000000ull / e->fps));
+    IMFSample_SetSampleDuration(s, (LONGLONG) (10000000ull / e->fps));
+    if (key && e->api) vid_api_u32(e->api, &VG_FORCE_KEY, 1);
+    HRESULT hr = e->ev && !mf_pump(e, 0) ? E_FAIL : IMFTransform_ProcessInput(e->t, 0, s, 0);
+    IMFSample_Release(s);
+    if (FAILED(hr)) return 0;
+    if (e->ev) e->need--;
+    // 出てくるまで受け取る（B フレームなしで遅れの少ない設定なので、1 つ入れれば 1 つ出る）
+    int got = 0;
+    for (;;) {
+        if (e->ev && !mf_pump(e, 1)) break;
+        MFT_OUTPUT_DATA_BUFFER ob;
+        memset(&ob, 0, sizeof ob);
+        if (!e->provides && !(ob.pSample = vid_sample(e->outsz))) break;
+        DWORD st = 0;
+        hr = IMFTransform_ProcessOutput(e->t, 0, 1, &ob, &st);
+        if (e->ev) e->have--;
+        if (ob.pEvents) IMFCollection_Release(ob.pEvents);
+        if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+            // 出す形が変わった：新しい形を受け入れて続ける
+            IMFMediaType *t = NULL;
+            if (ob.pSample) IMFSample_Release(ob.pSample);
+            if (SUCCEEDED(IMFTransform_GetOutputAvailableType(e->t, 0, 0, &t)) && t) {
+                IMFTransform_SetOutputType(e->t, 0, t, 0);
+                IMFMediaType_Release(t);
+            }
+            continue;
+        }
+        if (FAILED(hr)) {
+            if (ob.pSample) IMFSample_Release(ob.pSample);
+            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) break;
+            return 0;
+        }
+        IMFMediaBuffer *mb = NULL;
+        BYTE *q = NULL;
+        DWORD len = 0;
+        if (SUCCEEDED(IMFSample_ConvertToContiguousBuffer(ob.pSample, &mb)) && SUCCEEDED(IMFMediaBuffer_Lock(mb, &q, NULL, &len))) {
+            vr_put(out, q, len);
+            IMFMediaBuffer_Unlock(mb);
+        }
+        if (mb) IMFMediaBuffer_Release(mb);
+        UINT32 clean = 0;
+        if (SUCCEEDED(IMFSample_GetUINT32(ob.pSample, &VG_CLEAN_POINT, &clean)) && clean) *iskey = 1;
+        IMFSample_Release(ob.pSample);
+        got = 1;
+        if (e->ev) break; // 非同期：出力の知らせ 1 つに 1 つ
+    }
+    return got;
+}
+
+static int vid_encode(void *p, const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, int bgra, uint64_t idx, int key, vr_buf *out, int *iskey) {
+    mf_enc *e = (mf_enc *) p;
+    static _Thread_local int com; // 作った糸と違う糸（先送りの糸など）から使うこともある
+    if (!com) { CoInitializeEx(NULL, COINIT_MULTITHREADED); com = 1; }
+    int ok = mf_encode(e, px, w, h, stride, bgra, idx, key, out, iskey);
+    // GPU の物が出さなくなったら、この先はソフトの物にする（作り直しは呼んだ側がする）
+    if (!ok && e->hw && !g_vid_hw_bad) { g_vid_hw_bad = 1; vlog("GPU の H.264 エンコーダ %s が出さない。この先はソフトの物を使う", e->name); }
+    return ok;
+}
+
+static void vid_close(void *p) { mf_free((mf_enc *) p); }
+
+#elif defined(__APPLE__)
+// ---- iPhone：VideoToolbox の H.264 エンコーダ（専用回路） ----
+// iPhone では未確認。Windows では組めないので、Apple の資料どおりに書いた。
+// VTCompressionSession を低遅延のレート（EnableLowLatencyRateControl・iOS 14.5 から）・RealTime・並べ替えなしで作り、
+// 1 コマ渡すたびに VTCompressionSessionCompleteFrames で出てくるまで待つ。出てきた AVCC（長さ＋NAL）は Annex B に直す
+typedef struct {
+    VTCompressionSessionRef s;
+    uint32_t ew, eh, fps;
+    vr_buf *out; // 縮めている間だけ、出てきた NAL をここに足す
+    int key, got, force_key;
+    OSStatus err;
+} vt_enc;
+
+static void vt_done(void *ref, void *frame, OSStatus st, VTEncodeInfoFlags info, CMSampleBufferRef sb) {
+    (void) frame;
+    vt_enc *e = (vt_enc *) ref;
+    if (!e->out) return; // 閉じるときの残り
+    if (st != noErr) { e->err = st; return; }
+    if (!sb || (info & kVTEncodeInfo_FrameDropped)) return; // 落とされた。次をキーフレームにする
+    static const uint8_t sc4[4] = { 0, 0, 0, 1 };
+    int key = 1;
+    CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(sb, false);
+    if (att && CFArrayGetCount(att) > 0) {
+        CFDictionaryRef d = (CFDictionaryRef) CFArrayGetValueAtIndex(att, 0);
+        const void *v = NULL;
+        if (CFDictionaryGetValueIfPresent(d, kCMSampleAttachmentKey_NotSync, &v) && v && CFBooleanGetValue((CFBooleanRef) v)) key = 0;
+    }
+    CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb);
+    size_t nps = 0;
+    int nlen = 4;
+    if (!fd || CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, 0, NULL, NULL, &nps, &nlen) != noErr) { e->err = -1; return; }
+    if (key)
+        for (size_t i = 0; i < nps; i++) { // SPS と PPS
+            const uint8_t *p = NULL;
+            size_t sz = 0;
+            if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fd, i, &p, &sz, NULL, NULL) == noErr && p) {
+                vr_put(e->out, sc4, 4);
+                vr_put(e->out, p, sz);
+            }
+        }
+    CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+    size_t total = bb ? CMBlockBufferGetDataLength(bb) : 0;
+    uint8_t *tmp = total ? malloc(total) : NULL;
+    if (!tmp || CMBlockBufferCopyDataBytes(bb, 0, total, tmp) != kCMBlockBufferNoErr || nlen < 1 || nlen > 4) { free(tmp); e->err = -1; return; }
+    for (size_t at = 0; at + (size_t) nlen <= total;) {
+        uint32_t l = 0;
+        for (int k = 0; k < nlen; k++) l = (l << 8) | tmp[at + (size_t) k];
+        at += (size_t) nlen;
+        if (l > total - at) break;
+        vr_put(e->out, sc4, 4);
+        vr_put(e->out, tmp + at, l);
+        at += l;
+    }
+    free(tmp);
+    e->key = key;
+    e->got = 1;
+}
+
+static void vt_num(VTCompressionSessionRef s, CFStringRef k, int32_t v) {
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberSInt32Type, &v);
+    if (n) { VTSessionSetProperty(s, k, n); CFRelease(n); }
+}
+
+static void *vid_open(uint32_t ew, uint32_t eh, uint32_t kbps, uint32_t fps, uint32_t gop) {
+    vt_enc *e = calloc(1, sizeof *e);
+    if (!e) return NULL;
+    e->ew = ew, e->eh = eh, e->fps = fps;
+    const void *sk[] = { kVTVideoEncoderSpecification_EnableLowLatencyRateControl };
+    const void *sv[] = { kCFBooleanTrue };
+    CFDictionaryRef spec = CFDictionaryCreate(NULL, sk, sv, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    // 入れる絵：NV12（狭い幅）。IOSurface つきにすると、専用回路に写さずに渡せる
+    int32_t pf = (int32_t) kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, iw = (int32_t) ew, ih = (int32_t) eh;
+    CFNumberRef npf = CFNumberCreate(NULL, kCFNumberSInt32Type, &pf), nw = CFNumberCreate(NULL, kCFNumberSInt32Type, &iw),
+                nh = CFNumberCreate(NULL, kCFNumberSInt32Type, &ih);
+    CFDictionaryRef ios = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    const void *ak[] = { kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelBufferHeightKey, kCVPixelBufferIOSurfacePropertiesKey };
+    const void *av[] = { npf, nw, nh, ios };
+    CFDictionaryRef attrs = CFDictionaryCreate(NULL, ak, av, 4, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    OSStatus st = VTCompressionSessionCreate(NULL, iw, ih, kCMVideoCodecType_H264, spec, attrs, NULL, vt_done, e, &e->s);
+    CFRelease(attrs); CFRelease(ios); CFRelease(nh); CFRelease(nw); CFRelease(npf); CFRelease(spec);
+    if (st != noErr || !e->s) {
+        vlog("H.264 のエンコーダを作れない（%d）", (int) st);
+        free(e);
+        return NULL;
+    }
+    VTSessionSetProperty(e->s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+    VTSessionSetProperty(e->s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse); // B フレームなし
+    // 低遅延の作り方は Constrained High（B フレームの無い High）を使う。断られたら High
+    if (VTSessionSetProperty(e->s, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_ConstrainedHigh_AutoLevel) != noErr)
+        VTSessionSetProperty(e->s, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
+    vt_num(e->s, kVTCompressionPropertyKey_AverageBitRate, (int32_t) (kbps > 2000000 ? 2000000000 : kbps * 1000));
+    vt_num(e->s, kVTCompressionPropertyKey_ExpectedFrameRate, (int32_t) fps);
+    vt_num(e->s, kVTCompressionPropertyKey_MaxKeyFrameInterval, (int32_t) gop);
+    VTCompressionSessionPrepareToEncodeFrames(e->s);
+    vlog("H.264 のエンコーダ：VideoToolbox・%u x %u・%u kbps・%u コマ/秒・キーフレームは %u コマごと", ew, eh, kbps, fps, gop);
+    return e;
+}
+
+static void vid_close(void *p) {
+    vt_enc *e = (vt_enc *) p;
+    if (!e) return;
+    e->out = NULL;
+    if (e->s) {
+        VTCompressionSessionCompleteFrames(e->s, kCMTimeInvalid);
+        VTCompressionSessionInvalidate(e->s);
+        CFRelease(e->s);
+    }
+    free(e);
+}
+
+static int vid_probe(void) {
+    void *e = vid_open(64, 64, 500, 30, 30);
+    if (!e) return 0;
+    vid_close(e);
+    return 1;
+}
+
+static int vid_encode(void *p, const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, int bgra, uint64_t idx, int key, vr_buf *out, int *iskey) {
+    vt_enc *e = (vt_enc *) p;
+    CVPixelBufferPoolRef pool = VTCompressionSessionGetPixelBufferPool(e->s);
+    CVPixelBufferRef pb = NULL;
+    if (!pool || CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb) != kCVReturnSuccess || !pb) return 0;
+    CVPixelBufferLockBaseAddress(pb, 0);
+    vid_rgb_to_nv12(px, w, h, stride, bgra, (uint8_t *) CVPixelBufferGetBaseAddressOfPlane(pb, 0), (uint32_t) CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
+                    (uint8_t *) CVPixelBufferGetBaseAddressOfPlane(pb, 1), (uint32_t) CVPixelBufferGetBytesPerRowOfPlane(pb, 1));
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    CFDictionaryRef opt = NULL;
+    if (key || e->force_key) {
+        const void *k[] = { kVTEncodeFrameOptionKey_ForceKeyFrame };
+        const void *v[] = { kCFBooleanTrue };
+        opt = CFDictionaryCreate(NULL, k, v, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    }
+    e->out = out, e->got = 0, e->key = 0, e->err = noErr;
+    CMTime pts = CMTimeMake((int64_t) idx, (int32_t) e->fps);
+    VTEncodeInfoFlags fl = 0;
+    OSStatus st = VTCompressionSessionEncodeFrame(e->s, pb, pts, CMTimeMake(1, (int32_t) e->fps), opt, NULL, &fl);
+    // 出てくるまで待つ（後ろにためない）
+    if (st == noErr) st = VTCompressionSessionCompleteFrames(e->s, pts);
+    e->out = NULL;
+    if (opt) CFRelease(opt);
+    CVPixelBufferRelease(pb);
+    if (st != noErr || e->err != noErr) {
+        vlog("H.264 に縮められない（%d・%d）", (int) st, (int) e->err);
+        return 0;
+    }
+    // 落とされたら空のまま返し、次をキーフレームにする（ドライバは空のコマを飛ばす）
+    e->force_key = !e->got;
+    *iskey = e->key;
+    return 1;
+}
+
+#else
+// ほかの機械（Linux での文法の確かめなど）では縮められない。名乗らない
+static int vid_probe(void) { return 0; }
+static void *vid_open(uint32_t ew, uint32_t eh, uint32_t kbps, uint32_t fps, uint32_t gop) {
+    (void) ew; (void) eh; (void) kbps; (void) fps; (void) gop;
+    return NULL;
+}
+static int vid_encode(void *p, const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, int bgra, uint64_t idx, int key, vr_buf *out, int *iskey) {
+    (void) p; (void) px; (void) w; (void) h; (void) stride; (void) bgra; (void) idx; (void) key; (void) out; (void) iskey;
+    return 0;
+}
+static void vid_close(void *p) { (void) p; }
+#endif
+
+// 流れ（ドライバの swapchain）ごとのエンコーダ。たいていは 1 つ。3 秒使われなかった物は閉じる（GPU のエンコーダは数に限りがある）
+#define VENC_MAX 4
+static struct venc {
+    uint64_t stream, n; // n：この流れで縮めたコマの数
+    uint32_t w, h, kbps, fps, gop;
+    double used;
+    void *e;
+} g_venc[VENC_MAX];
+
+static void venc_drop(struct venc *v) {
+    if (v->e) vid_close(v->e);
+    memset(v, 0, sizeof *v);
+}
+
+static struct venc *venc_get(uint64_t stream, uint32_t w, uint32_t h, uint32_t kbps, uint32_t fps, uint32_t gop) {
+    double now = t_ms();
+    struct venc *hit = NULL, *spare = NULL;
+    for (int i = 0; i < VENC_MAX; i++) {
+        struct venc *v = &g_venc[i];
+        if (v->e && v->stream == stream) hit = v;
+        else if (v->e && now - v->used > 3000) venc_drop(v);
+    }
+    // 同じ流れで大きさや設定が変わったら作り直す（最初のコマはキーフレームになる）
+    if (hit && (hit->w != w || hit->h != h || hit->kbps != kbps || hit->fps != fps || hit->gop != gop)) { venc_drop(hit); spare = hit; hit = NULL; }
+    if (!hit) {
+        for (int i = 0; i < VENC_MAX && !spare; i++) if (!g_venc[i].e) spare = &g_venc[i];
+        if (!spare) {
+            spare = &g_venc[0];
+            for (int i = 1; i < VENC_MAX; i++) if (g_venc[i].used < spare->used) spare = &g_venc[i];
+            venc_drop(spare);
+        }
+        void *e = vid_open((w + 1) & ~1u, (h + 1) & ~1u, kbps, fps, gop);
+        if (!e) return NULL;
+        vlog("H.264 のエンコーダを作るのに %.0f ms（その間、窓の絵は止まる）", t_ms() - now);
+        spare->stream = stream, spare->n = 0, spare->w = w, spare->h = h, spare->kbps = kbps, spare->fps = fps, spare->gop = gop, spare->e = e;
+        hit = spare;
+    }
+    hit->used = now;
+    return hit;
+}
+
+// 1 コマを縮めて、頭（VR_H264_HEAD）と NAL の並びを out に足す。縮められなければ 0
+static int h264_frame(const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, int bgra, uint32_t flags, uint32_t kbps, uint32_t fps, uint32_t gop,
+                      uint64_t stream, uint64_t tag, vr_buf *out) {
+    // 調べ用：VKR_VIDEO_FAIL=n なら、n コマ目から縮められないふりをする（ドライバが JPEG に戻るかを試す）
+    static long fail_at = -1;
+    static uint64_t seen;
+    if (fail_at < 0) { const char *e = getenv("VKR_VIDEO_FAIL"); fail_at = e ? atol(e) : 0; }
+    if (fail_at > 0 && ++seen >= (uint64_t) fail_at) return 0;
+    const size_t at = out->n;
+    uint8_t head[VR_H264_HEAD];
+    memset(head, 0, sizeof head);
+    int key = 0;
+    for (int tries = 0; tries < 2; tries++) {
+        // 1 回目が失敗したら、エンコーダを作り直してもう 1 回（iPhone で後ろに回ったあとは、作り直さないと使えない）
+        struct venc *v = venc_get(stream, w, h, kbps, fps, gop);
+        if (!v) break;
+        out->n = at;
+        vr_put(out, head, sizeof head);
+        key = 0;
+        if (vid_encode(v->e, px, w, h, stride, bgra, v->n, (flags & VR_H264_KEY) || v->n == 0, out, &key)) {
+            v->n++;
+            uint32_t f = key ? 1u : 0u;
+            uint8_t *hp = out->p + at;
+            memcpy(hp, &stream, 8);
+            memcpy(hp + 8, &tag, 8);
+            memcpy(hp + 16, &w, 4);
+            memcpy(hp + 20, &h, 4);
+            memcpy(hp + 24, &f, 4);
+            return 1;
+        }
+        venc_drop(v);
+    }
+    out->n = at;
+    return 0;
+}
+
+// 先送り：今のコマを写して別の糸で縮め始め、返事にはひとつ前のコマを入れる（JPEG の先送りと同じ形）
+static struct {
+    uint8_t *px;
+    size_t cap;
+    uint32_t w, h, stride, bgra, flags, kbps, fps, gop;
+    uint64_t stream, tag;
+    int has, ok, busy; // has：縮め始めたコマがある
+    double ms;
+    vr_buf out;
+#ifdef _WIN32
+    HANDLE thr;
+#else
+    pthread_t thr;
+#endif
+} g_vp;
+
+static void vp_encode(void) {
+    double t0 = t_ms();
+    g_vp.out.n = 0;
+    g_vp.ok = h264_frame(g_vp.px, g_vp.w, g_vp.h, g_vp.stride, (int) g_vp.bgra, g_vp.flags, g_vp.kbps, g_vp.fps, g_vp.gop, g_vp.stream, g_vp.tag, &g_vp.out);
+    g_vp.ms = t_ms() - t0;
+}
+
+#ifdef _WIN32
+static DWORD WINAPI vp_thread(LPVOID a) {
+    (void) a;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    vp_encode();
+    return 0;
+}
+#else
+static void *vp_thread(void *a) {
+    (void) a;
+    vp_encode();
+    return NULL;
+}
+#endif
+
+static void vp_join(void) {
+    if (!g_vp.busy) return;
+#ifdef _WIN32
+    WaitForSingleObject(g_vp.thr, INFINITE);
+    CloseHandle(g_vp.thr);
+#else
+    pthread_join(g_vp.thr, NULL);
+#endif
+    g_vp.busy = 0;
+}
+
+static int vp_start(const uint8_t *src) {
+    size_t need = (size_t) g_vp.stride * g_vp.h;
+    if (g_vp.cap < need) {
+        free(g_vp.px);
+        g_vp.px = malloc(need);
+        g_vp.cap = g_vp.px ? need : 0;
+        if (!g_vp.px) return 0;
+    }
+    memcpy(g_vp.px, src, need); // GPU のメモリから、まとめて写す
+    g_vp.ok = 0;
+    g_vp.has = 1;
+#ifdef _WIN32
+    g_vp.thr = CreateThread(NULL, 0, vp_thread, NULL, 0, NULL);
+    g_vp.busy = g_vp.thr != NULL;
+#else
+    g_vp.busy = pthread_create(&g_vp.thr, NULL, vp_thread, NULL) == 0;
+#endif
+    if (!g_vp.busy) vp_encode(); // 糸を作れなければ、その場で縮める
+    return 1;
+}
+
+// 接続が切れたとき：縮めている途中なら待ち、エンコーダを全部閉じる（次につないだ人に前の人のコマを見せない）
+static void vid_reset(void) {
+    vp_join();
+    g_vp.has = g_vp.ok = 0;
+    g_vp.out.n = 0;
+    for (int i = 0; i < VENC_MAX; i++) venc_drop(&g_venc[i]);
+}
+
 // ---- 1 つの命令を実行する。返事が要るものは reply する ----
 static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     g_cur_op = op;
@@ -1651,7 +2209,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     // GPU を失っていたら、返事のある命令でそれを伝える（黙って間違った答えを返さない）
     if (g_err != VK_SUCCESS) {
         switch (op) {
-        case VR_MEM_READ: case VR_MEM_READ_DELTA: case VR_READ_JPEG: case VR_READ_JPEG_PIPE: case VR_WAIT_FOR_FENCES: case VR_GET_FENCE_STATUS: case VR_WAIT_SEMAPHORES:
+        case VR_MEM_READ: case VR_MEM_READ_DELTA: case VR_READ_JPEG: case VR_READ_JPEG_PIPE: case VR_READ_H264: case VR_WAIT_FOR_FENCES: case VR_GET_FENCE_STATUS: case VR_WAIT_SEMAPHORES:
         case VR_GET_SEMAPHORE_COUNTER: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE: case VR_GET_QUERY_POOL_RESULTS:
             return reply(s, g_err);
         default:
@@ -1989,6 +2547,65 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         (void) bgra; (void) q;
         return reply(s, VK_ERROR_FEATURE_NOT_PRESENT);
 #endif
+    }
+    case VR_READ_H264: {
+        static double vt_wait, vt_join_ms, vt_enc;
+        static uint64_t vn, vbytes, vkeys;
+        double t0 = t_ms();
+        uint64_t mid = vr_ru64(r);
+        drain_upto(last_with_mem(mid));
+        vt_wait += t_ms() - t0;
+        if (g_err != VK_SUCCESS) return reply(s, g_err);
+        ent *e = find(mid);
+        uint64_t off = vr_ru64(r);
+        uint32_t w = vr_ru32(r), h = vr_ru32(r), stride = vr_ru32(r), bgra = vr_ru32(r), flags = vr_ru32(r);
+        uint32_t kbps = vr_ru32(r), fps = vr_ru32(r), gop = vr_ru32(r);
+        uint64_t stream = vr_ru64(r), tag = vr_ru64(r);
+        if (r->bad || !e || !e->map || w == 0 || h == 0 || w > 16384 || h > 16384 || stride < (uint64_t) w * 4 || off > e->size ||
+            (uint64_t) stride * h > e->size - off)
+            return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
+        if (!kbps || kbps > 1000000) kbps = 8000;
+        if (!fps || fps > 1000) fps = 60;
+        if (!gop) gop = 600;
+        const uint8_t *src = (const uint8_t *) e->map + off;
+        size_t before = g_out.n;
+        if (flags & VR_H264_PIPE) {
+            // ひとつ前のコマができあがるのを待って、返事に入れる
+            double t1 = t_ms();
+            vp_join();
+            vt_join_ms += t_ms() - t1;
+            if (g_vp.has) {
+                g_vp.has = 0;
+                if (!g_vp.ok) return reply(s, VK_ERROR_FEATURE_NOT_PRESENT);
+                vr_put(&g_out, g_vp.out.p, g_vp.out.n);
+                vt_enc += g_vp.ms;
+            }
+            // 今のコマを写して、後ろで縮め始める
+            g_vp.w = w, g_vp.h = h, g_vp.stride = stride, g_vp.bgra = bgra, g_vp.flags = flags, g_vp.kbps = kbps, g_vp.fps = fps, g_vp.gop = gop;
+            g_vp.stream = stream, g_vp.tag = tag;
+            if (!vp_start(src)) return reply(s, VK_ERROR_OUT_OF_HOST_MEMORY);
+        } else {
+            // その場で縮める。先送りで縮めたコマが残っていれば捨て、並びが崩れないようにキーフレームにする
+            vp_join();
+            if (g_vp.has) { g_vp.has = 0; flags |= VR_H264_KEY; }
+            double t1 = t_ms();
+            if (!h264_frame(src, w, h, stride, (int) bgra, flags, kbps, fps, gop, stream, tag, &g_out)) {
+                g_out.n = before;
+                return reply(s, VK_ERROR_FEATURE_NOT_PRESENT);
+            }
+            vt_enc += t_ms() - t1;
+        }
+        if (g_out.n > before) {
+            uint32_t f = 0;
+            memcpy(&f, g_out.p + before + 24, 4);
+            vbytes += g_out.n - before - VR_H264_HEAD;
+            vkeys += f & 1;
+            if (++vn % 100 == 0)
+                vlog("H.264：%llu コマ・GPU を待つ %.1f ms・前のコマを待つ %.1f ms・縮める %.1f ms・平均 %.1f KB・キーフレーム %llu 枚（100 コマあたり）",
+                     (unsigned long long) vn, vt_wait / 100, vt_join_ms / 100, vt_enc / 100, vbytes / 1024.0 / 100, (unsigned long long) vkeys),
+                    vt_wait = vt_join_ms = vt_enc = 0, vbytes = vkeys = 0;
+        }
+        return reply(s, 0);
     }
     case VR_MEM_READ_DELTA: {
         // ドライバ側の写しと同じものを持っておき、今回との違い（XOR）を 4 バイトずつ見て、

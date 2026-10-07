@@ -11,7 +11,7 @@ targets:
       - path: Sources
       # Vulkan の命令の受け手（PC 側のドライバは vk/icd）
       - path: vk/remote
-        includes: ["server.c", "bw.c", "proto.h", "wire.h"]
+        includes: ["server.c", "bw.c", "proto.h", "wire.h", "video.h"]
     info:
       path: Sources/Info.plist
       properties:
@@ -54,3 +54,7 @@ targets:
       - sdk: CoreGraphics.framework
       # 窓に出すコマを JPEG に縮める（vk/remote/server.c）
       - sdk: ImageIO.framework
+      # 窓に出すコマを H.264 に縮める（vk/remote/server.c）
+      - sdk: VideoToolbox.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework

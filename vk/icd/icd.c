@@ -22,6 +22,9 @@
 #include <windows.h>
 #define COBJMACROS
 #include <wincodec.h>
+#include "../remote/video.h"
+#include <d3d11.h>
+#include <d3d10.h>
 #include <dbghelp.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -132,6 +135,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_DESTROY_BUFFER_VIEW] = "DESTROY_BUFFER_VIEW", [VR_GET_IMAGE_SUBRESOURCE_LAYOUT] = "GET_IMAGE_SUBRESOURCE_LAYOUT",
     [VR_READ_JPEG_PIPE] = "READ_JPEG_PIPE", [VR_GET_BUFFER_ADDRESS] = "GET_BUFFER_ADDRESS",
     [VR_PACKED] = "PACKED", [VR_CREATE_BUFFER_NR] = "CREATE_BUFFER_NR", [VR_CREATE_IMAGE_NR] = "CREATE_IMAGE_NR", [VR_GET_STATUS] = "GET_STATUS",
+    [VR_READ_H264] = "READ_H264",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -149,6 +153,7 @@ static struct {
     uint64_t lat_n;
     int heat_max;                  // いちばん熱かったときの iPhone の熱の状態
     uint64_t wr_bytes[6], wr_n[6]; // GPU が書くかもしれない CPU から見える範囲（読み戻す元）を理由別に
+    double cpu0;                   // 最初の present のときのプロセスの CPU 時間（ms）
 } g_stat;
 static int g_stats = -1;
 
@@ -158,6 +163,8 @@ static double now_ms(void) {
     QueryPerformanceCounter(&c);
     return (double) c.QuadPart * 1000.0 / (double) f.QuadPart;
 }
+
+static double proc_cpu_ms(void);
 
 static void print_stats(void) {
     uint64_t ts = 0, tc = 0, tb = 0;
@@ -189,6 +196,9 @@ static void print_stats(void) {
         fprintf(stderr, "  present %llu 回 %.1f ms（うち窓に描く %llu 回 %.1f ms）\n", (unsigned long long) g_stat.presents, g_stat.present_ms,
                 (unsigned long long) g_stat.blits, g_stat.blit_ms);
     if (g_stat.heat_max) fprintf(stderr, "  iPhone の熱：いちばん熱かったのは %d（0 ふつう〜3 とても熱い）\n", g_stat.heat_max);
+    if (g_stat.presents > 1)
+        fprintf(stderr, "  最初の present からのプロセスの CPU %.0f ms（present 1 回 %.2f ms）\n", proc_cpu_ms() - g_stat.cpu0,
+                (proc_cpu_ms() - g_stat.cpu0) / (double) (g_stat.presents - 1));
     if (g_stat.lat_n)
         fprintf(stderr, "  present から窓に出るまで：平均 %.1f ms・いちばん長い %.1f ms（%llu 枚）\n", g_stat.lat_sum / (double) g_stat.lat_n,
                 g_stat.lat_max, (unsigned long long) g_stat.lat_n);
@@ -279,7 +289,7 @@ static void rpc_flush(void) {
 // 返事を待つ。返事の中身は out に入る（要らなければ NULL）
 // あとで受け取る返事。窓に出す絵を頼んだら返事を待たずにアプリを先へ進め、次のコマで受け取る。
 // 返事は頼んだ順にしか届かないので、ほかの命令が返事を読む前に、先にこれを読んで取っておく
-static struct { int active, ready; VkResult r; vr_buf out; } g_defer;
+static struct { int active, ready; VkResult r; vr_buf out; uint32_t op; } g_defer; // op：頼んだ命令（数えるため）
 
 // つながりが切れたことにする。最初の 1 回だけ書く（IPHONE_VK_LOG が無くても書く）
 static void banner(const wchar_t *t);
@@ -369,7 +379,7 @@ static void read_deferred_locked(void) {
     g_defer.r = VK_ERROR_DEVICE_LOST;
     g_defer.out.n = 0;
     uint32_t h[2];
-    if (!recv_head(h, VR_READ_JPEG_PIPE)) return;
+    if (!recv_head(h, g_defer.op)) return;
     vr_reserve(&g_defer.out, h[1]);
     if (h[1] && !vr_recv_all(g_sock, g_defer.out.p, h[1])) { conn_lost("窓の絵の返事の途中"); return; }
     g_defer.out.n = h[1];
@@ -383,7 +393,7 @@ static void rpc_call_deferred(uint32_t op, vr_buf *b) {
     if (op < VR_OP_COUNT) g_stat.calls[op]++;
     if (g_defer.active) { flush_locked(); read_deferred_locked(); }
     put_msg_locked(op, b);
-    if (flush_locked()) { g_defer.active = 1; g_defer.ready = 0; }
+    if (flush_locked()) { g_defer.active = 1; g_defer.ready = 0; g_defer.op = op; }
     ReleaseSRWLockExclusive(&g_lock);
     b->n = 0;
 }
@@ -402,7 +412,7 @@ static VkResult rpc_take_deferred(vr_buf *out) {
         if (g_defer.out.n) memcpy(out->p, g_defer.out.p, g_defer.out.n);
         out->n = g_defer.out.n;
     }
-    g_stat.wait_ms[VR_READ_JPEG_PIPE] += now_ms() - t0;
+    g_stat.wait_ms[g_defer.op ? g_defer.op : VR_READ_JPEG_PIPE] += now_ms() - t0;
     ReleaseSRWLockExclusive(&g_lock);
     return r;
 }
@@ -3301,6 +3311,337 @@ static VkResult VKAPI_CALL surface_modes(VkPhysicalDevice pd, VkSurfaceKHR s, ui
     return k < all ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+// ---- 窓の絵を H.264 でほどく（Media Foundation の Microsoft H.264 デコーダ・遅れの少ない設定） ----
+// 受け手が 1 コマずつ縮めた物（VR_READ_H264）を、表示の糸で順にほどく。絵は NV12 で出てくるので、BGRA に直して描く。
+// GPU でほどけるとき（D3D11 の DXVA）は GPU で。だめならソフトで
+struct vdec {
+    IMFTransform *t;
+    IMFDXGIDeviceManager *mgr; // GPU でほどくとき（D3D11 の DXVA）
+    ID3D11Device *dev;
+    ID3D11DeviceContext *ctx;
+    ID3D11Texture2D *stage;    // 読み出し用（最後にほどけた絵を写しておく）
+    uint32_t sw, sh;
+    int hw, staged, mapped;
+    int provides;           // 出力の sample をデコーダが用意する
+    DWORD outsz;
+    uint32_t fw, fh, pitch; // 出てくる NV12 の大きさ（16 の倍数に揃っていることがある）・1 行のバイト
+    uint8_t *nv12;          // 最後にほどけた絵
+    size_t cap;
+    uint32_t npitch, nrows; // nv12 の 1 行のバイトと Y の面の行数
+    int has;
+    uint64_t tag;           // 最後にほどけた絵の札（何回目の present の物か）
+};
+
+static void vdec_unmap(struct vdec *d);
+
+static void vdec_close(struct vdec *d) {
+    if (d->t) {
+        IMFTransform_ProcessMessage(d->t, MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+        IMFTransform_Release(d->t);
+    }
+    if (d->mgr) IMFDXGIDeviceManager_Release(d->mgr);
+    vdec_unmap(d);
+    if (d->stage) ID3D11Texture2D_Release(d->stage);
+    if (d->ctx) ID3D11DeviceContext_Release(d->ctx);
+    if (d->dev) ID3D11Device_Release(d->dev);
+    free(d->nv12);
+    memset(d, 0, sizeof *d);
+}
+
+// 出す形を NV12 に決める。大きさと 1 行のバイトを覚える
+static int vdec_out_type(struct vdec *d) {
+    for (DWORD i = 0;; i++) {
+        IMFMediaType *t = NULL;
+        if (FAILED(IMFTransform_GetOutputAvailableType(d->t, 0, i, &t)) || !t) return 0;
+        GUID sub;
+        if (SUCCEEDED(IMFMediaType_GetGUID(t, &VG_SUBTYPE, &sub)) && !memcmp(&sub, &VG_NV12, sizeof sub)) {
+            HRESULT hr = IMFTransform_SetOutputType(d->t, 0, t, 0);
+            UINT64 fs = 0;
+            UINT32 st = 0;
+            IMFMediaType_GetUINT64(t, &VG_FRAME_SIZE, &fs);
+            d->fw = (uint32_t) (fs >> 32), d->fh = (uint32_t) fs;
+            d->pitch = SUCCEEDED(IMFMediaType_GetUINT32(t, &VG_STRIDE, &st)) && (int32_t) st > 0 ? st : d->fw;
+            IMFMediaType_Release(t);
+            if (FAILED(hr)) return 0;
+            MFT_OUTPUT_STREAM_INFO si;
+            memset(&si, 0, sizeof si);
+            IMFTransform_GetOutputStreamInfo(d->t, 0, &si);
+            d->provides = (si.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
+            d->outsz = si.cbSize > d->pitch * d->fh * 3 / 2 ? si.cbSize : d->pitch * d->fh * 3 / 2;
+            return 1;
+        }
+        IMFMediaType_Release(t);
+    }
+}
+
+// Windows の d3d11.dll を読んでよいか。DXVK のアプリは同じ名前の d3d11.dll・dxgi.dll を横に置いて先に読んでいる。
+// そこへ Windows の d3d11.dll を読むと、その中の dxgi.dll がアプリの物（DXVK）につながって落ちる（10/7 の d3d11cube）。
+// 読み込み済みの物が Windows の物で、アプリの横にも置いていないときだけ使う
+static int vdec_hw_safe(void) {
+    WCHAR sys[MAX_PATH], p[MAX_PATH + 16];
+    UINT n = GetSystemDirectoryW(sys, MAX_PATH);
+    if (!n || n >= MAX_PATH) return 0;
+    static const WCHAR *const names[] = { L"dxgi.dll", L"d3d11.dll" };
+    for (int i = 0; i < 2; i++) {
+        HMODULE m = GetModuleHandleW(names[i]);
+        DWORD k = m ? GetModuleFileNameW(m, p, MAX_PATH) : 0;
+        if (m && (!k || k >= MAX_PATH || _wcsnicmp(p, sys, n) != 0 || p[n] != L'\\')) return 0;
+        k = GetModuleFileNameW(NULL, p, MAX_PATH);
+        WCHAR *slash = k && k < MAX_PATH ? wcsrchr(p, L'\\') : NULL;
+        if (!slash) return 0;
+        wcscpy(slash + 1, names[i]);
+        if (GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES) return 0;
+    }
+    return 1;
+}
+
+// GPU でほどけるようにする（D3D11 の装置を作り、デコーダに渡す）。だめなら 0 で、ソフトでほどく。
+// d3d11.dll は Windows の物をパスで読む
+static int vdec_hw(struct vdec *d) {
+    static const GUID aware_g = { 0x206b4fc8, 0xfcf9, 0x4c51, { 0xaf, 0xe3, 0x97, 0x64, 0x36, 0x9e, 0x33, 0xa0 } };       // MF_SA_D3D11_AWARE
+    static const GUID mt_g = { 0x9b7e4e00, 0x342c, 0x4106, { 0xa1, 0x9f, 0x4f, 0x27, 0x04, 0xf6, 0x89, 0xf0 } };          // ID3D10Multithread
+    static PFN_D3D11_CREATE_DEVICE create;
+    static HRESULT (WINAPI *mk_mgr)(UINT *, IMFDXGIDeviceManager **);
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    const char *e = getenv("IPHONE_VK_VIDEO_HWDEC");
+    if (e && *e == '0') return 0;
+    // 確かめてから読む（読むだけでも、中の dxgi.dll がアプリの物につながる）
+    if (!vdec_hw_safe()) {
+        say("アプリが自分の d3d11.dll か dxgi.dll（DXVK など）を持っているので、H.264 は GPU でなくソフトでほどく");
+        return 0;
+    }
+    BOOL pending = FALSE;
+    if (InitOnceBeginInitialize(&once, 0, &pending, NULL) && pending) {
+        WCHAR path[MAX_PATH + 16];
+        UINT n = GetSystemDirectoryW(path, MAX_PATH);
+        HMODULE m = NULL, mf = GetModuleHandleW(L"mfplat.dll");
+        if (n && n < MAX_PATH) { wcscpy(path + n, L"\\d3d11.dll"); m = LoadLibraryW(path); }
+        if (m) create = (PFN_D3D11_CREATE_DEVICE) (void *) GetProcAddress(m, "D3D11CreateDevice");
+        if (mf) mk_mgr = (HRESULT (WINAPI *)(UINT *, IMFDXGIDeviceManager **)) (void *) GetProcAddress(mf, "MFCreateDXGIDeviceManager");
+        InitOnceComplete(&once, 0, NULL);
+    }
+    if (!create || !mk_mgr) return 0;
+    IMFAttributes *at = NULL;
+    UINT32 aware = 0;
+    if (SUCCEEDED(IMFTransform_GetAttributes(d->t, &at)) && at) {
+        IMFAttributes_GetUINT32(at, &aware_g, &aware);
+        IMFAttributes_Release(at);
+    }
+    if (!aware || FAILED(create(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, NULL, 0, D3D11_SDK_VERSION, &d->dev, NULL, NULL))) {
+        d->dev = NULL;
+        return 0;
+    }
+    ID3D11Device_GetImmediateContext(d->dev, &d->ctx);
+    ID3D10Multithread *mt = NULL;
+    if (SUCCEEDED(ID3D11Device_QueryInterface(d->dev, &mt_g, (void **) &mt)) && mt) {
+        ID3D10Multithread_SetMultithreadProtected(mt, TRUE);
+        ID3D10Multithread_Release(mt);
+    }
+    UINT tok = 0;
+    if (FAILED(mk_mgr(&tok, &d->mgr)) || FAILED(IMFDXGIDeviceManager_ResetDevice(d->mgr, (IUnknown *) d->dev, tok)) ||
+        FAILED(IMFTransform_ProcessMessage(d->t, MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR) d->mgr))) {
+        if (d->mgr) IMFDXGIDeviceManager_Release(d->mgr);
+        if (d->ctx) ID3D11DeviceContext_Release(d->ctx);
+        ID3D11Device_Release(d->dev);
+        d->mgr = NULL, d->dev = NULL, d->ctx = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+// hw なら GPU でほどけるかも試す（IPHONE_VK_VIDEO_HWDEC=0 でソフトだけ）
+static int vdec_open(struct vdec *d, int hw) {
+    memset(d, 0, sizeof *d);
+    if (!vid_mf()) return 0;
+    if (FAILED(CoCreateInstance(&VG_CLSID_H264_DEC, NULL, CLSCTX_INPROC_SERVER, &VG_IID_TRANSFORM, (void **) &d->t))) { d->t = NULL; return 0; }
+    // 遅れの少ない設定：ほどけたらすぐ出す（並べ替えのために待たない）
+    IMFAttributes *at = NULL;
+    if (SUCCEEDED(IMFTransform_GetAttributes(d->t, &at)) && at) {
+        IMFAttributes_SetUINT32(at, &VG_LOW_LATENCY, TRUE);
+        IMFAttributes_Release(at);
+    }
+    ICodecAPI *api = NULL;
+    if (SUCCEEDED(IMFTransform_QueryInterface(d->t, &VG_IID_CODECAPI, (void **) &api)) && api) {
+        vid_api_bool(api, &VG_LOW_LATENCY, 1);
+        ICodecAPI_Release(api);
+    }
+    d->hw = hw && vdec_hw(d);
+    IMFMediaType *in = vid_type(&VG_H264, 0, 0, 0, 0, 0);
+    HRESULT hr = in ? IMFTransform_SetInputType(d->t, 0, in, 0) : E_FAIL;
+    if (in) IMFMediaType_Release(in);
+    if (FAILED(hr)) { vdec_close(d); return 0; }
+    vdec_out_type(d); // 絵の大きさが分かるのは最初のコマから（そのとき形が変わったと言ってくる）
+    IMFTransform_ProcessMessage(d->t, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    IMFTransform_ProcessMessage(d->t, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    return 1;
+}
+
+// ソフトでほどいた絵（CPU のメモリ）を nv12 に写す
+static int vdec_take_cpu(struct vdec *d, IMFMediaBuffer *mb) {
+    IMF2DBuffer *b2 = NULL;
+    BYTE *p = NULL;
+    LONG pitch = 0;
+    DWORD len = 0;
+    int locked2d = SUCCEEDED(IMFMediaBuffer_QueryInterface(mb, &VG_IID_2DBUFFER, (void **) &b2)) && b2 && SUCCEEDED(IMF2DBuffer_Lock2D(b2, &p, &pitch));
+    if (!locked2d && SUCCEEDED(IMFMediaBuffer_Lock(mb, &p, NULL, &len))) pitch = (LONG) d->pitch;
+    int ok = 0;
+    if (p && pitch > 0) {
+        size_t need = (size_t) pitch * d->fh * 3 / 2;
+        if (!locked2d && len < need) need = 0;
+        if (need && d->cap < need) {
+            free(d->nv12);
+            d->nv12 = malloc(need);
+            d->cap = d->nv12 ? need : 0;
+        }
+        if (need && d->nv12) {
+            memcpy(d->nv12, p, need);
+            d->npitch = (uint32_t) pitch, d->nrows = d->fh, d->has = 1, d->staged = 0, ok = 1;
+        }
+    }
+    if (locked2d) IMF2DBuffer_Unlock2D(b2);
+    else if (p) IMFMediaBuffer_Unlock(mb);
+    if (b2) IMF2DBuffer_Release(b2);
+    return ok;
+}
+
+// GPU でほどいた絵（D3D11 の画像）を、読み出し用の画像に写す（GPU の中で・待たない）。CPU に読み出すのは描くコマだけ
+static int vdec_take_gpu(struct vdec *d, IMFMediaBuffer *mb) {
+    static const GUID tex_g = { 0x6f15aaf2, 0xd208, 0x4e89, { 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c } }; // ID3D11Texture2D
+    IMFDXGIBuffer *db = NULL;
+    ID3D11Texture2D *tx = NULL;
+    UINT sub = 0;
+    int ok = 0;
+    if (SUCCEEDED(IMFMediaBuffer_QueryInterface(mb, &VG_IID_DXGIBUFFER, (void **) &db)) && db &&
+        SUCCEEDED(IMFDXGIBuffer_GetResource(db, &tex_g, (void **) &tx)) && tx && SUCCEEDED(IMFDXGIBuffer_GetSubresourceIndex(db, &sub))) {
+        D3D11_TEXTURE2D_DESC td;
+        ID3D11Texture2D_GetDesc(tx, &td);
+        if (td.Format == DXGI_FORMAT_NV12 && (!d->stage || d->sw != td.Width || d->sh != td.Height)) {
+            if (d->stage) ID3D11Texture2D_Release(d->stage);
+            D3D11_TEXTURE2D_DESC sd;
+            memset(&sd, 0, sizeof sd);
+            sd.Width = td.Width, sd.Height = td.Height, sd.MipLevels = 1, sd.ArraySize = 1, sd.Format = td.Format;
+            sd.SampleDesc.Count = 1, sd.Usage = D3D11_USAGE_STAGING, sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            if (FAILED(ID3D11Device_CreateTexture2D(d->dev, &sd, NULL, &d->stage))) d->stage = NULL;
+            d->sw = td.Width, d->sh = td.Height;
+        }
+        if (td.Format == DXGI_FORMAT_NV12 && d->stage) {
+            ID3D11DeviceContext_CopySubresourceRegion(d->ctx, (ID3D11Resource *) d->stage, 0, 0, 0, 0, (ID3D11Resource *) tx, sub, NULL);
+            d->has = 1, d->staged = 1, ok = 1;
+        }
+    }
+    if (tx) ID3D11Texture2D_Release(tx);
+    if (db) IMFDXGIBuffer_Release(db);
+    return ok;
+}
+
+// ほどけた絵を受け取って nv12 に写す。1 受け取った・0 もう無い・-1 失敗
+static int vdec_pull(struct vdec *d) {
+    for (int tries = 0; tries < 4; tries++) {
+        MFT_OUTPUT_DATA_BUFFER ob;
+        memset(&ob, 0, sizeof ob);
+        if (!d->provides && !(ob.pSample = vid_sample(d->outsz))) return -1;
+        DWORD st = 0;
+        HRESULT hr = IMFTransform_ProcessOutput(d->t, 0, 1, &ob, &st);
+        if (ob.pEvents) IMFCollection_Release(ob.pEvents);
+        if (hr == MF_E_TRANSFORM_STREAM_CHANGE || hr == MF_E_TRANSFORM_TYPE_NOT_SET) {
+            // 最初のコマ・大きさが変わったとき：出す形を決め直して、もう一度
+            if (ob.pSample) IMFSample_Release(ob.pSample);
+            if (!vdec_out_type(d)) return hr == MF_E_TRANSFORM_TYPE_NOT_SET ? 0 : -1;
+            continue;
+        }
+        if (FAILED(hr)) {
+            if (ob.pSample) IMFSample_Release(ob.pSample);
+            return hr == MF_E_TRANSFORM_NEED_MORE_INPUT ? 0 : -1;
+        }
+        int ok = 0;
+        IMFMediaBuffer *mb = NULL;
+        if (SUCCEEDED(IMFSample_GetBufferByIndex(ob.pSample, 0, &mb)) && mb) {
+            ok = (d->hw && vdec_take_gpu(d, mb)) || vdec_take_cpu(d, mb);
+            IMFMediaBuffer_Release(mb);
+        }
+        LONGLONG t = 0;
+        if (ok && SUCCEEDED(IMFSample_GetSampleTime(ob.pSample, &t))) d->tag = (uint64_t) t;
+        IMFSample_Release(ob.pSample);
+        return ok ? 1 : -1;
+    }
+    return -1;
+}
+
+// ほどけた最後の絵の NV12 を指す。GPU でほどいた物はここで読み出す（終わったら vdec_unmap）
+static int vdec_map(struct vdec *d, const uint8_t **y, uint32_t *pitch, uint32_t *rows) {
+    if (!d->has) return 0;
+    if (!d->staged) {
+        *y = d->nv12, *pitch = d->npitch, *rows = d->nrows;
+        return 1;
+    }
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ID3D11DeviceContext_Map(d->ctx, (ID3D11Resource *) d->stage, 0, D3D11_MAP_READ, 0, &m))) return 0;
+    d->mapped = 1;
+    *y = (const uint8_t *) m.pData, *pitch = m.RowPitch, *rows = d->sh; // UV の面は Y の面のすぐ後ろ（1 行は同じ長さ）
+    return 1;
+}
+
+static void vdec_unmap(struct vdec *d) {
+    if (d->mapped) ID3D11DeviceContext_Unmap(d->ctx, (ID3D11Resource *) d->stage, 0);
+    d->mapped = 0;
+}
+
+// 1 コマぶんの NAL の並びを入れて、出てきた絵を受け取る。札は sample の時刻として通し、出てきた絵の物を d->tag に入れる。
+// 1 ほどけた絵がある・0 まだ無い・-1 失敗
+static int vdec_push(struct vdec *d, const uint8_t *au, size_t n, uint64_t tag) {
+    IMFSample *s = vid_sample((DWORD) n);
+    if (!s) return -1;
+    IMFMediaBuffer *b = NULL;
+    BYTE *p = NULL;
+    if (SUCCEEDED(IMFSample_GetBufferByIndex(s, 0, &b)) && SUCCEEDED(IMFMediaBuffer_Lock(b, &p, NULL, NULL))) {
+        memcpy(p, au, n);
+        IMFMediaBuffer_Unlock(b);
+        IMFMediaBuffer_SetCurrentLength(b, (DWORD) n);
+    }
+    if (b) IMFMediaBuffer_Release(b);
+    IMFSample_SetSampleTime(s, (LONGLONG) tag);
+    int got = 0;
+    HRESULT hr = IMFTransform_ProcessInput(d->t, 0, s, 0);
+    if (hr == MF_E_NOTACCEPTING) {
+        // 先に出てきた絵を受け取ってから入れ直す
+        int k;
+        while ((k = vdec_pull(d)) > 0) got = 1;
+        if (k < 0) { IMFSample_Release(s); return -1; }
+        hr = IMFTransform_ProcessInput(d->t, 0, s, 0);
+    }
+    IMFSample_Release(s);
+    if (FAILED(hr)) return -1;
+    int k;
+    while ((k = vdec_pull(d)) > 0) got = 1;
+    return k < 0 ? -1 : got;
+}
+
+// この PC で H.264 をほどけるか（Windows の N 版などは Media Foundation が無い）。最初の 1 回だけ、別の糸で試す
+// （アプリの糸の COM の設定に触らないため）
+static DWORD WINAPI vdec_probe_thread(LPVOID p) {
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    struct vdec d;
+    *(int *) p = vdec_open(&d, 0);
+    vdec_close(&d);
+    CoUninitialize();
+    return 0;
+}
+
+static int vdec_available(void) {
+    static volatile LONG v = -1;
+    if (v < 0) {
+        static int ok; // 糸が待ちきれずに残っても書ける所
+        HANDLE t = CreateThread(NULL, 0, vdec_probe_thread, &ok, 0, NULL);
+        if (t && WaitForSingleObject(t, 10000) != WAIT_OBJECT_0) ok = 0;
+        if (t) CloseHandle(t);
+        if (!ok) say("この PC では H.264 をほどけないので、窓の絵は JPEG で受け取る");
+        InterlockedExchange(&v, ok);
+    }
+    return v > 0;
+}
+
+static volatile LONG64 g_vstream; // 流れの番号（swapchain ごとに新しくする）
+
 // ---- swapchain：受け手に画像を作り、出すたびに 1 コマを持ち帰って窓に描き写す ----
 // 出すときは待たずに、画像を持ち帰り用のバッファに写す仕事だけ頼む。窓に描くのは 1 つ前のコマ
 // （1 コマ遅れる代わりに、GPU が次のコマを描いている間に前のコマを運べる）。
@@ -3312,6 +3653,16 @@ struct swapchain {
     VkFormat fmt;
     int use_jpeg;        // 受け手に JPEG に縮めてもらう
     uint64_t jpeg_bytes; // 受け取った JPEG の合計
+    // H.264 で受け取る（受け手が VR_CAP_H264 を名乗ったとき。IPHONE_VK_VIDEO=0 で JPEG に戻す）。use_jpeg も 1 のまま
+    int use_video;
+    uint32_t v_kbps, v_fps, v_gop;
+    uint64_t v_stream;         // 流れの番号
+    volatile LONG v_need_key;  // 表示の糸がほどけなかった。次に頼むコマをキーフレームにしてもらう
+    volatile LONG v_broken;    // 表示の糸でデコーダを作れなかった。JPEG に戻す
+    uint64_t v_bytes, v_keys, v_got, v_decoded; // 受け取った H.264 の合計・キーフレームの数・受け取ったコマ・ほどいたコマ
+    double v_dec_ms, v_cvt_ms, v_draw_ms;        // 表示の糸：ほどく・NV12 を BGRA に直す・窓に描く（合計）
+    int v_hwdec;                                 // GPU でほどいている
+    double cpu0, disp_cpu;     // 作ったときのプロセスの CPU 時間・表示の糸の CPU 時間（ms）
     // 窓に描く糸。アプリの糸は JPEG を渡してすぐ戻り、この糸が最新の 1 枚だけをほどいて描く（間に合わない絵は飛ばす）
     struct {
         HANDLE thr;
@@ -3321,6 +3672,7 @@ struct swapchain {
         int has, quit;
         uint64_t dropped;
         uint64_t serial; // 渡した絵が何回目の present の物か（0 なら分からない）
+        int skip;        // H.264：渡す側がためすぎて捨てた。表示の糸はキーフレームまで待つ
     } disp;
     // 窓に出るまでの遅れ：present した時刻を覚え、その絵を窓に描いた時刻との差を足す
     uint64_t npres;
@@ -3370,6 +3722,14 @@ static void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cbh, VkImage im,
 static void VKAPI_CALL get_queue(VkDevice dv, uint32_t fam, uint32_t idx, VkQueue *out);
 
 static void disp_stop(struct swapchain *sc);
+static int disp_thread_on(void);
+
+// CPU を使った時間（ms）。FILETIME は 100 ns 単位
+static double ft_ms(const FILETIME *f) { return (double) (((uint64_t) f->dwHighDateTime << 32) | f->dwLowDateTime) / 1e4; }
+static double proc_cpu_ms(void) {
+    FILETIME c, e, k, u;
+    return GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u) ? ft_ms(&k) + ft_ms(&u) : 0;
+}
 
 static void VKAPI_CALL destroy_swapchain(VkDevice dv, VkSwapchainKHR h, const VkAllocationCallbacks *a) {
     (void) a;
@@ -3387,8 +3747,18 @@ static void VKAPI_CALL destroy_swapchain(VkDevice dv, VkSwapchainKHR h, const Vk
         if (sc->rbmem[i]) free_memory(dv, sc->rbmem[i], NULL);
     }
     if (sc->frames) say("swapchain：%llu コマ・%.1f コマ/秒%s", (unsigned long long) sc->frames, sc->frames * 1000.0 / (now_ms() - sc->t0),
-                        sc->use_jpeg ? "・JPEG" : "");
-    if (sc->frames && sc->use_jpeg) say("JPEG：1 コマ平均 %.1f KB", sc->jpeg_bytes / 1024.0 / (double) sc->frames);
+                        sc->use_video ? "・H.264" : sc->use_jpeg ? "・JPEG" : "");
+    if (sc->frames && sc->use_jpeg && !sc->use_video) say("JPEG：1 コマ平均 %.1f KB", sc->jpeg_bytes / 1024.0 / (double) sc->frames);
+    if (sc->v_got)
+        say("H.264：1 コマ平均 %.1f KB・受け取った %llu コマ・ほどいた %llu コマ・キーフレーム %llu 枚", sc->v_bytes / 1024.0 / (double) sc->v_got,
+            (unsigned long long) sc->v_got, (unsigned long long) sc->v_decoded, (unsigned long long) sc->v_keys);
+    if (sc->v_decoded && sc->frames)
+        say("H.264 の表示の糸（%s）：ほどく %.2f ms（1 コマ）・BGRA に直す %.2f ms・窓に描く %.2f ms（1 回）", sc->v_hwdec ? "GPU" : "ソフト",
+            sc->v_dec_ms / (double) sc->v_decoded,
+            sc->v_cvt_ms / (double) sc->frames, sc->v_draw_ms / (double) sc->frames);
+    if (sc->npres)
+        say("CPU：このプロセス %.0f ms（present 1 回 %.2f ms）・窓に描く糸 %.0f ms（1 回 %.2f ms）", proc_cpu_ms() - sc->cpu0,
+            (proc_cpu_ms() - sc->cpu0) / (double) sc->npres, sc->disp_cpu, sc->disp_cpu / (double) sc->npres);
     if (sc->lat_n) say("present から窓に出るまで：平均 %.1f ms・いちばん長い %.1f ms（%llu 枚）", sc->lat_sum / (double) sc->lat_n, sc->lat_max,
                        (unsigned long long) sc->lat_n);
     free(sc);
@@ -3477,6 +3847,26 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
             say("present を %.0f コマ/秒で区切る（%s）", hz, mf && atof(mf) > 0 ? "IPHONE_VK_MAX_FPS" : "書き換えに合わせる出し方");
         }
     }
+    // 窓の絵を H.264 で受け取る：IPHONE_VK_VIDEO=1 のときで、受け手が名乗り、表示の糸を使い、この PC でほどけるとき。
+    // 代役では量は減るが、遅れと PC の CPU はわずかに増えた。iPhone で測るまでは、既定は今までの JPEG。
+    // ビットレートは 1 コマあたりの量で決める（区切りの速さ、区切らなければ 60 コマ/秒として）。キーフレームは 10 秒ごと。
+    // IPHONE_VK_VIDEO_KBPS・IPHONE_VK_VIDEO_GOP（コマ）で変える
+    {
+        const char *e = getenv("IPHONE_VK_VIDEO");
+        sc->use_video = sc->use_jpeg && (g_hw.caps & VR_CAP_H264) && disp_thread_on() && e && *e == '1' && vdec_available();
+        if (sc->use_video) {
+            const char *k = getenv("IPHONE_VK_VIDEO_KBPS"), *g = getenv("IPHONE_VK_VIDEO_GOP");
+            sc->v_fps = sc->gap > 0 ? (uint32_t) (1000.0 / sc->gap + 0.5) : 60;
+            if (sc->v_fps < 1) sc->v_fps = 1;
+            double kb = (double) ci->imageExtent.width * ci->imageExtent.height * 0.15 * sc->v_fps / 1000.0;
+            sc->v_kbps = k && atoi(k) > 0 ? (uint32_t) atoi(k) : kb < 1000 ? 1000 : kb > 100000 ? 100000 : (uint32_t) kb;
+            sc->v_gop = g && atoi(g) > 0 ? (uint32_t) atoi(g) : sc->v_fps * 10;
+            sc->v_stream = (uint64_t) InterlockedIncrement64(&g_vstream);
+            sc->v_need_key = 1;
+            say("窓の絵は H.264 で受け取る（%u kbps・%u コマ/秒・キーフレームは %u コマごと）", sc->v_kbps, sc->v_fps, sc->v_gop);
+        }
+    }
+    sc->cpu0 = proc_cpu_ms();
     sc->n = ci->minImageCount < 2 ? 2 : ci->minImageCount > 8 ? 8 : ci->minImageCount;
     sc->pend = -1;
     VkResult r = VK_SUCCESS;
@@ -3736,6 +4126,8 @@ static void disp_stop(struct swapchain *sc) {
     WakeConditionVariable(&sc->disp.cv);
     ReleaseSRWLockExclusive(&sc->disp.lk);
     WaitForSingleObject(sc->disp.thr, 5000);
+    FILETIME c, e, k, u;
+    if (GetThreadTimes(sc->disp.thr, &c, &e, &k, &u)) sc->disp_cpu += ft_ms(&k) + ft_ms(&u);
     CloseHandle(sc->disp.thr);
     sc->disp.thr = NULL;
     free(sc->disp.jpg.p);
@@ -3743,16 +4135,19 @@ static void disp_stop(struct swapchain *sc) {
     if (sc->disp.dropped) say("窓に描く糸が間に合わず飛ばした絵：%llu 枚", (unsigned long long) sc->disp.dropped);
 }
 
-// IPHONE_VK_DUMP=コマ番号:ファイル名 で、そのコマを PPM に書く（絵が正しいかを確かめる用）
-static void dump_frame(struct swapchain *sc, const uint8_t *px) {
+// IPHONE_VK_DUMP=コマ番号:ファイル名 で、そのコマを PPM に書く（絵が正しいかを確かめる用）。
+// H.264 のときのコマ番号は、ほどいたコマの番号（窓に描かずに飛ばしたコマも数える）
+static void dump_frame_at(struct swapchain *sc, const uint8_t *px, uint64_t frame);
+static void dump_frame(struct swapchain *sc, const uint8_t *px) { dump_frame_at(sc, px, sc->frames); }
+static void dump_frame_at(struct swapchain *sc, const uint8_t *px, uint64_t frame) {
     const char *dump = getenv("IPHONE_VK_DUMP");
-    if (dump && (uint64_t) atoi(dump) == sc->frames && strchr(dump, ':')) {
+    if (dump && (uint64_t) atoi(dump) == frame && strchr(dump, ':')) {
         FILE *fp = fopen(strchr(dump, ':') + 1, "wb");
         if (fp) {
             fprintf(fp, "P6\n%u %u\n255\n", sc->w, sc->h);
             for (size_t p = 0; p < (size_t) sc->w * sc->h; p++) { uint8_t rgb[3] = { px[p * 4 + 2], px[p * 4 + 1], px[p * 4] }; fwrite(rgb, 1, 3, fp); }
             fclose(fp);
-            say("%llu コマ目を %s に書いた", (unsigned long long) sc->frames, strchr(dump, ':') + 1);
+            say("%llu コマ目を %s に書いた", (unsigned long long) frame, strchr(dump, ':') + 1);
         }
     }
 }
@@ -3785,8 +4180,224 @@ static void disp_give(struct swapchain *sc, vr_buf *out, uint64_t serial) {
     ReleaseSRWLockExclusive(&sc->disp.lk);
 }
 
+// ---- 窓の絵を H.264 で受け取る ----
+// H.264 は前のコマを元にするので、JPEG と違って間のコマを飛ばせない。表示の糸は届いた順に全部ほどき、最後の 1 枚だけを描く
+static void draw_bgra(struct swapchain *sc, const uint8_t *px) {
+    BITMAPINFO bmi = { 0 };
+    bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
+    bmi.bmiHeader.biWidth = (LONG) sc->w;
+    bmi.bmiHeader.biHeight = -(LONG) sc->h; // 上から下へ
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    RECT rc;
+    GetClientRect(sc->hwnd, &rc);
+    HDC dc = GetDC(sc->hwnd);
+    SetStretchBltMode(dc, COLORONCOLOR);
+    StretchDIBits(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, 0, 0, (int) sc->w, (int) sc->h, px, &bmi, DIB_RGB_COLORS, SRCCOPY);
+    ReleaseDC(sc->hwnd, dc);
+    GdiFlush();
+}
+
+// 窓に描く糸（H.264）：渡されたコマを順にほどいて、最後の 1 枚を描く
+static DWORD WINAPI vdisp_thread(LPVOID arg) {
+    struct swapchain *sc = (struct swapchain *) arg;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    struct vdec d;
+    if (!vdec_open(&d, 1)) {
+        say("H.264 のデコーダを作れない。窓の絵は JPEG に戻す");
+        InterlockedExchange(&sc->v_broken, 1);
+    } else {
+        say("H.264 を%sでほどく", d.hw ? " GPU（D3D11）" : "ソフト");
+        sc->v_hwdec = d.hw;
+    }
+    uint8_t *px = malloc((size_t) sc->w * sc->h * 4);
+    vr_buf mine = { 0 };
+    int wait_key = 1; // キーフレームが来るまでほどかない（最初・失敗したあと・ためすぎて捨てたあと）
+    uint64_t seen = 0; // ほどいたコマの番号（IPHONE_VK_DUMP 用）
+    const char *dump = getenv("IPHONE_VK_DUMP");
+    for (;;) {
+        AcquireSRWLockExclusive(&sc->disp.lk);
+        while (!sc->disp.has && !sc->disp.quit) SleepConditionVariableSRW(&sc->disp.cv, &sc->disp.lk, INFINITE, 0);
+        if (!sc->disp.has) { ReleaseSRWLockExclusive(&sc->disp.lk); break; }
+        vr_buf t = mine;
+        mine = sc->disp.jpg;
+        sc->disp.jpg = t;
+        sc->disp.jpg.n = 0;
+        sc->disp.has = 0;
+        if (sc->disp.skip) wait_key = 1, sc->disp.skip = 0;
+        ReleaseSRWLockExclusive(&sc->disp.lk);
+        if (!d.t || !px) continue;
+        int shown = 0;
+        for (size_t at = 0; at + 4 <= mine.n;) {
+            uint32_t n;
+            memcpy(&n, mine.p + at, 4);
+            at += 4;
+            if (n > mine.n - at) break;
+            const uint8_t *a = mine.p + at;
+            at += n;
+            if (n < VR_H264_HEAD) continue; // 先送りの最初（まだ何も無い）
+            uint64_t st, tag;
+            uint32_t aw, ah, fl;
+            memcpy(&st, a, 8), memcpy(&tag, a + 8, 8), memcpy(&aw, a + 16, 4), memcpy(&ah, a + 20, 4), memcpy(&fl, a + 24, 4);
+            // 作り直す前の swapchain の絵は出さない。受け手が落としたコマ（中身が空）は飛ばす（次はキーフレームが来る）
+            if (st != sc->v_stream || aw != sc->w || ah != sc->h || n == VR_H264_HEAD) continue;
+            if (wait_key && !(fl & 1)) continue;
+            wait_key = 0;
+            double t0 = now_ms();
+            int k = vdec_push(&d, a + VR_H264_HEAD, n - VR_H264_HEAD, tag);
+            sc->v_dec_ms += now_ms() - t0;
+            if (k < 0) {
+                say("H.264 をほどけなかった。キーフレームから始め直す");
+                wait_key = 1;
+                InterlockedExchange(&sc->v_need_key, 1);
+                continue;
+            }
+            if (k > 0) {
+                shown = 1;
+                sc->v_decoded++;
+                if (dump && (uint64_t) atoi(dump) == ++seen) {
+                    const uint8_t *y;
+                    uint32_t pitch, rows;
+                    if (vdec_map(&d, &y, &pitch, &rows) && rows >= sc->h && pitch >= sc->w) {
+                        vid_nv12_to_bgra(y, pitch, y + (size_t) pitch * rows, pitch, sc->w, sc->h, px);
+                        dump_frame_at(sc, px, seen);
+                    }
+                    vdec_unmap(&d);
+                }
+            }
+        }
+        if (!shown) continue;
+        double t1 = now_ms();
+        const uint8_t *y;
+        uint32_t pitch, rows;
+        int got = vdec_map(&d, &y, &pitch, &rows) && rows >= sc->h && pitch >= sc->w;
+        if (got) vid_nv12_to_bgra(y, pitch, y + (size_t) pitch * rows, pitch, sc->w, sc->h, px);
+        vdec_unmap(&d);
+        if (!got) continue;
+        double t2 = now_ms();
+        draw_bgra(sc, px);
+        sc->v_cvt_ms += t2 - t1;
+        sc->v_draw_ms += now_ms() - t2;
+        uint64_t serial = d.tag;
+        if (serial && sc->npres - serial < 64) {
+            double lat = now_ms() - sc->pres_t[serial % 64];
+            sc->lat_sum += lat;
+            sc->lat_n++;
+            if (lat > sc->lat_max) sc->lat_max = lat;
+            g_stat.lat_sum += lat;
+            g_stat.lat_n++;
+            if (lat > g_stat.lat_max) g_stat.lat_max = lat;
+        }
+        sc->frames++;
+    }
+    free(px);
+    free(mine.p);
+    vdec_close(&d);
+    CoUninitialize();
+    return 0;
+}
+
+// 受け取ったコマを表示の糸に渡す（後ろに足す）。ためすぎたら（ほどくのが追いつかない）捨てて、キーフレームから始め直す
+static void disp_give_video(struct swapchain *sc, const vr_buf *out) {
+    if (!sc->disp.thr) {
+        InitializeSRWLock(&sc->disp.lk);
+        InitializeConditionVariable(&sc->disp.cv);
+        sc->disp.thr = CreateThread(NULL, 0, vdisp_thread, sc, 0, NULL);
+    }
+    if (out->n >= VR_H264_HEAD) {
+        uint32_t fl;
+        memcpy(&fl, out->p + 24, 4);
+        sc->v_bytes += out->n - VR_H264_HEAD;
+        sc->v_keys += fl & 1;
+        sc->v_got++;
+    }
+    AcquireSRWLockExclusive(&sc->disp.lk);
+    if (sc->disp.jpg.n > (16u << 20)) {
+        sc->disp.jpg.n = 0;
+        sc->disp.dropped++;
+        sc->disp.skip = 1;
+        InterlockedExchange(&sc->v_need_key, 1);
+    }
+    uint32_t n = (uint32_t) out->n;
+    vr_put(&sc->disp.jpg, &n, 4);
+    vr_put(&sc->disp.jpg, out->p, out->n);
+    sc->disp.has = 1;
+    WakeConditionVariable(&sc->disp.cv);
+    ReleaseSRWLockExclusive(&sc->disp.lk);
+}
+
+// H.264 をやめて JPEG に戻す（受け手が縮められない・この PC でほどけない）。表示の糸は JPEG の物に替える
+static void video_fallback(struct swapchain *sc) {
+    say("窓の絵を H.264 で受け取れないので、この窓は JPEG に戻す");
+    sc->use_video = 0;
+    disp_stop(sc);
+    sc->disp.quit = 0;
+    sc->disp.has = 0;
+    sc->disp.skip = 0;
+}
+
+// 受け手に H.264 で頼む。now ならその場で今のコマを（区切りの待ちがあるとき）、でなければ JPEG と同じ先送り
+// （IPHONE_VK_JPEG_PIPE・IPHONE_VK_ASYNC_PRESENT に従う）。受け取ったコマは表示の糸に渡す。
+// 受け手が失敗を返したら、その結果を返す（呼んだ側が JPEG に戻す）
+static VkResult video_request(struct swapchain *sc, uint32_t j, uint64_t serial, int now) {
+    static int pipe = -1, async = -1;
+    if (pipe < 0) {
+        const char *p = getenv("IPHONE_VK_JPEG_PIPE"), *a = getenv("IPHONE_VK_ASYNC_PRESENT");
+        pipe = (g_hw.caps & VR_CAP_JPEG_PIPE) && !(p && *p == '0');
+        async = pipe && !(a && *a == '0');
+    }
+    if (sc->v_broken) return VK_ERROR_FEATURE_NOT_PRESENT;
+    int key = InterlockedExchange(&sc->v_need_key, 0) != 0;
+    vr_buf b = { 0 }, out = { 0 };
+    vr_u64(&b, ID(sc->rbmem[j]));
+    vr_u64(&b, 0);
+    vr_u32(&b, sc->w);
+    vr_u32(&b, sc->h);
+    vr_u32(&b, sc->w * 4);
+    vr_u32(&b, sc->fmt == VK_FORMAT_B8G8R8A8_UNORM || sc->fmt == VK_FORMAT_B8G8R8A8_SRGB ? 1 : 0);
+    vr_u32(&b, (key ? VR_H264_KEY : 0) | (!now && pipe ? VR_H264_PIPE : 0));
+    vr_u32(&b, sc->v_kbps);
+    vr_u32(&b, sc->v_fps);
+    vr_u32(&b, sc->v_gop);
+    vr_u64(&b, sc->v_stream);
+    vr_u64(&b, serial);
+    VkResult r;
+    if (!now && async) {
+        // 前のコマで頼んだ返事を受け取ってから、今のコマを頼む（返事は次のコマで受け取る）
+        r = rpc_take_deferred(&out);
+        if (r == VK_NOT_READY) r = VK_SUCCESS;
+        if (r == VK_SUCCESS) rpc_call_deferred(VR_READ_H264, &b);
+        else if (key) InterlockedExchange(&sc->v_need_key, 1);
+    } else {
+        r = rpc_call(VR_READ_H264, &b, &out);
+    }
+    free(b.p);
+    if (r == VK_SUCCESS && out.n) disp_give_video(sc, &out);
+    free(out.p);
+    return r;
+}
+
+// H.264 で窓の絵を頼む。1 頼めた・0 JPEG で頼み直す（JPEG に戻した）・-1 つながりが切れた（r に結果）
+static int video_blit(struct swapchain *sc, uint32_t j, uint64_t serial, int now, VkResult *r) {
+    if (!sc->use_video) return 0;
+    *r = sc->v_broken ? VK_ERROR_FEATURE_NOT_PRESENT : video_request(sc, j, serial, now);
+    if (*r == VK_SUCCESS) return 1;
+    if (g_dead) return -1;
+    video_fallback(sc);
+    return 0;
+}
+
 // 今のコマの JPEG をその場で受け取って、表示の糸に渡す（区切りの待ちがあるときの、遅れの少ないやり方）
 static VkResult blit_now(struct swapchain *sc, uint32_t j, uint64_t serial) {
+    VkResult vr = VK_SUCCESS;
+    int vk = video_blit(sc, j, serial, 1, &vr);
+    if (vk < 0) return vr;
+    if (vk > 0) {
+        RECT rc;
+        GetClientRect(sc->hwnd, &rc);
+        return ask_resize(sc, &rc) ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
+    }
     static int q = -1;
     if (q < 0) { const char *e = getenv("IPHONE_VK_JPEG_Q"); q = e && atoi(e) > 0 ? atoi(e) : 80; }
     vr_buf b = { 0 }, out = { 0 };
@@ -3815,6 +4426,15 @@ static VkResult blit(struct swapchain *sc, uint32_t j, uint64_t serial) {
     if (!sc->hwnd) return VK_SUCCESS;
     uint8_t *px = sc->px[j];
     if (sc->use_jpeg && disp_thread_on()) {
+        // H.264 で頼めたら、それで終わり（ほどいて描くのは表示の糸）
+        VkResult vr = VK_SUCCESS;
+        int vk = video_blit(sc, j, serial, 0, &vr);
+        if (vk != 0) {
+            RECT rc;
+            GetClientRect(sc->hwnd, &rc);
+            if (vk > 0 && ask_resize(sc, &rc)) return VK_SUBOPTIMAL_KHR;
+            return VK_SUCCESS;
+        }
         // JPEG を取ってきて表示の糸に渡し、ほどいて描くのを待たずに戻る
         vr_buf out = { 0 };
         int k = jpeg_request(sc, j, &out);
@@ -3905,6 +4525,7 @@ static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi)
     heat_check();
     double slept = sc0 ? pace_present(sc0) : 0;
     double tp = now_ms();
+    if (!g_stat.presents) g_stat.cpu0 = proc_cpu_ms();
     g_stat.presents++;
     for (uint32_t i = 0; i < pi->swapchainCount; i++) {
         struct swapchain *sc = (struct swapchain *) pi->pSwapchains[i];

@@ -31,6 +31,13 @@
 #define VR_CAP_NULL_DESC 2048u      // 空（VK_NULL_HANDLE）の descriptor と頂点バッファを受ける。GPU が持たなければ受け手が代わりの物を使う
 #define VR_CAP_D3D 512u              // DirectX（DXVK）の土台：VR_CREATE_BUFFER_VIEW・texel buffer の descriptor・VR_GET_IMAGE_SUBRESOURCE_LAYOUT
 #define VR_CAP_DESC_FLAGS 262144u   // VR_CREATE_DSL の末尾の binding ごとの flags と、VR_ALLOC_DESCRIPTOR_SETS の末尾の set ごとの数（variable descriptor count）を読む
+#define VR_CAP_H264 262144u          // VR_READ_H264：窓に出すコマを受け手が H.264 に縮めて、1 コマずつ返す（iPhone は VideoToolbox、PC の代役は Media Foundation）
+// VR_READ_H264 の印
+#define VR_H264_KEY 1u               // このコマをキーフレーム（IDR）にする。ドライバがほどき直すとき
+#define VR_H264_PIPE 2u              // 先送り：今のコマを後ろで縮め始めて、ひとつ前に頼んだコマを返す（最初は空）
+// VR_READ_H264 の返事の頭（32 バイト）：流れの番号（u64）・札（u64）・幅・高さ・印（u32。1 ならキーフレーム）・空き（u32）。
+// そのあとに 1 コマぶんの NAL の並び（Annex B。00 00 00 01 で区切る。キーフレームには SPS と PPS が付く）
+#define VR_H264_HEAD 32u
 #define VR_CAP_NEW_MASK (VR_CAP_VK13 | VR_CAP_DYNAMIC_RENDERING | VR_CAP_SYNC2 | VR_CAP_RENDER_PASS2 | VR_CAP_CMD10 | VR_CAP_EXT_DYNAMIC_STATE | VR_CAP_QUERY)
 // 1.3 の受け手は、VR_GET_FORMAT_PROPS の返事の後ろに VkFormatProperties3 の 3 つの値（u64）を付ける。古いドライバは読まない
 
@@ -117,6 +124,8 @@ enum vr_op {
     VR_CREATE_IMAGE_NR,          // VR_CREATE_IMAGE と同じ中身で、返事をしない（VR_CAP_ASYNC_CREATE）
     VR_GET_STATUS,               // [同期] → 熱の状態（u32・0 ふつう〜3 とても熱い）・後ろに回っているか（u32）（VR_CAP_STATUS）
     VR_GET_LINK,                 // [同期] → 使えるか（u32）・合言葉（16 バイト）・住所（u32・IPv4 をネットワークの並びで）・ポート（u32）。USB の口からだけ答える（VR_CAP_LINK）
+    VR_READ_H264,                // [同期] memory・offset・幅・高さ・行の長さ・BGRA か・印（VR_H264_*）・kbps・コマ/秒・キーフレームの間隔（コマ）・
+                                 // 流れの番号（u64）・札（u64）→ 頭（VR_H264_HEAD）と 1 コマぶんの H.264。先送りの最初は空（VR_CAP_H264）
     VR_OP_COUNT
 };
 
