@@ -8,6 +8,8 @@
 
 最終更新 2026-10-07
 
+数（10/7 午後）：代役か iPhone のふりで動いた物 28 本（Vulkan 8・DirectX 11 20）。iPhone の実機で動いた物 16 本（Vulkan 8・DirectX 11 8）。目標は 50 本
+
 ## Vulkan のアプリ
 | アプリ | 代役 | iPhone | 数字（iPhone） |
 |---|---|---|---|
@@ -41,6 +43,12 @@
 | MultithreadedRendering11 | 素材が足りない | | | |
 
 ## 組んであるがまだ試していない物
-- vkQuake 1.36.0（Quake のシェアウェアのデータを取ってくる許可待ち）
+- vkQuake 1.36.0（データは無料の LibreQuake〈BSD-3〉か Quake のシェアウェア。取ってくる許可待ち）
 - WebDriverAgent（iPhone のアプリを Windows から操作する⑥用）
 - マイクラのサーバー Pumpkin（アプリ 0.7.23 に入っている）
+
+## 次に試す候補（取ってくる許可待ち）
+- GZDoom 4.14.2 ＋ Freedoom（Vulkan で描く。必須の機能 4 つは iPhone も持っている）
+- OpenGL を zink で（docs/opengl_zink_plan.md・出るのは OpenGL 2.1 まで）
+- Unigine Heaven と Valley（DirectX 11・docs/dx11_games_candidates.md）
+- Godot 4.7 の見本（Mobile の描き方・Vulkan を名前で選ぶ）
