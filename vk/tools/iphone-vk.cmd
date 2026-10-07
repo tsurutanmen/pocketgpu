@@ -13,4 +13,6 @@ set DISABLE_VULKAN_OBS_CAPTURE=1
 set DISABLE_VULKAN_OW_OBS_CAPTURE=1
 rem つなぎ先：USB は usb_forward.py --local 50061 --remote 50060
 if "%IPHONE_VK%"=="" set IPHONE_VK=127.0.0.1:50061
+rem IPHONE_VK_ONLY=1 なら、ほかの GPU のドライバを隠して iPhone だけを見せる（最初の GPU を勝手に選ぶゲーム用）
+if "%IPHONE_VK_ONLY%"=="1" set "VK_LOADER_DRIVERS_SELECT=*iphone_icd*"
 %*
