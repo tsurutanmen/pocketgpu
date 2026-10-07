@@ -417,6 +417,11 @@ static void sleep_ms(int ms) {
 // 1 つの接続の間に、どこに時間がかかったか
 static struct { double wait_ms, record_ms, submit_ms, paused_ms; uint64_t waits, records, submits; uint64_t wait_by_op[64]; } g_st;
 static uint32_t g_cur_op; // いま処理している命令（どの命令で GPU を待ったかを数える）
+// アプリの画面のファンを回すための数。アプリが少しずつ読んで、増えた速さで回す
+static volatile uint64_t g_ops_total;
+static volatile int g_clients;
+uint64_t vkr_ops_total(void) { return g_ops_total; }
+int vkr_clients(void) { return g_clients; }
 
 // command buffer ごとに、どの command pool の物か・記録した中でどの descriptor set を使うか
 typedef struct { uint64_t cb, pool; uint64_t *sets; uint32_t n, cap; idlist *mems; } cbinfo;
@@ -1418,6 +1423,7 @@ static void jp_reset(void) {}
 // ---- 1 つの命令を実行する。返事が要るものは reply する ----
 static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     g_cur_op = op;
+    g_ops_total++;
     // 調べ用：VKR_DRAIN=命令の番号,… なら、その命令の前は出した仕事を全部待つ
     static int drain_ops_ready;
     static unsigned char drain_ops[256];
@@ -2990,7 +2996,9 @@ int vkr_serve(const char *host, int port) {
         setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
         vlog("つながった");
+        g_clients = 1;
         serve_client(c);
+        g_clients = 0;
         if (g_lost) {
 #ifdef _WIN32
             // PC の代役（RTX）は、GPU を失うと同じプロセスでは Vulkan を作り直しても装置を作れない（-3 が続く）。

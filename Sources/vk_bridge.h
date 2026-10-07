@@ -1,5 +1,6 @@
 // Swift から呼ぶ、Vulkan の命令の受け手（vk/remote/server.c）の入口
 #pragma once
+#include <stdint.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -8,6 +9,9 @@ extern "C" {
 int vkr_serve(const char * host, int port);
 // アプリが前にいないときは 1。その間は GPU に新しい仕事を出さずに待つ（出すと GPU を失う）
 void vkr_set_paused(int on);
+// 受け手が処理した命令の数（つないでから増え続ける）と、いま PC がつながっているか。画面のファンを回すのに使う
+uint64_t vkr_ops_total(void);
+int vkr_clients(void);
 // USB の通り道の速さを測る受け口（vk/remote/bw.c）。戻ってこないので別のスレッドで呼ぶ
 int vkr_bw_serve(const char * host, int port);
 // マイクラのサーバー（mc/pumpkin-ios・Pumpkin・GPL-3.0）。PUMPKIN を付けて組んだときだけ入っている。止まるまで戻らない

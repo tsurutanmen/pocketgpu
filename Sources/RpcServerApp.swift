@@ -128,6 +128,8 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             Form {
+                // GPU のカード：ファンの数は機種で、回る速さは PC から来る仕事の量で変わる
+                Section { GPUCardView() }
                 Section("この iPhone") {
                     Text(devices.isEmpty ? "読み込み中" : devices).font(.footnote.monospaced())
                     Text("アプリが使えるメモリの残り：\(availMB) MB").font(.footnote)
