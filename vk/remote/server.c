@@ -117,6 +117,12 @@ static int like_ios(void) {
     return v;
 }
 
+// iPhone のふりで持たない形式。iPhone の GPU（Apple の GPU）には 24 ビットの深度の形式が無い（Metal の Depth24Unorm_Stencil8 は
+// macOS の一部の GPU だけ）。DXVK はこれを見て 32 ビット浮動小数の深度に置き換える
+static int like_ios_no_format(VkFormat f) {
+    return like_ios() && (f == VK_FORMAT_D24_UNORM_S8_UINT || f == VK_FORMAT_X8_D24_UNORM_PACK32 || f == VK_FORMAT_D16_UNORM_S8_UINT);
+}
+
 // iPhone のふりで隠す機能。10/7 の iPhone 17 Pro（MoltenVK 1.4.2）の DXVK の記録と比べて、iPhone に無かった物
 static void like_ios_mask(VkPhysicalDeviceFeatures *f) {
     if (!like_ios()) return;
@@ -1561,12 +1567,14 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkFormat fmt = (VkFormat) vr_ru32(r);
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(g_pd, fmt, &fp);
+        if (like_ios_no_format(fmt)) memset(&fp, 0, sizeof fp);
         vr_put(&g_out, &fp, sizeof fp);
         if (g_fmt3) {
             // 1.3 の 64 ビットの形（STORAGE_READ_WITHOUT_FORMAT など 1.0 の形に無い印がある）を後ろに付ける
             VkFormatProperties3 f3 = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3 };
             VkFormatProperties2 f2 = { .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2, .pNext = &f3 };
             vkGetPhysicalDeviceFormatProperties2(g_pd, fmt, &f2);
+            if (like_ios_no_format(fmt)) f3.linearTilingFeatures = f3.optimalTilingFeatures = f3.bufferFeatures = 0;
             vr_u64(&g_out, f3.linearTilingFeatures);
             vr_u64(&g_out, f3.optimalTilingFeatures);
             vr_u64(&g_out, f3.bufferFeatures);
@@ -2790,7 +2798,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t fmt = vr_ru32(r), type = vr_ru32(r), tiling = vr_ru32(r), usage = vr_ru32(r), flags = vr_ru32(r);
         VkImageFormatProperties ip;
         memset(&ip, 0, sizeof ip);
-        VkResult res = vkGetPhysicalDeviceImageFormatProperties(g_pd, (VkFormat) fmt, (VkImageType) type, (VkImageTiling) tiling, usage, flags, &ip);
+        VkResult res = like_ios_no_format((VkFormat) fmt) ? VK_ERROR_FORMAT_NOT_SUPPORTED
+                                                         : vkGetPhysicalDeviceImageFormatProperties(g_pd, (VkFormat) fmt, (VkImageType) type, (VkImageTiling) tiling, usage, flags, &ip);
         vr_put(&g_out, &ip, sizeof ip);
         return reply(s, res);
     }
