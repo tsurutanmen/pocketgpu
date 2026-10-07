@@ -3388,13 +3388,34 @@ static int wr_may(uint32_t set, uint32_t binding) {
     if (off || g_wr_all || set >= 32 || binding >= 256) return 1;
     return ((uint32_t) g_wr[set][binding / 32] >> (binding % 32)) & 1;
 }
+// 根の変数を結ぶ（0 は根なし・WR_MANY は 2 つ以上）
+#define WR_MANY 0xffffffffu
+static void wr_link(uint32_t *root, uint32_t bound, uint32_t dst, uint32_t src) {
+    if (dst >= bound || src >= bound || !root[src]) return;
+    uint32_t r = root[src];
+    if (!root[dst]) root[dst] = r;
+    else if (root[dst] != r) root[dst] = WR_MANY;
+}
+static void wr_store(const uint32_t *root, uint8_t *stored, uint32_t bound, uint32_t p, int *all) {
+    if (p >= bound || !root[p]) return;
+    if (root[p] == WR_MANY) *all = 1;
+    else stored[root[p]] = 1;
+}
+// 中で書くかまで見るか（IPHONE_VK_RO_DEEP=0 で宣言だけを見る前のやり方）
+static int wr_deep(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_RO_DEEP"); v = !(e && *e == '0'); }
+    return v;
+}
+
 static void wr_scan(const uint32_t *w, size_t nw) {
     if (nw < 5 || w[0] != 0x07230203 || w[3] > (1u << 22)) { InterlockedExchange(&g_wr_all, 1); return; }
     uint32_t bound = w[3];
     uint32_t *set = calloc(bound, 4), *bnd = calloc(bound, 4), *memnw = calloc(bound, 4), *memn = calloc(bound, 4);
     uint32_t *ptr_t = calloc(bound, 4), *ptr_sc = calloc(bound, 4), *elem = calloc(bound, 4), *imgw = calloc(bound, 4);
     uint8_t *fl = calloc(bound, 1); // 1 set・2 binding・4 NonWritable・8 BufferBlock・16 struct
-    uint32_t *vars = calloc(bound, 4), nvars = 0;
+    uint32_t *vars = calloc(bound, 4), nvars = 0, *root = NULL;
+    uint8_t *stored = NULL;
     if (!set || !bnd || !memnw || !memn || !ptr_t || !ptr_sc || !elem || !imgw || !fl || !vars) { InterlockedExchange(&g_wr_all, 1); goto out; }
     for (size_t i = 5; i < nw;) {
         uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
@@ -3413,10 +3434,37 @@ static void wr_scan(const uint32_t *w, size_t nw) {
         else if (op == 59 && wc >= 4 && x[2] < bound) vars[nvars++] = i; // OpVariable
         i += wc;
     }
+    // 宣言に readonly が無くても、中で書かない物は書かない（GLSL は readonly を付けない物が多い。GZDoom の光の表など）。
+    // 変数から辿れるポインタ（access chain・写し・phi・select・texel pointer・load）を根の変数に結び、
+    // store・atomic・画像への書き込み・関数や拡張命令への受け渡しの先が根なら「書く」。根が 2 つ以上に分かれる物へ書くなら、全部書くとみなす
+    root = calloc(bound, 4);
+    stored = calloc(bound, 1);
+    if (!root || !stored) { InterlockedExchange(&g_wr_all, 1); goto out; }
+    for (uint32_t k = 0; k < nvars; k++) root[w[vars[k] + 2]] = w[vars[k] + 2];
+    for (int pass = 0; pass < 3; pass++) // phi は後ろで作られる物も指すので、何回か回す
+        for (size_t i = 5; i < nw; i += w[i] >> 16) {
+            uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+            const uint32_t *x = &w[i];
+            if ((op == 65 || op == 66 || op == 67 || op == 70 || op == 83 || op == 124 || op == 60 || op == 61) && wc >= 4)
+                wr_link(root, bound, x[2], x[3]);
+            else if (op == 245)
+                for (uint32_t k = 3; k < wc; k += 2) wr_link(root, bound, x[2], x[k]);
+            else if (op == 169 && wc >= 6) { wr_link(root, bound, x[2], x[4]); wr_link(root, bound, x[2], x[5]); }
+        }
+    int all = 0;
+    for (size_t i = 5; i < nw; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        const uint32_t *x = &w[i];
+        if ((op == 62 || op == 63 || op == 64 || op == 228 || op == 319 || op == 99) && wc >= 2) wr_store(root, stored, bound, x[1], &all);
+        else if (((op >= 229 && op <= 242) || op == 318 || op == 5614 || op == 5615 || op == 6035) && wc >= 4) wr_store(root, stored, bound, x[3], &all);
+        else if (op == 57) for (uint32_t k = 4; k < wc; k++) wr_store(root, stored, bound, x[k], &all);
+        else if (op == 12) for (uint32_t k = 5; k < wc; k++) wr_store(root, stored, bound, x[k], &all);
+    }
     for (uint32_t k = 0; k < nvars; k++) {
         const uint32_t *x = &w[vars[k]];
         uint32_t v = x[2], pt = x[1] < bound ? x[1] : 0, sc = x[3];
         if (!(fl[v] & 3)) continue;
+        if (!all && !stored[v] && wr_deep()) continue; // 中で書いていない
         uint32_t t = pt ? ptr_t[pt] : 0;
         for (int d = 0; d < 4 && t < bound && elem[t]; d++) t = elem[t];
         if (t >= bound) continue;
@@ -3429,6 +3477,7 @@ static void wr_scan(const uint32_t *w, size_t nw) {
     }
 out:
     free(set); free(bnd); free(memnw); free(memn); free(ptr_t); free(ptr_sc); free(elem); free(imgw); free(fl); free(vars);
+    free(root); free(stored);
 }
 
 static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out) {
