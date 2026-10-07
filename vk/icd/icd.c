@@ -1950,20 +1950,30 @@ static VkResult VKAPI_CALL flush_ranges(VkDevice dv, uint32_t n, const VkMappedM
 static void VKAPI_CALL get_commitment(VkDevice dv, VkDeviceMemory mm, VkDeviceSize *c) { (void) dv; *c = ((struct mem *) mm)->size; }
 
 // ---- バッファ ----
-// buffer の必要なメモリの量は、flags と使い道が同じなら、大きさを並びの単位に切り上げただけになる GPU が多い。
-// 最初の 1 回は受け手に聞いて、そうなっていると確かめられたら、次からは手元で計算して返事を待たない（先例 Venus と同じ考え方）
-static struct bufreq { int used, linear; uint32_t flags, usage; VkMemoryRequirements req; } g_brq[256];
+// buffer の必要なメモリの量は、flags と使い道が同じなら、大きさから決まる GPU が多い。
+// 並びの単位に切り上げる物（RTX など）と、大きさをそのまま返す物（iPhone の MoltenVK）がある。
+// 受け手に聞いた答えから、どちらの型かが決まったら、次からは手元で計算して返事を待たない（先例 Venus と同じ考え方）。
+// 大きさが並びの単位のちょうど倍のときは、どちらの型でも同じ答えになるので、決まるまで聞き続ける
+enum { BRQ_UNKNOWN, BRQ_ROUND, BRQ_EXACT, BRQ_ASK };
+static struct bufreq { int used, mode; uint32_t flags, usage; VkMemoryRequirements req; } g_brq[256];
 static SRWLOCK g_brq_lock = SRWLOCK_INIT;
 
 static int brq_find(uint32_t flags, uint32_t usage, VkDeviceSize size, VkMemoryRequirements *req) {
     int hit = 0;
     AcquireSRWLockShared(&g_brq_lock);
     for (int i = 0; i < 256 && g_brq[i].used; i++)
-        if (g_brq[i].flags == flags && g_brq[i].usage == usage && g_brq[i].linear) {
-            *req = g_brq[i].req;
-            VkDeviceSize al = req->alignment ? req->alignment : 1;
-            req->size = (size + al - 1) / al * al;
-            hit = 1;
+        if (g_brq[i].flags == flags && g_brq[i].usage == usage) {
+            VkDeviceSize al = g_brq[i].req.alignment ? g_brq[i].req.alignment : 1;
+            if (g_brq[i].mode == BRQ_ROUND || g_brq[i].mode == BRQ_EXACT) {
+                *req = g_brq[i].req;
+                req->size = g_brq[i].mode == BRQ_ROUND ? (size + al - 1) / al * al : size;
+                hit = 1;
+            } else if (g_brq[i].mode == BRQ_UNKNOWN && size % al == 0) {
+                // 単位のちょうど倍なら、どちらの型でも答えは大きさそのもの
+                *req = g_brq[i].req;
+                req->size = size;
+                hit = 1;
+            }
             break;
         }
     ReleaseSRWLockShared(&g_brq_lock);
@@ -1972,7 +1982,9 @@ static int brq_find(uint32_t flags, uint32_t usage, VkDeviceSize size, VkMemoryR
 
 static void brq_learn(uint32_t flags, uint32_t usage, VkDeviceSize size, const VkMemoryRequirements *req) {
     VkDeviceSize al = req->alignment ? req->alignment : 1;
-    int linear = req->size == (size + al - 1) / al * al;
+    VkDeviceSize up = (size + al - 1) / al * al;
+    int mode = size % al == 0 ? (req->size == size ? BRQ_UNKNOWN : BRQ_ASK)
+             : req->size == up ? BRQ_ROUND : req->size == size ? BRQ_EXACT : BRQ_ASK;
     AcquireSRWLockExclusive(&g_brq_lock);
     int i = 0;
     while (i < 256 && g_brq[i].used && !(g_brq[i].flags == flags && g_brq[i].usage == usage)) i++;
@@ -1981,7 +1993,11 @@ static void brq_learn(uint32_t flags, uint32_t usage, VkDeviceSize size, const V
         g_brq[i].flags = flags;
         g_brq[i].usage = usage;
         g_brq[i].req = *req;
-        g_brq[i].linear = linear;
+        g_brq[i].mode = mode;
+    } else if (i < 256 && g_brq[i].mode == BRQ_UNKNOWN && mode != BRQ_UNKNOWN) {
+        // まだ決まっていなかった型が、この答えで決まった（並びの単位や memoryTypeBits が違えば聞き続ける）
+        int same = g_brq[i].req.alignment == req->alignment && g_brq[i].req.memoryTypeBits == req->memoryTypeBits;
+        g_brq[i].mode = same ? mode : BRQ_ASK;
     }
     ReleaseSRWLockExclusive(&g_brq_lock);
 }
