@@ -23,6 +23,7 @@
 | vkQuake 1.36.0＋LibreQuake（本物のゲーム） | ✅ RTX 直 584.9・ふり 159.6 | ✅ 1280×720 timedemo demo1 | 149.6 コマ/秒（10/7） |
 | GZDoom 4.14.2＋Freedoom（本物のゲーム） | ✅ ふり 135 | ✅ MAP01 を 40 秒・窓 1520×825 | **225.9 コマ/秒**（10/7 夜・0.7.24）。裏の窓だと GZDoom が休むので vid_activeinbackground 1 |
 | Godot 4.7.2 の公式の見本 8 本（Forward Mobile） | ✅ ふり：squash_the_creeps 191・truck_town 174・dodge_the_creeps 171・lights_and_shadows 152・volumetric_fog 149・platformer 135・compute_texture 175・particles 23 | 未 | particles は GPU が書く粒の buffer を毎回読み戻すので遅い |
+| Godot 4.7.2 の Forward+（机の上の PC 向けの描き方） | ✅ ふり：squash_the_creeps 174・volumetric_fog 148 | 未 | |
 | SuperTuxKart 1.5（Vulkan・本物のゲーム） | ✅ ふり 110 コマ/秒（RTX 直 107.9）・lighthouse を 4 台で自動走行 | 未 | 22 本の糸で command buffer を捨てる順のずれを直して落ちなくなった |
 
 ## DirectX 11（DXVK-macOS 1.10.3 と DXVK 3.1.1）
