@@ -1041,6 +1041,13 @@ static void add_name(ctx *c, uint32_t id, const char *s) {
     il_push(&c->newdbg, make_ins(OP_Name, 1 + n, w));
 }
 
+// GS の出力のうち、PrimitiveId の組み込みの物か
+static int gs_prim_out(ctx *c, uint32_t var) {
+    for (int i = 0; i < c->n_gs_out; i++)
+        if (c->gs_out[i].var == var && c->gs_out[i].builtin == BI_PrimitiveId) return 1;
+    return 0;
+}
+
 static uint32_t new_var(ctx *c, uint32_t ptype, uint32_t sc, const char *name) {
     uint32_t w[3] = { ptype, spv_new_id(c), sc };
     il_push(&c->newvars, make_ins(OP_Variable, 3, w));
@@ -1258,7 +1265,12 @@ int gs_emu_build2(const uint32_t *vs, size_t vs_words, const uint32_t *gs, size_
         uint32_t *d = NULL;
         for (size_t j = 0; j < c->g.s[S_GLOB].n; j++)
             if (OPC(c->g.s[S_GLOB].v[j]) == OP_Variable && c->g.s[S_GLOB].v[j][2] == c->gs_out[i].var) d = c->g.s[S_GLOB].v[j];
-        c->sel[c->gs_out[i].var] = new_var(c, d[1], SC_Output, NULL);
+        // PrimitiveId の出力は VS からは出せない（Geometry の capability が要る。残すと NVIDIA は GPU の例外で止まる）。
+        // 作る VS では Private の変数にして捨てる。PS が読めば、GPU が数えた番号（作った描画の中の番号）になる
+        if (c->gs_out[i].builtin == BI_PrimitiveId)
+            c->sel[c->gs_out[i].var] = new_var(c, ty_ptr(c, SC_Private, plain(c, c->gs_out[i].type)), SC_Private, NULL);
+        else
+            c->sel[c->gs_out[i].var] = new_var(c, d[1], SC_Output, NULL);
         if (c->list) {
             uint32_t pp = ty_ptr(c, SC_Private, plain(c, c->gs_out[i].type));
             c->prev1[i] = new_var(c, pp, SC_Private, NULL);
@@ -1389,6 +1401,7 @@ int gs_emu_build2(const uint32_t *vs, size_t vs_words, const uint32_t *gs, size_
                 uint32_t *a = ms[m]->s[S_ANN].v[i], op = OPC(a);
                 if ((op == OP_Decorate || op == OP_DecorateId || op == OP_DecorateString) && a[1] < c->cap && c->conv[a[1]]) {
                     if (!c->sel[a[1]] || a[2] == DEC_Stream || a[2] == DEC_Offset || a[2] == DEC_XfbBuffer || a[2] == DEC_XfbStride) continue;
+                    if (gs_prim_out(c, a[1])) continue; // Private にした PrimitiveId の出力には飾りを付けない
                     uint32_t *x = dup_ins(a);
                     x[1] = c->sel[a[1]];
                     wb_ins(&o, x);

@@ -315,7 +315,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     if (v13 && (caps & need13) == need13) caps |= VR_CAP_VK13;
     g_fmt3 = (v13 || has_ext(ep, ne, "VK_KHR_format_feature_flags2")) && vkGetPhysicalDeviceFormatProperties2;
     caps |= VR_CAP_D3D; // buffer view と画像の並び方は 1.0 の入口なので、どの GPU でも使える
-    caps |= VR_CAP_PACK | VR_CAP_ASYNC_CREATE | VR_CAP_STATUS;
+    caps |= VR_CAP_PACK | VR_CAP_ASYNC_CREATE | VR_CAP_STATUS | VR_CAP_LINK;
     // 頂点の step rate：GPU が拡張を持てば、pipeline の末尾を読んでつなぐ（MoltenVK も持つ）
     {
         uint32_t ne = 0;
@@ -425,6 +425,28 @@ static volatile int g_paused;   // アプリが前にいない間は 1（GPU に
 
 // アプリから呼ぶ：前にいないときは 1
 void vkr_set_paused(int on) { g_paused = on; }
+
+// ---- インターネット共有の口（Backburner と同じく、USB を有線のネットワークとして使う道） ----
+// USB の口（iPhone の中の 127.0.0.1・usbmux）に加えて、インターネット共有の口でも待つ。
+// インターネット共有は Wi-Fi でも近くの人がつなげるので、最初に合言葉を出さない相手は断る。
+// 合言葉はアプリが起動のたびに作り、USB の口（信頼済みの PC だけがつなげる）で VR_GET_LINK に答えて渡す
+static uint8_t g_token[16];
+static int g_token_ok;
+static char g_extra_host[64];
+static int g_main_port = VR_DEFAULT_PORT;
+static volatile int g_cur_remote; // いま相手をしているのがインターネット共有の口から来た人なら 1
+static vr_sock g_extra_ls = VR_BAD_SOCK;
+static const char *g_extra_env; // PC の代役の調べ用（VKR_EXTRA_LISTEN）
+#ifdef _WIN32
+static SRWLOCK g_serve_lk = SRWLOCK_INIT;
+static void serve_lock(void) { AcquireSRWLockExclusive(&g_serve_lk); }
+static void serve_unlock(void) { ReleaseSRWLockExclusive(&g_serve_lk); }
+#else
+static pthread_mutex_t g_serve_mx = PTHREAD_MUTEX_INITIALIZER;
+static void serve_lock(void) { pthread_mutex_lock(&g_serve_mx); }
+static void serve_unlock(void) { pthread_mutex_unlock(&g_serve_mx); }
+#endif
+void vkr_set_token(const char *hex) { g_token_ok = vr_token_parse(hex, g_token); }
 static volatile int g_thermal; // iPhone の熱の状態（0 ふつう・1 やや熱い・2 熱い・3 とても熱い）。アプリが知らせる
 void vkr_set_thermal(int state) { g_thermal = state; }
 
@@ -725,6 +747,13 @@ static void cleanup(void) {
     g_cap = g_cnt = 0;
 }
 
+// 届いた文字列。終わりの 0 が無い物は空にする（strcmp やドライバが外を読まないように）
+static const char *rd_str(vr_rd *r) {
+    uint32_t l;
+    const char *p = (const char *) vr_rbytes(r, &l);
+    return p && l && p[l - 1] == 0 ? p : "";
+}
+
 // ---- 返事 ----
 static vr_buf g_out;
 static int reply(vr_sock s, int32_t result) {
@@ -740,7 +769,10 @@ static void *build_chain(vr_rd *r, uint32_t count, void **blocks, uint32_t *size
     for (uint32_t i = 0; i < count; i++) {
         uint32_t st = vr_ru32(r), sz = vr_ru32(r);
         if (sz < sizeof(VkBaseOutStructure)) sz = sizeof(VkBaseOutStructure);
-        VkBaseOutStructure *b = calloc(1, sz);
+        if (sz > (1u << 16)) sz = (1u << 16); // 申告が大きすぎるのは細工
+        // ドライバは sType を見て構造体まるごと書く。申告 sz が小さくても溢れないよう、余裕をもって確保する
+        uint32_t asz = sz < 4096u ? 4096u : sz;
+        VkBaseOutStructure *b = calloc(1, asz);
         b->sType = (VkStructureType) st;
         blocks[i] = b;
         sizes[i] = sz;
@@ -844,7 +876,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             uint32_t nd = vr_ru32(r);
             uint32_t dyn[64];
             for (uint32_t i = 0; i < nd && i < 64; i++) dyn[i] = vr_ru32(r);
-            vkCmdBindDescriptorSets(cb, (VkPipelineBindPoint) bp, pl, first, n, sets, nd, dyn);
+            vkCmdBindDescriptorSets(cb, (VkPipelineBindPoint) bp, pl, first, n < 32 ? n : 32, sets, nd < 64 ? nd : 64, dyn);
         } break;
         case VR_CMD_PUSH_CONSTANTS: {
             VkPipelineLayout pl = OBJ(VkPipelineLayout, vr_ru64(r));
@@ -912,6 +944,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             VkMemoryBarrier mb[16];
             for (uint32_t i = 0; i < nm && i < 16; i++) mb[i] = (VkMemoryBarrier) { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, vr_ru32(r), vr_ru32(r) };
             uint32_t nb = vr_ru32(r);
+            if (nb > r->n - r->at) { r->bad = 1; break; }
             VkBufferMemoryBarrier *bb = calloc(nb ? nb : 1, sizeof *bb);
             for (uint32_t i = 0; i < nb; i++) {
                 bb[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -931,6 +964,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             VkMemoryBarrier mb[16];
             for (uint32_t i = 0; i < nm && i < 16; i++) mb[i] = (VkMemoryBarrier) { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, vr_ru32(r), vr_ru32(r) };
             uint32_t nb = vr_ru32(r);
+            if (nb > r->n - r->at) { r->bad = 1; break; }
             VkBufferMemoryBarrier *bb = calloc(nb ? nb : 1, sizeof *bb);
             for (uint32_t i = 0; i < nb; i++) {
                 bb[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -943,6 +977,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
                 bb[i].size = vr_ru64(r);
             }
             uint32_t ni = vr_ru32(r);
+            if (ni > r->n - r->at) { free(bb); r->bad = 1; break; }
             VkImageMemoryBarrier *ib = calloc(ni ? ni : 1, sizeof *ib);
             for (uint32_t i = 0; i < ni; i++) {
                 ib[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1038,6 +1073,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
         case VR_CMD_COPY_BUFFER_TO_IMAGE: {
             uint64_t a = vr_ru64(r), b = vr_ru64(r);
             uint32_t layout = vr_ru32(r), n = vr_ru32(r);
+            if (n > r->n - r->at) { r->bad = 1; break; }
             VkBufferImageCopy *rg = calloc(n ? n : 1, sizeof *rg);
             for (uint32_t i = 0; i < n; i++) vr_rcopy(r, &rg[i], sizeof rg[i]);
             if (op == VR_CMD_COPY_IMAGE_TO_BUFFER) {
@@ -1073,6 +1109,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             uint32_t sl = vr_ru32(r);
             uint64_t did = vr_ru64(r);
             uint32_t dl = vr_ru32(r), n = vr_ru32(r);
+            if (n > r->n - r->at) { r->bad = 1; break; }
             ent *se = find(sid), *de = find(did);
             if (se && ci) use_buffer_mem(ci, se->aux);
             if (de && ci) use_buffer_mem(ci, de->aux);
@@ -1611,7 +1648,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t ne = vr_ru32(r);
         const char *names[64];
         uint32_t n_names = 0;
-        for (uint32_t i = 0; i < ne && i < 63; i++) { uint32_t l; names[n_names++] = (const char *) vr_rbytes(r, &l); }
+        for (uint32_t i = 0; i < ne && i < 63; i++) names[n_names++] = rd_str(r);
         if (g_portability) names[n_names++] = "VK_KHR_portability_subset";
         uint32_t has_f = vr_ru32(r);
         VkPhysicalDeviceFeatures feats;
@@ -1785,7 +1822,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         ent *e = find(mid);
         uint64_t off = vr_ru64(r);
         uint32_t w = vr_ru32(r), h = vr_ru32(r), stride = vr_ru32(r), bgra = vr_ru32(r), q = vr_ru32(r);
-        if (!e || !e->map || w == 0 || h == 0 || stride < w * 4 || off > e->size || (uint64_t) stride * h > e->size - off)
+        if (!e || !e->map || w == 0 || h == 0 || stride < (uint64_t) w * 4 || off > e->size || (uint64_t) stride * h > e->size - off)
             return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
 #if defined(__APPLE__) || defined(_WIN32)
         double jt1 = t_ms();
@@ -1813,7 +1850,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         ent *e = find(mid);
         uint64_t off = vr_ru64(r);
         uint32_t w = vr_ru32(r), h = vr_ru32(r), stride = vr_ru32(r), bgra = vr_ru32(r), q = vr_ru32(r);
-        if (!e || !e->map || w == 0 || h == 0 || stride < w * 4 || off > e->size || (uint64_t) stride * h > e->size - off)
+        if (!e || !e->map || w == 0 || h == 0 || stride < (uint64_t) w * 4 || off > e->size || (uint64_t) stride * h > e->size - off)
             return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
 #if defined(__APPLE__) || defined(_WIN32)
         // ひとつ前のコマの JPEG ができあがるのを待って、返事に入れる
@@ -1898,7 +1935,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkDevice d = DEV(vr_ru64(r));
         uint64_t id = vr_ru64(r);
         uint32_t flags = vr_ru32(r), n = vr_ru32(r);
+        if (n > r->n - r->at) return 1; // 本文より多い binding は細工。1 つ 16 バイトなので残りより多いことはない
         VkDescriptorSetLayoutBinding *b = calloc(n ? n : 1, sizeof *b);
+        if (!b) return 1;
         for (uint32_t i = 0; i < n; i++) {
             b[i].binding = vr_ru32(r);
             b[i].descriptorType = (VkDescriptorType) vr_ru32(r);
@@ -1949,8 +1988,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         ci.stage.flags = vr_ru32(r);
         ci.stage.module = OBJ(VkShaderModule, vr_ru64(r));
-        uint32_t l;
-        ci.stage.pName = (const char *) vr_rbytes(r, &l);
+        ci.stage.pName = rd_str(r);
         uint32_t nm = vr_ru32(r);
         VkSpecializationMapEntry me[64];
         for (uint32_t i = 0; i < nm && i < 64; i++) { me[i].constantID = vr_ru32(r); me[i].offset = vr_ru32(r); me[i].size = (size_t) vr_ru32(r); }
@@ -1987,6 +2025,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         ci.poolSizeCount = vr_ru32(r);
         VkDescriptorPoolSize ps[16];
         for (uint32_t i = 0; i < ci.poolSizeCount && i < 16; i++) { ps[i].type = (VkDescriptorType) vr_ru32(r); ps[i].descriptorCount = vr_ru32(r); }
+        if (ci.poolSizeCount > 16) ci.poolSizeCount = 16; // 詰めた分より多い数をドライバに渡さない
         ci.pPoolSizes = ps;
         VkDescriptorPool p;
         if (vkCreateDescriptorPool(d, &ci, NULL, &p) == VK_SUCCESS) put(id, (uint64_t) p, K_DPOOL);
@@ -2078,6 +2117,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             w.dstArrayElement = vr_ru32(r);
             w.descriptorType = (VkDescriptorType) vr_ru32(r);
             w.descriptorCount = vr_ru32(r);
+            if (w.descriptorCount > r->n - r->at) return 1;
             ent *se = find(sid);
             int image = w.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || w.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
                         w.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
@@ -2136,6 +2176,15 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     vr_put(dset_of(sid), t, (size_t) tn);
                 }
             }
+            // 空の uniform・storage buffer（OpenGL を Vulkan に直す zink が書く）は、GPU が空の descriptor を持たなければ、
+            // 0 で埋めた代わりにする（iPhone は持たない。仕様の外なので、どう動くか分からない）
+            for (uint32_t k = 0; k < w.descriptorCount && !g_nulldesc_gpu; k++)
+                if (!bi[k].buffer && dummy_vb()) {
+                    int ubo = w.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || w.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+                    bi[k].buffer = dummy_vb();
+                    bi[k].offset = 0;
+                    bi[k].range = ubo ? 16384 : VK_WHOLE_SIZE; // uniform は仕様の下限の 16 KiB に収める
+                }
             w.pBufferInfo = bi;
             vkUpdateDescriptorSets(d, 1, &w, 0, NULL);
             free(bi);
@@ -2445,6 +2494,18 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         vkSignalSemaphore(d, &si);
         return 1;
     }
+    case VR_GET_LINK: {
+        // USB の口からだけ答える（インターネット共有の口から来た相手には、合言葉を教えない）
+        struct in_addr ia = { 0 };
+        int ok = !g_cur_remote && g_token_ok && g_extra_host[0] && inet_pton(AF_INET, g_extra_host, &ia) == 1;
+        vr_u32(&g_out, ok ? 1u : 0u);
+        uint8_t zero[16] = { 0 };
+        vr_put(&g_out, ok ? g_token : zero, 16);
+        uint32_t ip = ok ? (uint32_t) ia.s_addr : 0;
+        vr_put(&g_out, &ip, 4);
+        vr_u32(&g_out, ok ? (uint32_t) g_main_port : 0u);
+        return reply(s, 0);
+    }
     case VR_GET_STATUS: {
         // PC の代役は VKR_THERMAL_FILE に書いた数字を返す（熱くなったときのドライバの動きを試す）
         int t = g_thermal;
@@ -2547,10 +2608,12 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkRenderPassCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
         ci.flags = vr_ru32(r);
         ci.attachmentCount = vr_ru32(r);
+        if (ci.attachmentCount > r->n - r->at) return 1;
         VkAttachmentDescription *att = calloc(ci.attachmentCount ? ci.attachmentCount : 1, sizeof *att);
         for (uint32_t i = 0; i < ci.attachmentCount; i++) vr_rcopy(r, &att[i], sizeof att[i]);
         ci.pAttachments = att;
         ci.subpassCount = vr_ru32(r);
+        if (ci.subpassCount > r->n - r->at) ci.subpassCount = 0, r->bad = 1;
         VkSubpassDescription *sub = calloc(ci.subpassCount ? ci.subpassCount : 1, sizeof *sub);
         // 参照の並びは、まとめて 1 つの塊に置く
         VkAttachmentReference *refs = calloc(256, sizeof *refs);
@@ -2582,6 +2645,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         }
         ci.pSubpasses = sub;
         ci.dependencyCount = vr_ru32(r);
+        if (ci.dependencyCount > r->n - r->at) ci.dependencyCount = 0, r->bad = 1;
         VkSubpassDependency *dep = calloc(ci.dependencyCount ? ci.dependencyCount : 1, sizeof *dep);
         for (uint32_t i = 0; i < ci.dependencyCount; i++) vr_rcopy(r, &dep[i], sizeof dep[i]);
         ci.pDependencies = dep;
@@ -2599,6 +2663,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         ci.flags = vr_ru32(r);
         ci.renderPass = OBJ(VkRenderPass, vr_ru64(r));
         ci.attachmentCount = vr_ru32(r);
+        if (ci.attachmentCount > r->n - r->at) return 1;
         VkImageView *v = calloc(ci.attachmentCount ? ci.attachmentCount : 1, sizeof *v);
         uint64_t vids[32];
         for (uint32_t i = 0; i < ci.attachmentCount; i++) {
@@ -2641,8 +2706,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             st[i].stage = (VkShaderStageFlagBits) vr_ru32(r);
             st[i].flags = vr_ru32(r);
             st[i].module = OBJ(VkShaderModule, vr_ru64(r));
-            uint32_t l;
-            st[i].pName = (const char *) vr_rbytes(r, &l);
+            st[i].pName = rd_str(r);
             uint32_t nm = vr_ru32(r);
             for (uint32_t k = 0; k < nm; k++) {
                 uint32_t a = vr_ru32(r), b = vr_ru32(r), c = vr_ru32(r);
@@ -2978,7 +3042,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t first = vr_ru32(r), n = vr_ru32(r);
         uint64_t size = vr_ru64(r), stride = vr_ru64(r);
         uint32_t flags = vr_ru32(r);
-        if (!qp || !size || size > (64u << 20)) return reply(s, VK_ERROR_INITIALIZATION_FAILED);
+        if (!qp || !size || size > (64u << 20) || (uint64_t) n * stride > size) return reply(s, VK_ERROR_INITIALIZATION_FAILED);
         vr_reserve(&g_out, (size_t) size);
         memset(g_out.p, 0, (size_t) size);
         VkResult res = vkGetQueryPoolResults(d, qp, first, n, (size_t) size, g_out.p, stride, flags);
@@ -3099,8 +3163,128 @@ static void serve_client(vr_sock c) {
 }
 
 // iPhone のアプリから呼ぶ入口。戻ってこない
+static void serve_one(vr_sock c, int remote) {
+    serve_lock();
+    g_cur_remote = remote;
+    vlog(remote ? "つながった（インターネット共有の口）" : "つながった");
+    g_clients = 1;
+    serve_client(c);
+    g_clients = 0;
+    g_cur_remote = 0;
+    if (g_lost) {
+#ifdef _WIN32
+        // PC の代役（RTX）は、GPU を失うと同じプロセスでは Vulkan を作り直しても装置を作れない（-3 が続く）。
+        // プロセスごと終わり、立て直しは外の台本に任せる
+        vlog("GPU を失ったので終わる（代役は立て直しが要る）");
+        exit(3);
+#endif
+        // GPU を失ったあとは、同じ Vulkan のままだと次の装置が作れないことがある
+        vlog("GPU を失ったので、Vulkan を作り直す");
+        vkDestroyInstance(g_inst, NULL);
+        g_inst = VK_NULL_HANDLE;
+        g_lost = 0;
+        if (!vk_init()) vlog("Vulkan を作り直せない");
+    }
+#ifdef _WIN32
+    closesocket(c);
+#else
+    close(c);
+#endif
+    vlog("切れた");
+    serve_unlock();
+}
+
+// インターネット共有の口で待つ糸。合言葉を確かめてから相手をする
+#ifdef _WIN32
+static DWORD WINAPI extra_thread(LPVOID p) {
+#else
+static void *extra_thread(void *p) {
+#endif
+    vr_sock ls = (vr_sock) (uintptr_t) p;
+    for (;;) {
+        vr_sock c = accept(ls, NULL, NULL);
+        if (c == VR_BAD_SOCK) {
+            if (ls != g_extra_ls) break; // 口を替えたので終わる
+            sleep_ms(100);
+            continue;
+        }
+#ifdef SO_NOSIGPIPE
+        int one = 1;
+        setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
+#endif
+        if (!g_token_ok || !vr_link_auth(c, g_token)) {
+            vlog("インターネット共有の口：合言葉が無い・違うので断った");
+#ifdef _WIN32
+            closesocket(c);
+#else
+            close(c);
+#endif
+            continue;
+        }
+        serve_one(c, 1);
+    }
+    return 0;
+}
+
+// インターネット共有の口（host）でも待ち始める。同じ口なら何もしない。違う口なら前の口を閉じて替える。
+// 空の住所なら口を閉じる（インターネット共有が切れたとき）。Vulkan がまだ起きていなければ 2
+int vkr_listen_extra(const char *host) {
+    if (!host || !*host) {
+        vr_sock old = g_extra_ls;
+        g_extra_ls = VR_BAD_SOCK;
+        g_extra_host[0] = 0;
+        if (old != VR_BAD_SOCK) {
+#ifdef _WIN32
+            closesocket(old);
+#else
+            close(old);
+#endif
+            vlog("インターネット共有の口を閉じた");
+        }
+        return 0;
+    }
+    if (!strcmp(host, g_extra_host)) return 0;
+    if (!g_inst) return 2; // Vulkan がまだ起きていない。あとで呼び直してもらう
+    vr_sock ls = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, sizeof one);
+    struct sockaddr_in a = { 0 };
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t) g_main_port);
+    if (inet_pton(AF_INET, host, &a.sin_addr) != 1 || bind(ls, (struct sockaddr *) &a, sizeof a) != 0 || listen(ls, 4) != 0) {
+        vlog("インターネット共有の口 %s:%d で待てない", host, g_main_port);
+#ifdef _WIN32
+        closesocket(ls);
+#else
+        close(ls);
+#endif
+        return 1;
+    }
+    vr_sock old = g_extra_ls;
+    g_extra_ls = ls;
+    snprintf(g_extra_host, sizeof g_extra_host, "%s", host);
+    if (old != VR_BAD_SOCK) {
+#ifdef _WIN32
+        closesocket(old);
+#else
+        close(old);
+#endif
+    }
+#ifdef _WIN32
+    HANDLE t = CreateThread(NULL, 0, extra_thread, (LPVOID) (uintptr_t) ls, 0, NULL);
+    if (t) CloseHandle(t);
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, extra_thread, (void *) (uintptr_t) ls) == 0) pthread_detach(t);
+#endif
+    vlog("インターネット共有の口：%s:%d でも待つ（合言葉つき）", host, g_main_port);
+    return 0;
+}
+
 int vkr_serve(const char *host, int port) {
     if (!vk_init()) { vlog("Vulkan を起動できない"); return 1; }
+    g_main_port = port;
+    if (g_extra_env) vkr_listen_extra(g_extra_env);
 #ifdef _WIN32
     WSADATA w;
     WSAStartup(MAKEWORD(2, 2), &w);
@@ -3121,30 +3305,7 @@ int vkr_serve(const char *host, int port) {
         // PC が先に切ったときに書き込むと SIGPIPE でアプリごと落ちるので、止める
         setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
-        vlog("つながった");
-        g_clients = 1;
-        serve_client(c);
-        g_clients = 0;
-        if (g_lost) {
-#ifdef _WIN32
-            // PC の代役（RTX）は、GPU を失うと同じプロセスでは Vulkan を作り直しても装置を作れない（-3 が続く）。
-            // プロセスごと終わり、立て直しは外の台本に任せる
-            vlog("GPU を失ったので終わる（代役は立て直しが要る）");
-            exit(3);
-#endif
-            // GPU を失ったあとは、同じ Vulkan のままだと次の装置が作れないことがある
-            vlog("GPU を失ったので、Vulkan を作り直す");
-            vkDestroyInstance(g_inst, NULL);
-            g_inst = VK_NULL_HANDLE;
-            g_lost = 0;
-            if (!vk_init()) vlog("Vulkan を作り直せない");
-        }
-#ifdef _WIN32
-        closesocket(c);
-#else
-        close(c);
-#endif
-        vlog("切れた");
+        serve_one(c, 0);
     }
 }
 
@@ -3199,6 +3360,18 @@ int main(int argc, char **argv) {
     // OBS が起動している間、OBS の部品が vkCreateDevice から戻ってこなかった
     SetEnvironmentVariableA("VK_LOADER_LAYERS_DISABLE", "~implicit~");
 #endif
+    // 調べ用：VKR_EXTRA_LISTEN=住所 でインターネット共有の口の真似（VKR_LINK_TOKEN=16 進 32 文字の合言葉）
+    const char *ex = getenv("VKR_EXTRA_LISTEN");
+    if (ex && *ex) {
+        g_main_port = argc > 2 ? atoi(argv[2]) : VR_DEFAULT_PORT;
+        vkr_set_token(getenv("VKR_LINK_TOKEN"));
+        if (!g_token_ok) vlog("VKR_LINK_TOKEN が無い・読めないので、インターネット共有の口は全部断る");
+#ifdef _WIN32
+        WSADATA w;
+        WSAStartup(MAKEWORD(2, 2), &w);
+#endif
+        g_extra_env = ex; // Vulkan が起きてから開ける（vkr_serve の中）
+    }
     return vkr_serve(argc > 1 ? argv[1] : "127.0.0.1", argc > 2 ? atoi(argv[2]) : VR_DEFAULT_PORT);
 }
 #endif

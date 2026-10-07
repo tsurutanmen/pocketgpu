@@ -15,6 +15,7 @@ typedef SOCKET vr_sock;
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 typedef int vr_sock;
 #define VR_BAD_SOCK (-1)
@@ -69,6 +70,51 @@ static inline int vr_recv_all(vr_sock s, void *d, size_t n) {
     }
     return 1;
 }
+// 合言葉：16 バイト。16 進の 32 文字から読む（読めなければ 0）
+static inline int vr_token_parse(const char *hex, uint8_t out[16]) {
+    if (!hex) return 0;
+    for (int i = 0; i < 16; i++) {
+        unsigned v = 0;
+        for (int k = 0; k < 2; k++) {
+            char c = hex[i * 2 + k];
+            int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (d < 0) return 0;
+            v = v * 16 + (unsigned) d;
+        }
+        out[i] = (uint8_t) v;
+    }
+    return hex[32] == 0;
+}
+// 時間で中身が漏れないように、全部の字を比べてから答える
+static inline int vr_token_equal(const uint8_t *a, const uint8_t *b) {
+    uint8_t d = 0;
+    for (int i = 0; i < 16; i++) d |= (uint8_t) (a[i] ^ b[i]);
+    return d == 0;
+}
+// インターネット共有の口につないだ相手から、最初の 20 バイト（"VKRA"＋合言葉）を 5 秒以内に受け取って確かめる
+static inline int vr_link_auth(vr_sock c, const uint8_t token[16]) {
+#ifdef _WIN32
+    DWORD to = 5000;
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char *) &to, sizeof to);
+#else
+    struct timeval to = { 5, 0 };
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof to);
+#endif
+    uint8_t b[20];
+    uint32_t magic;
+    int ok = vr_recv_all(c, b, sizeof b);
+    memcpy(&magic, b, 4);
+    ok = ok && magic == 0x41524b56u && vr_token_equal(b + 4, token);
+#ifdef _WIN32
+    to = 0;
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char *) &to, sizeof to);
+#else
+    to.tv_sec = 0;
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof to);
+#endif
+    return ok;
+}
+
 static inline void vr_nodelay(vr_sock s) {
     int one = 1;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *) &one, sizeof one);

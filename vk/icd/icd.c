@@ -507,14 +507,85 @@ static vr_sock usb_connect(int port) {
     return s;
 }
 
+// ---- インターネット共有の口（Backburner と同じく、USB を有線のネットワークとして使う道） ----
+// まず USB の口（usbmux）か host:port につなぎ、VR_GET_LINK で「インターネット共有の口の住所と合言葉」を聞く。
+// 聞けたら、その口に TCP でつなぎ直し、最初に "VKRA" と合言葉を送る。だめなら、いつもの口でつなぐ
+static vr_sock link_connect(const char *boot, char *host, size_t nhost, char *port, size_t nport) {
+    char bh[128] = "127.0.0.1", bp[16] = "50060";
+    vr_sock b;
+    if (boot && *boot) {
+        const char *c = strrchr(boot, ':');
+        if (c) {
+            size_t n = (size_t) (c - boot) < sizeof bh - 1 ? (size_t) (c - boot) : sizeof bh - 1;
+            memcpy(bh, boot, n);
+            bh[n] = 0;
+            snprintf(bp, sizeof bp, "%s", c + 1);
+        } else {
+            snprintf(bh, sizeof bh, "%s", boot);
+        }
+        b = tcp_connect(bh, bp);
+    } else {
+        b = usb_connect(50060);
+        snprintf(bh, sizeof bh, "USB の iPhone");
+    }
+    if (b == INVALID_SOCKET) { say("%s:%s につながらないので、インターネット共有の口を聞けない", bh, bp); return INVALID_SOCKET; }
+    uint32_t h[2] = { VR_GET_LINK, 0 };
+    uint8_t body[28];
+    uint32_t ok = 0, ip = 0, lport = 0;
+    uint8_t token[16];
+    if (vr_send_all(b, h, 8) && vr_recv_all(b, h, 8) && h[0] == 0 && h[1] == sizeof body && vr_recv_all(b, body, sizeof body)) {
+        memcpy(&ok, body, 4);
+        memcpy(token, body + 4, 16);
+        memcpy(&ip, body + 20, 4);
+        memcpy(&lport, body + 24, 4);
+    }
+    vr_sock s = INVALID_SOCKET;
+    if (ok && ip && lport && lport < 65536) {
+        // 前のつなぎを閉じきってから、つなぎ直す（受け手は一度に 1 人の相手しかしない）
+        closesocket(b);
+        b = INVALID_SOCKET;
+        struct in_addr ia;
+        ia.s_addr = ip;
+        char lh[32], lp[16];
+        inet_ntop(AF_INET, &ia, lh, sizeof lh);
+        snprintf(lp, sizeof lp, "%u", (unsigned) lport);
+        s = tcp_connect(lh, lp);
+        uint8_t pre[20];
+        uint32_t magic = VR_LINK_MAGIC;
+        memcpy(pre, &magic, 4);
+        memcpy(pre + 4, token, 16);
+        if (s != INVALID_SOCKET && !vr_send_all(s, pre, sizeof pre)) { closesocket(s); s = INVALID_SOCKET; }
+        if (s != INVALID_SOCKET) {
+            snprintf(host, nhost, "インターネット共有の口 %s", lh);
+            snprintf(port, nport, "%s", lp);
+            return s;
+        }
+        say("インターネット共有の口 %s:%s につながらないので、いつもの口でつなぐ", lh, lp);
+    } else {
+        say("受け手がインターネット共有の口を教えない（共有が切れている・古い受け手）ので、いつもの口でつなぐ");
+    }
+    if (b != INVALID_SOCKET) closesocket(b);
+    if (boot && *boot) {
+        snprintf(host, nhost, "%s", bh);
+        snprintf(port, nport, "%s", bp);
+        return tcp_connect(bh, bp);
+    }
+    snprintf(host, nhost, "USB の iPhone");
+    snprintf(port, nport, "50060");
+    return usb_connect(50060);
+}
+
 static int connect_locked(void) {
     WSADATA w;
     WSAStartup(MAKEWORD(2, 2), &w);
-    // IPHONE_VK：「usb」か「usb:番号」なら USB の iPhone に直接。それ以外は host:port
+    // IPHONE_VK：「usb」か「usb:番号」なら USB の iPhone に直接。「link」ならインターネット共有の口。それ以外は host:port
     const char *e = getenv("IPHONE_VK");
     char host[128] = "127.0.0.1", port[16] = "50061";
     vr_sock s;
-    if (e && !strncmp(e, "usb", 3) && (e[3] == 0 || e[3] == ':')) {
+    if (e && !strncmp(e, "link", 4) && (e[4] == 0 || e[4] == ':')) {
+        // 「link」なら USB の口で聞いて、「link:host:port」なら host:port で聞いて、インターネット共有の口につなぐ
+        s = link_connect(e[4] == ':' ? e + 5 : NULL, host, sizeof host, port, sizeof port);
+    } else if (e && !strncmp(e, "usb", 3) && (e[3] == 0 || e[3] == ':')) {
         int p = e[3] == ':' ? atoi(e + 4) : 50060;
         s = usb_connect(p);
         snprintf(host, sizeof host, "USB の iPhone");
@@ -564,12 +635,15 @@ static SRWLOCK g_hw_lock = SRWLOCK_INIT;
 // （descriptor indexing の 5 つ・inline uniform block・maintenance5 と 6）。確かめ終わったら外す。
 // アプリの情報のエンジンの名前が DXVK で版が 2 以上なら自動で名乗る。IPHONE_VK_DXVK3=1 で必ず・=0 で名乗らない
 static int g_engine_dxvk2;
+// アプリのエンジンが Mesa の zink（OpenGL を Vulkan に直す部品）
+static int g_engine_zink;
 static int dxvk3(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("IPHONE_VK_DXVK3");
-        v = e && *e ? *e == '1' : g_engine_dxvk2;
-        if (v && !(e && *e)) say("新しい DXVK なので、DXVK 3 のための名乗りを入れる");
+        v = e && *e ? *e == '1' : g_engine_dxvk2 || g_engine_zink;
+        // zink（Mesa 26）も nullDescriptor と maintenance5 が無いと装置を断る
+        if (v && !(e && *e)) say(g_engine_zink ? "zink なので、DXVK 3 と同じ名乗りを入れる" : "新しい DXVK なので、DXVK 3 のための名乗りを入れる");
     }
     return v;
 }
@@ -684,7 +758,9 @@ static void mask_features(VkPhysicalDeviceFeatures *f) {
     if (g_bc) f->textureCompressionBC = VK_TRUE;
     // 新しい DXVK は geometry shader と cull distance を必須にする。iPhone の GPU は持たないので名乗りだけする。
     // geometry shader を使う pipeline は作らずに失敗を返す（DXVK はその描画を飛ばす）
-    if (dxvk3()) f->geometryShader = f->shaderCullDistance = VK_TRUE;
+    // zink には名乗らない。名乗ると zink は四角形（GL_QUADS）や頂点の順（provoking vertex）の真似に GS を作り、
+    // それがドライバの GS の真似を通る（10/7 は PrimitiveId の出力で受け手の GPU が止まった）。名乗らなければ zink は GS を使わない道を通る
+    if (dxvk3() && !g_engine_zink) f->geometryShader = f->shaderCullDistance = VK_TRUE;
     // 中継していない機能は「無い」と答える
     f->sparseBinding = f->sparseResidencyBuffer = f->sparseResidencyImage2D = f->sparseResidencyImage3D = VK_FALSE;
     f->sparseResidency2Samples = f->sparseResidency4Samples = f->sparseResidency8Samples = f->sparseResidency16Samples = VK_FALSE;
@@ -1171,6 +1247,7 @@ static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *ci, const
         uint32_t major = (ai->engineVersion >> 22) & 0x7F; // VK_MAKE_VERSION の形
         say("アプリのエンジン：%s %u.%u.%u", ai->pEngineName, major, (ai->engineVersion >> 12) & 0x3FF, ai->engineVersion & 0xFFF);
         if (!strcmp(ai->pEngineName, "DXVK") && major >= 2) g_engine_dxvk2 = 1;
+        if (!strcmp(ai->pEngineName, "mesa zink")) g_engine_zink = 1;
     }
     struct inst *i = calloc(1, sizeof *i);
     if (!i) return VK_ERROR_OUT_OF_HOST_MEMORY;

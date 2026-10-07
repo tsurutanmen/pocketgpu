@@ -16,6 +16,12 @@ uint64_t vkr_ops_total(void);
 int vkr_clients(void);
 // USB の通り道の速さを測る受け口（vk/remote/bw.c）。戻ってこないので別のスレッドで呼ぶ
 int vkr_bw_serve(const char * host, int port);
+// インターネット共有の口（USB を有線のネットワークとして使う道）。合言葉は 16 進 32 文字で、起動のたびに作る。
+// 住所で待ち始め、同じ住所なら何もしない。空の住所なら口を閉じる。PC のドライバは USB の口で住所と合言葉を聞いてからつなぐ
+void vkr_set_token(const char * hex);
+int vkr_listen_extra(const char * host);
+void vkr_bw_set_token(const char * hex);
+int vkr_bw_listen_extra(const char * host, int port);
 // マイクラのサーバー（mc/pumpkin-ios・Pumpkin・GPL-3.0）。PUMPKIN を付けて組んだときだけ入っている。止まるまで戻らない
 int pumpkin_ios_run(const char * dir);
 

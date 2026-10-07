@@ -7,7 +7,11 @@
 
   python usb_bw.py                       # USB の iPhone で全部
   python usb_bw.py --addr 127.0.0.1:50058 # 代役（PC の bw.exe）や、ほかの中継の先で測る
+  python usb_bw.py --link                 # インターネット共有の口（USB を有線のネットワークとして使う）と usbmux を比べる
+  python usb_bw.py --link --link-boot 127.0.0.1:50070  # 代役で：受け手に住所と合言葉を聞く所を host:port にする
 """
+import os
+import re
 import argparse
 import socket
 import struct
@@ -84,6 +88,60 @@ def measure(opener, conns, direction, total):
     return per * conns / MB / dt
 
 
+def rtt_ms(opener, n=200):
+    """1 バイトを頼んで受け取る往復を n 回。中央値と最大（ミリ秒）"""
+    s = opener()
+    tune(s)
+    b = bytearray(16)
+    ts = []
+    for _ in range(n):
+        t0 = time.perf_counter()
+        one_transfer(s, 0, 1, b)
+        ts.append((time.perf_counter() - t0) * 1000)
+    s.close()
+    ts.sort()
+    return ts[len(ts) // 2], ts[-1]
+
+
+def op_number(name):
+    """vk/remote/proto.h の enum vr_op から、命令の番号を数える"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = open(os.path.join(here, "..", "vk", "remote", "proto.h"), encoding="utf-8").read()
+    body = src.split("enum vr_op {", 1)[1].split("};", 1)[0]
+    n = 0
+    for line in body.splitlines():
+        m = re.match(r"\s+(VR_[A-Z0-9_]+)\s*(?:=\s*(\d+))?\s*,", line)
+        if not m:
+            continue
+        n = int(m.group(2)) if m.group(2) else n + 1
+        if m.group(1) == name:
+            return n
+    raise KeyError(name)
+
+
+def ask_link(boot):
+    """受け手（50060 番）に VR_GET_LINK で、インターネット共有の口の住所と合言葉を聞く"""
+    if boot:
+        h, p = boot.rsplit(":", 1)
+        s = socket.create_connection((h, int(p)), timeout=5)
+    else:
+        s = uf.connect_device(uf.usb_device_id(), 50060)
+    s.settimeout(5)
+    s.sendall(struct.pack("<II", op_number("VR_GET_LINK"), 0))
+    head = bytearray(8)
+    recv_exact(s, 8, head)
+    res, n = struct.unpack("<iI", head)
+    body = bytearray(max(n, 1))
+    if n:
+        recv_exact(s, n, body)
+    s.close()
+    if res != 0 or n != 28 or not struct.unpack("<I", body[:4])[0]:
+        raise ConnectionError("受け手がインターネット共有の口を教えない（共有が切れている・古い受け手）")
+    token = bytes(body[4:20])
+    ip = socket.inet_ntoa(bytes(body[20:24]))
+    return ip, token
+
+
 def start_relay(remote):
     """usb_forward.py と同じ中継を、空いている番号で立てる"""
     srv = socket.socket()
@@ -111,6 +169,8 @@ def main():
     ap.add_argument("--mb", type=int, default=256, help="1 回に流す量（MB）")
     ap.add_argument("--conns", default="1,2,4")
     ap.add_argument("--mux", type=int, help="試験用：usbmuxd の番号（偽物の fake_usbmuxd.py に向ける）")
+    ap.add_argument("--link", action="store_true", help="インターネット共有の口でも測り、usbmux と比べる")
+    ap.add_argument("--link-boot", help="試験用：住所と合言葉を聞く受け手を host:port にする（ふつうは USB の 50060 番）")
     a = ap.parse_args()
     if a.mux:
         uf.MUX = ("127.0.0.1", a.mux)
@@ -118,7 +178,21 @@ def main():
     total = a.mb * MB
 
     paths = []
-    if a.addr:
+    if a.link:
+        ip, token = ask_link(a.link_boot)
+        print(f"インターネット共有の口：{ip}:{a.port}")
+
+        def link_open():
+            s = socket.create_connection((ip, a.port), timeout=5)
+            s.settimeout(None)
+            s.sendall(struct.pack("<I", 0x41524B56) + token)
+            return s
+
+        paths.append(("インターネット共有の口", link_open))
+        if not a.link_boot:
+            dev = uf.usb_device_id()
+            paths.append(("Apple のサービスに直接", lambda: uf.connect_device(dev, a.port)))
+    elif a.addr:
         h, p = a.addr.rsplit(":", 1)
         paths.append((a.addr, lambda: socket.create_connection((h, int(p)))))
     else:
@@ -127,6 +201,9 @@ def main():
         rp = start_relay(a.port)
         paths.append(("Python の中継を通す", lambda: socket.create_connection(("127.0.0.1", rp))))
 
+    for name, opener in paths:
+        med, mx = rtt_ms(opener)
+        print(f"{name:<18} 往復 中央値 {med:6.3f} ms   最大 {mx:6.3f} ms", flush=True)
     print(f"1 回に {a.mb} MB。数字は MB/s")
     for name, opener in paths:
         for c in conns:

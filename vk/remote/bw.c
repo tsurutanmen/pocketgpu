@@ -64,6 +64,64 @@ static DWORD WINAPI bw_thread(LPVOID p) { bw_client((vr_sock) (uintptr_t) p); re
 static void *bw_thread(void *p) { bw_client((vr_sock) (intptr_t) p); return NULL; }
 #endif
 
+// ---- インターネット共有の口（合言葉つき） ----
+static uint8_t g_bw_token[16];
+static int g_bw_token_ok;
+static char g_bw_extra[64];
+static vr_sock g_bw_extra_ls = VR_BAD_SOCK;
+void vkr_bw_set_token(const char *hex) { g_bw_token_ok = vr_token_parse(hex, g_bw_token); }
+
+#ifdef _WIN32
+static DWORD WINAPI bw_extra_thread(LPVOID p) {
+#else
+static void *bw_extra_thread(void *p) {
+#endif
+    vr_sock ls = (vr_sock) (uintptr_t) p;
+    for (;;) {
+        vr_sock c = accept(ls, NULL, NULL);
+        if (c == VR_BAD_SOCK) break;
+        if (!g_bw_token_ok || !vr_link_auth(c, g_bw_token)) { BW_CLOSE(c); continue; }
+#ifdef _WIN32
+        HANDLE t = CreateThread(NULL, 0, bw_thread, (LPVOID) (uintptr_t) c, 0, NULL);
+        if (t) CloseHandle(t); else BW_CLOSE(c);
+#else
+        pthread_t t;
+        if (pthread_create(&t, NULL, bw_thread, (void *) (intptr_t) c) == 0) pthread_detach(t); else BW_CLOSE(c);
+#endif
+    }
+    return 0;
+}
+
+// インターネット共有の口（host）でも待ち始める。同じ口なら何もしない。空の住所なら口を閉じる
+int vkr_bw_listen_extra(const char *host, int port) {
+    if (!host || !*host) {
+        if (g_bw_extra_ls != VR_BAD_SOCK) BW_CLOSE(g_bw_extra_ls);
+        g_bw_extra_ls = VR_BAD_SOCK;
+        g_bw_extra[0] = 0;
+        return 0;
+    }
+    if (!strcmp(host, g_bw_extra)) return 0;
+    if (g_bw_extra_ls != VR_BAD_SOCK) BW_CLOSE(g_bw_extra_ls);
+    g_bw_extra_ls = VR_BAD_SOCK;
+    vr_sock ls = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, sizeof one);
+    struct sockaddr_in a = { 0 };
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t) port);
+    if (inet_pton(AF_INET, host, &a.sin_addr) != 1 || bind(ls, (struct sockaddr *) &a, sizeof a) != 0 || listen(ls, 16) != 0) { BW_CLOSE(ls); return 1; }
+    snprintf(g_bw_extra, sizeof g_bw_extra, "%s", host);
+    g_bw_extra_ls = ls;
+#ifdef _WIN32
+    HANDLE t = CreateThread(NULL, 0, bw_extra_thread, (LPVOID) (uintptr_t) ls, 0, NULL);
+    if (t) CloseHandle(t);
+#else
+    pthread_t t;
+    if (pthread_create(&t, NULL, bw_extra_thread, (void *) (uintptr_t) ls) == 0) pthread_detach(t);
+#endif
+    return 0;
+}
+
 // 戻ってこない。別のスレッドで呼ぶ
 int vkr_bw_serve(const char *host, int port) {
 #ifdef _WIN32
@@ -95,6 +153,16 @@ int vkr_bw_serve(const char *host, int port) {
 int main(int argc, char **argv) {
     printf("速さを測る受け口：%s:%d\n", argc > 1 ? argv[1] : "127.0.0.1", argc > 2 ? atoi(argv[2]) : 50058);
     fflush(stdout);
+    // 調べ用：VKR_EXTRA_LISTEN=住所 でインターネット共有の口の真似（VKR_LINK_TOKEN=16 進 32 文字の合言葉）
+    const char *ex = getenv("VKR_EXTRA_LISTEN");
+    if (ex && *ex) {
+#ifdef _WIN32
+        WSADATA w;
+        WSAStartup(MAKEWORD(2, 2), &w);
+#endif
+        vkr_bw_set_token(getenv("VKR_LINK_TOKEN"));
+        vkr_bw_listen_extra(ex, argc > 2 ? atoi(argv[2]) : 50058);
+    }
     return vkr_bw_serve(argc > 1 ? argv[1] : "127.0.0.1", argc > 2 ? atoi(argv[2]) : 50058);
 }
 #endif

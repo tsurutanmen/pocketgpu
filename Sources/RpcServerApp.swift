@@ -15,6 +15,7 @@ struct RpcServerApp: App {
         let t = Thread { rpc_bridge_serve_log(50059) }
         t.start()
         // USB の通り道の速さを測る受け口（50058 番。PC は app/pc/usb_bw.py）
+        vkr_bw_set_token(linkToken)
         let b = Thread { _ = vkr_bw_serve("127.0.0.1", 50058) }
         b.start()
         // Apple の機能（文字認識など）を Windows から使う受け口（50057 番。PC は app/pc/apple_ocr.py）
@@ -73,6 +74,14 @@ final class Keeper {
 
 struct Addr: Hashable { let name: String; let ip: String }
 
+// インターネット共有の口の合言葉。起動のたびに作り、USB の口で PC のドライバにだけ渡す
+let linkToken: String = (0..<16).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+
+// インターネット共有を USB で PC に出しているときの住所（bridge100 の 172.20.10.1 など）
+func hotspotAddress() -> String? {
+    listAddresses().first(where: { $0.name.hasPrefix("bridge") || $0.ip.hasPrefix("172.20.10.") })?.ip
+}
+
 // この iPhone の IPv4 の住所（Wi-Fi は en0、Tailscale は utun で 100.x）
 func listAddresses() -> [Addr] {
     var out: [Addr] = []
@@ -120,6 +129,7 @@ struct ContentView: View {
     @State private var vkStarted = false
     @State private var vkFailed = false
     @State private var mcRunning = false
+    @State private var linkHost = "" // インターネット共有の口で待っている住所（空なら待っていない）
     @Environment(\.scenePhase) private var scenePhase
     private let usbHost = "127.0.0.1"
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -165,6 +175,9 @@ struct ContentView: View {
                         Text("Vulkan：起動に失敗（下の記録の vk: を見る）").font(.footnote)
                     } else if vkStarted {
                         Text("Vulkan：USB の 50060 番で待ち受け中").font(.footnote.monospaced()).textSelection(.enabled)
+                        if !linkHost.isEmpty {
+                            Text("Vulkan：インターネット共有の口 \(linkHost):50060 でも待ち受け中").font(.footnote.monospaced()).textSelection(.enabled)
+                        }
                     }
                 }
                 #if PUMPKIN
@@ -198,6 +211,17 @@ struct ContentView: View {
         }
         .onReceive(tick) { _ in
             vkr_set_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
+            // インターネット共有の口が出たら、そこでも待つ（消えたら閉じる）
+            if vkStarted {
+                let h = hotspotAddress() ?? ""
+                if h != linkHost, !vkFailed {
+                    // 2 は Vulkan がまだ起きていない。次の 1 秒でもう一度
+                    if h.withCString({ vkr_listen_extra($0) }) != 2 {
+                        linkHost = h
+                        h.withCString { _ = vkr_bw_listen_extra($0, 50058) }
+                    }
+                }
+            }
             log = readBridge { rpc_bridge_log($0, $1) }
             availMB = Int(os_proc_available_memory() / 1_048_576)
             onCPU = rpc_bridge_last_on_cpu() != 0
@@ -228,6 +252,7 @@ struct ContentView: View {
         // Vulkan の受け手は USB（iPhone の中の 127.0.0.1）だけで待つ。命令をそのまま GPU に流すので、Wi-Fi には出さない
         if h == usbHost && !vkStarted {
             vkStarted = true
+            vkr_set_token(linkToken)
             let v = Thread {
                 // 待ち受けている間は戻ってこない。戻ってきたら起動に失敗した
                 _ = vkr_serve("127.0.0.1", 50060)

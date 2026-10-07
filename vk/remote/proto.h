@@ -22,6 +22,8 @@
 #define VR_CAP_JPEG 256u             // VR_READ_JPEG：窓に出すコマを受け手が JPEG に縮めて返す
 #define VR_CAP_JPEG_PIPE 1024u       // VR_READ_JPEG_PIPE：今のコマを後ろで縮め始めて、ひとつ前のコマの JPEG を返す
 #define VR_CAP_ASYNC_CREATE 16384u  // VR_CREATE_BUFFER_NR：返事を待たずに buffer を作る。必要なメモリの量はドライバが前に聞いた物から計算する
+#define VR_CAP_LINK 131072u         // VR_GET_LINK：インターネット共有の口（USB の有線ネットワーク）の住所と合言葉を、USB の口で教える
+#define VR_LINK_MAGIC 0x41524b56u   // インターネット共有の口につないだら、最初にこの 4 バイト（"VKRA"）と合言葉 16 バイトを送る
 #define VR_CAP_DIVISOR 65536u       // 頂点の step rate（VK_EXT_vertex_attribute_divisor）：pipeline の末尾の VkPipelineVertexInputDivisorStateCreateInfoEXT を読む
 #define VR_CAP_STATUS 32768u        // VR_GET_STATUS：iPhone の熱の状態を返す
 #define VR_CAP_PACK 8192u           // VR_PACKED：いくつもの命令をまとめて LZ4 で縮めた物を受けて、ほどいて順に処理する
@@ -113,6 +115,7 @@ enum vr_op {
     VR_CREATE_BUFFER_NR,         // VR_CREATE_BUFFER と同じ中身で、返事をしない（VR_CAP_ASYNC_CREATE）
     VR_CREATE_IMAGE_NR,          // VR_CREATE_IMAGE と同じ中身で、返事をしない（VR_CAP_ASYNC_CREATE）
     VR_GET_STATUS,               // [同期] → 熱の状態（u32・0 ふつう〜3 とても熱い）・後ろに回っているか（u32）（VR_CAP_STATUS）
+    VR_GET_LINK,                 // [同期] → 使えるか（u32）・合言葉（16 バイト）・住所（u32・IPv4 をネットワークの並びで）・ポート（u32）。USB の口からだけ答える（VR_CAP_LINK）
     VR_OP_COUNT
 };
 
