@@ -7,6 +7,12 @@
 #include <vulkan/vulkan.h>
 #include "proto.h"
 #include "wire.h"
+// 命令の並びを縮める LZ4（BSD-2）。この 1 つのファイルの中に取り込む
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+#include "../third_party/lz4/lz4.c"
+#pragma GCC diagnostic pop
 
 #ifdef _WIN32
 #include <windows.h>
@@ -294,6 +300,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     if (v13 && (caps & need13) == need13) caps |= VR_CAP_VK13;
     g_fmt3 = (v13 || has_ext(ep, ne, "VK_KHR_format_feature_flags2")) && vkGetPhysicalDeviceFormatProperties2;
     caps |= VR_CAP_D3D; // buffer view と画像の並び方は 1.0 の入口なので、どの GPU でも使える
+    caps |= VR_CAP_PACK;
 #if defined(__APPLE__) || defined(_WIN32)
     caps |= VR_CAP_JPEG | VR_CAP_JPEG_PIPE; // 窓に出すコマを JPEG に縮められる（iPhone は ImageIO、PC の代役は WIC）
 #endif
@@ -2946,17 +2953,41 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
 
 static void serve_client(vr_sock c) {
     vr_nodelay(c);
-    uint8_t *buf = NULL;
-    size_t cap = 0;
+    uint8_t *buf = NULL, *pk = NULL;
+    size_t cap = 0, pcap = 0;
     for (;;) {
         uint32_t h[2];
         if (!vr_recv_all(c, h, 8)) break;
         if (h[1] > cap) { cap = h[1]; buf = realloc(buf, cap); }
         if (h[1] && !vr_recv_all(c, buf, h[1])) break;
+        if (h[0] == VR_PACKED) {
+            // いくつもの命令をまとめて縮めた物：ほどいて、中の命令を順に処理する
+            uint32_t raw = 0;
+            if (h[1] < 4) break;
+            memcpy(&raw, buf, 4);
+            if (raw > (512u << 20)) { vlog("縮めた命令が大きすぎる (%u)", raw); break; }
+            if (raw > pcap) { pcap = raw; pk = realloc(pk, pcap); }
+            int got = LZ4_decompress_safe((const char *) buf + 4, (char *) pk, (int) h[1] - 4, (int) raw);
+            if (got != (int) raw) { vlog("縮めた命令をほどけない (%d)", got); break; }
+            size_t pos = 0;
+            int ok = 1;
+            while (ok && pos + 8 <= raw) {
+                uint32_t ih[2];
+                memcpy(ih, pk + pos, 8);
+                pos += 8;
+                if (ih[1] > raw - pos) { ok = 0; break; }
+                vr_rd r2 = { pk + pos, ih[1], 0, 0 };
+                if (!handle(c, ih[0], &r2)) ok = 0;
+                pos += ih[1];
+            }
+            if (!ok) break;
+            continue;
+        }
         vr_rd r = { buf, h[1], 0, 0 };
         if (!handle(c, h[0], &r)) break;
     }
     free(buf);
+    free(pk);
     if (g_st.submits)
         vlog("この接続：submit %llu 回 %.0f ms・記録 %llu 回 %.0f ms・GPU を待った %llu 回 %.0f ms・後ろで止めた %.0f ms",
              (unsigned long long) g_st.submits, g_st.submit_ms, (unsigned long long) g_st.records, g_st.record_ms,

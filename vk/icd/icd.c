@@ -138,6 +138,8 @@ static struct {
     uint64_t bytes_in, flushes;
     uint64_t ww_calls, ww_pages;   // 書き込み監視を見た回数・見つかった書いたページ
     uint64_t wdiff_pages, wdiff_sent; // 違う所だけ送ったページの数と、送ったバイト
+    uint64_t pack_in, pack_out;    // LZ4 で縮める前と後のバイト
+    double pack_ms;
     uint64_t skipped;              // 往復せずに済ませた待ち
     double ww_ms, rb_ms;           // 書き込み監視にかかった時間・引き取りにかかった時間
 } g_stat;
@@ -165,6 +167,9 @@ static void print_stats(void) {
     fprintf(stderr, "  書き込み監視 %llu 回 %.1f ms 書いたページ %llu / 引き取り %.1f ms\n", (unsigned long long) g_stat.ww_calls, g_stat.ww_ms,
             (unsigned long long) g_stat.ww_pages, g_stat.rb_ms);
     fprintf(stderr, "  往復せずに済ませた待ち %llu\n", (unsigned long long) g_stat.skipped);
+    if (g_stat.pack_in)
+        fprintf(stderr, "  LZ4 で縮めた：%llu バイトを %llu バイトに・%.1f ms\n", (unsigned long long) g_stat.pack_in,
+                (unsigned long long) g_stat.pack_out, g_stat.pack_ms);
     if (g_stat.wdiff_pages)
         fprintf(stderr, "  違う所だけ送ったページ %llu・送ったバイト %llu・丸ごとなら %llu\n", (unsigned long long) g_stat.wdiff_pages,
                 (unsigned long long) g_stat.wdiff_sent, (unsigned long long) g_stat.wdiff_pages * PAGE);
@@ -180,9 +185,43 @@ static volatile LONG64 g_next_id;
 // 数字だけの物（shader module など）の番号。ポインタと重ならないように上の方の桁を使う
 static uint64_t new_id(void) { return (1ull << 62) | (uint64_t) InterlockedIncrement64(&g_next_id); }
 
+// 命令の並びを縮める LZ4（BSD-2）。この 1 つのファイルの中に取り込む
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+#include "../third_party/lz4/lz4.c"
+#pragma GCC diagnostic pop
+static int g_can_pack; // 受け手が VR_CAP_PACK を名乗った
+
+// 送る命令の並びを LZ4 で縮めるか（受け手が名乗ったとき。IPHONE_VK_PACK=0 で縮めない）
+static int pack_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_PACK"); v = !(e && *e == '0'); }
+    return v;
+}
+
 static int flush_locked(void) {
     if (g_dead || g_sock == VR_BAD_SOCK) { g_q.n = 0; return 0; }
     if (g_q.n) g_stat.flushes++;
+    // 1 KB 以上なら、命令の並びをまとめて縮め、1 つの命令にして送る。縮まらなければそのまま
+    if (g_q.n >= 1024 && g_q.n < (1u << 30) && g_can_pack && pack_on()) {
+        static vr_buf pk;
+        int bound = LZ4_compressBound((int) g_q.n);
+        pk.n = 0;
+        vr_reserve(&pk, (size_t) bound + 12);
+        double t0 = now_ms();
+        int cl = LZ4_compress_default((const char *) g_q.p, (char *) pk.p + 12, (int) g_q.n, bound);
+        g_stat.pack_ms += now_ms() - t0;
+        if (cl > 0 && (size_t) cl + 12 < g_q.n / 10 * 9) {
+            uint32_t h[3] = { VR_PACKED, (uint32_t) cl + 4, (uint32_t) g_q.n };
+            memcpy(pk.p, h, 12);
+            g_stat.pack_in += g_q.n;
+            g_stat.pack_out += (uint64_t) cl + 12;
+            if (!vr_send_all(g_sock, pk.p, (size_t) cl + 12)) { g_dead = 1; say("送れない：切れた"); }
+            g_q.n = 0;
+            return !g_dead;
+        }
+    }
     if (g_q.n && !vr_send_all(g_sock, g_q.p, g_q.n)) { g_dead = 1; say("送れない：切れた"); }
     g_q.n = 0;
     return !g_dead;
@@ -594,6 +633,7 @@ static int hello(void) {
             size_t ext_at = rd.at;
             vr_take(&rd, (size_t) ne * sizeof(VkExtensionProperties));
             if (!rd.bad && rd.at + 4 <= rd.n) g_hw.caps = vr_ru32(&rd); // 古い受け手は付けない
+            g_can_pack = (g_hw.caps & VR_CAP_PACK) != 0;
             const char *dl = getenv("IPHONE_VK_DELTA");
             if (dl && *dl == '0') g_hw.caps &= ~VR_CAP_DELTA;
             // 調べ用：IPHONE_VK_CAPS=数 で受け手の caps を絞る（0 なら古い受け手と同じに振る舞う）
