@@ -148,6 +148,7 @@ static struct {
     double lat_sum, lat_max;       // present から窓に出るまで
     uint64_t lat_n;
     int heat_max;                  // いちばん熱かったときの iPhone の熱の状態
+    uint64_t wr_bytes[6], wr_n[6]; // GPU が書くかもしれない CPU から見える範囲（読み戻す元）を理由別に
 } g_stat;
 static int g_stats = -1;
 
@@ -170,6 +171,17 @@ static void print_stats(void) {
     }
     fprintf(stderr, "  %-24s %9llu %9llu %13llu %10.1f\n", "合計", (unsigned long long) ts, (unsigned long long) tc, (unsigned long long) tb, tw);
     fprintf(stderr, "  受け取ったバイト %llu・まとめて送った回数 %llu\n", (unsigned long long) g_stat.bytes_in, (unsigned long long) g_stat.flushes);
+    {
+        static const char *why[6] = { "storage buffer", "buffer への写し", "fill・update", "画像から buffer へ", "query の結果", "そのほか" };
+        uint64_t any = 0;
+        for (int k = 0; k < 6; k++) any += g_stat.wr_n[k];
+        if (any) {
+            fprintf(stderr, "  GPU が書くかもしれない範囲（記録した回数・MB）：");
+            for (int k = 0; k < 6; k++)
+                if (g_stat.wr_n[k]) fprintf(stderr, "%s %llu 回 %.1f MB・", why[k], (unsigned long long) g_stat.wr_n[k], g_stat.wr_bytes[k] / 1048576.0);
+            fprintf(stderr, "\n");
+        }
+    }
     fprintf(stderr, "  書き込み監視 %llu 回 %.1f ms 書いたページ %llu / 引き取り %.1f ms\n", (unsigned long long) g_stat.ww_calls, g_stat.ww_ms,
             (unsigned long long) g_stat.ww_pages, g_stat.rb_ms);
     fprintf(stderr, "  往復せずに済ませた待ち %llu\n", (unsigned long long) g_stat.skipped);
@@ -995,6 +1007,8 @@ struct cb {
     size_t nph, cph;
     struct wrcand *wc;        // storage buffer につないだ物。シェーダーが書く場所かどうかは submit のときに決める
     size_t nwc, cwc;
+    uint64_t bpl[64];         // つないだ pipeline の番号（書く場所かどうかを、その pipeline のシェーダーで決める）
+    int nbpl, bpl_over;       // 64 を超えたら、全部のシェーダーで決める前のやり方に戻す
 };
 struct pushheld { struct dsl *l; VkDescriptorSet s; };
 struct wrcand { struct buf *b; uint64_t off, len; uint32_t set, binding; int done; };
@@ -3049,8 +3063,14 @@ static const VkGraphicsPipelineCreateInfo *vf_pipeline(VkDevice dv, const VkGrap
     return &t->ci;
 }
 
+static void wr_pipes(uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkPipeline *out);
+
 static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
-    if (!vf_on()) return create_graphics_pipelines_raw(dv, cache, n, ci, a, out);
+    if (!vf_on()) {
+        VkResult r = create_graphics_pipelines_raw(dv, cache, n, ci, a, out);
+        wr_pipes(n, ci, out);
+        return r;
+    }
     VkResult worst = VK_SUCCESS;
     for (uint32_t i = 0; i < n; i++) {
         struct vf_pipe t;
@@ -3058,6 +3078,7 @@ static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCach
         if (t.mod) destroy_shader(dv, t.mod, NULL);
         if (r != VK_SUCCESS) worst = r;
     }
+    wr_pipes(n, ci, out);
     return worst;
 }
 
@@ -3833,6 +3854,68 @@ static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi)
 // IPHONE_VK_RO_SKIP=0 で前のやり方
 static volatile LONG g_wr[32][8]; // set ごとに binding 256 個までの印
 static volatile LONG g_wr_all;
+// ---- shader module と pipeline ごとの、書く場所の一覧 ----
+// 全部のシェーダーをまとめて (set, binding) で覚えると、同じ場所を計算のシェーダーでは書き、描くシェーダーでは読むだけに使う
+// アプリ（Godot など）で、読むだけの buffer まで毎回読み戻してしまう。pipeline ごとに覚え、command buffer でつないだ物だけで決める
+struct wrinfo { int all; uint32_t n, cap; uint32_t *sb; }; // sb：set << 16 | binding。all は「分からないので全部書く」
+#define WRM_N 4096
+static struct wrnode { uint64_t id; struct wrinfo *w; struct wrnode *next; } *g_wrm[WRM_N];
+static SRWLOCK g_wrm_lock = SRWLOCK_INIT;
+static unsigned wrm_slot(uint64_t id) { return (unsigned) ((id * 0x9E3779B97F4A7C15ull) >> 52) & (WRM_N - 1); }
+static void wri_add(struct wrinfo *w, uint32_t set, uint32_t binding) {
+    if (!w) return;
+    if (set > 0xffff || binding > 0xffff) { w->all = 1; return; }
+    uint32_t k = set << 16 | binding;
+    for (uint32_t i = 0; i < w->n; i++) if (w->sb[i] == k) return;
+    if (w->n == w->cap) {
+        uint32_t cap = w->cap ? w->cap * 2 : 8;
+        uint32_t *q = realloc(w->sb, cap * sizeof *q);
+        if (!q) { w->all = 1; return; }
+        w->sb = q;
+        w->cap = cap;
+    }
+    w->sb[w->n++] = k;
+}
+static int wri_has(const struct wrinfo *w, uint32_t set, uint32_t binding) {
+    uint32_t k = set << 16 | binding;
+    for (uint32_t i = 0; i < w->n; i++) if (w->sb[i] == k) return 1;
+    return 0;
+}
+static void wri_merge(struct wrinfo *u, const struct wrinfo *w) {
+    if (!w) { u->all = 1; return; }
+    if (w->all) u->all = 1;
+    for (uint32_t i = 0; i < w->n; i++) wri_add(u, w->sb[i] >> 16, w->sb[i] & 0xffff);
+}
+static void wri_free(struct wrinfo *w) { if (w) { free(w->sb); free(w); } }
+static struct wrinfo *wrm_find(uint64_t id) { // g_wrm_lock を持って呼ぶ
+    for (struct wrnode *n = g_wrm[wrm_slot(id)]; n; n = n->next) if (n->id == id) return n->w;
+    return NULL;
+}
+static void wrm_del(uint64_t id) {
+    AcquireSRWLockExclusive(&g_wrm_lock);
+    for (struct wrnode **pp = &g_wrm[wrm_slot(id)]; *pp; pp = &(*pp)->next)
+        if ((*pp)->id == id) {
+            struct wrnode *n = *pp;
+            *pp = n->next;
+            wri_free(n->w);
+            free(n);
+            break;
+        }
+    ReleaseSRWLockExclusive(&g_wrm_lock);
+}
+static void wrm_put(uint64_t id, struct wrinfo *w) {
+    if (!w) return;
+    wrm_del(id);
+    struct wrnode *n = malloc(sizeof *n);
+    if (!n) { wri_free(w); return; }
+    n->id = id;
+    n->w = w;
+    AcquireSRWLockExclusive(&g_wrm_lock);
+    n->next = g_wrm[wrm_slot(id)];
+    g_wrm[wrm_slot(id)] = n;
+    ReleaseSRWLockExclusive(&g_wrm_lock);
+}
+
 static void wr_mark(uint32_t set, uint32_t binding) {
     if (set >= 32 || binding >= 256) { InterlockedExchange(&g_wr_all, 1); return; }
     InterlockedOr(&g_wr[set][binding / 32], (LONG) (1u << (binding % 32)));
@@ -3863,18 +3946,18 @@ static int wr_deep(void) {
     return v;
 }
 
-static void wr_scan(const uint32_t *w, size_t nw) {
-    if (nw < 5 || w[0] != 0x07230203 || w[3] > (1u << 22)) { InterlockedExchange(&g_wr_all, 1); return; }
+static void wr_scan(const uint32_t *w, size_t nw, struct wrinfo *info) {
+    if (nw < 5 || w[0] != 0x07230203 || w[3] > (1u << 22)) { InterlockedExchange(&g_wr_all, 1); if (info) info->all = 1; return; }
     uint32_t bound = w[3];
     uint32_t *set = calloc(bound, 4), *bnd = calloc(bound, 4), *memnw = calloc(bound, 4), *memn = calloc(bound, 4);
     uint32_t *ptr_t = calloc(bound, 4), *ptr_sc = calloc(bound, 4), *elem = calloc(bound, 4), *imgw = calloc(bound, 4);
     uint8_t *fl = calloc(bound, 1); // 1 set・2 binding・4 NonWritable・8 BufferBlock・16 struct
     uint32_t *vars = calloc(bound, 4), nvars = 0, *root = NULL;
     uint8_t *stored = NULL;
-    if (!set || !bnd || !memnw || !memn || !ptr_t || !ptr_sc || !elem || !imgw || !fl || !vars) { InterlockedExchange(&g_wr_all, 1); goto out; }
+    if (!set || !bnd || !memnw || !memn || !ptr_t || !ptr_sc || !elem || !imgw || !fl || !vars) { InterlockedExchange(&g_wr_all, 1); if (info) info->all = 1; goto out; }
     for (size_t i = 5; i < nw;) {
         uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
-        if (!wc || i + wc > nw) { InterlockedExchange(&g_wr_all, 1); goto out; }
+        if (!wc || i + wc > nw) { InterlockedExchange(&g_wr_all, 1); if (info) info->all = 1; goto out; }
         const uint32_t *x = &w[i];
         if (op == 71 && wc >= 3 && x[1] < bound) { // OpDecorate
             if (x[2] == 34 && wc >= 4) { set[x[1]] = x[3]; fl[x[1]] |= 1; }
@@ -3894,7 +3977,7 @@ static void wr_scan(const uint32_t *w, size_t nw) {
     // store・atomic・画像への書き込み・関数や拡張命令への受け渡しの先が根なら「書く」。根が 2 つ以上に分かれる物へ書くなら、全部書くとみなす
     root = calloc(bound, 4);
     stored = calloc(bound, 1);
-    if (!root || !stored) { InterlockedExchange(&g_wr_all, 1); goto out; }
+    if (!root || !stored) { InterlockedExchange(&g_wr_all, 1); if (info) info->all = 1; goto out; }
     for (uint32_t k = 0; k < nvars; k++) root[w[vars[k] + 2]] = w[vars[k] + 2];
     for (int pass = 0; pass < 3; pass++) // phi は後ろで作られる物も指すので、何回か回す
         for (size_t i = 5; i < nw; i += w[i] >> 16) {
@@ -3928,7 +4011,7 @@ static void wr_scan(const uint32_t *w, size_t nw) {
             writable = !(fl[v] & 4) && !((fl[t] & 16) && memn[t] && memnw[t] >= memn[t]);
         else if (sc == 0 && imgw[t]) // storage texel buffer
             writable = !(fl[v] & 4);
-        if (writable) wr_mark(set[v], bnd[v]);
+        if (writable) { wr_mark(set[v], bnd[v]); wri_add(info, set[v], bnd[v]); }
     }
 out:
     free(set); free(bnd); free(memnw); free(memn); free(ptr_t); free(ptr_sc); free(elem); free(imgw); free(fl); free(vars);
@@ -3937,8 +4020,10 @@ out:
 
 static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out) {
     (void) a;
-    wr_scan(ci->pCode, ci->codeSize / 4);
+    struct wrinfo *wi = calloc(1, sizeof *wi);
+    wr_scan(ci->pCode, ci->codeSize / 4, wi);
     uint64_t id = new_id();
+    wrm_put(id, wi);
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, id);
@@ -3962,12 +4047,43 @@ static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreate
         free(b.p); \
     }
 DESTROY_SIMPLE(destroy_shader_rpc, VkShaderModule, VR_DESTROY_SHADER_MODULE)
-static void VKAPI_CALL destroy_shader(VkDevice dv, VkShaderModule h, const VkAllocationCallbacks *a) { gs_forget_pipe(VK_NULL_HANDLE, ID(h)); vf_forget(ID(h)); destroy_shader_rpc(dv, h, a); }
+static void VKAPI_CALL destroy_shader(VkDevice dv, VkShaderModule h, const VkAllocationCallbacks *a) { gs_forget_pipe(VK_NULL_HANDLE, ID(h)); vf_forget(ID(h)); wrm_del(ID(h)); destroy_shader_rpc(dv, h, a); }
 DESTROY_SIMPLE(destroy_playout_rpc, VkPipelineLayout, VR_DESTROY_PIPELINE_LAYOUT)
 static void pl_forget(uint64_t id);
 static void VKAPI_CALL destroy_playout(VkDevice dv, VkPipelineLayout h, const VkAllocationCallbacks *a) { gs_forget_layout(dv, ID(h)); pl_forget(ID(h)); destroy_playout_rpc(dv, h, a); }
 DESTROY_SIMPLE(destroy_pipeline_rpc, VkPipeline, VR_DESTROY_PIPELINE)
-static void VKAPI_CALL destroy_pipeline(VkDevice dv, VkPipeline h, const VkAllocationCallbacks *a) { gs_forget_pipe(dv, ID(h)); destroy_pipeline_rpc(dv, h, a); }
+static void VKAPI_CALL destroy_pipeline(VkDevice dv, VkPipeline h, const VkAllocationCallbacks *a) { gs_forget_pipe(dv, ID(h)); wrm_del(ID(h)); destroy_pipeline_rpc(dv, h, a); }
+
+// pipeline の 1 つの段のシェーダーが書く場所を u に足す（module が分からなければ「全部書く」）
+static void wri_stage(const VkPipelineShaderStageCreateInfo *st, struct wrinfo *u) {
+    if (st->module) {
+        AcquireSRWLockShared(&g_wrm_lock);
+        wri_merge(u, wrm_find(ID(st->module)));
+        ReleaseSRWLockShared(&g_wrm_lock);
+        return;
+    }
+    for (const VkBaseInStructure *x = st->pNext; x; x = x->pNext)
+        if (x->sType == VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO) {
+            const VkShaderModuleCreateInfo *mi = (const VkShaderModuleCreateInfo *) x;
+            struct wrinfo t = { 0 };
+            wr_scan(mi->pCode, mi->codeSize / 4, &t);
+            wri_merge(u, &t);
+            free(t.sb);
+            return;
+        }
+    u->all = 1;
+}
+
+static void wr_pipes(uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkPipeline *out) {
+    for (uint32_t i = 0; i < n; i++) {
+        if (!out[i]) continue;
+        struct wrinfo *u = calloc(1, sizeof *u);
+        if (!u) continue;
+        if (!ci[i].stageCount) u->all = 1; // pipeline library でつなぐ物は分からない
+        for (uint32_t k = 0; k < ci[i].stageCount; k++) wri_stage(&ci[i].pStages[k], u);
+        wrm_put(ID(out[i]), u);
+    }
+}
 
 static VkResult VKAPI_CALL create_dsl(VkDevice dv, const VkDescriptorSetLayoutCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorSetLayout *out) {
     (void) a;
@@ -4057,7 +4173,18 @@ static VkResult VKAPI_CALL create_pcache(VkDevice dv, const VkPipelineCacheCreat
     return VK_SUCCESS;
 }
 static void VKAPI_CALL destroy_pcache(VkDevice dv, VkPipelineCache c, const VkAllocationCallbacks *a) { (void) dv; (void) c; (void) a; }
-static VkResult VKAPI_CALL pcache_data(VkDevice dv, VkPipelineCache c, size_t *n, void *p) { (void) dv; (void) c; (void) p; *n = 0; return VK_SUCCESS; }
+// 中身は持たないが、決まりどおりの頭（32 バイト）だけは返す。空で返すと Godot などが誤りとみなす
+static VkResult VKAPI_CALL pcache_data(VkDevice dv, VkPipelineCache c, size_t *n, void *p) {
+    (void) dv; (void) c;
+    VkPipelineCacheHeaderVersionOne h = { .headerSize = sizeof h, .headerVersion = VK_PIPELINE_CACHE_HEADER_VERSION_ONE,
+                                          .vendorID = g_hw.props.vendorID, .deviceID = g_hw.props.deviceID };
+    memcpy(h.pipelineCacheUUID, g_hw.props.pipelineCacheUUID, VK_UUID_SIZE);
+    if (!p) { *n = sizeof h; return VK_SUCCESS; }
+    if (*n < sizeof h) { *n = 0; return VK_INCOMPLETE; }
+    memcpy(p, &h, sizeof h);
+    *n = sizeof h;
+    return VK_SUCCESS;
+}
 static VkResult VKAPI_CALL merge_pcache(VkDevice dv, VkPipelineCache c, uint32_t n, const VkPipelineCache *s) { (void) dv; (void) c; (void) n; (void) s; return VK_SUCCESS; }
 
 static VkResult VKAPI_CALL create_compute_pipelines(VkDevice dv, VkPipelineCache cache, uint32_t n, const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
@@ -4095,6 +4222,9 @@ static VkResult VKAPI_CALL create_compute_pipelines(VkDevice dv, VkPipelineCache
         if (tmp) destroy_shader(dv, tmp, NULL);
         if (r != VK_SUCCESS) { say("compute pipeline を作れない (%d)", r); out[i] = VK_NULL_HANDLE; worst = r; continue; }
         out[i] = (VkPipeline) (uintptr_t) id;
+        struct wrinfo *u = calloc(1, sizeof *u);
+        if (u) wri_stage(&ci[i].stage, u);
+        wrm_put(id, u);
     }
     return worst;
 }
@@ -4651,7 +4781,7 @@ static void bct_free(struct cb *c) {
     c->bct = NULL;
 }
 
-static void cb_clear(struct cb *c) { push_release(c); c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; c->nwc = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
+static void cb_clear(struct cb *c) { push_release(c); c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; c->nwc = 0; c->nbpl = 0; c->bpl_over = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
 
 static void cb_free(struct cb *c) { push_release(c); free(c->ph); free(c->wc); gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c->ev); free(c); }
 
@@ -4759,10 +4889,23 @@ static VkResult VKAPI_CALL reset_cb(VkCommandBuffer cbh, VkCommandBufferResetFla
 }
 
 // GPU が書くかもしれない範囲として覚える
+static int g_wr_why = 5; // 次の cb_writes の理由（集計のためだけ）
 static void cb_writes(struct cb *c, struct buf *bf, uint64_t off, uint64_t len) {
     if (!bf || !bf->m || !bf->m->host) return;
     if (len == VK_WHOLE_SIZE) len = off < bf->size ? bf->size - off : 0;
+    int w = g_wr_why;
+    g_wr_why = 5;
+    InterlockedIncrement64((volatile LONG64 *) &g_stat.wr_n[w]);
+    InterlockedAdd64((volatile LONG64 *) &g_stat.wr_bytes[w], (LONG64) len);
     rng_add(&c->r, &c->nr, &c->capr, bf->m, bf->memoff + off, len, 0);
+}
+
+// つないだ pipeline の番号を覚える
+static void cb_note_pipe(struct cb *c, uint64_t id) {
+    if (!id) return;
+    for (int i = 0; i < c->nbpl; i++) if (c->bpl[i] == id) return;
+    if (c->nbpl < 64) c->bpl[c->nbpl++] = id;
+    else c->bpl_over = 1;
 }
 
 // storage buffer につないだ物を候補として覚える（書く場所かどうかは submit のときに決める）
@@ -4779,9 +4922,26 @@ static void wr_cand(struct cb *c, uint32_t set, uint32_t binding, struct buf *bf
 }
 
 // submit のとき：作られたシェーダーのどれかが書く場所なら、GPU が書くかもしれない範囲にする
+// この command buffer でつないだ pipeline のどれかが、この場所に書くか。IPHONE_VK_RO_PIPE=0 で全部のシェーダーで決める前のやり方
+static int wr_may_cb(struct cb *c, uint32_t set, uint32_t binding) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("IPHONE_VK_RO_PIPE"); const char *f = getenv("IPHONE_VK_RO_SKIP"); on = !(e && *e == '0') && !(f && *f == '0'); }
+    if (!wr_may(set, binding)) return 0;
+    if (!on || c->bpl_over || !c->nbpl) return 1;
+    int hit = 0;
+    AcquireSRWLockShared(&g_wrm_lock);
+    for (int i = 0; i < c->nbpl && !hit; i++) {
+        struct wrinfo *w = wrm_find(c->bpl[i]);
+        if (!w || w->all || wri_has(w, set, binding)) hit = 1;
+    }
+    ReleaseSRWLockShared(&g_wrm_lock);
+    return hit;
+}
+
 static void wr_resolve(struct cb *c) {
     for (size_t k = 0; k < c->nwc; k++)
-        if (!c->wc[k].done && wr_may(c->wc[k].set, c->wc[k].binding)) {
+        if (!c->wc[k].done && wr_may_cb(c, c->wc[k].set, c->wc[k].binding)) {
+            g_wr_why = 0;
             cb_writes(c, c->wc[k].b, c->wc[k].off, c->wc[k].len);
             c->wc[k].done = 1;
         }
@@ -4800,6 +4960,7 @@ static void VKAPI_CALL cmd_bind_pipeline(VkCommandBuffer cbh, VkPipelineBindPoin
     vr_u32(&c->s, bp);
     vr_u64(&c->s, ID(p));
     gs_bind(c, bp, p);
+    cb_note_pipe(c, ID(p));
 }
 
 static void VKAPI_CALL cmd_bind_sets(VkCommandBuffer cbh, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t first, uint32_t n, const VkDescriptorSet *sets, uint32_t nd, const uint32_t *dyn) {
@@ -4873,6 +5034,7 @@ static void VKAPI_CALL cmd_copy(VkCommandBuffer cbh, VkBuffer src, VkBuffer dst,
         vr_u64(&c->s, r[i].srcOffset);
         vr_u64(&c->s, r[i].dstOffset);
         vr_u64(&c->s, r[i].size);
+        g_wr_why = 1;
         cb_writes(c, (struct buf *) dst, r[i].dstOffset, r[i].size);
         cb_reads(c, (struct buf *) src, r[i].srcOffset, r[i].size);
     }
@@ -4885,6 +5047,7 @@ static void VKAPI_CALL cmd_fill(VkCommandBuffer cbh, VkBuffer dst, VkDeviceSize 
     vr_u64(&c->s, off);
     vr_u64(&c->s, size);
     vr_u32(&c->s, data);
+    g_wr_why = 2;
     cb_writes(c, (struct buf *) dst, off, size);
 }
 
@@ -4894,6 +5057,7 @@ static void VKAPI_CALL cmd_update(VkCommandBuffer cbh, VkBuffer dst, VkDeviceSiz
     vr_u64(&c->s, ID(dst));
     vr_u64(&c->s, off);
     vr_bytes(&c->s, data, (uint32_t) size);
+    g_wr_why = 2;
     cb_writes(c, (struct buf *) dst, off, size);
 }
 
@@ -4978,6 +5142,8 @@ static void VKAPI_CALL cmd_exec(VkCommandBuffer cbh, uint32_t n, const VkCommand
         for (size_t k = 0; k < s->nrd; k++) rng_add(&c->rd, &c->nrd, &c->caprd, s->rd[k].m, s->rd[k].off, s->rd[k].len, 0);
         for (size_t k = 0; k < s->nev; k++) ev_add(c, s->ev[k].e, s->ev[k].val);
         for (size_t k = 0; k < s->nwc; k++) wr_cand(c, s->wc[k].set, s->wc[k].binding, s->wc[k].b, s->wc[k].off, s->wc[k].len);
+        for (int k = 0; k < s->nbpl; k++) cb_note_pipe(c, s->bpl[k]);
+        if (s->bpl_over) c->bpl_over = 1;
     }
 }
 
@@ -5069,6 +5235,7 @@ static void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cbh, VkImage im,
     vr_u32(&c->s, fix_layout(l));
     vr_u32(&c->s, n);
     vr_put(&c->s, rg, n * sizeof *rg);
+    g_wr_why = 3;
     cb_writes(c, (struct buf *) bb, 0, VK_WHOLE_SIZE);
 }
 
@@ -6069,6 +6236,7 @@ static void VKAPI_CALL cmd_copy_qpool_results(VkCommandBuffer cbh, VkQueryPool q
     vr_u64(&c->s, stride);
     vr_u32(&c->s, flags);
     // GPU が書く範囲として覚える（CPU から見えるメモリなら、待ちのあとに引き取る）
+    g_wr_why = 4;
     cb_writes(c, (struct buf *) dst, off, n ? stride * (n - 1) + ((flags & VK_QUERY_RESULT_64_BIT) ? 16 : 8) : 0);
 }
 

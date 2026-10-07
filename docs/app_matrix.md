@@ -8,7 +8,7 @@
 
 最終更新 2026-10-07
 
-数（10/7 夜）：代役か iPhone のふりで動いた物 29 本（Vulkan 9・DirectX 11 20）。iPhone の実機で動いた物 23 本（Vulkan 10・DirectX 11 13）。目標は 50 本
+数（10/7 夜）：代役か iPhone のふりで動いた物 39 本（Vulkan 19・DirectX 11 20）。iPhone の実機で動いた物 23 本（Vulkan 10・DirectX 11 13）。目標は 50 本
 
 ## Vulkan のアプリ
 | アプリ | 代役 | iPhone | 数字（iPhone） |
@@ -22,6 +22,7 @@
 | stable-diffusion.cpp | ✅ | ✅ | 1 枚 66.5 秒 |
 | vkQuake 1.36.0＋LibreQuake（本物のゲーム） | ✅ RTX 直 584.9・ふり 159.6 | ✅ 1280×720 timedemo demo1 | 149.6 コマ/秒（10/7） |
 | GZDoom 4.14.2＋Freedoom（本物のゲーム） | ✅ ふり 135 | ✅ MAP01 を 40 秒・窓 1520×825 | **225.9 コマ/秒**（10/7 夜・0.7.24）。裏の窓だと GZDoom が休むので vid_activeinbackground 1 |
+| Godot 4.7.2 の公式の見本 8 本（Forward Mobile） | ✅ ふり：squash_the_creeps 191・truck_town 174・dodge_the_creeps 171・lights_and_shadows 152・volumetric_fog 149・platformer 135・compute_texture 175・particles 23 | 未 | particles は GPU が書く粒の buffer を毎回読み戻すので遅い |
 
 ## DirectX 11（DXVK-macOS 1.10.3 と DXVK 3.1.1）
 | アプリ | 代役 | iPhone のふり | iPhone | 数字（iPhone） |
