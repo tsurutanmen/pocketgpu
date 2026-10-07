@@ -2025,6 +2025,21 @@ static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCach
             vr_bytes(&b, t.p, (uint32_t) t.n);
             free(t.p);
         }
+        // 末尾：テッセレーションの設定。1 つのパッチの点の数と、面の向きの原点。
+        // RTX は無くても描くが、MoltenVK は無いと何も描かない。古い受け手は知らない末尾を読み飛ばす
+        if (c->pTessellationState) {
+            const VkPipelineTessellationStateCreateInfo *ts = c->pTessellationState;
+            uint32_t origin = VK_TESSELLATION_DOMAIN_ORIGIN_UPPER_LEFT;
+            for (const VkBaseInStructure *x = ts->pNext; x; x = x->pNext)
+                if (x->sType == VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO)
+                    origin = ((const VkPipelineTessellationDomainOriginStateCreateInfo *) x)->domainOrigin;
+            vr_buf t = { 0 };
+            vr_u32(&t, ts->patchControlPoints);
+            vr_u32(&t, origin);
+            vr_u32(&b, VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO);
+            vr_bytes(&b, t.p, (uint32_t) t.n);
+            free(t.p);
+        }
         VkResult r = rpc_call(VR_CREATE_GRAPHICS_PIPELINE, &b, NULL);
         free(b.p);
         if (r != VK_SUCCESS) { say("graphics pipeline を作れない (%d)", r); out[i] = VK_NULL_HANDLE; worst = r; continue; }

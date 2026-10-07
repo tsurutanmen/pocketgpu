@@ -2662,6 +2662,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (dy.dynamicStateCount) ci.pDynamicState = &dy;
         // 末尾に付いている物（[sType][中身]）。古いドライバは付けない
         VkPipelineRenderingCreateInfo pri = { .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+        VkPipelineTessellationStateCreateInfo tsi = { .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO };
+        VkPipelineTessellationDomainOriginStateCreateInfo tdo = { .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO };
         VkFormat cfmt[16];
         while (!r->bad && r->at + 8 <= r->n) {
             uint32_t st = vr_ru32(r), len;
@@ -2678,6 +2680,14 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 pri.depthAttachmentFormat = (VkFormat) vr_ru32(&br);
                 pri.stencilAttachmentFormat = (VkFormat) vr_ru32(&br);
                 if (!br.bad) { pri.pNext = ci.pNext; ci.pNext = &pri; }
+            } else if (st == VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO) {
+                // テッセレーション：1 つのパッチの点の数と、面の向きの原点
+                tsi.patchControlPoints = vr_ru32(&br);
+                tdo.domainOrigin = (VkTessellationDomainOrigin) vr_ru32(&br);
+                if (!br.bad) {
+                    if (tdo.domainOrigin != VK_TESSELLATION_DOMAIN_ORIGIN_UPPER_LEFT) tsi.pNext = &tdo;
+                    ci.pTessellationState = &tsi;
+                }
             }
         }
         VkPipeline pp;

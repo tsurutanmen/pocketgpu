@@ -3,12 +3,14 @@
 #   win/run_iphone_dx.sh [版の名前]
 #   1. 装置の拡張と、BC を読めるか  2. Vulkan の三角形と足し算  3. vkcube：JPEG の先送りあり・なし
 #   4. DirectX 11 の三角形と立方体（BC1 も）  5. DirectX のサンプル（BC は GPU が読めなければドライバがほどく）
-V=${1:-v0722}
+V=${1:-v0723}
 VKB=/d/iphone-rpc/vkbuild
 OUT=$VKB/iphone_runs/$V
 WOUT=$(cygpath -w "$OUT")
 mkdir -p "$OUT"
 export IPHONE_VK=${IPHONE_VK_ADDR:-usb} # 代役で試すときは IPHONE_VK_ADDR=127.0.0.1:50070
+# 窓はサブモニターに出す（メインは CEO が使う）
+export IPHONE_VK_MONITOR=${IPHONE_VK_MONITOR:-sub}
 VKCMD='D:/iphone-rpc/vkbuild/iphone-vk.cmd'
 run() { timeout "$1" cmd.exe //c "$VKCMD" "${@:2}"; }
 echo "結果は $OUT"
@@ -45,6 +47,14 @@ for m in plain bc1; do
     echo "立方体 $m：$(grep -a 'コマ/秒\|検算\|失敗' "$OUT/d3d11cube_$m.txt" | grep -av '^\[iphone-vk\]' | tr '\n' ' ')"
 done
 echo "（代役とふつうの DirectX は d760538a・BC1 はふつう 139f0d27・ドライバでほどくと b186cdaa）"
+# 新しい DXVK 3.1.1：名乗りのスイッチを入れて同じ立方体
+D3=$VKB/dxvk3
+for m in plain bc1; do
+    arg=""; [ $m = bc1 ] && arg=bc1
+    (cd "$D3" && IPHONE_VK_DXVK3=1 DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=info DXVK_LOG_PATH=none IPHONE_VK_LOG=1 \
+        run 300 "D:/iphone-rpc/vkbuild/dxvk3/d3d11cube.exe" 300 "$WOUT\\dxvk3cube_$m.ppm" $arg) > "$OUT/d3d11dxvk3_$m.txt" 2>&1
+    echo "DXVK 3 の立方体 $m：$(grep -a 'コマ/秒\|検算\|失敗' "$OUT/d3d11dxvk3_$m.txt" | grep -av '^\[iphone-vk\]' | tr '\n' ' ')"
+done
 # DXVK が「足りない」と言った機能を拾う
 grep -a -h "not supported\|Failed\|err:" "$OUT"/d3d11*.txt | sort | uniq -c | head -10
 

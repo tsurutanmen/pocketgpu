@@ -18,7 +18,9 @@ NAMES=("$@")
     FluidCS11 NBodyGravityCS11 HDRToneMappingCS11 SimpleBezier11 DynamicShaderLinkage11 MultithreadedRendering11 OIT11)
 FRAMES=${FRAMES:-300}
 mkdir -p "$OUT"
-ARGS="-windowed -width:640 -height:480 -forcevsync:0 -noerrormsgboxes -nostats -constantframetime:0.0166"
+# 窓はサブモニターに出す（左にある・X=-1920）。ドライバ越しの窓は IPHONE_VK_MONITOR=sub でも動く
+ARGS="-windowed -width:640 -height:480 -forcevsync:0 -noerrormsgboxes -nostats -constantframetime:0.0166 -startx:${SUB_X:--1800} -starty:${SUB_Y:-100}"
+export IPHONE_VK_MONITOR=${IPHONE_VK_MONITOR:-sub}
 echo "受け手 $VK・結果は $OUT"
 
 run() { # 名前 形 フォルダ 記録の印 追加の引数
