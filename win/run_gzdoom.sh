@@ -20,8 +20,8 @@ export IPHONE_VK_MONITOR=${IPHONE_VK_MONITOR:-sub}
 export VK_LOADER_LAYERS_DISABLE='~implicit~'
 cd "$G" || exit 1
 cp -f ../fd/freedoom-0.13.0/freedoom2.wad . 2> /dev/null || cp -f ../fd/*/freedoom2.wad . 2> /dev/null
-# vid_preferbackend 1 が Vulkan。コマ数の上限と垂直同期を外し、全速で描かせる
-ARGS=(-iwad freedoom2.wad -width "$W" -height "$H" +vid_fullscreen 0 +vid_preferbackend 1 +vid_maxfps 0 +vid_vsync 0
+# vid_preferbackend 1 が Vulkan。コマ数の上限と垂直同期を外し、全速で描かせる。窓が選ばれていないと GZDoom は休むので、裏でも描かせる
+ARGS=(-iwad freedoom2.wad -width "$W" -height "$H" +vid_fullscreen 0 +vid_preferbackend 1 +vid_maxfps 0 +vid_vsync 0 +vid_activeinbackground 1
     +map "$MAP" +logfile "$(cygpath -w "$GLOG")" -nosound)
 if [ "$VK" = direct ]; then
     ./gzdoom.exe "${ARGS[@]}" > "$LOG" 2>&1 &

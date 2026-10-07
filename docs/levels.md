@@ -13,7 +13,7 @@
 - [x] 窓に絵を出せる（JPEG で運ぶ・先送り）
 - [x] DirectX 11 が DXVK を通して iPhone で描ける（DXVK-macOS と DXVK 3.1.1）
 - [x] iPhone の Apple の機能を Windows から呼べる（文字認識・音声認識・Apple Intelligence・翻訳・読み上げ）
-- [ ] テッセレーションの直しを iPhone に入れる（受け手の組み直し待ち）
+- [x] テッセレーションの直しを iPhone に入れる：0.7.24 で SimpleBezier11 が 17.2→51.6dB
 - [x] geometry shader の真似：点を広げる形（流体の粒）。iPhone の実機でも FluidCS11 が 48.7dB（DXVK-macOS）。DXVK 3 では 25.9dB で、PrimitiveId の出力の直しを入れたので次に確かめる
 - [x] geometry shader の真似：三角・線を受ける形、番号つき・インスタンスつきの描画、層への描き分け。iPhone のふりで試験 6 場面がふつうの DirectX と同じ。間接の描画と transform feedback はまだ・iPhone の実機はこれから
 
@@ -25,7 +25,7 @@
 - [ ] DirectX 11 のゲームを 10 本
 - [ ] DirectX 12（vkd3d-proton）
 - [ ] OpenGL（Zink）：OpenGL 2.1 が RTX 直・ドライバ越し・iPhone のふりの 3 つで同じ絵。iPhone の実機はこれから。3.0 より上は transform feedback が要る
-- [ ] 本物のゲーム：vkQuake は iPhone で 1280×720 149.6 コマ/秒。GZDoom は iPhone のふりで 135 コマ/秒（シェーダーの中で書かない storage buffer を読み戻さなくして 8.7 から）。Godot・SuperTuxKart はこれから
+- [ ] 本物のゲーム：vkQuake は iPhone で 1280×720 149.6 コマ/秒。GZDoom は iPhone で 225.9 コマ/秒（シェーダーの中で書かない storage buffer を読み戻さない・buffer の量を手元で出す）。Godot・SuperTuxKart はこれから
 
 ### Lv 30〜50 速さ
 - [ ] 窓の絵を H.264 か HEVC で送る（iPhone の専用回路で縮め、PC の専用回路でほどく）
