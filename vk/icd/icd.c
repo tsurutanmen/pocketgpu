@@ -888,8 +888,12 @@ static int hello(void) {
                 for (uint32_t i = 0; i < g_hw.mem.memoryTypeCount; i++)
                     if (g_hw.mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
                         g_hw.mem.memoryTypes[i].propertyFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+                // 調べ用：IPHONE_VK_QUEUES=数 で、1 つの種類のキューの数をそれ以下に見せる（命令は 1 本の通り道で順に送るので、数で速さは変わらない）
+                const char *qe = getenv("IPHONE_VK_QUEUES");
+                uint32_t qmax = qe && *qe ? (uint32_t) atoi(qe) : 0;
                 for (uint32_t i = 0; i < g_hw.nq; i++) {
                     g_hw.q[i].queueFlags &= VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+                    if (qmax && g_hw.q[i].queueCount > qmax) g_hw.q[i].queueCount = qmax;
                 }
                 g_hw.ok = 1;
                 say("受け手の GPU：%s", g_hw.props.deviceName);
@@ -4843,16 +4847,18 @@ static void VKAPI_CALL free_cbs(VkDevice dv, VkCommandPool pp, uint32_t n, const
     uint32_t real = 0;
     for (uint32_t i = 0; i < n; i++) if (cbs[i]) real++;
     vr_u32(&b, real);
+    for (uint32_t i = 0; i < n; i++) if (cbs[i]) vr_u64(&b, ID(cbs[i]));
+    // 番号は入れ物の番地なので、受け手に捨てると送ってから入れ物を解放する。先に解放すると、別の糸がすぐ同じ番地で
+    // 新しい command buffer を作って先に受け手に届き、受け手が新しい方を古い pool から捨ててしまう（10/7 SuperTuxKart の 22 本の糸で）
+    rpc_send(VR_FREE_COMMAND_BUFFERS, &b);
+    free(b.p);
     for (uint32_t i = 0; i < n; i++) {
         if (!cbs[i]) continue;
         struct cb *c = (struct cb *) cbs[i], **pp2 = &p->head;
-        vr_u64(&b, ID(c));
         while (*pp2 && *pp2 != c) pp2 = &(*pp2)->next;
         if (*pp2) *pp2 = c->next;
         cb_free(c);
     }
-    rpc_send(VR_FREE_COMMAND_BUFFERS, &b);
-    free(b.p);
 }
 
 static VkResult VKAPI_CALL begin_cb(VkCommandBuffer cbh, const VkCommandBufferBeginInfo *bi) {
