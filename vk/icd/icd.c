@@ -823,7 +823,8 @@ struct dev {
 
 struct queue { VK_LOADER_DATA loader; struct dev *d; uint32_t fam, idx; };
 
-struct dent { uint32_t binding, elem, type; struct buf *b; uint64_t off, range; };
+struct dent { uint32_t binding, elem, type; struct buf *b; uint64_t off, range; uint64_t h0, h1; uint32_t layout; };
+// h0・h1：画像なら sampler と image view、texel buffer なら buffer view（descriptor の写しを、ふつうの書き込みに直すのに使う）
 struct dpool;
 // descriptor set の形。pool の残りを数えるため、種類ごとの数を覚えておく。
 // 形を消したあとも、その形で取った set が残っていれば数を使うので、数え札（refs）で持つ
@@ -3562,16 +3563,66 @@ static int is_texel_desc(VkDescriptorType t) {
     return t == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || t == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
 }
 
-static void dset_put(struct dset *s, uint32_t binding, uint32_t elem, uint32_t type, struct buf *bf, uint64_t off, uint64_t range) {
+static void dset_put_full(struct dset *s, struct dent d) {
     for (uint32_t i = 0; i < s->n; i++)
-        if (s->e[i].binding == binding && s->e[i].elem == elem) { s->e[i] = (struct dent) { binding, elem, type, bf, off, range }; return; }
+        if (s->e[i].binding == d.binding && s->e[i].elem == d.elem) { s->e[i] = d; return; }
     if (s->n == s->cap) { s->cap = s->cap ? s->cap * 2 : 8; s->e = realloc(s->e, s->cap * sizeof *s->e); }
-    s->e[s->n++] = (struct dent) { binding, elem, type, bf, off, range };
+    s->e[s->n++] = d;
+}
+
+static void dset_put(struct dset *s, uint32_t binding, uint32_t elem, uint32_t type, struct buf *bf, uint64_t off, uint64_t range) {
+    dset_put_full(s, (struct dent) { binding, elem, type, bf, off, range, 0, 0, 0 });
+}
+
+static const struct dent *dset_get(const struct dset *s, uint32_t binding, uint32_t elem) {
+    for (uint32_t i = 0; i < s->n; i++)
+        if (s->e[i].binding == binding && s->e[i].elem == elem) return &s->e[i];
+    return NULL;
+}
+
+static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c);
+
+// descriptor の写しを、覚えている中身からふつうの書き込みに直す（受け手には写しを送らない）
+static void copy_dsets(VkDevice dv, uint32_t nc, const VkCopyDescriptorSet *c) {
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < nc; i++) total += c[i].descriptorCount;
+    if (!total) return;
+    VkWriteDescriptorSet *w = calloc(total, sizeof *w);
+    VkDescriptorImageInfo *ii = calloc(total, sizeof *ii);
+    VkDescriptorBufferInfo *bi = calloc(total, sizeof *bi);
+    VkBufferView *tv = calloc(total, sizeof *tv);
+    if (!w || !ii || !bi || !tv) { free(w); free(ii); free(bi); free(tv); return; }
+    uint32_t n = 0, missing = 0;
+    for (uint32_t i = 0; i < nc; i++) {
+        const struct dset *src = (const struct dset *) c[i].srcSet;
+        for (uint32_t k = 0; k < c[i].descriptorCount; k++) {
+            const struct dent *e = src ? dset_get(src, c[i].srcBinding, c[i].srcArrayElement + k) : NULL;
+            if (!e) { missing++; continue; }
+            w[n] = (VkWriteDescriptorSet) { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c[i].dstSet, .dstBinding = c[i].dstBinding,
+                                            .dstArrayElement = c[i].dstArrayElement + k, .descriptorCount = 1, .descriptorType = (VkDescriptorType) e->type };
+            if (is_image_desc(e->type)) {
+                ii[n] = (VkDescriptorImageInfo) { (VkSampler) (uintptr_t) e->h0, (VkImageView) (uintptr_t) e->h1, (VkImageLayout) e->layout };
+                w[n].pImageInfo = &ii[n];
+            } else if (is_texel_desc(e->type)) {
+                tv[n] = (VkBufferView) (uintptr_t) e->h0;
+                w[n].pTexelBufferView = &tv[n];
+            } else if (is_buffer_desc(e->type)) {
+                if (!e->b) { missing++; continue; } // 消えたバッファ
+                bi[n] = (VkDescriptorBufferInfo) { (VkBuffer) e->b, e->off, e->range };
+                w[n].pBufferInfo = &bi[n];
+            } else {
+                missing++;
+                continue;
+            }
+            n++;
+        }
+    }
+    if (missing) say("descriptor の写し：中身が分からない %u 個を飛ばした", missing);
+    if (n) update_dsets(dv, n, w, 0, NULL);
+    free(w); free(ii); free(bi); free(tv);
 }
 
 static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c) {
-    (void) c;
-    if (nc) say("descriptor のコピーはまだ扱わない（%u 件を飛ばした）", nc);
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     uint32_t real = 0;
@@ -3589,9 +3640,12 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
         if (is_image_desc(w[i].descriptorType)) {
             for (uint32_t k = 0; k < w[i].descriptorCount; k++) {
                 const VkDescriptorImageInfo *ii = &w[i].pImageInfo[k];
-                vr_u64(&b, w[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || w[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? ID(ii->sampler) : 0);
-                vr_u64(&b, w[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ? 0 : ID(ii->imageView));
+                uint64_t smp = w[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || w[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? ID(ii->sampler) : 0;
+                uint64_t view = w[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER ? 0 : ID(ii->imageView);
+                vr_u64(&b, smp);
+                vr_u64(&b, view);
                 vr_u32(&b, fix_layout(ii->imageLayout));
+                dset_put_full(s, (struct dent) { w[i].dstBinding, w[i].dstArrayElement + k, w[i].descriptorType, NULL, 0, 0, smp, view, (uint32_t) ii->imageLayout });
             }
             continue;
         }
@@ -3599,7 +3653,7 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
             for (uint32_t k = 0; k < w[i].descriptorCount; k++) {
                 struct bview *v = (struct bview *) w[i].pTexelBufferView[k];
                 vr_u64(&b, ID(v));
-                if (v) dset_put(s, w[i].dstBinding, w[i].dstArrayElement + k, w[i].descriptorType, v->b, v->off, v->range);
+                if (v) dset_put_full(s, (struct dent) { w[i].dstBinding, w[i].dstArrayElement + k, w[i].descriptorType, v->b, v->off, v->range, ID(v), 0, 0 });
             }
             continue;
         }
@@ -3615,6 +3669,8 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
     }
     rpc_send(VR_UPDATE_DESCRIPTOR_SETS, &b);
     free(b.p);
+    // 写しは書き込みのあとに行う（vkUpdateDescriptorSets の決まり）
+    if (nc) copy_dsets(dv, nc, c);
 }
 
 // ---- push descriptor（VK_KHR_push_descriptor） ----

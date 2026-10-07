@@ -30,7 +30,7 @@ IPHONE_VK_ONLY=1 run 120 "D:/iphone-rpc/vk-apps/vulkaninfo/vulkaninfo.exe" > "$O
 echo "vulkaninfo：$(wc -l < "$OUT/vulkaninfo_full.txt") 行・$(grep -a -m1 "deviceName" "$OUT/vulkaninfo_full.txt" | sed 's/^ *//')"
 
 echo "== 2. Vulkan の三角形と足し算"
-for t in tri tri13 vecadd pushdesc; do
+for t in tri tri13 vecadd pushdesc copydesc; do
     (cd "$OUT" && IPHONE_VK_LOG=1 run 120 "D:/iphone-rpc/vkbuild/$t.exe") > "$OUT/$t.txt" 2>&1
     echo "$t：$(grep -a -v '^\[iphone-vk\]' "$OUT/$t.txt" | tail -1)"
     # 1 回目だけ GPU を失ったと出たことがある（10/7）。ドライバが何を見たかを出す
