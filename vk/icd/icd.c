@@ -311,13 +311,17 @@ static void stall_banner(double sec) {
 static int recv_head(uint32_t h[2], uint32_t op) {
     static double giveup = -1;
     if (giveup < 0) { const char *e = getenv("IPHONE_VK_GIVEUP"); giveup = e ? atof(e) : 0; }
+    // 窓の無い計算のアプリ（画像生成など）は GPU の 1 回の仕事が数秒かかることがあるので、GPU を待つ命令は 20 秒まで黙る
+    int gpu_wait = op == VR_WAIT_FOR_FENCES || op == VR_WAIT_SEMAPHORES || op == VR_QUEUE_WAIT_IDLE || op == VR_DEVICE_WAIT_IDLE ||
+                   op == VR_MEM_READ || op == VR_MEM_READ_DELTA || op == VR_GET_QUERY_POOL_RESULTS;
+    double quiet = gpu_wait && !g_stall_hwnd ? 20 : 3;
     WSAPOLLFD pf = { .fd = g_sock, .events = POLLRDNORM };
     double t0 = 0, warned = 0;
     while (WSAPoll(&pf, 1, 1000) == 0) {
         if (!t0) t0 = now_ms() - 1000;
         double sec = (now_ms() - t0) / 1000;
-        if (sec >= 3 && (!warned || sec - warned >= 10)) {
-            fprintf(stderr, "[iphone-vk] 受け手の返事が %.0f 秒ない（命令 %u）。iPhone の受け手のアプリが前に出ているか確かめる\n", sec, op);
+        if (sec >= quiet && (!warned || sec - warned >= 10)) {
+            fprintf(stderr, "[iphone-vk] 受け手の返事が %.0f 秒ない（命令 %u）。GPU の仕事が長いか、iPhone の受け手のアプリが後ろに回っている\n", sec, op);
             warned = sec;
             g_stalled = 1;
         }

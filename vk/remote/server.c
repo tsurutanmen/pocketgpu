@@ -1445,6 +1445,14 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         }
     }
     if (op < 256 && drain_ops[op]) drain();
+    // 調べ用：VKR_SLOW_OP=命令の番号:ミリ秒 なら、その命令の前で待つ（GPU の仕事が長いときのドライバの動きを試す）
+    static int slow_op = -1, slow_ms;
+    if (slow_op < 0) {
+        const char *e = getenv("VKR_SLOW_OP");
+        slow_op = e ? atoi(e) : 0;
+        slow_ms = e && strchr(e, ':') ? atoi(strchr(e, ':') + 1) : 0;
+    }
+    if (slow_op && (int) op == slow_op && slow_ms > 0) sleep_ms(slow_ms);
     // 出した仕事が使っているかもしれない物を変える・調べる命令の前に、出した仕事が全部終わるのを待つ
     switch (op) {
     // （command buffer の記録し直し・command pool の reset・descriptor の書き換え・fence の reset は、
