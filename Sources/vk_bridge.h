@@ -9,6 +9,8 @@ extern "C" {
 int vkr_serve(const char * host, int port);
 // アプリが前にいないときは 1。その間は GPU に新しい仕事を出さずに待つ（出すと GPU を失う）
 void vkr_set_paused(int on);
+// iPhone の熱の状態（ProcessInfo.thermalState の 0〜3）。PC のドライバが聞いて、熱いときはコマ数を落とす
+void vkr_set_thermal(int state);
 // 受け手が処理した命令の数（つないでから増え続ける）と、いま PC がつながっているか。画面のファンを回すのに使う
 uint64_t vkr_ops_total(void);
 int vkr_clients(void);

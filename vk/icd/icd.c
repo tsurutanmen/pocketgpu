@@ -131,7 +131,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_RESET_QUERY_POOL] = "RESET_QUERY_POOL", [VR_CREATE_BUFFER_VIEW] = "CREATE_BUFFER_VIEW",
     [VR_DESTROY_BUFFER_VIEW] = "DESTROY_BUFFER_VIEW", [VR_GET_IMAGE_SUBRESOURCE_LAYOUT] = "GET_IMAGE_SUBRESOURCE_LAYOUT",
     [VR_READ_JPEG_PIPE] = "READ_JPEG_PIPE", [VR_GET_BUFFER_ADDRESS] = "GET_BUFFER_ADDRESS",
-    [VR_PACKED] = "PACKED", [VR_CREATE_BUFFER_NR] = "CREATE_BUFFER_NR", [VR_CREATE_IMAGE_NR] = "CREATE_IMAGE_NR",
+    [VR_PACKED] = "PACKED", [VR_CREATE_BUFFER_NR] = "CREATE_BUFFER_NR", [VR_CREATE_IMAGE_NR] = "CREATE_IMAGE_NR", [VR_GET_STATUS] = "GET_STATUS",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -147,6 +147,7 @@ static struct {
     double ww_ms, rb_ms;           // 書き込み監視にかかった時間・引き取りにかかった時間
     double lat_sum, lat_max;       // present から窓に出るまで
     uint64_t lat_n;
+    int heat_max;                  // いちばん熱かったときの iPhone の熱の状態
 } g_stat;
 static int g_stats = -1;
 
@@ -175,6 +176,7 @@ static void print_stats(void) {
     if (g_stat.presents)
         fprintf(stderr, "  present %llu 回 %.1f ms（うち窓に描く %llu 回 %.1f ms）\n", (unsigned long long) g_stat.presents, g_stat.present_ms,
                 (unsigned long long) g_stat.blits, g_stat.blit_ms);
+    if (g_stat.heat_max) fprintf(stderr, "  iPhone の熱：いちばん熱かったのは %d（0 ふつう〜3 とても熱い）\n", g_stat.heat_max);
     if (g_stat.lat_n)
         fprintf(stderr, "  present から窓に出るまで：平均 %.1f ms・いちばん長い %.1f ms（%llu 枚）\n", g_stat.lat_sum / (double) g_stat.lat_n,
                 g_stat.lat_max, (unsigned long long) g_stat.lat_n);
@@ -3070,9 +3072,39 @@ static VkResult blit(struct swapchain *sc, uint32_t j, uint64_t serial) {
     return VK_SUCCESS;
 }
 
-// present の間を sc->gap より短くしない。待った時間を返す
+// iPhone の熱の状態を 2 秒ごとに聞く。熱い（2）以上の間は、コマ数を IPHONE_VK_HEAT_FPS（標準 30・0 で落とさない）に落とす。
+// iOS は熱いと自分で GPU を遅くするが、コマ数を落として熱を出さない方が、速さの上がり下がりが少ない
+static int g_heat = -1;
+static double g_heat_gap;
+static void heat_check(void) {
+    static double last;
+    if (!(g_hw.caps & VR_CAP_STATUS) || g_dead) return;
+    double t = now_ms();
+    if (t - last < 2000) return;
+    last = t;
+    vr_buf b = { 0 }, out = { 0 };
+    VkResult r = rpc_call(VR_GET_STATUS, &b, &out);
+    free(b.p);
+    uint32_t h = 0;
+    if (r == VK_SUCCESS && out.n >= 4) memcpy(&h, out.p, 4);
+    free(out.p);
+    if (r != VK_SUCCESS || h > 3 || (int) h == g_heat) return;
+    static double fps = -1;
+    if (fps < 0) { const char *e = getenv("IPHONE_VK_HEAT_FPS"); fps = e ? atof(e) : 30; }
+    double gap = h >= 2 && fps > 0 ? 1000.0 / fps : 0;
+    if (gap > 0 && g_heat_gap <= 0) timeBeginPeriod(1);
+    static const char *const NAME[] = { "ふつう", "やや熱い", "熱い", "とても熱い" };
+    if (g_heat >= 0 || h > 0)
+        fprintf(stderr, "[iphone-vk] iPhone の熱：%s%s\n", NAME[h], gap > 0 ? "。冷めるまでコマ数を落とす" : g_heat_gap > 0 ? "。コマ数を戻す" : "");
+    g_heat_gap = gap;
+    g_heat = (int) h;
+    if ((int) h > g_stat.heat_max) g_stat.heat_max = (int) h;
+}
+
+// present の間を区切りより短くしない（熱いときの区切りの方が長ければそちら）。待った時間を返す
 static double pace_present(struct swapchain *sc) {
-    if (sc->gap <= 0) return 0;
+    double gap = sc->gap > g_heat_gap ? sc->gap : g_heat_gap;
+    if (gap <= 0) return 0;
     double t = now_ms(), t0 = t;
     if (sc->next_t > t) {
         if (sc->next_t - t > 2) Sleep((DWORD) (sc->next_t - t - 1.5));
@@ -3080,13 +3112,14 @@ static double pace_present(struct swapchain *sc) {
         t = sc->next_t;
     }
     // 遅れたときは、取り返そうとして詰めずに、今から数え直す
-    sc->next_t = (sc->next_t > 0 && t - sc->next_t < sc->gap) ? sc->next_t + sc->gap : t + sc->gap;
+    sc->next_t = (sc->next_t > 0 && t - sc->next_t < gap) ? sc->next_t + gap : t + gap;
     return now_ms() - t0;
 }
 
 static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi) {
     VkResult worst = VK_SUCCESS;
     struct swapchain *sc0 = pi->swapchainCount ? (struct swapchain *) pi->pSwapchains[0] : NULL;
+    heat_check();
     double slept = sc0 ? pace_present(sc0) : 0;
     double tp = now_ms();
     g_stat.presents++;

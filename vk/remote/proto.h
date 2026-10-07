@@ -22,6 +22,7 @@
 #define VR_CAP_JPEG 256u             // VR_READ_JPEG：窓に出すコマを受け手が JPEG に縮めて返す
 #define VR_CAP_JPEG_PIPE 1024u       // VR_READ_JPEG_PIPE：今のコマを後ろで縮め始めて、ひとつ前のコマの JPEG を返す
 #define VR_CAP_ASYNC_CREATE 16384u  // VR_CREATE_BUFFER_NR：返事を待たずに buffer を作る。必要なメモリの量はドライバが前に聞いた物から計算する
+#define VR_CAP_STATUS 32768u        // VR_GET_STATUS：iPhone の熱の状態を返す
 #define VR_CAP_PACK 8192u           // VR_PACKED：いくつもの命令をまとめて LZ4 で縮めた物を受けて、ほどいて順に処理する
 #define VR_CAP_BDA 4096u            // buffer device address：VR_GET_BUFFER_ADDRESS と、VR_ALLOC_MEMORY の末尾の flags（VkMemoryAllocateFlagsInfo）
 #define VR_CAP_NULL_DESC 2048u      // 空（VK_NULL_HANDLE）の descriptor と頂点バッファを受ける。GPU が持たなければ受け手が代わりの物を使う
@@ -110,6 +111,7 @@ enum vr_op {
     VR_PACKED,                   // 元の長さ（u32）・LZ4 で縮めた「命令の並び」。中の命令の返事は、ふつうに順に返す（VR_CAP_PACK）
     VR_CREATE_BUFFER_NR,         // VR_CREATE_BUFFER と同じ中身で、返事をしない（VR_CAP_ASYNC_CREATE）
     VR_CREATE_IMAGE_NR,          // VR_CREATE_IMAGE と同じ中身で、返事をしない（VR_CAP_ASYNC_CREATE）
+    VR_GET_STATUS,               // [同期] → 熱の状態（u32・0 ふつう〜3 とても熱い）・後ろに回っているか（u32）（VR_CAP_STATUS）
     VR_OP_COUNT
 };
 

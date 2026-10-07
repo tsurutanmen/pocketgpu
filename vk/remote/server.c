@@ -300,7 +300,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     if (v13 && (caps & need13) == need13) caps |= VR_CAP_VK13;
     g_fmt3 = (v13 || has_ext(ep, ne, "VK_KHR_format_feature_flags2")) && vkGetPhysicalDeviceFormatProperties2;
     caps |= VR_CAP_D3D; // buffer view と画像の並び方は 1.0 の入口なので、どの GPU でも使える
-    caps |= VR_CAP_PACK | VR_CAP_ASYNC_CREATE;
+    caps |= VR_CAP_PACK | VR_CAP_ASYNC_CREATE | VR_CAP_STATUS;
 #if defined(__APPLE__) || defined(_WIN32)
     caps |= VR_CAP_JPEG | VR_CAP_JPEG_PIPE; // 窓に出すコマを JPEG に縮められる（iPhone は ImageIO、PC の代役は WIC）
 #endif
@@ -399,6 +399,8 @@ static volatile int g_paused;   // アプリが前にいない間は 1（GPU に
 
 // アプリから呼ぶ：前にいないときは 1
 void vkr_set_paused(int on) { g_paused = on; }
+static volatile int g_thermal; // iPhone の熱の状態（0 ふつう・1 やや熱い・2 熱い・3 とても熱い）。アプリが知らせる
+void vkr_set_thermal(int state) { g_thermal = state; }
 
 static double t_ms(void) {
 #ifdef _WIN32
@@ -2395,6 +2397,21 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         si.value = vr_ru64(r);
         vkSignalSemaphore(d, &si);
         return 1;
+    }
+    case VR_GET_STATUS: {
+        // PC の代役は VKR_THERMAL_FILE に書いた数字を返す（熱くなったときのドライバの動きを試す）
+        int t = g_thermal;
+        const char *f = getenv("VKR_THERMAL_FILE");
+        if (f) {
+            FILE *fp = fopen(f, "r");
+            if (fp) {
+                if (fscanf(fp, "%d", &t) != 1) t = 0;
+                fclose(fp);
+            }
+        }
+        vr_u32(&g_out, (uint32_t) t);
+        vr_u32(&g_out, g_paused ? 1u : 0u);
+        return reply(s, 0);
     }
     case VR_CREATE_IMAGE_NR:
     case VR_CREATE_IMAGE: {

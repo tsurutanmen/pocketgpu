@@ -197,6 +197,7 @@ struct ContentView: View {
             vkr_set_paused(phase == .active ? 0 : 1)
         }
         .onReceive(tick) { _ in
+            vkr_set_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
             log = readBridge { rpc_bridge_log($0, $1) }
             availMB = Int(os_proc_available_memory() / 1_048_576)
             onCPU = rpc_bridge_last_on_cpu() != 0
