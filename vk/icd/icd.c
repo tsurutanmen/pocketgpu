@@ -733,6 +733,8 @@ static int hello(void) {
             if (g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_swapchain", 70 };
             // ドライバの中だけで済む拡張（受け手には送らない）
             if ((g_hw.caps & VR_CAP_NEW_MASK) && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_copy_commands2", 1 };
+            // ひな形での descriptor の書き込みは、ドライバがふつうの書き込みに直す（zink が名前で確かめる）
+            if (g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_descriptor_update_template", 1 };
             // depth clip は pipeline を作るときに depth clamp に置き換える（DXVK 2 が拡張の無い GPU でしていたのと同じ）
             if (dxvk3() && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_depth_clip_enable", 1 };
             // 空の descriptor は受け手が受ける（GPU が持たなければ代わりの物で）
