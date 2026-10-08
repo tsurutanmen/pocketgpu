@@ -29,7 +29,11 @@ for w in $WHAT; do
     tools)
         $CC -Wall tools/stackdump.c -o "$OUT/stackdump.exe" -ldbghelp
         $CC -Wall $VKH tools/vklist.c -o "$OUT/vklist.exe" $VKLIB
-        echo "道具：stackdump・vklist"
+        # 窓を主のモニターに一瞬も出さずにサブモニターへ出す起動の道具（iphone-vk.cmd が IPHONE_VK_MONITOR のときに使う）
+        $CC -Wall -municode ../win/subwin.c -o "$OUT/subwin.exe" -luser32
+        $CC -Wall -shared ../win/subwin_hook.c -o "$OUT/subwin_hook.dll" -luser32
+        rm -f "$OUT/subwin_hook.lib"
+        echo "道具：stackdump・vklist・subwin"
         ;;
     tests)
         for t in tri tri13 vecadd pushdesc copydesc copyimg extlist; do $CC $VKH tests/$t.c -o "$OUT/$t.exe" $VKLIB; done

@@ -15,4 +15,10 @@ rem つなぎ先：USB は usb_forward.py --local 50061 --remote 50060
 if "%IPHONE_VK%"=="" set IPHONE_VK=127.0.0.1:50061
 rem IPHONE_VK_ONLY=1 なら、ほかの GPU のドライバを隠して iPhone だけを見せる（最初の GPU を勝手に選ぶゲーム用）
 if "%IPHONE_VK_ONLY%"=="1" set "VK_LOADER_DRIVERS_SELECT=*iphone_icd*"
+rem IPHONE_VK_MONITOR があれば、窓を主のモニターに一瞬も出さずに出す起動の道具（subwin.exe）を通す
+if not defined IPHONE_VK_MONITOR goto plain
+if not exist "%~dp0subwin.exe" goto plain
+"%~dp0subwin.exe" %*
+exit /b %errorlevel%
+:plain
 %*

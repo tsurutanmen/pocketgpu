@@ -106,7 +106,7 @@ FT=$VKB/d3d11/feat.exe
 mkdir -p "$OUT/feat_native" "$OUT/feat_iphone" "$VKB/d3d11native"
 cp -f "$FT" "$VKB/d3d11native/"
 for sc in $("$FT" list | tr -d '\r'); do
-    (cd "$VKB/d3d11native" && timeout 60 ./feat.exe "$sc" "$(cygpath -w "$OUT/feat_native/$sc.ppm")") > "$OUT/feat_native/$sc.txt" 2>&1
+    (cd "$VKB/d3d11native" && timeout 60 "$VKB/subwin.exe" ./feat.exe "$sc" "$(cygpath -w "$OUT/feat_native/$sc.ppm")") > "$OUT/feat_native/$sc.txt" 2>&1
     (cd "$VKB/d3d11" && DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=none IPHONE_VK_LOG=1 \
         run 120 "$(cygpath -m "$FT")" "$sc" "$(cygpath -w "$OUT/feat_iphone/$sc.ppm")") > "$OUT/feat_iphone/$sc.txt" 2>&1
     if [ -s "$OUT/feat_native/$sc.ppm" ] && [ -s "$OUT/feat_iphone/$sc.ppm" ]; then
