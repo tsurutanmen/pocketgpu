@@ -5320,20 +5320,124 @@ out:
     free(root); free(stored);
 }
 
+// MoltenVK（中の SPIRV-Cross）が Metal に訳せない形を、意味を変えずに直す。IPHONE_VK_SPVFIX=0 で直さない
+//   1. OpName・OpMemberName を外す。zink の "sampler" のように Metal の型の名前とぶつかる名前があると、訳した MSL が組めない
+//   2. 計算の組の大きさを数で書き直す。DXVK 3 は OpExecutionModeId LocalSizeId（大きさを定数の番号で指す）で書く。
+//      指す先が全部ふつうの数の定数なら、同じ長さの OpExecutionMode LocalSize（数をそのまま書く）に置き換える
+//   3. 組で分け合うメモリ（Workgroup）を 0 で始める計算シェーダーには、組の大きさの定数（BuiltIn WorkgroupSize の印つき）を足す。
+//      SPIRV-Cross は 0 で埋める繰り返しに gl_WorkGroupSize を使うのに、その印が無いと宣言しない（DXVK 3 の FluidCS11 で断られた）。
+//      値は LocalSize と同じなので意味は変わらない
+// 直したら新しく確保した並びを返す（*n に語の数）。直す所が無ければ NULL
+static int spvfix_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_SPVFIX"); v = !(e && *e == '0'); }
+    return v;
+}
+
+static uint32_t *spv_fix(const uint32_t *w, size_t nw, size_t *n) {
+    if (!spvfix_on() || nw < 5 || w[0] != 0x07230203) return NULL;
+    uint32_t bound = w[3];
+    uint32_t *cval = calloc(bound, sizeof *cval), *cdef = calloc(bound, sizeof *cdef); // OpConstant の値・何語目で作られたか
+    if (!cval || !cdef) { free(cval); free(cdef); return NULL; }
+    size_t nnames = 0, lsid_at = 0, ann_end = 0, first_type = 0, first_func = 0;
+    int compute = 0, has_wgsize = 0, wg_init = 0, have_ls = 0;
+    uint32_t ls[3] = { 0 }, t_uint = 0, t_v3 = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > nw) { free(cval); free(cdef); return NULL; } // 壊れている：触らない
+        const uint32_t *x = &w[i];
+        if (op == 5 || op == 6) nnames++;
+        else if (op == 15 && wc >= 3 && x[1] == 5) compute = 1; // OpEntryPoint GLCompute
+        else if (op == 16 && wc == 6 && x[2] == 17) { ls[0] = x[3]; ls[1] = x[4]; ls[2] = x[5]; have_ls = 1; }
+        else if (op == 331 && wc == 6 && x[2] == 38 && !lsid_at) lsid_at = i; // OpExecutionModeId LocalSizeId
+        else if (op == 71 || op == 72 || op == 73 || op == 74 || op == 75 || op == 332 || op == 5632) {
+            ann_end = i + wc; // 印の並びの終わり
+            if (op == 71 && wc == 4 && x[2] == 11 && x[3] == 25) has_wgsize = 1;
+        } else if (op == 21 && wc == 4 && x[2] == 32 && x[3] == 0 && !t_uint) t_uint = x[1];
+        else if (op == 23 && wc == 4 && t_uint && x[2] == t_uint && x[3] == 3 && !t_v3) t_v3 = x[1];
+        else if (op == 43 && wc == 4 && x[2] < bound) { cval[x[2]] = x[3]; cdef[x[2]] = (uint32_t) i; }
+        else if (op == 59 && wc >= 5 && x[3] == 4) wg_init = 1; // OpVariable Workgroup に初期値
+        else if (op == 54 && !first_func) first_func = i;
+        if (!first_type && op >= 19 && op <= 39) first_type = i;
+        i += wc;
+    }
+    // LocalSizeId の指す先が全部ふつうの数の定数なら、その数
+    int lsid_ok = 0;
+    if (lsid_at) {
+        lsid_ok = 1;
+        uint32_t v[3];
+        for (int k = 0; k < 3; k++) {
+            uint32_t c = w[lsid_at + 3 + k];
+            if (c >= bound || !cdef[c] || (w[cdef[c]] & 0xffff) != 43) lsid_ok = 0;
+            else v[k] = cval[c];
+        }
+        if (lsid_ok) { memcpy(ls, v, sizeof ls); have_ls = 1; }
+    }
+    free(cval);
+    free(cdef);
+    int add_wg = compute && wg_init && !has_wgsize && have_ls && first_func && (ann_end || first_type);
+    if (!nnames && !lsid_ok && !add_wg) return NULL;
+    // 足す命令：（型が無ければ）uint・uint3、数の定数 3 つ、組、印
+    uint32_t add_t[64], add_d[4];
+    size_t nt = 0, nd = 0;
+    uint32_t nb = bound;
+    if (add_wg) {
+        if (!t_uint) { t_uint = nb++; add_t[nt++] = (4u << 16) | 21; add_t[nt++] = t_uint; add_t[nt++] = 32; add_t[nt++] = 0; }
+        if (!t_v3) { t_v3 = nb++; add_t[nt++] = (4u << 16) | 23; add_t[nt++] = t_v3; add_t[nt++] = t_uint; add_t[nt++] = 3; }
+        uint32_t c[3];
+        for (int k = 0; k < 3; k++) { c[k] = nb++; add_t[nt++] = (4u << 16) | 43; add_t[nt++] = t_uint; add_t[nt++] = c[k]; add_t[nt++] = ls[k]; }
+        uint32_t comp = nb++;
+        add_t[nt++] = (6u << 16) | 44; add_t[nt++] = t_v3; add_t[nt++] = comp; add_t[nt++] = c[0]; add_t[nt++] = c[1]; add_t[nt++] = c[2];
+        add_d[nd++] = (4u << 16) | 71; add_d[nd++] = comp; add_d[nd++] = 11; add_d[nd++] = 25; // OpDecorate BuiltIn WorkgroupSize
+    }
+    uint32_t *o = malloc((nw + nt + nd) * sizeof *o);
+    if (!o) return NULL;
+    memcpy(o, w, 5 * sizeof *o);
+    o[3] = nb;
+    size_t k = 5;
+    size_t dec_at = ann_end ? ann_end : first_type; // 印は印の並びの終わりに（無ければ型の前に）
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (nd && i == dec_at) { memcpy(o + k, add_d, nd * sizeof *o); k += nd; }
+        if (nt && i == first_func) { memcpy(o + k, add_t, nt * sizeof *o); k += nt; } // 型と定数は関数の前に
+        if (!(op == 5 || op == 6)) {
+            memcpy(o + k, w + i, wc * sizeof *o);
+            if (lsid_ok && i == lsid_at) { o[k] = (6u << 16) | 16; o[k + 2] = 17; o[k + 3] = ls[0]; o[k + 4] = ls[1]; o[k + 5] = ls[2]; } // → OpExecutionMode LocalSize
+            k += wc;
+        }
+        i += wc;
+    }
+    *n = k;
+    return o;
+}
+
 static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out) {
     (void) a;
+    size_t nfix = 0;
+    uint32_t *fix = spv_fix(ci->pCode, ci->codeSize / 4, &nfix);
+    const uint32_t *code = fix ? fix : ci->pCode;
+    size_t size = fix ? nfix * 4 : ci->codeSize;
     struct wrinfo *wi = calloc(1, sizeof *wi);
-    wr_scan(ci->pCode, ci->codeSize / 4, wi);
+    wr_scan(code, size / 4, wi);
     uint64_t id = new_id();
     wrm_put(id, wi);
+    // 調べ用：IPHONE_VK_SPV_DUMP=フォルダ で、受け手に送るシェーダーを番号ごとに書き出す
+    const char *dump = getenv("IPHONE_VK_SPV_DUMP");
+    if (dump && *dump) {
+        char p[MAX_PATH];
+        snprintf(p, sizeof p, "%s\\%llu%s.spv", dump, (unsigned long long) id, fix ? "_fix" : "");
+        FILE *f = fopen(p, "wb");
+        if (f) { fwrite(code, 1, size, f); fclose(f); }
+    }
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, id);
-    vr_bytes(&b, ci->pCode, (uint32_t) ci->codeSize);
+    vr_bytes(&b, code, (uint32_t) size);
     rpc_send(VR_CREATE_SHADER_MODULE, &b);
     free(b.p);
-    gs_keep(id, ci->pCode, ci->codeSize);
-    vf_keep(id, ci->pCode, ci->codeSize);
+    gs_keep(id, code, size);
+    vf_keep(id, code, size);
+    free(fix);
     *out = (VkShaderModule) (uintptr_t) id;
     return VK_SUCCESS;
 }
