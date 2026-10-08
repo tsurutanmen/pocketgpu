@@ -2,7 +2,7 @@
 
 目標は「iPhone を USB でつなぐと、Windows の PC が GPU を 1 枚増やしたように使える」。
 比べる相手は RTX ではなく、GPU の無い PC やノート（CPU と内蔵 GPU）。そこで目に見えて得をすることを目指す。
-2026-10-07 夜の見立ては **Lv 9**（Lv 10 の残りは、テッセレーションと三角を受ける geometry shader の真似を iPhone で確かめること）。
+2026-10-08 夕方の見立ては **Lv 12**。Lv 10 の残りだった DXVK 3 の流体も iPhone で直り、Lv 10〜30 のうち DirectX 12 と OpenGL が iPhone の実機で動いた。
 
 ## 段階と、クリアの条件
 
@@ -14,7 +14,7 @@
 - [x] DirectX 11 が DXVK を通して iPhone で描ける（DXVK-macOS と DXVK 3.1.1）
 - [x] iPhone の Apple の機能を Windows から呼べる（文字認識・音声認識・Apple Intelligence・翻訳・読み上げ）
 - [x] テッセレーションの直しを iPhone に入れる：0.7.24 で SimpleBezier11 が 17.2→51.6dB
-- [x] geometry shader の真似：点を広げる形（流体の粒）。iPhone の実機でも FluidCS11 が 48.7dB（DXVK-macOS）。DXVK 3 では 25.9dB で、PrimitiveId の出力の直しを入れたので次に確かめる
+- [x] geometry shader の真似：点を広げる形（流体の粒）。iPhone の実機でも FluidCS11 が 48.7dB（DXVK-macOS）。DXVK 3 も 48.7dB（10/8：MoltenVK が gl_WorkGroupSize を宣言しないシェーダーを、ドライバで組の大きさの定数を足して直した）
 - [x] geometry shader の真似：三角・線を受ける形、番号つき・インスタンスつきの描画、層への描き分け。iPhone のふりで試験 6 場面がふつうの DirectX と同じ。間接の描画と transform feedback はまだ・iPhone の実機はこれから
 
 ### Lv 10〜30 正しさと広さ
@@ -23,12 +23,12 @@
 - [x] DirectX 12 の下ごしらえ：push descriptor と descriptor の写しをドライバの中で直す（vkd3d-proton はほかに、空の descriptor と大きな descriptor の数が要る）
 - [ ] 試すアプリの表を 50 本にして、動く・動かないを毎回測る
 - [ ] DirectX 11 のゲームを 10 本
-- [ ] DirectX 12（vkd3d-proton）：自作の 5 場面が代役（11_1）と iPhone のふり（11_0）でふつうの DirectX 12 と同じ値。iPhone は受け手の組み直しが要る。12_0 には tiled resources が要る
-- [ ] OpenGL（Zink）：OpenGL 2.1 が RTX 直・ドライバ越し・iPhone のふりの 3 つで同じ絵。iPhone の実機はこれから。3.0 より上は transform feedback が要る
-- [ ] 本物のゲーム：vkQuake は iPhone で 1280×720 149.6 コマ/秒。GZDoom は iPhone で 225.9 コマ/秒（シェーダーの中で書かない storage buffer を読み戻さない・buffer の量を手元で出す）。Godot・SuperTuxKart はこれから
+- [x] DirectX 12（vkd3d-proton）：自作の 5 場面が iPhone の実機（0.7.26・11_0）で全部正しい。ベクトルの要素への atomic を配列への atomic にドライバで直した。12_0 には tiled resources が要る
+- [x] OpenGL（Zink）：OpenGL 2.1 が iPhone の実機で合格（10/8：Metal の型の名前とぶつかるシェーダーの名前をドライバで外した）。3.0 より上は transform feedback が要る
+- [ ] 本物のゲーム（iPhone の実機・10/8）：vkQuake 1280×720 198.8 コマ/秒・GZDoom 232・SuperTuxKart 93.7・Godot の squash_the_creeps 558・truck_town 349・particles 63〜74。読み戻しは CPU が触るまで遅らせる（Godot の粒は代役で 24→163）
 
 ### Lv 30〜50 速さ
-- [ ] 窓の絵を H.264 か HEVC で送る（iPhone の専用回路で縮め、PC の専用回路でほどく）
+- [ ] 窓の絵を H.264 か HEVC で送る：iPhone の VideoToolbox で縮めて PC の Media Foundation でほどくところまで動いた（0.7.26・1 コマ 8.9KB で JPEG の 4 分の 1）。ただ全速 92 コマ/秒・遅れ 16.9 ms で JPEG（548 コマ/秒・9.6 ms）より遅いので、既定は JPEG のまま
 - [ ] USB の 90MB/s の天井を超える道を探す：Backburner と同じく、インターネット共有を USB で出した有線のネットワークでもつなげるようにした（合言葉つき・0.7.24）。usbmux の往復は中央値 0.86 ms。共有の口と比べるのはこれから
 - [x] 窓の絵の返事を次のコマで受け取る（模擬の USB で影のサンプル 105→152 コマ/秒）
 - [x] 送る命令の並びを LZ4 で縮める（送る量 3.6 分の 1・152→205 コマ/秒）
@@ -48,7 +48,7 @@
 - [ ] iPhone で後ろに回ったときに、実機で同じになるか確かめる。後ろに回る前に知らせる仕組みは受け手の組み直しが要る
 - [ ] 7 日ごとの署名し直しを無くす（有料の開発者登録か App Store）
 - [x] 細工した命令で受け手が落ちない：点検で見つけた穴（大きさを信じてヒープを壊す・巨大な確保・文字列の終わり・掛け算のあふれ）をふさぎ、揺さぶり 12,739 件で落ちない。記録の中の命令まで深く揺さぶるのはこれから
-- [ ] ハンドルの種類を受け手が確かめる（今は番号を信じる）
+- [x] ハンドルの種類を受け手が確かめる：番号の種類を型から確かめ、描き方の無い draw・dispatch は飛ばす（0.7.25）
 
 ### Lv 70〜90 広がり
 - [ ] iPhone を何台もつなぐ
@@ -68,3 +68,4 @@
 - 測った数字は `project` のメモと `vkbuild/iphone_runs/` に残す。主な物：
   - 2026-10-07 iPhone 17 Pro：vkcube 1280×720 244.8 コマ/秒・DirectX 11 の立方体 260 コマ/秒・DirectX のサンプル 6 本がふつうの DirectX と見た目で区別できない
   - 2026-10-07 夜 iPhone 17 Pro：vkQuake 1280×720 149.6 コマ/秒・DirectX のサンプル 13 本が動く・機能の 29 場面で iPhone だけ違うのは頂点の形式 A2B10G10R10_UINT（vfmt）
+  - 2026-10-08 iPhone 17 Pro（0.7.25・0.7.26）：DirectX 12 と OpenGL が動いた・SuperTuxKart 93.7 コマ/秒・vkQuake 198.8・DXVK 3 の流体と vfmt が DXVK-macOS と同じ絵に（どちらも MoltenVK の穴をドライバで避けた）
