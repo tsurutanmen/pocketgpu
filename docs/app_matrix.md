@@ -14,18 +14,18 @@
 | アプリ | 代役 | iPhone | 数字（iPhone） |
 |---|---|---|---|
 | vulkaninfo | ✅ | ✅ | Vulkan 1.3 |
-| vkcube | ✅ | ✅ | 500×500 353.7 コマ/秒・1280×720 244.8 |
+| vkcube | ✅ | ✅ | 500×500 1008 コマ/秒・1280×720 622〜639（10/8・JPEG）。H.264 は 113（0.7.28） |
 | 三角形 tri・tri13 | ✅ | ✅ | Apple の丸めで ±1 |
 | 足し算 vecadd | ✅ | ⚠️ 失敗が 1 回あった。0.7.23 の通しの試験では 1 回目から正しい | 代役 3 種類では出ない。次の通しで記録を取る |
 | llama.cpp（Qwen3 0.6B〜8B） | ✅ | ✅ | 0.6B 67 t/s・8B 12.3 t/s |
 | whisper.cpp | ✅ | ✅ | 2 分の音声 43.8 秒 |
 | stable-diffusion.cpp | ✅ | ✅ | 1 枚 66.5 秒 |
-| vkQuake 1.36.0＋LibreQuake（本物のゲーム） | ✅ RTX 直 584.9・ふり 159.6 | ✅ 1280×720 timedemo demo1 | 149.6 コマ/秒（10/7） |
-| GZDoom 4.14.2＋Freedoom（本物のゲーム） | ✅ ふり 135 | ✅ MAP01 を 40 秒・窓 1520×825 | **225.9 コマ/秒**（10/7 夜・0.7.24）。裏の窓だと GZDoom が休むので vid_activeinbackground 1 |
-| Godot 4.7.2 の公式の見本 8 本（Forward Mobile） | ✅ ふり：squash_the_creeps 191・truck_town 174・dodge_the_creeps 171・lights_and_shadows 152・volumetric_fog 149・platformer 135・compute_texture 175・particles 23 | 未 | particles は GPU が書く粒の buffer を毎回読み戻すので遅い |
+| vkQuake 1.36.0＋LibreQuake（本物のゲーム） | ✅ RTX 直 584.9・ふり 159.6 | ✅ 1280×720 timedemo demo1 | **198.8 コマ/秒**（10/8・0.7.25。10/7 は 149.6） |
+| GZDoom 4.14.2＋Freedoom（本物のゲーム） | ✅ ふり 135 | ✅ MAP01 を 40 秒・窓 1520×825 | **232 コマ/秒**（10/8・0.7.25。10/7 夜は 225.9）。裏の窓だと GZDoom が休むので vid_activeinbackground 1 |
+| Godot 4.7.2 の公式の見本 8 本（Forward Mobile） | ✅ ふり：squash_the_creeps 191・truck_town 174・dodge_the_creeps 171・lights_and_shadows 152・volumetric_fog 149・platformer 135・compute_texture 175・particles 23 | ✅ 10/8：squash_the_creeps 558・truck_town 349・particles 63〜74 | 粒の buffer は CPU が触るまで読み戻さない（代役で 24→163） |
 | Godot 4.7.2 の Forward+（机の上の PC 向けの描き方） | ✅ ふり：squash_the_creeps 174・volumetric_fog 148 | 未 | |
-| SuperTuxKart 1.5（Vulkan・本物のゲーム） | ✅ ふり 110 コマ/秒（RTX 直 107.9）・lighthouse を 4 台で自動走行 | 未 | 22 本の糸で command buffer を捨てる順のずれを直して落ちなくなった |
-| Veloren（ボクセルの RPG・wgpu の Vulkan） | ✅ ふり：最初のメニュー画面 49.7 コマ/秒 | 未 | 遊ぶところまでは試していない |
+| SuperTuxKart 1.5（Vulkan・本物のゲーム） | ✅ ふり 110 コマ/秒（RTX 直 107.9）・lighthouse を 4 台で自動走行 | ✅ **93.7 コマ/秒**（10/8・3005 コマ 32 秒） | 22 本の糸で command buffer を捨てる順のずれを直して落ちなくなった |
+| Veloren（ボクセルの RPG・wgpu の Vulkan） | ✅ ふり：最初のメニュー画面 49.7 コマ/秒 | ✅ メニュー 59.6 コマ/秒（10/8・60 で止まる） | 遊ぶところまでは試していない |
 
 ## DirectX 11（DXVK-macOS 1.10.3 と DXVK 3.1.1）
 | アプリ | 代役 | iPhone のふり | iPhone | 数字（iPhone） |
