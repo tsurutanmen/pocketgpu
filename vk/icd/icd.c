@@ -3181,6 +3181,13 @@ static void VKAPI_CALL destroy_fb(VkDevice dv, VkFramebuffer h, const VkAllocati
 static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out);
 static void VKAPI_CALL destroy_shader(VkDevice dv, VkShaderModule h, const VkAllocationCallbacks *a);
 
+// divisor 0 を大きな divisor に置き換えるか。受け手が Apple の GPU（MoltenVK）なら置き換える。IPHONE_VK_DIV0=1 で必ず・0 で置き換えない
+static int div0_fix(void) {
+    const char *e = getenv("IPHONE_VK_DIV0");
+    if (e && *e) return *e == '1';
+    return g_hw.props.vendorID == 0x106b;
+}
+
 // maintenance5 では、module を作らずに stage の pNext に VkShaderModuleCreateInfo を入れてよい（新しい DXVK はこう書く）。
 // 受け手には一時の module を作って送り、pipeline を作り終えたら消す
 static VkShaderModule stage_module(VkDevice dv, const VkPipelineShaderStageCreateInfo *st, VkShaderModule *tmp) {
@@ -3351,7 +3358,12 @@ static VkResult VKAPI_CALL create_graphics_pipelines_raw(VkDevice dv, VkPipeline
             vr_u32(&t, dv2->vertexBindingDivisorCount);
             for (uint32_t k = 0; k < dv2->vertexBindingDivisorCount; k++) {
                 vr_u32(&t, dv2->pVertexBindingDivisors[k].binding);
-                vr_u32(&t, dv2->pVertexBindingDivisors[k].divisor);
+                uint32_t dvs = dv2->pVertexBindingDivisors[k].divisor;
+                // iPhone（MoltenVK）は divisor 0 を持つと名乗るのに、その描き方が丸ごと消える（DXVK 3 の step rate 0）。
+                // divisor 0 の意味は「どのインスタンスも firstInstance の要素」で、大きな divisor でもインスタンスの数が
+                // それに届かなければ (instance - firstInstance) / divisor = 0 で同じになる。iPhone の上限 2^30 に置き換える
+                if (!dvs && div0_fix()) dvs = 1u << 30;
+                vr_u32(&t, dvs);
             }
             vr_u32(&b, VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT);
             vr_bytes(&b, t.p, (uint32_t) t.n);
