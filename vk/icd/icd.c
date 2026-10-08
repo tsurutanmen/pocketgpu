@@ -5411,10 +5411,147 @@ static uint32_t *spv_fix(const uint32_t *w, size_t nw, size_t *n) {
     return o;
 }
 
+// ベクトルの 1 要素への atomic を、同じ並びの配列への atomic に直す。Metal はベクトルの要素のアドレスを取れず、
+// vkd3d-proton が装置を作るときの計算シェーダー（GPU のアドレスで指す struct { uint3; uint; uint[] } の .x に atomic）を
+// MoltenVK が組めなかった（address of vector element requested）。
+// struct のメンバーがベクトルで、atomic がその要素を access chain で指しているとき、そのメンバーの型を
+// 同じ大きさの配列（ArrayStride は要素の大きさ）に替える。並びは同じなので意味は変わらない。
+// ベクトルそのものを指すポインタや、struct を丸ごと読み書きする所があれば触らない
+static uint32_t *spv_vecatomic(const uint32_t *w, size_t nw, size_t *n) {
+    if (!spvfix_on() || nw < 5 || w[0] != 0x07230203) return NULL;
+    uint32_t bound = w[3];
+    uint32_t *tdef = calloc(bound, sizeof *tdef), *rty = calloc(bound, sizeof *rty), *cval = calloc(bound, sizeof *cval);
+    uint32_t *acdef = calloc(bound, sizeof *acdef);
+    uint8_t *iscon = calloc(bound, 1), *bad = calloc(bound, 1); // bad：その struct は替えない
+    enum { MAXC = 8 };
+    struct { uint32_t s, m; } cand[MAXC];
+    int nc = 0;
+    size_t ann_end = 0;
+    uint32_t t_u32 = 0;
+    uint32_t *o = NULL;
+    if (!tdef || !rty || !cval || !acdef || !iscon || !bad) goto done;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > nw) goto done;
+        const uint32_t *x = &w[i];
+        if (op >= 19 && op <= 39 && x[1] < bound) tdef[x[1]] = (uint32_t) i;
+        if (op == 21 && wc == 4 && x[2] == 32 && x[3] == 0 && !t_u32) t_u32 = x[1];
+        if (op == 43 && wc == 4 && x[2] < bound) { cval[x[2]] = x[3]; iscon[x[2]] = 1; }
+        if ((op == 59 || op == 61 || op == 65 || op == 66 || op == 120 || op == 55 || op == 83 || op == 124 || op == 245 || op == 169) && wc >= 3 && x[2] < bound) rty[x[2]] = x[1];
+        if ((op == 65 || op == 66) && wc >= 4 && x[2] < bound) acdef[x[2]] = (uint32_t) i;
+        if ((op == 61 || op == 80) && wc >= 3 && x[1] < bound) bad[x[1]] = 1; // struct を丸ごと読む・作る
+        if (op == 71 || op == 72 || op == 73 || op == 74 || op == 75 || op == 332 || op == 5632) ann_end = i + wc;
+        i += wc;
+    }
+    if (!ann_end) goto done;
+    // access chain を型でたどる。最後に着いた所が「struct のメンバーのベクトルそのもの」なら、その struct を bad に。
+    // atomic のポインタなら、「struct のメンバーのベクトルの要素」かを見て候補にする
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        const uint32_t *x = &w[i];
+        uint32_t aptr = 0;
+        if (op == 228 && wc >= 2) aptr = x[1];
+        else if (((op >= 227 && op <= 242) || op == 5614 || op == 5615 || op == 6035) && wc >= 4) aptr = x[3];
+        if ((op == 65 || op == 66) && wc >= 4) {
+            uint32_t bt = x[3] < bound ? rty[x[3]] : 0, t = 0;
+            if (bt && bt < bound && tdef[bt] && (w[tdef[bt]] & 0xffff) == 32) t = w[tdef[bt] + 3];
+            uint32_t s = 0, m = 0;
+            for (uint32_t k = 4; k < wc && t && t < bound && tdef[t]; k++) {
+                const uint32_t *td = &w[tdef[t]];
+                uint32_t top = td[0] & 0xffff;
+                if (top == 30) {
+                    if (!iscon[x[k]] || cval[x[k]] + 2 >= (td[0] >> 16)) { t = 0; break; }
+                    s = t; m = cval[x[k]];
+                    t = td[2 + m];
+                } else if (top == 28 || top == 29 || top == 23) { s = 0; t = td[2]; }
+                else { t = 0; break; }
+            }
+            // 最後に着いた型がベクトルで、その一つ手前が struct のメンバー＝ベクトルそのものを指す
+            if (s && t && t < bound && tdef[t] && (w[tdef[t]] & 0xffff) == 23) bad[s] = 1;
+        }
+        if (aptr && aptr < bound && acdef[aptr]) {
+            const uint32_t *ac = &w[acdef[aptr]];
+            uint32_t acw = ac[0] >> 16, bt = ac[3] < bound ? rty[ac[3]] : 0, t = 0;
+            if (bt && bt < bound && tdef[bt] && (w[tdef[bt]] & 0xffff) == 32) t = w[tdef[bt] + 3];
+            for (uint32_t k = 4; k < acw && t && t < bound && tdef[t]; k++) {
+                const uint32_t *td = &w[tdef[t]];
+                uint32_t top = td[0] & 0xffff;
+                if (top == 30) {
+                    if (!iscon[ac[k]] || cval[ac[k]] + 2 >= (td[0] >> 16)) break;
+                    uint32_t mt = td[2 + cval[ac[k]]];
+                    // struct のメンバーがベクトルで、その要素で終わる（k の次が最後の添字）
+                    if (k + 2 == acw && mt < bound && tdef[mt] && (w[tdef[mt]] & 0xffff) == 23) {
+                        int dup = 0;
+                        for (int c = 0; c < nc; c++) dup |= cand[c].s == t && cand[c].m == cval[ac[k]];
+                        if (!dup && nc < MAXC) { cand[nc].s = t; cand[nc].m = cval[ac[k]]; nc++; }
+                        break;
+                    }
+                    t = mt;
+                } else if (top == 28 || top == 29) t = td[2];
+                else break;
+            }
+        }
+        i += wc;
+    }
+    int nok = 0;
+    for (int c = 0; c < nc; c++) nok += !bad[cand[c].s];
+    if (!nok) goto done;
+    // 足す物：（無ければ）uint、候補ごとに 長さの定数・配列の型・ArrayStride の印
+    o = malloc((nw + 4 + nok * 12) * sizeof *o);
+    if (!o) goto done;
+    uint32_t nb = bound, new_u32 = 0;
+    if (!t_u32) t_u32 = new_u32 = nb++;
+    uint32_t arr[MAXC] = { 0 }, len[MAXC] = { 0 };
+    for (int c = 0; c < nc; c++) if (!bad[cand[c].s]) { len[c] = nb++; arr[c] = nb++; }
+    memcpy(o, w, 5 * sizeof *o);
+    o[3] = nb;
+    size_t k = 5;
+    int first_type_done = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (i == ann_end) // 印：配列の要素の間
+            for (int c = 0; c < nc; c++) {
+                if (bad[cand[c].s]) continue;
+                const uint32_t *st = &w[tdef[cand[c].s]];
+                uint32_t vt = st[2 + cand[c].m], ct = w[tdef[vt] + 2];
+                uint32_t bytes = tdef[ct] ? w[tdef[ct] + 2] / 8 : 4;
+                o[k++] = (4u << 16) | 71; o[k++] = arr[c]; o[k++] = 6; o[k++] = bytes ? bytes : 4; // ArrayStride
+            }
+        if (op >= 19 && op <= 39 && !first_type_done && new_u32) { // uint が無ければ最初の型の前に
+            o[k++] = (4u << 16) | 21; o[k++] = new_u32; o[k++] = 32; o[k++] = 0;
+            first_type_done = 1;
+        }
+        for (int c = 0; c < nc; c++) {
+            if (bad[cand[c].s] || i != tdef[cand[c].s]) continue;
+            // その struct の直前に、長さの定数と配列の型
+            const uint32_t *st = &w[i];
+            uint32_t vt = st[2 + cand[c].m], ct = w[tdef[vt] + 2], cnt = w[tdef[vt] + 3];
+            o[k++] = (4u << 16) | 43; o[k++] = t_u32; o[k++] = len[c]; o[k++] = cnt;
+            o[k++] = (4u << 16) | 28; o[k++] = arr[c]; o[k++] = ct; o[k++] = len[c];
+        }
+        memcpy(o + k, w + i, wc * sizeof *o);
+        if (op == 30)
+            for (int c = 0; c < nc; c++)
+                if (!bad[cand[c].s] && i == tdef[cand[c].s]) o[k + 2 + cand[c].m] = arr[c];
+        k += wc;
+        i += wc;
+    }
+    *n = k;
+done:
+    free(tdef); free(rty); free(cval); free(acdef); free(iscon); free(bad);
+    if (o && !*n) { free(o); o = NULL; }
+    return o;
+}
+
 static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out) {
     (void) a;
     size_t nfix = 0;
     uint32_t *fix = spv_fix(ci->pCode, ci->codeSize / 4, &nfix);
+    {
+        size_t n2 = 0;
+        uint32_t *fix2 = spv_vecatomic(fix ? fix : ci->pCode, fix ? nfix : ci->codeSize / 4, &n2);
+        if (fix2) { free(fix); fix = fix2; nfix = n2; }
+    }
     const uint32_t *code = fix ? fix : ci->pCode;
     size_t size = fix ? nfix * 4 : ci->codeSize;
     struct wrinfo *wi = calloc(1, sizeof *wi);
