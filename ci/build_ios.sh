@@ -40,8 +40,14 @@ ls -la MoltenVK/MoltenVK/static/MoltenVK.xcframework/ios-arm64
 
 EXTRA=()
 if [ "${MINECRAFT:-false}" = "true" ]; then
-    bash ci/build_pumpkin_ios.sh
-    cp pumpkin/target/aarch64-apple-ios/release/libpumpkin_ios.a libs/
+    if [ -f vendor/pumpkin-lib/libpumpkin_ios.a.xz ]; then
+        # GitHub Actions の pumpkin-ios で組んだ物を xz で縮めて置いてある（組むと 15 分かかるので、無料枠を使わない）
+        xz -dc vendor/pumpkin-lib/libpumpkin_ios.a.xz > libs/libpumpkin_ios.a
+        cat vendor/pumpkin-lib/PUMPKIN_COMMIT.txt
+    else
+        bash ci/build_pumpkin_ios.sh
+        cp pumpkin/target/aarch64-apple-ios/release/libpumpkin_ios.a libs/
+    fi
     EXTRA=("PUMPKIN_LDFLAGS=-lpumpkin_ios -framework Security -framework SystemConfiguration" "PUMPKIN_SWIFT_FLAG=PUMPKIN")
 fi
 

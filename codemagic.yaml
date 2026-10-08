@@ -8,8 +8,8 @@ workflows:
     environment:
       xcode: 26.3
       vars:
-        # true にするとマイクラのサーバー Pumpkin も組んで入れる。初回は 15 分ほどかかる
-        MINECRAFT: "false"
+        # true ならマイクラのサーバー Pumpkin も入れる。vendor/pumpkin-lib に組んだ物があればそれを使う（無ければ組む・15 分ほど）
+        MINECRAFT: "true"
     cache:
       cache_paths:
         - $HOME/.cargo/registry
