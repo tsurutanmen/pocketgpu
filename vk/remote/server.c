@@ -201,7 +201,8 @@ static int g_fmt3;                     // VkFormatProperties3 を答えられる
 // aux：バッファならつないだメモリの番号。list：descriptor set なら中のバッファの番号の並び
 typedef struct { uint64_t *ids; uint32_t n, cap; } idlist;
 typedef struct { uint64_t id, h; uint32_t kind; void *map; uint64_t size; uint64_t aux; idlist *list;
-                 uint8_t *last; } ent; // last：ドライバが持っているはずの中身。VR_MEM_READ_DELTA で使う
+                 uint8_t *last; uint64_t dev; } ent; // last：ドライバが持っているはずの中身。VR_MEM_READ_DELTA で使う
+                                                    // dev：持ち主の装置（装置ならそれ自身）
 
 static void idlist_add(idlist **l, uint64_t id) {
     if (!*l) *l = calloc(1, sizeof **l);
@@ -238,13 +239,16 @@ static void tab_grow(void) {
     free(o);
 }
 
+// 持ち主の装置：作る命令はどれも最初に DEV で装置を引くので、最後に引いた装置を持ち主にする
+static uint64_t g_last_dev;
+
 static void put(uint64_t id, uint64_t h, uint32_t kind) {
     if ((g_cnt + 1) * 2 > g_cap) tab_grow();
     size_t s = slot(id);
     while (g_tab[s].id && g_tab[s].id != id) s = (s + 1) & (g_cap - 1);
     if (!g_tab[s].id) g_cnt++;
     if (g_tab[s].id == id) { idlist_free(&g_tab[s].list); free(g_tab[s].last); }
-    g_tab[s] = (ent) { id, h, kind, NULL, 0, 0, NULL, NULL };
+    g_tab[s] = (ent) { id, h, kind, NULL, 0, 0, NULL, NULL, kind == K_DEVICE ? h : g_last_dev };
 }
 
 static ent *find(uint64_t id) {
@@ -288,6 +292,7 @@ static void del(uint64_t id) {
     VkRenderPass: K_RPASS, VkSampler: K_SAMPLER, VkSemaphore: K_SEM, VkShaderModule: K_SHADER, default: 0)
 static uint64_t HK(uint64_t id, uint32_t kind) {
     ent *e = find(id);
+    if (e && kind == K_DEVICE && e->kind == K_DEVICE) g_last_dev = e->h;
     return e && (!kind || e->kind == kind) ? e->h : 0;
 }
 #define DEV(id) ((VkDevice) (uintptr_t) HK(id, K_DEVICE))
@@ -796,53 +801,11 @@ static int chain_ready(void) {
 // ---- 1 つの接続の間に作った物を、切れたときに片づける ----
 static void jp_reset(void);
 static void vid_reset(void);
-static void cleanup(void) {
-    drain();
-    jp_reset();
-    vid_reset();
-    for (size_t i = 0; i < g_ncbi; i++) { free(g_cbi[i].sets); idlist_free(&g_cbi[i].mems); }
-    g_ncbi = 0;
-    if (g_err == VK_ERROR_DEVICE_LOST) g_lost = 1;
-    g_err = VK_SUCCESS;
-    if (g_dev) {
-        for (int i = 0; i < g_nfpool; i++) vkDestroyFence(g_dev, g_fpool[i], NULL);
-        for (int i = 0; i < 4; i++) if (g_chain[i]) vkDestroySemaphore(g_dev, g_chain[i], NULL);
-    }
-    memset(g_chain, 0, sizeof g_chain);
-    g_chain_last = -1;
-    g_nfpool = 0;
-    g_dev = VK_NULL_HANDLE;
-    for (int kind = K_PIPELINE; kind >= K_DEVICE; kind--) { (void) kind; }
-    VkDevice dev = VK_NULL_HANDLE;
-    for (size_t i = 0; i < g_cap; i++) if (g_tab[i].id && g_tab[i].kind == K_DEVICE) dev = (VkDevice) (uintptr_t) g_tab[i].h;
+// 手伝いの物を dev の上から消す（自前の fence・つなぎの semaphore・空の代わりの物）。どれも要るときにまた作る
+static void helpers_free(VkDevice dev) {
     if (dev) {
-        vkDeviceWaitIdle(dev);
-        static const int order[] = { K_PIPELINE, K_FB, K_RPASS, K_PLAYOUT, K_SHADER, K_DPOOL, K_DSL, K_SAMPLER, K_CPOOL, K_FENCE, K_SEM,
-                                     K_QPOOL, K_VIEW, K_BVIEW, K_IMAGE, K_BUFFER, K_MEMORY };
-        for (size_t o = 0; o < sizeof order / sizeof *order; o++)
-            for (size_t i = 0; i < g_cap; i++) {
-                ent *e = &g_tab[i];
-                if (!e->id || e->kind != (uint32_t) order[o]) continue;
-                switch (e->kind) {
-                case K_PIPELINE: vkDestroyPipeline(dev, (VkPipeline) e->h, NULL); break;
-                case K_PLAYOUT: vkDestroyPipelineLayout(dev, (VkPipelineLayout) e->h, NULL); break;
-                case K_SHADER: vkDestroyShaderModule(dev, (VkShaderModule) e->h, NULL); break;
-                case K_DPOOL: vkDestroyDescriptorPool(dev, (VkDescriptorPool) e->h, NULL); break;
-                case K_DSL: vkDestroyDescriptorSetLayout(dev, (VkDescriptorSetLayout) e->h, NULL); break;
-                case K_CPOOL: vkDestroyCommandPool(dev, (VkCommandPool) e->h, NULL); break;
-                case K_FENCE: vkDestroyFence(dev, (VkFence) e->h, NULL); break;
-                case K_SEM: vkDestroySemaphore(dev, (VkSemaphore) e->h, NULL); break;
-                case K_BUFFER: vkDestroyBuffer(dev, (VkBuffer) e->h, NULL); break;
-                case K_MEMORY: vkFreeMemory(dev, (VkDeviceMemory) e->h, NULL); break;
-                case K_FB: vkDestroyFramebuffer(dev, (VkFramebuffer) e->h, NULL); break;
-                case K_RPASS: vkDestroyRenderPass(dev, (VkRenderPass) e->h, NULL); break;
-                case K_VIEW: vkDestroyImageView(dev, (VkImageView) e->h, NULL); break;
-                case K_IMAGE: vkDestroyImage(dev, (VkImage) e->h, NULL); break;
-                case K_SAMPLER: vkDestroySampler(dev, (VkSampler) e->h, NULL); break;
-                case K_QPOOL: vkDestroyQueryPool(dev, (VkQueryPool) e->h, NULL); break;
-                case K_BVIEW: vkDestroyBufferView(dev, (VkBufferView) e->h, NULL); break;
-                }
-            }
+        for (int i = 0; i < g_nfpool; i++) vkDestroyFence(dev, g_fpool[i], NULL);
+        for (int i = 0; i < 4; i++) if (g_chain[i]) vkDestroySemaphore(dev, g_chain[i], NULL);
         if (g_dummy_vb) vkDestroyBuffer(dev, g_dummy_vb, NULL);
         if (g_dummy_mem) vkFreeMemory(dev, g_dummy_mem, NULL);
         if (g_dummy_smp) vkDestroySampler(dev, g_dummy_smp, NULL);
@@ -852,7 +815,91 @@ static void cleanup(void) {
         if (g_dummy_bview) vkDestroyBufferView(dev, g_dummy_bview, NULL);
         if (g_dummy_tb) vkDestroyBuffer(dev, g_dummy_tb, NULL);
         if (g_dummy_tb_mem) vkFreeMemory(dev, g_dummy_tb_mem, NULL);
-        vkDestroyDevice(dev, NULL);
+    }
+    memset(g_chain, 0, sizeof g_chain);
+    g_chain_last = -1;
+    g_nfpool = 0;
+    g_dummy_img = VK_NULL_HANDLE;
+    g_dummy_iview = VK_NULL_HANDLE;
+    g_dummy_img_mem = VK_NULL_HANDLE;
+    g_dummy_tb = VK_NULL_HANDLE;
+    g_dummy_bview = VK_NULL_HANDLE;
+    g_dummy_tb_mem = VK_NULL_HANDLE;
+    g_dummy_vb = VK_NULL_HANDLE;
+    g_dummy_mem = VK_NULL_HANDLE;
+    g_dummy_smp = VK_NULL_HANDLE;
+}
+
+// 装置 dev の物を全部消してから dev を消し、表からも外す。last なら持ち主の分からない物もここで消す
+static void dev_free(VkDevice dev, int last) {
+    vkDeviceWaitIdle(dev);
+    uint64_t me = (uint64_t) (uintptr_t) dev;
+    static const int order[] = { K_PIPELINE, K_FB, K_RPASS, K_PLAYOUT, K_SHADER, K_DPOOL, K_DSL, K_SAMPLER, K_CPOOL, K_FENCE, K_SEM,
+                                 K_QPOOL, K_VIEW, K_BVIEW, K_IMAGE, K_BUFFER, K_MEMORY };
+    for (size_t o = 0; o < sizeof order / sizeof *order; o++)
+        for (size_t i = 0; i < g_cap; i++) {
+            ent *e = &g_tab[i];
+            if (!e->id || !e->h || e->kind != (uint32_t) order[o] || !(e->dev == me || (last && !e->dev))) continue;
+            switch (e->kind) {
+            case K_PIPELINE: vkDestroyPipeline(dev, (VkPipeline) e->h, NULL); break;
+            case K_PLAYOUT: vkDestroyPipelineLayout(dev, (VkPipelineLayout) e->h, NULL); break;
+            case K_SHADER: vkDestroyShaderModule(dev, (VkShaderModule) e->h, NULL); break;
+            case K_DPOOL: vkDestroyDescriptorPool(dev, (VkDescriptorPool) e->h, NULL); break;
+            case K_DSL: vkDestroyDescriptorSetLayout(dev, (VkDescriptorSetLayout) e->h, NULL); break;
+            case K_CPOOL: vkDestroyCommandPool(dev, (VkCommandPool) e->h, NULL); break;
+            case K_FENCE: vkDestroyFence(dev, (VkFence) e->h, NULL); break;
+            case K_SEM: vkDestroySemaphore(dev, (VkSemaphore) e->h, NULL); break;
+            case K_BUFFER: vkDestroyBuffer(dev, (VkBuffer) e->h, NULL); break;
+            case K_MEMORY: vkFreeMemory(dev, (VkDeviceMemory) e->h, NULL); break;
+            case K_FB: vkDestroyFramebuffer(dev, (VkFramebuffer) e->h, NULL); break;
+            case K_RPASS: vkDestroyRenderPass(dev, (VkRenderPass) e->h, NULL); break;
+            case K_VIEW: vkDestroyImageView(dev, (VkImageView) e->h, NULL); break;
+            case K_IMAGE: vkDestroyImage(dev, (VkImage) e->h, NULL); break;
+            case K_SAMPLER: vkDestroySampler(dev, (VkSampler) e->h, NULL); break;
+            case K_QPOOL: vkDestroyQueryPool(dev, (VkQueryPool) e->h, NULL); break;
+            case K_BVIEW: vkDestroyBufferView(dev, (VkBufferView) e->h, NULL); break;
+            }
+            e->h = 0; // 消した印（表から外すのは最後にまとめて）
+        }
+    vkDestroyDevice(dev, NULL);
+    // 表から外す：この装置の物（消した物・キュー・command buffer・descriptor set）と装置そのもの
+    size_t nk = 0, ck = 64;
+    uint64_t *kill = malloc(ck * sizeof *kill);
+    for (size_t i = 0; i < g_cap && kill; i++) {
+        ent *e = &g_tab[i];
+        if (!e->id) continue;
+        if (!(e->dev == me || (last && !e->dev))) continue;
+        if (nk == ck) {
+            uint64_t *q = realloc(kill, ck * 2 * sizeof *kill);
+            if (!q) break;
+            kill = q;
+            ck *= 2;
+        }
+        idlist_free(&e->list);
+        kill[nk++] = e->id;
+    }
+    for (size_t i = 0; i < nk; i++) del(kill[i]);
+    free(kill);
+}
+
+static void cleanup(void) {
+    drain();
+    jp_reset();
+    vid_reset();
+    for (size_t i = 0; i < g_ncbi; i++) { free(g_cbi[i].sets); idlist_free(&g_cbi[i].mems); }
+    g_ncbi = 0;
+    if (g_err == VK_ERROR_DEVICE_LOST) g_lost = 1;
+    g_err = VK_SUCCESS;
+    helpers_free(g_dev);
+    g_dev = VK_NULL_HANDLE;
+    // 装置ごとに、その装置の物を片づけてから装置を消す。持ち主の分からない物は最後の装置で片づける
+    for (;;) {
+        VkDevice dev = VK_NULL_HANDLE;
+        int ndev = 0;
+        for (size_t i = 0; i < g_cap; i++)
+            if (g_tab[i].id && g_tab[i].kind == K_DEVICE) { ndev++; if (!dev) dev = (VkDevice) (uintptr_t) g_tab[i].h; }
+        if (!dev) break;
+        dev_free(dev, ndev == 1);
     }
     g_dummy_img = VK_NULL_HANDLE;
     g_dummy_iview = VK_NULL_HANDLE;
@@ -2457,13 +2504,40 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkDevice dev;
         VkResult res = vkCreateDevice(g_pd, &dci, NULL, &dev);
         for (uint32_t i = 0; i < nc && i < 32; i++) free(blocks[i]);
-        if (res == VK_SUCCESS) { put(id, (uint64_t) (uintptr_t) dev, K_DEVICE); g_dev = dev; }
+        if (res == VK_SUCCESS) {
+            put(id, (uint64_t) (uintptr_t) dev, K_DEVICE);
+            if (g_dev && g_dev != dev) {
+                // 2 つ目の装置（CTS の試験が自分で作る物など）。手伝いの物は前の装置の上にあるので、新しい装置で作り直す
+                drain();
+                jp_reset();
+                vid_reset();
+                helpers_free(g_dev);
+                vlog("装置をもう 1 つ作った（前の装置も残す）");
+            }
+            g_dev = dev;
+        }
         return reply(s, res);
     }
     case VR_DESTROY_DEVICE: {
         uint64_t id = vr_ru64(r);
-        (void) id;
-        cleanup();
+        VkDevice h = DEV(id), other = VK_NULL_HANDLE;
+        int ndev = 0;
+        for (size_t i = 0; i < g_cap; i++)
+            if (g_tab[i].id && g_tab[i].kind == K_DEVICE) {
+                ndev++;
+                if ((VkDevice) (uintptr_t) g_tab[i].h != h) other = (VkDevice) (uintptr_t) g_tab[i].h;
+            }
+        if (!h || ndev <= 1) { cleanup(); return 1; }
+        // ほかの装置が残る：この装置の物だけを片づける（前は全部を片づけ、残った装置で作ると落ちていた）
+        drain();
+        if (g_dev == h) {
+            jp_reset();
+            vid_reset();
+            helpers_free(h);
+            g_dev = other;
+        }
+        dev_free(h, 0);
+        vlog("装置を 1 つ消した（ほかの装置は残す）");
         return 1;
     }
     case VR_GET_QUEUE: {
