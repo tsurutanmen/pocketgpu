@@ -1053,7 +1053,8 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             uint32_t dyn[64];
             for (uint32_t i = 0; i < nd && i < 64; i++) dyn[i] = vr_ru32(r);
             for (uint32_t i = 64; i < nd && !r->bad; i++) (void) vr_ru32(r);
-            vkCmdBindDescriptorSets(cb, (VkPipelineBindPoint) bp, pl, first, n < 32 ? n : 32, sets, nd < 64 ? nd : 64, dyn);
+            if (pl) vkCmdBindDescriptorSets(cb, (VkPipelineBindPoint) bp, pl, first, n < 32 ? n : 32, sets, nd < 64 ? nd : 64, dyn);
+            else vlog("descriptor set をつなぐ layout が無いので飛ばした");
         } break;
         case VR_CMD_PUSH_CONSTANTS: {
             VkPipelineLayout pl = OBJ(VkPipelineLayout, vr_ru64(r));
@@ -1064,7 +1065,8 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
                 for (uint32_t i = 0; i < sz / 4 && i < 24; i++) snprintf(h + strlen(h), sizeof h - strlen(h), " %u", ((const uint32_t *) d)[i]);
                 tracef(ci, "  push %u バイト:%s", sz, h);
             }
-            if (d) vkCmdPushConstants(cb, pl, st, off, sz, d);
+            if (d && pl) vkCmdPushConstants(cb, pl, st, off, sz, d);
+            else if (d) vlog("push constants の layout が無いので飛ばした");
         } break;
         case VR_CMD_DISPATCH: {
             uint32_t x = vr_ru32(r), y = vr_ru32(r), z = vr_ru32(r);
@@ -2925,10 +2927,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         return 1;
     }
     case VR_DESTROY_PIPELINE_LAYOUT: {
-        VkDevice d = DEV(vr_ru64(r));
-        uint64_t id = vr_ru64(r);
-        vkDestroyPipelineLayout(d, OBJ(VkPipelineLayout, id), NULL);
-        del(id);
+        // 消さずに残し、装置を消すときにまとめて消す。command buffer の記録は記録し終えたときにまとめて届くので、
+        // アプリが記録の途中で layout を消すと、消す知らせが先に着いて、再生で layout が無くなっていた（CTS の multisample で
+        // 代役の NVIDIA が落ちた）。番号は使い回されないので、残しても取り違えない。layout は小さい
+        (void) DEV(vr_ru64(r));
+        (void) vr_ru64(r);
         return 1;
     }
     case VR_CREATE_COMPUTE_PIPELINE: {
@@ -3605,34 +3608,65 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         ci.subpassCount = vr_ru32(r);
         if (ci.subpassCount > r->n - r->at) ci.subpassCount = 0, r->bad = 1;
         VkSubpassDescription *sub = calloc(ci.subpassCount ? ci.subpassCount : 1, sizeof *sub);
-        // 参照の並びは、まとめて 1 つの塊に置く
-        VkAttachmentReference *refs = calloc(256, sizeof *refs);
-        uint32_t *pres = calloc(256, sizeof *pres);
-        uint32_t nref = 0, npres = 0;
-        for (uint32_t i = 0; i < ci.subpassCount; i++) {
+        // 参照の並びは、まとめて 1 つの塊に置く。塊は足りなければ伸ばし、指す先は全部読んでから決める
+        // （前は 256 個で打ち切り、数はそのまま渡していたので、多い render pass で塊の外を読み、並びもずれて落ちた）
+        typedef struct { uint32_t in, col, res, ds, pres; } suboff; // 塊の中の始まり。res・ds は無ければ UINT32_MAX
+        suboff *so = calloc(ci.subpassCount ? ci.subpassCount : 1, sizeof *so);
+        uint32_t cref = 64, cpres = 64, nref = 0, npres = 0;
+        VkAttachmentReference *refs = malloc(cref * sizeof *refs);
+        uint32_t *pres = malloc(cpres * sizeof *pres);
+        for (uint32_t i = 0; i < ci.subpassCount && !r->bad && refs && pres && so; i++) {
             sub[i].flags = vr_ru32(r);
             sub[i].pipelineBindPoint = (VkPipelineBindPoint) vr_ru32(r);
-            uint32_t nin = vr_ru32(r);
-            sub[i].inputAttachmentCount = nin;
-            sub[i].pInputAttachments = refs + nref;
-            for (uint32_t k = 0; k < nin && nref < 256; k++) vr_rcopy(r, &refs[nref++], sizeof *refs);
-            uint32_t ncol = vr_ru32(r);
-            sub[i].colorAttachmentCount = ncol;
-            sub[i].pColorAttachments = refs + nref;
-            for (uint32_t k = 0; k < ncol && nref < 256; k++) vr_rcopy(r, &refs[nref++], sizeof *refs);
-            if (vr_ru32(r)) {
-                sub[i].pResolveAttachments = refs + nref;
-                for (uint32_t k = 0; k < ncol && nref < 256; k++) vr_rcopy(r, &refs[nref++], sizeof *refs);
+            uint32_t cnt[3] = { 0 }, *dst[3] = { &so[i].in, &so[i].col, &so[i].res };
+            so[i].res = so[i].ds = UINT32_MAX;
+            for (int part = 0; part < 3 && !r->bad; part++) {
+                if (part == 2 && !vr_ru32(r)) break; // resolve は無いことがある（数は color と同じ）
+                uint32_t n = part == 2 ? cnt[1] : vr_ru32(r);
+                if (n > (r->n - r->at) / sizeof *refs) { r->bad = 1; break; }
+                cnt[part] = n;
+                while (nref + n + 1 > cref) {
+                    VkAttachmentReference *q = realloc(refs, cref * 2 * sizeof *refs);
+                    if (!q) { r->bad = 1; break; }
+                    refs = q;
+                    cref *= 2;
+                }
+                *dst[part] = nref;
+                for (uint32_t k = 0; k < n && !r->bad; k++) vr_rcopy(r, &refs[nref++], sizeof *refs);
             }
-            if (vr_ru32(r)) {
-                sub[i].pDepthStencilAttachment = refs + nref;
-                if (nref < 256) vr_rcopy(r, &refs[nref++], sizeof *refs);
+            sub[i].inputAttachmentCount = cnt[0];
+            sub[i].colorAttachmentCount = cnt[1];
+            if (!r->bad && vr_ru32(r)) {
+                if (nref + 1 > cref) {
+                    VkAttachmentReference *q = realloc(refs, (cref + 1) * sizeof *refs);
+                    if (!q) { r->bad = 1; break; }
+                    refs = q;
+                    cref++;
+                }
+                so[i].ds = nref;
+                vr_rcopy(r, &refs[nref++], sizeof *refs);
             }
             uint32_t np = vr_ru32(r);
+            if (np > (r->n - r->at) / 4) { r->bad = 1; break; }
+            while (npres + np > cpres) {
+                uint32_t *q = realloc(pres, cpres * 2 * sizeof *pres);
+                if (!q) { r->bad = 1; break; }
+                pres = q;
+                cpres *= 2;
+            }
+            so[i].pres = npres;
             sub[i].preserveAttachmentCount = np;
-            sub[i].pPreserveAttachments = pres + npres;
-            for (uint32_t k = 0; k < np && npres < 256; k++) pres[npres++] = vr_ru32(r);
+            for (uint32_t k = 0; k < np && !r->bad; k++) pres[npres++] = vr_ru32(r);
         }
+        if (!refs || !pres || !so) r->bad = 1;
+        for (uint32_t i = 0; i < ci.subpassCount && !r->bad; i++) {
+            sub[i].pInputAttachments = refs + so[i].in;
+            sub[i].pColorAttachments = refs + so[i].col;
+            sub[i].pResolveAttachments = so[i].res != UINT32_MAX ? refs + so[i].res : NULL;
+            sub[i].pDepthStencilAttachment = so[i].ds != UINT32_MAX ? refs + so[i].ds : NULL;
+            sub[i].pPreserveAttachments = pres + so[i].pres;
+        }
+        free(so);
         ci.pSubpasses = sub;
         ci.dependencyCount = vr_ru32(r);
         if (ci.dependencyCount > r->n - r->at) ci.dependencyCount = 0, r->bad = 1;
@@ -3640,7 +3674,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         for (uint32_t i = 0; i < ci.dependencyCount; i++) vr_rcopy(r, &dep[i], sizeof dep[i]);
         ci.pDependencies = dep;
         VkRenderPass rp;
-        VkResult res = r->bad ? VK_ERROR_INITIALIZATION_FAILED : vkCreateRenderPass(d, &ci, NULL, &rp);
+        VkResult res = r->bad || !d ? VK_ERROR_INITIALIZATION_FAILED : vkCreateRenderPass(d, &ci, NULL, &rp);
         if (res == VK_SUCCESS) put(id, (uint64_t) rp, K_RPASS);
         else vlog("render pass を作れない (%d)", res);
         free(att); free(sub); free(refs); free(pres); free(dep);
