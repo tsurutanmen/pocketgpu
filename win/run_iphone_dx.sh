@@ -138,7 +138,7 @@ echo "== 9. 本物のゲーム（vkQuake・GZDoom・Godot・SuperTuxKart）"
 echo "vkQuake：$(bash /d/iphone-rpc/app/win/run_vkquake.sh "$IPHONE_VK" 2>&1 | grep -a -m1 "fps\|結果なし")"
 echo "GZDoom：$(bash /d/iphone-rpc/app/win/run_gzdoom.sh "$IPHONE_VK" MAP01 30 2>&1 | head -1)"
 for d in 3d_squash_the_creeps/squash_the_creeps 3d_truck_town/truck_town 3d_particles/particles; do
-    echo "Godot $(basename "$d")：$(bash /d/iphone-rpc/app/win/run_godot.sh "$IPHONE_VK" "$d" mobile 900 2>&1 | sed -n 2p | grep -o 'Project FPS: [0-9]*' | tail -2 | tr '\n' ' ')"
+    echo "Godot $(basename "$d")：$(bash /d/iphone-rpc/app/win/run_godot.sh "$IPHONE_VK" "$d" mobile 900 2>&1 | sed -n 2p | sed 's/ ([0-9.]* mspf)//g' | cut -c1-140)"
 done
 echo "SuperTuxKart：$(bash /d/iphone-rpc/app/win/run_stk.sh "$IPHONE_VK" lighthouse 20 2>&1 | grep -a "終わり方")"
 

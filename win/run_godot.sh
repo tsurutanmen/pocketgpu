@@ -25,6 +25,7 @@ else
         timeout 300 cmd.exe //c ${IPHONE_VK_CMD:-D:/iphone-rpc/vkbuild/iphone-vk.cmd} "$EXE" "${ARGS[@]}" > "$LOG" 2>&1
 fi
 echo "終わり方 $?・$(grep -a -m1 "Vulkan.*- \|Forward\|Mobile" "$LOG" | sed 's/^ *//' | cut -c1-120)"
-grep -a "Project FPS" "$LOG" | tail -5 | tr '\n' ' '; echo
+# Godot の毎秒のコマ数が出ない短い回（最初のコマのシェーダー作りが長い場面など）でも、ドライバの数で速さが分かるようにする
+echo "$(grep -a "Project FPS" "$LOG" | tail -5 | tr '\n' ' ')ドライバ $(grep -a "swapchain：[0-9]* コマ" "$LOG" | tail -1 | sed 's/^\[iphone-vk\] swapchain：//')"
 grep -a -i "error\|失敗\|切れた" "$LOG" | grep -v "^\[iphone-vk\] まだ無い入口\|入口が無い" | head -5
 echo "記録：$LOG"
