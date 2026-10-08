@@ -11,6 +11,7 @@
 //   PC 側に写しを持ち、アプリにはその写しを map させる。写しは Windows の書き込み監視つきで確保して、
 //   vkQueueSubmit の前に、その submit で GPU が読む範囲（コピー元・つないだバッファ）のうち、アプリが書いたページだけを受け手へ送る。
 //   GPU が書いたかもしれない範囲（storage buffer・コピー先）は、fence などで終わりを待ったときに引き取る。
+//   storage buffer と fill・update の所は、CPU が触ったときに初めて引き取る（IPHONE_VK_LAZY_RB・本体は lz_ の関数）
 //
 // 待ち方（取り決めの版 3）
 //   持ち帰る物が無い待ち（fence・timeline semaphore・idle）には、往復せずにその場で「終わった」と答える。
@@ -166,6 +167,8 @@ static double now_ms(void) {
 
 static double proc_cpu_ms(void);
 
+static void lz_print(void);
+
 static void print_stats(void) {
     uint64_t ts = 0, tc = 0, tb = 0;
     double tw = 0;
@@ -191,6 +194,7 @@ static void print_stats(void) {
     }
     fprintf(stderr, "  書き込み監視 %llu 回 %.1f ms 書いたページ %llu / 引き取り %.1f ms\n", (unsigned long long) g_stat.ww_calls, g_stat.ww_ms,
             (unsigned long long) g_stat.ww_pages, g_stat.rb_ms);
+    lz_print();
     fprintf(stderr, "  往復せずに済ませた待ち %llu\n", (unsigned long long) g_stat.skipped);
     if (g_stat.presents)
         fprintf(stderr, "  present %llu 回 %.1f ms（うち窓に描く %llu 回 %.1f ms）\n", (unsigned long long) g_stat.presents, g_stat.present_ms,
@@ -959,12 +963,13 @@ struct mem {
     int jpeg;          // 窓に出すコマ用：引き取らずに、受け手に JPEG に縮めて送ってもらう（VR_READ_JPEG）
     uint8_t *sent;     // 受け手が持っている中身の写し。書かれたページは、これと比べて変わった所だけ送る
     uint8_t *known;    // ページごとの「受け手の中身を知っている」印。知らないページは丸ごと送る
+    struct lazy *lz;   // 読み戻しを遅らせている所（IPHONE_VK_LAZY_RB）
     struct mem *prev, *next;
 };
 
 struct buf { uint64_t size; VkMemoryRequirements req; struct mem *m; uint64_t memoff; uint64_t addr; }; // addr：受け手の GPU の中のアドレス
 
-typedef struct { struct mem *m; uint64_t off, len, serial; struct queue *q; } rng;
+typedef struct { struct mem *m; uint64_t off, len, serial; struct queue *q; int lazy; } rng; // lazy：読み戻しを遅らせてよい
 
 struct dev {
     VK_LOADER_DATA loader;
@@ -1081,7 +1086,7 @@ static void rng_add(rng **a, size_t *n, size_t *cap, struct mem *m, uint64_t off
         *cap = *cap ? *cap * 2 : 16;
         *a = realloc(*a, *cap * sizeof **a);
     }
-    (*a)[(*n)++] = (rng) { m, off, len, serial, NULL };
+    (*a)[(*n)++] = (rng) { m, off, len, serial, NULL, 0 };
 }
 
 static int rng_cmp(const void *x, const void *y) {
@@ -1102,6 +1107,7 @@ static void rng_merge(rng *a, size_t *n) {
             uint64_t end = a[i].off + a[i].len;
             if (end > last->off + last->len) last->len = end - last->off;
             if (a[i].serial > last->serial) last->serial = a[i].serial;
+            last->lazy &= a[i].lazy; // すぐ読む物と重なれば、すぐ読む
         } else {
             a[++k] = a[i];
         }
@@ -1123,6 +1129,538 @@ static void collect_dirty(struct mem *m, size_t p0, size_t p1) {
     if (r != 0) return;
     g_stat.ww_pages += count;
     for (ULONG_PTR i = 0; i < count; i++) m->dirty[(size_t) ((uint8_t *) m->addrs[i] - m->shadow) / PAGE] = 1;
+}
+
+// ---- GPU が書いた所の読み戻しを、CPU が触るまで遅らせる（IPHONE_VK_LAZY_RB） ----
+// 待ったときにすぐ読み戻さず「古い」と印を付け、そのページを PAGE_NOACCESS にする。CPU（アプリでもドライバでも）が触ると例外になるので、
+// ベクトル化例外処理で受け手から読み、ページを開けてから続けさせる。Godot の粒のように、GPU が毎コマ書くが CPU は読まない
+// storage buffer が CPU から見えるメモリにあると、今までは毎コマ全部を読み戻していた。
+//   読むのは古いバイトだけ。同じページの、アプリが書いてまだ送っていない所は書き換えない
+//   開けたページの書き込み監視の印は消さない（消すとアプリの書いた印まで消える）。送るときは sent と比べるので、余計には送らない
+//   CPU が触ったページは「熱い」として、しばらくは待ったときにすぐ読む（毎コマ読む物で、例外と往復を増やさない）
+//   ドライバ自身が写しに触る前（送る前・引き取る前・BC をほどく前）は、その範囲を先に読む。例外の中で g_lock を取るので、
+//   g_lock を持ったまま写しに触らない。g_lz_lock を持って g_lock を取るのはよいが、逆はしない
+//   アプリが写しを OS に渡すと（ReadFile など）、例外にならず失敗が返る。そのため既定では storage buffer と fill・update の所だけを
+//   遅らせ、CPU が読むための写し（buffer への写し・画像から buffer・query の結果）は今までどおりすぐ読む。
+//   buffer を消すとき・vkMapMemory・vkInvalidateMappedMemoryRanges では、その範囲を先に読む（map のたびに番地を OS に渡すアプリ向け。IPHONE_VK_LAZY_MAP=0 で map では読まない）
+//   IPHONE_VK_LAZY_RB=0 で今までどおり全部すぐ読む。2 で全部遅らせる（調べ用）
+#include <errno.h>
+struct lzr { uint64_t a, b; };
+struct lazy {
+    uint8_t *stale;          // ページごとの「GPU の中身がまだ届いていない」印。印のあるページは PAGE_NOACCESS
+    uint8_t *hot;            // ページごとの残り回数。CPU が最近触ったページは、待ったときにすぐ読む
+    size_t nhot;             // hot が 0 でないページの数
+    struct lzr *r;           // まだ届いていないバイトの範囲（並べて、重ねない）
+    size_t nr, cr, nstale;   // nstale：印のあるページの数
+    size_t ra_next, ra_win;  // 先読み：続けて触られたら窓を広げる
+};
+// LZ_HOT：触ったページをすぐ読む回数・LZ_RA0・LZ_RAMAX：先読みの窓（ページ）・LZ_SMALL：丸ごと読む塊・LZ_MAXR：範囲の数の上限
+enum { LZ_HOT = 8, LZ_RA0 = 16, LZ_RAMAX = 4096, LZ_SMALL = 64, LZ_MAXR = 1024 };
+enum { LZ_FAULT, LZ_SEND, LZ_BACK, LZ_OTHER };
+static SRWLOCK g_lz_lock = SRWLOCK_INIT; // 遅らせる仕組みの中身は全部これで守る
+static struct mem **g_lz_m;              // 遅らせる仕組みを使ったメモリ（例外のとき、触られた番地から引く）
+static volatile LONG g_lz_n;
+static size_t g_lz_cap;
+static PVOID g_lz_veh;
+static struct {
+    uint64_t mark_n, mark_bytes, fill_n[4], fill_bytes[4], hot_bytes, back_n, maps, map_stale;
+    double fill_ms;
+} g_lzs;
+static void read_back_many(rng *r, size_t n);
+
+// g_lz_lock を取る・放す。持っている糸を覚える（ドライバの誤りで、持ったまま例外になったら固まらずに落とす）
+static volatile DWORD g_lz_owner;
+static void lz_lock(void) {
+    AcquireSRWLockExclusive(&g_lz_lock);
+    g_lz_owner = GetCurrentThreadId();
+}
+
+static void lz_unlock(void) {
+    g_lz_owner = 0;
+    ReleaseSRWLockExclusive(&g_lz_lock);
+}
+
+// 調べ用：IPHONE_VK_LAZY_DBG=1 で読むたびに、2 で例外の場所も記録に出す（IPHONE_VK_LOG=1 と一緒に）
+static int lz_dbg(int lv) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_LAZY_DBG"); v = e ? atoi(e) : 0; }
+    return v >= lv;
+}
+
+static int lz_mode(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_LAZY_RB"); v = e && *e == '0' ? 0 : e && *e == '2' ? 2 : 1; }
+    return v;
+}
+
+// cb_writes の理由（0 storage buffer・1 buffer への写し・2 fill・update・3 画像から buffer・4 query の結果・5 そのほか）ごとに、遅らせてよいか
+static int lz_why_ok(int w) {
+    int v = lz_mode();
+    return v == 2 || (v == 1 && (w == 0 || w == 2));
+}
+
+static int lzr_room(struct lazy *lz) {
+    if (lz->nr < lz->cr) return 1;
+    size_t cap = lz->cr ? lz->cr * 2 : 8;
+    struct lzr *p = realloc(lz->r, cap * sizeof *p);
+    if (!p) return 0;
+    lz->r = p;
+    lz->cr = cap;
+    return 1;
+}
+
+// [a, b) がもう全部古い印の中にあるか
+static int lzr_has(const struct lazy *lz, uint64_t a, uint64_t b) {
+    for (size_t i = 0; i < lz->nr && lz->r[i].a <= a; i++)
+        if (lz->r[i].b >= b) return 1;
+    return 0;
+}
+
+// [a, b) を足す。重なる・接する範囲とはまとめる
+static int lzr_add(struct lazy *lz, uint64_t a, uint64_t b) {
+    if (!lzr_room(lz)) return 0;
+    size_t i = 0, j;
+    while (i < lz->nr && lz->r[i].b < a) i++;
+    for (j = i; j < lz->nr && lz->r[j].a <= b; j++) {
+        if (lz->r[j].a < a) a = lz->r[j].a;
+        if (lz->r[j].b > b) b = lz->r[j].b;
+    }
+    if (j == i) {
+        memmove(&lz->r[i + 1], &lz->r[i], (lz->nr - i) * sizeof *lz->r);
+        lz->nr++;
+    } else if (j > i + 1) {
+        memmove(&lz->r[i + 1], &lz->r[j], (lz->nr - j) * sizeof *lz->r);
+        lz->nr -= j - i - 1;
+    }
+    lz->r[i] = (struct lzr) { a, b };
+    return 1;
+}
+
+// [a, b) を抜く
+static void lzr_cut(struct lazy *lz, uint64_t a, uint64_t b) {
+    for (size_t i = 0; i < lz->nr; i++)
+        if (lz->r[i].a < a && lz->r[i].b > b) {
+            // 真ん中を抜くと 2 つに分かれる（ほかに重なる範囲は無い）
+            uint64_t end = lz->r[i].b;
+            lz->r[i].b = a;
+            if (!lzr_room(lz)) { conn_lost("読み戻しを遅らせる所でメモリが足りない"); return; }
+            memmove(&lz->r[i + 2], &lz->r[i + 1], (lz->nr - i - 1) * sizeof *lz->r);
+            lz->r[i + 1] = (struct lzr) { b, end };
+            lz->nr++;
+            return;
+        }
+    size_t k = 0;
+    for (size_t i = 0; i < lz->nr; i++) {
+        struct lzr x = lz->r[i];
+        if (x.a < a && x.b > a) x.b = a;          // 右を削る
+        else if (x.a < b && x.b > b) x.a = b;     // 左を削る
+        else if (x.a >= a && x.b <= b) continue;  // 全部抜く
+        lz->r[k++] = x;
+    }
+    lz->nr = k;
+}
+
+// m の遅らせる仕組みの中身。使えないメモリ（窓に出すコマ用など）なら NULL。g_lz_lock の中で呼ぶ
+static struct lazy *lz_get(struct mem *m) {
+    if (m->lz) return m->lz;
+    if (!m->host || !m->shadow || m->delta || m->jpeg) return NULL;
+    if ((size_t) g_lz_n == g_lz_cap) {
+        size_t cap = g_lz_cap ? g_lz_cap * 2 : 16;
+        struct mem **p = realloc(g_lz_m, cap * sizeof *p);
+        if (!p) return NULL;
+        g_lz_m = p;
+        g_lz_cap = cap;
+    }
+    struct lazy *lz = calloc(1, sizeof *lz);
+    uint8_t *st = calloc(m->npages, 2);
+    if (!lz || !st) { free(lz); free(st); return NULL; }
+    lz->stale = st;
+    lz->hot = st + m->npages;
+    g_lz_m[g_lz_n] = m;
+    g_lz_n = g_lz_n + 1;
+    m->lz = lz;
+    return lz;
+}
+
+// ページ p0〜p1 を「CPU が触った」にする。何回すぐ読むかは LZ_HOT（試験では IPHONE_VK_LAZY_HOT=回数。0 なら毎回遅らせる）
+static void lz_heat(struct lazy *lz, size_t p0, size_t p1) {
+    static int h = -1;
+    if (h < 0) { const char *e = getenv("IPHONE_VK_LAZY_HOT"); h = e && *e ? atoi(e) : LZ_HOT; h = h < 0 ? 0 : h > 255 ? 255 : h; }
+    for (size_t pg = p0; pg < p1 && h > 0; pg++) {
+        if (!lz->hot[pg]) lz->nhot++;
+        lz->hot[pg] = (uint8_t) h;
+    }
+}
+
+// 受け手から m の範囲の並び p を読み、dst に詰める。g_lock は持たずに呼ぶ
+static int lz_read(struct mem *m, const struct lzr *p, size_t n, uint8_t *dst) {
+    const uint64_t piece = 64u << 20;
+    vr_buf b = { 0 };
+    AcquireSRWLockExclusive(&g_lock);
+    for (size_t i = 0; i < n; i++)
+        for (uint64_t at = p[i].a; at < p[i].b; at += piece) {
+            uint64_t k = p[i].b - at < piece ? p[i].b - at : piece;
+            vr_u64(&b, ID(m));
+            vr_u64(&b, at);
+            vr_u64(&b, k);
+            g_stat.calls[VR_MEM_READ]++;
+            put_msg_locked(VR_MEM_READ, &b);
+            b.n = 0;
+        }
+    double t0 = now_ms();
+    int ok = flush_locked();
+    if (ok) read_deferred_locked();
+    uint8_t *o = dst;
+    for (size_t i = 0; i < n && ok; i++)
+        for (uint64_t at = p[i].a; at < p[i].b && ok; at += piece) {
+            uint64_t k = p[i].b - at < piece ? p[i].b - at : piece;
+            uint32_t h[2];
+            if (!recv_head(h, VR_MEM_READ)) { ok = 0; break; }
+            if ((int32_t) h[0] < 0) {
+                if (!g_dead) say("受け手が失敗を返した (%d)。この先は全部失敗にする", (int32_t) h[0]);
+                g_dead = 1;
+            }
+            if ((int32_t) h[0] == VK_SUCCESS && h[1] == k) {
+                if (!vr_recv_all(g_sock, o, k)) { ok = 0; conn_lost("読み出しの途中"); break; }
+            } else {
+                uint8_t tmp[4096];
+                for (uint32_t left = h[1]; left;) {
+                    uint32_t c = left < sizeof tmp ? left : (uint32_t) sizeof tmp;
+                    if (!vr_recv_all(g_sock, tmp, c)) { ok = 0; conn_lost("読み出しの途中"); break; }
+                    left -= c;
+                }
+            }
+            g_stat.bytes_in += 8 + h[1];
+            o += k;
+        }
+    g_stat.wait_ms[VR_MEM_READ] += now_ms() - t0;
+    ReleaseSRWLockExclusive(&g_lock);
+    free(b.p);
+    return ok && !g_dead;
+}
+
+// ページ p0〜p1 のうち印のあるページの、まだ届いていないバイトを受け手から読み、ページを開ける。g_lz_lock の中で呼ぶ。
+// ほかの糸が古い中身を見る間を狭めるため、読み終えてから、ページごとに開けてすぐ書く
+// why：誰が触るか（LZ_FAULT 例外・LZ_SEND 送る前・LZ_BACK 引き取る前・LZ_OTHER buffer を消す・invalidate・map・BC）
+static void lz_fill(struct mem *m, size_t p0, size_t p1, int why) {
+    struct lazy *lz = m->lz;
+    if (p1 > m->npages) p1 = m->npages;
+    if (!lz || p0 >= p1) return;
+    uint64_t A = (uint64_t) p0 * PAGE, B = (uint64_t) p1 * PAGE, total = 0;
+    size_t i0 = 0, n = 0;
+    while (i0 < lz->nr && lz->r[i0].b <= A) i0++;
+    while (i0 + n < lz->nr && lz->r[i0 + n].a < B) n++;
+    if (!n) return; // 古い所が無い（印のあるページには、必ず古い所がある）
+    struct lzr *p = malloc(n * sizeof *p);
+    for (size_t i = 0; p && i < n; i++) {
+        struct lzr x = lz->r[i0 + i];
+        p[i].a = x.a < A ? A : x.a;
+        p[i].b = x.b > B ? B : x.b;
+        total += p[i].b - p[i].a;
+    }
+    uint8_t *tmp = p ? malloc(total) : NULL;
+    if (!tmp) conn_lost("読み戻しを遅らせる所でメモリが足りない"); // 読めないまま開けるので、この先は全部失敗にする
+    double t0 = now_ms();
+    int ok = tmp && lz_read(m, p, n, tmp);
+    g_lzs.fill_ms += now_ms() - t0;
+    g_lzs.fill_n[why]++;
+    g_lzs.fill_bytes[why] += total;
+    if (lz_dbg(1)) say("遅らせた所を読んだ：理由 %d メモリ %p ページ %zu〜%zu %llu バイト", why, (void *) m, p0, p1, (unsigned long long) total);
+    size_t i = 0;
+    uint64_t pos = 0; // p[i] の中身が tmp のどこから始まるか
+    for (size_t pg = p0; pg < p1; pg++) {
+        if (!lz->stale[pg]) continue;
+        DWORD old;
+        VirtualProtect(m->shadow + (size_t) pg * PAGE, PAGE, PAGE_READWRITE, &old);
+        uint64_t s = (uint64_t) pg * PAGE, e = s + PAGE;
+        // p は並んでいるので、このページに掛かる物を書く
+        while (ok && i < n && p[i].a < e) {
+            uint64_t a = p[i].a > s ? p[i].a : s, b = p[i].b < e ? p[i].b : e;
+            if (a < b) {
+                memcpy(m->shadow + a, tmp + pos + (a - p[i].a), (size_t) (b - a));
+                if (m->sent) memcpy(m->sent + a, tmp + pos + (a - p[i].a), (size_t) (b - a));
+            }
+            if (p[i].b > e) break; // 次のページに続く
+            pos += p[i].b - p[i].a;
+            i++;
+        }
+        lz->stale[pg] = 0;
+        lz->nstale--;
+    }
+    lzr_cut(lz, A, B);
+    free(tmp);
+    free(p);
+}
+
+// 例外：触られた番地が古いページなら、受け手から読んで開ける。続けてよければ 1
+static int lz_fault(uint8_t *addr, void *pc, int wr) {
+    if (g_lz_owner == GetCurrentThreadId()) return 0;
+    lz_lock();
+    struct mem *m = NULL;
+    for (LONG i = 0; i < g_lz_n && !m; i++)
+        if (addr >= g_lz_m[i]->shadow && addr < g_lz_m[i]->shadow + g_lz_m[i]->npages * PAGE) m = g_lz_m[i];
+    int hit = 0;
+    if (m) {
+        struct lazy *lz = m->lz;
+        size_t pg = (size_t) (addr - m->shadow) / PAGE;
+        if (lz->stale[pg]) {
+            // 古いページの続きが小さければ丸ごと読む。大きければ触った所から先読みし、続けて触られたら窓を倍にする
+            size_t s = pg, e = pg + 1;
+            while (s > 0 && pg - s < LZ_SMALL && lz->stale[s - 1]) s--;
+            while (e < m->npages && e - pg < LZ_SMALL && lz->stale[e]) e++;
+            int small = (s == 0 || !lz->stale[s - 1]) && (e >= m->npages || !lz->stale[e]) && e - s <= LZ_SMALL;
+            if (!small) {
+                // 初めは触ったページだけ（Godot は大きな塊の先頭ページだけに毎コマ触る）。続けて触られたら LZ_RA0 から倍にしていく
+                size_t win = pg != lz->ra_next || !lz->ra_win ? 1 : lz->ra_win < LZ_RA0 ? LZ_RA0 : lz->ra_win * 2;
+                if (win > LZ_RAMAX) win = LZ_RAMAX;
+                lz->ra_win = win;
+                s = pg;
+                for (e = pg + 1; e < m->npages && e - pg < win && lz->stale[e]; e++) {}
+            }
+            lz->ra_next = e;
+            if (lz_dbg(2)) where(wr ? "遅らせた所に書いた場所" : "遅らせた所を読んだ場所", pc);
+            lz_heat(lz, s, e);
+            lz_fill(m, s, e, LZ_FAULT);
+            hit = 1;
+        } else {
+            // ほかの糸が先に開けた。開いていればやり直させる
+            MEMORY_BASIC_INFORMATION mi;
+            hit = VirtualQuery(addr, &mi, sizeof mi) && mi.Protect == PAGE_READWRITE;
+        }
+    }
+    lz_unlock();
+    return hit;
+}
+
+static LONG CALLBACK lz_veh(EXCEPTION_POINTERS *ep) {
+    EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || !g_lz_n) return EXCEPTION_CONTINUE_SEARCH;
+    // アプリの GetLastError と errno を変えない
+    DWORD le = GetLastError();
+    int en = errno;
+    int hit = lz_fault((uint8_t *) er->ExceptionInformation[1], er->ExceptionAddress, er->ExceptionInformation[0] == 1);
+    errno = en;
+    SetLastError(le);
+    return hit ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+}
+
+// ドライバが卸される（vkDestroyInstance）ときは例外処理を外し、残っている古いページは開けておく
+__attribute__((destructor)) static void lz_unload(void) {
+    if (!g_lz_veh) return;
+    RemoveVectoredExceptionHandler(g_lz_veh);
+    g_lz_veh = NULL;
+    for (LONG i = 0; i < g_lz_n; i++)
+        for (size_t pg = 0; pg < g_lz_m[i]->npages; pg++)
+            if (g_lz_m[i]->lz->stale[pg]) {
+                DWORD old;
+                VirtualProtect(g_lz_m[i]->shadow + pg * PAGE, PAGE, PAGE_READWRITE, &old);
+            }
+}
+
+// ドライバが写しの off から len バイトに触る前：その中の古いページを先に読む
+static void lz_settle(struct mem *m, uint64_t off, uint64_t len, int why) {
+    if (!m || !m->lz || !m->lz->nstale || !len) return;
+    lz_lock();
+    lz_fill(m, (size_t) (off / PAGE), (size_t) ((off + len + PAGE - 1) / PAGE), why);
+    lz_unlock();
+}
+
+// 送る前：書いた印のあるページに古い所があれば、先に読む（アプリが GPU の終わる前に、同じページの別の所に書いた）
+static void lz_settle_dirty(struct mem *m, size_t p0, size_t p1) {
+    if (!m->lz || !m->lz->nstale) return;
+    lz_lock();
+    struct lazy *lz = m->lz;
+    if (p1 > m->npages) p1 = m->npages;
+    for (size_t i = p0; i < p1;) {
+        if (!m->dirty[i] || !lz->stale[i]) { i++; continue; }
+        size_t j = i;
+        while (j < p1 && m->dirty[j] && lz->stale[j]) j++;
+        lz_heat(lz, i, j);
+        lz_fill(m, i, j, LZ_SEND);
+        i = j;
+    }
+    lz_unlock();
+}
+
+// 引き取る前（read_back_many）：古いページが混じっていれば先に読み、読み終えるまでほかの糸に印を付けさせない（受け取りは写しに直接書くので）。
+// 持ったら 1 を返す。lz_hold_end で放す
+static int lz_hold(rng *r, size_t n) {
+    if (!lz_mode()) return 0;
+    lz_lock();
+    for (size_t i = 0; i < n; i++) {
+        struct mem *m = r[i].m;
+        if (m->lz && m->lz->nstale && r[i].len)
+            lz_fill(m, (size_t) (r[i].off / PAGE), (size_t) ((r[i].off + r[i].len + PAGE - 1) / PAGE), LZ_BACK);
+    }
+    return 1;
+}
+
+static void lz_hold_end(int held) {
+    if (held) lz_unlock();
+}
+
+// m の [a, b) が、すぐ読む物（take の先頭 ne 個）とページを分け合うか
+static int lz_near_eager(const rng *t, size_t ne, const struct mem *m, uint64_t a, uint64_t b) {
+    uint64_t pa = a / PAGE * PAGE, pb = (b + PAGE - 1) / PAGE * PAGE;
+    for (size_t i = 0; i < ne; i++)
+        if (t[i].m == m && t[i].off < pb && t[i].off + t[i].len > pa) return 1;
+    return 0;
+}
+
+// complete で引き取る範囲から、遅らせる所を抜き出して返す（take にはすぐ読む物が残る）。返した物は lz_mark に渡す。
+// CPU が最近触ったページと、すぐ読む物とページを分け合う所は、すぐ読む方に回す
+static rng *lz_split(rng **take, size_t *nt, size_t *ct, size_t *nlz) {
+    *nlz = 0;
+    if (!lz_mode()) return NULL;
+    size_t n0 = *nt, k = 0, nin = 0, cout = 0;
+    for (size_t i = 0; i < n0; i++) nin += (*take)[i].lazy != 0;
+    if (!nin) return NULL;
+    rng *in = malloc(nin * sizeof *in), *out = NULL;
+    if (!in) { for (size_t i = 0; i < n0; i++) (*take)[i].lazy = 0; return NULL; }
+    nin = 0;
+    lz_lock();
+    for (size_t i = 0; i < n0; i++) {
+        rng x = (*take)[i];
+        struct lazy *lz = x.lazy ? lz_get(x.m) : NULL;
+        if (lz && lz->nr < LZ_MAXR) in[nin++] = x;
+        else { x.lazy = 0; (*take)[k++] = x; }
+    }
+    *nt = k;
+    for (size_t i = 0; i < nin; i++) {
+        struct mem *m = in[i].m;
+        struct lazy *lz = m->lz;
+        uint64_t a = in[i].off, b = in[i].off + in[i].len;
+        if (!lz->nhot && !lz_near_eager(*take, k, m, a, b)) {
+            rng_add(&out, nlz, &cout, m, a, b - a, in[i].serial);
+            continue;
+        }
+        // ページごとに決め、続いている所はまとめる
+        uint64_t s = a;
+        int cur = -1;
+        for (uint64_t pa = a / PAGE * PAGE; pa < b; pa += PAGE) {
+            size_t pg = (size_t) (pa / PAGE);
+            uint64_t ps = pa < a ? a : pa, pe = pa + PAGE < b ? pa + PAGE : b;
+            int now = lz->hot[pg] || lz_near_eager(*take, k, m, ps, pe);
+            if (lz->hot[pg] && !--lz->hot[pg]) lz->nhot--;
+            if (now != cur && cur >= 0) {
+                if (cur) { rng_add(take, nt, ct, m, s, ps - s, in[i].serial); g_lzs.hot_bytes += ps - s; }
+                else rng_add(&out, nlz, &cout, m, s, ps - s, in[i].serial);
+                s = ps;
+            }
+            cur = now;
+        }
+        if (cur) { rng_add(take, nt, ct, m, s, b - s, in[i].serial); g_lzs.hot_bytes += b - s; }
+        else rng_add(&out, nlz, &cout, m, s, b - s, in[i].serial);
+    }
+    lz_unlock();
+    free(in);
+    return out;
+}
+
+// すぐ読む物を読み終えたあと：lz_split が抜き出した範囲に古い印を付け、ページを閉じる。r は放す
+static void lz_mark(rng *r, size_t n) {
+    if (!n) { free(r); return; }
+    rng *back = NULL;
+    size_t nb = 0, cb = 0;
+    lz_lock();
+    if (!g_lz_veh) g_lz_veh = AddVectoredExceptionHandler(1, lz_veh);
+    for (size_t i = 0; i < n; i++) {
+        struct mem *m = r[i].m;
+        struct lazy *lz = m->lz;
+        uint64_t a = r[i].off, b = r[i].off + r[i].len;
+        g_lzs.mark_n++;
+        g_lzs.mark_bytes += r[i].len;
+        if (lz && lzr_has(lz, a, b)) continue; // 毎コマ同じ所：もう古いまま
+        if (!lz || !g_lz_veh || !lzr_add(lz, a, b)) { rng_add(&back, &nb, &cb, m, a, b - a, r[i].serial); continue; }
+        // まだ開いているページを、続いている所ごとに閉じる
+        size_t p0 = (size_t) (a / PAGE), p1 = (size_t) ((b + PAGE - 1) / PAGE), rs = p0;
+        for (size_t pg = p0; pg <= p1; pg++) {
+            if (pg < p1 && !lz->stale[pg]) continue;
+            DWORD old;
+            if (pg > rs && !VirtualProtect(m->shadow + rs * PAGE, (pg - rs) * PAGE, PAGE_NOACCESS, &old)) {
+                // 閉じられなければ、その所は今すぐ読む
+                say("読み戻しを遅らせるページを閉じられない（%lu）", GetLastError());
+                lzr_cut(lz, (uint64_t) rs * PAGE, (uint64_t) pg * PAGE);
+                uint64_t ca = (uint64_t) rs * PAGE > a ? (uint64_t) rs * PAGE : a, cz = (uint64_t) pg * PAGE < b ? (uint64_t) pg * PAGE : b;
+                rng_add(&back, &nb, &cb, m, ca, cz - ca, r[i].serial);
+            } else {
+                for (size_t q = rs; q < pg; q++) lz->stale[q] = 1;
+                lz->nstale += pg - rs;
+            }
+            rs = pg + 1;
+        }
+    }
+    lz_unlock();
+    if (nb) {
+        g_lzs.back_n += nb;
+        read_back_many(back, nb);
+    }
+    free(back);
+    free(r);
+}
+
+// vkFreeMemory：中身は要らないので読まずに外す（写しはこのあと VirtualFree で消える）
+static void lz_forget(struct mem *m) {
+    if (!m->lz) return;
+    lz_lock();
+    for (LONG i = 0; i < g_lz_n; i++)
+        if (g_lz_m[i] == m) {
+            g_lz_m[i] = g_lz_m[g_lz_n - 1];
+            g_lz_n = g_lz_n - 1;
+            break;
+        }
+    free(m->lz->stale);
+    free(m->lz->r);
+    free(m->lz);
+    m->lz = NULL;
+    lz_unlock();
+}
+
+// vkDestroyBuffer：あとで同じメモリに別の buffer がつながれ、写しの番地が OS に渡されることがあるので、
+// まだ終わっていない submit の分は遅らせないことにし、もう古い所は今読む
+static void lz_buffer_gone(struct dev *d, struct buf *bf) {
+    if (!lz_mode() || !bf || !bf->m || !bf->m->host) return;
+    struct mem *m = bf->m;
+    uint64_t a = bf->memoff, b = bf->memoff + bf->size;
+    AcquireSRWLockExclusive(&d->lock);
+    for (size_t i = 0; i < d->npend; i++)
+        if (d->pend[i].m == m && d->pend[i].off < b && d->pend[i].off + d->pend[i].len > a) d->pend[i].lazy = 0;
+    ReleaseSRWLockExclusive(&d->lock);
+    lz_settle(m, a, bf->size, LZ_OTHER);
+}
+
+// vkMapMemory：アプリが写しの番地を受け取る。古い所をここで全部読む（IPHONE_VK_LAZY_MAP=0 で読まない）。いつも map したままのアプリには効かない
+static void lz_on_map(struct mem *m) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_LAZY_MAP"); v = !(e && *e == '0'); }
+    g_lzs.maps++;
+    if (!m->lz || !m->lz->nstale) return;
+    g_lzs.map_stale++;
+    if (v) lz_settle(m, 0, m->size, LZ_OTHER);
+}
+
+// アプリが「これから読む」と言った所は先に読む
+static VkResult VKAPI_CALL invalidate_ranges(VkDevice dv, uint32_t n, const VkMappedMemoryRange *r) {
+    (void) dv;
+    for (uint32_t i = 0; i < n; i++) {
+        struct mem *m = (struct mem *) r[i].memory;
+        if (!m || !m->lz) continue;
+        uint64_t len = r[i].size == VK_WHOLE_SIZE ? (r[i].offset < m->size ? m->size - r[i].offset : 0) : r[i].size;
+        lz_settle(m, r[i].offset, len, LZ_OTHER);
+    }
+    return VK_SUCCESS;
+}
+
+static void lz_print(void) {
+    if (!g_lzs.mark_n && !g_lzs.fill_n[LZ_FAULT] && !g_lzs.fill_n[LZ_OTHER]) return;
+    fprintf(stderr, "  読み戻しを遅らせた：古い印 %llu 回 %.1f MB・読んだ時間 %.1f ms・触ったページを待ったときに読んだ %.2f MB・印を付けられずすぐ読んだ %llu\n",
+            (unsigned long long) g_lzs.mark_n, g_lzs.mark_bytes / 1048576.0, g_lzs.fill_ms, g_lzs.hot_bytes / 1048576.0, (unsigned long long) g_lzs.back_n);
+    fprintf(stderr, "    あとで読んだ：CPU が触った %llu 回 %.2f MB・送る前 %llu 回 %.2f MB・引き取る前 %llu 回 %.2f MB・"
+                    "buffer を消す・invalidate・map・BC %llu 回 %.2f MB・古い所のあるメモリの map %llu / %llu 回\n",
+            (unsigned long long) g_lzs.fill_n[LZ_FAULT], g_lzs.fill_bytes[LZ_FAULT] / 1048576.0, (unsigned long long) g_lzs.fill_n[LZ_SEND],
+            g_lzs.fill_bytes[LZ_SEND] / 1048576.0, (unsigned long long) g_lzs.fill_n[LZ_BACK], g_lzs.fill_bytes[LZ_BACK] / 1048576.0,
+            (unsigned long long) g_lzs.fill_n[LZ_OTHER], g_lzs.fill_bytes[LZ_OTHER] / 1048576.0, (unsigned long long) g_lzs.map_stale,
+            (unsigned long long) g_lzs.maps);
 }
 
 // 書いたページの中で、受け手の中身と違う所だけを送るか（IPHONE_VK_WDIFF=0 で、今までどおりページを丸ごと送る）
@@ -1178,6 +1716,7 @@ static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
     size_t p0 = (size_t) (off / PAGE), p1 = (size_t) ((off + len + PAGE - 1) / PAGE);
     if (p1 > m->npages) p1 = m->npages;
     collect_dirty(m, p0, p1);
+    lz_settle_dirty(m, p0, p1);
     const size_t chunk = (16u << 20) / PAGE;
     vr_buf b = { 0 };
     if (wdiff_on() && !m->sent && !m->delta && !m->jpeg) {
@@ -1216,6 +1755,7 @@ static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
 
 // いくつもの範囲を 1 回の往復で引き取る。頼みを全部送ってから、答えを順に受け取る
 static void read_back_many(rng *r, size_t n) {
+    int lzh = lz_hold(r, n); // 古いページが混じっていれば先に読む（受け取りは写しに直接書くので）
     const uint64_t piece = 64u << 20;
     vr_buf b = { 0 };
     size_t nreq = 0;
@@ -1309,6 +1849,7 @@ static void read_back_many(rng *r, size_t n) {
         uint64_t p0 = r[i].off / PAGE * PAGE, p1 = (r[i].off + r[i].len + PAGE - 1) / PAGE * PAGE;
         ResetWriteWatch(r[i].m->shadow + p0, (SIZE_T) (p1 - p0));
     }
+    lz_hold_end(lzh);
 }
 
 // キュー q（NULL なら全部）の serial までの submit が終わった：GPU が書いた範囲を引き取る
@@ -1318,15 +1859,22 @@ static void complete(struct dev *d, struct queue *q, uint64_t upto) {
     size_t nt = 0, ct = 0, k = 0;
     for (size_t i = 0; i < d->npend; i++) {
         if (d->pend[i].serial <= upto && (!q || d->pend[i].q == q)) {
-            if (!d->pend[i].m->jpeg) rng_add(&take, &nt, &ct, d->pend[i].m, d->pend[i].off, d->pend[i].len, d->pend[i].serial);
+            if (!d->pend[i].m->jpeg) {
+                size_t b0 = nt;
+                rng_add(&take, &nt, &ct, d->pend[i].m, d->pend[i].off, d->pend[i].len, d->pend[i].serial);
+                if (nt > b0) take[b0].lazy = d->pend[i].lazy;
+            }
         }
         else d->pend[k++] = d->pend[i];
     }
     d->npend = k;
     ReleaseSRWLockExclusive(&d->lock);
+    size_t nlz;
+    rng *lzr = lz_split(&take, &nt, &ct, &nlz); // 遅らせる所は、すぐ読む物を読んでから印を付ける
     rng_merge(take, &nt);
     double t0 = now_ms();
     if (nt) read_back_many(take, nt);
+    lz_mark(lzr, nlz);
     g_stat.rb_ms += now_ms() - t0;
     free(take);
 }
@@ -2104,6 +2652,7 @@ static void VKAPI_CALL free_memory(VkDevice dv, VkDeviceMemory mm, const VkAlloc
     for (size_t i = 0; i < d->npend; i++) if (d->pend[i].m != m) d->pend[k++] = d->pend[i];
     d->npend = k;
     ReleaseSRWLockExclusive(&d->lock);
+    lz_forget(m);
     if (m->shadow) VirtualFree(m->shadow, 0, MEM_RELEASE);
     free(m->addrs);
     free(m->dirty);
@@ -2116,6 +2665,7 @@ static VkResult VKAPI_CALL map_memory(VkDevice dv, VkDeviceMemory mm, VkDeviceSi
     (void) dv; (void) size; (void) fl;
     struct mem *m = (struct mem *) mm;
     if (!m->host) return VK_ERROR_MEMORY_MAP_FAILED;
+    lz_on_map(m);
     *pp = m->shadow + off;
     return VK_SUCCESS;
 }
@@ -2220,6 +2770,7 @@ static void forget_buffer_in_sets(struct buf *bf);
 static void VKAPI_CALL destroy_buffer(VkDevice dv, VkBuffer bb, const VkAllocationCallbacks *a) {
     (void) a;
     if (!bb) return;
+    lz_buffer_gone((struct dev *) dv, (struct buf *) bb);
     forget_buffer_in_sets((struct buf *) bb);
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
@@ -5720,7 +6271,9 @@ static void cb_writes(struct cb *c, struct buf *bf, uint64_t off, uint64_t len) 
     g_wr_why = 5;
     InterlockedIncrement64((volatile LONG64 *) &g_stat.wr_n[w]);
     InterlockedAdd64((volatile LONG64 *) &g_stat.wr_bytes[w], (LONG64) len);
+    size_t b0 = c->nr;
     rng_add(&c->r, &c->nr, &c->capr, bf->m, bf->memoff + off, len, 0);
+    if (c->nr > b0) c->r[b0].lazy = lz_why_ok(w);
 }
 
 // つないだ pipeline の番号を覚える
@@ -6135,6 +6688,7 @@ static void VKAPI_CALL cmd_copy_buffer_to_image(VkCommandBuffer cbh, VkBuffer bb
         // 全部の範囲をほどいて 1 つの一時バッファに並べ、そこから 1 回で写す（一時バッファを作る往復を 1 回にする）
         const struct buf *src = (const struct buf *) bb;
         if (!src || !src->m || !src->m->shadow) { say("BC：CPU から見えないバッファからは写せない（飛ばした）"); return; }
+        lz_settle(src->m, src->memoff, src->size, LZ_OTHER);
         VkBufferImageCopy *r2 = malloc((n ? n : 1) * sizeof *r2);
         uint64_t total = 0;
         for (uint32_t i = 0; i < n; i++) {
@@ -6824,7 +7378,7 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
             for (size_t k = 0; k < c->nr; k++) {
                 size_t before = d->npend;
                 rng_add(&d->pend, &d->npend, &d->cappend, c->r[k].m, c->r[k].off, c->r[k].len, serial);
-                if (d->npend > before) d->pend[before].q = q;
+                if (d->npend > before) { d->pend[before].q = q; d->pend[before].lazy = c->r[k].lazy; }
             }
         }
         const VkTimelineSemaphoreSubmitInfo *tl = NULL;
@@ -7265,7 +7819,7 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkMapMemory", map_memory);
     F("vkUnmapMemory", unmap_memory);
     F("vkFlushMappedMemoryRanges", flush_ranges);
-    F("vkInvalidateMappedMemoryRanges", flush_ranges);
+    F("vkInvalidateMappedMemoryRanges", invalidate_ranges);
     F("vkGetDeviceMemoryCommitment", get_commitment);
     F("vkCreateBuffer", create_buffer);
     F("vkDestroyBuffer", destroy_buffer);
