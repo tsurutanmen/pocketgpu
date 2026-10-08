@@ -2892,13 +2892,36 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t id = vr_ru64(r);
         uint32_t ns = vr_ru32(r);
         VkDescriptorSetLayout sl[32];
-        for (uint32_t i = 0; i < ns && i < 32; i++) sl[i] = OBJ(VkDescriptorSetLayout, vr_ru64(r));
+        // 上限を超えた分も読み捨てて、並びをずらさない（前は数をそのまま渡し、並びの外を読んでいた）
+        for (uint32_t i = 0; i < ns && !r->bad; i++) {
+            uint64_t sid = vr_ru64(r);
+            if (i < 32) sl[i] = OBJ(VkDescriptorSetLayout, sid);
+        }
+        if (ns > 32) ns = 32;
         uint32_t np = vr_ru32(r);
         VkPushConstantRange pr[8];
-        for (uint32_t i = 0; i < np && i < 8; i++) { pr[i].stageFlags = vr_ru32(r); pr[i].offset = vr_ru32(r); pr[i].size = vr_ru32(r); }
+        for (uint32_t i = 0; i < np && !r->bad; i++) {
+            uint32_t sf = vr_ru32(r), of = vr_ru32(r), sz = vr_ru32(r);
+            if (i < 8) { pr[i].stageFlags = sf; pr[i].offset = of; pr[i].size = sz; }
+        }
+        if (np > 8) np = 8;
+        if (!d || r->bad) return 1;
+        // 無い set layout（消した番号・作れなかった番号・アプリが渡した空）は、中身の無い layout で埋める。
+        // MoltenVK は空のまま渡すと中で落ちる（CTS の alloc_callback_fail のあとに起きた）
+        VkDescriptorSetLayout empty = VK_NULL_HANDLE;
+        for (uint32_t i = 0; i < ns; i++) {
+            if (sl[i]) continue;
+            if (!empty) {
+                VkDescriptorSetLayoutCreateInfo ec = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+                if (vkCreateDescriptorSetLayout(d, &ec, NULL, &empty) != VK_SUCCESS) { vlog("pipeline layout：空の set layout を作れない。作らない"); return 1; }
+                vlog("pipeline layout：無い set layout を中身の無い物で埋めた");
+            }
+            sl[i] = empty;
+        }
         VkPipelineLayoutCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = ns, .pSetLayouts = sl, .pushConstantRangeCount = np, .pPushConstantRanges = pr };
         VkPipelineLayout l;
         if (vkCreatePipelineLayout(d, &ci, NULL, &l) == VK_SUCCESS) put(id, (uint64_t) l, K_PLAYOUT);
+        if (empty) vkDestroyDescriptorSetLayout(d, empty, NULL); // layout を作ったあとは消してよい
         return 1;
     }
     case VR_DESTROY_PIPELINE_LAYOUT: {
@@ -2929,8 +2952,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t req_subgroup = vr_ru32(r);
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = req_subgroup };
         if (req_subgroup) ci.stage.pNext = &rs;
-        if (!ci.stage.module || r->bad) {
-            vlog("compute pipeline の shader module が無い。作らない");
+        if (!d || !ci.stage.module || !ci.layout || r->bad) {
+            vlog("compute pipeline の装置・shader module・layout のどれかが無い。作らない");
             return reply(s, VK_ERROR_INITIALIZATION_FAILED);
         }
         VkPipeline p;
