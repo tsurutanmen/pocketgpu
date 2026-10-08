@@ -2497,15 +2497,66 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         // 機能の鎖（Vulkan11Features など）は中身ごと届く
         uint32_t nc = vr_ru32(r);
         void *head = NULL, **link = &head, *blocks[32];
+        size_t blk_sz[32] = { 0 };
         for (uint32_t i = 0; i < nc && i < 32; i++) {
             uint32_t st = vr_ru32(r), sz;
             const void *d = vr_rbytes(r, &sz);
+            blk_sz[i] = sz + sizeof(VkBaseOutStructure);
             VkBaseOutStructure *b = calloc(1, sz + sizeof(VkBaseOutStructure));
             b->sType = (VkStructureType) st;
             if (d) memcpy((uint8_t *) b + sizeof(VkBaseOutStructure), d, sz);
             blocks[i] = b;
             *link = b;
             link = (void **) &b->pNext;
+        }
+        // 持たない機能を頼まれたら、MoltenVK に作らせずにここで断る。MoltenVK は作れない装置を片づける所で落ちる
+        // （iPhone の実機で CTS の api.info の試験のあと MVKDevice::~MVKDevice の中で落ちた）。
+        // 機能の鎖の写しを、ありえない値（0xFFFFFFFF）で埋めてから GPU に聞き、書き換わった構造体だけで比べる
+        // （GPU が知らない構造体は書き換わらないので、比べずにそのまま渡す）
+        {
+            int missing = 0;
+            if (has_f) {
+                VkPhysicalDeviceFeatures sup;
+                vkGetPhysicalDeviceFeatures(g_pd, &sup);
+                const VkBool32 *q = (const VkBool32 *) &feats, *h = (const VkBool32 *) &sup;
+                for (size_t k = 0; k < sizeof feats / sizeof(VkBool32); k++) if (q[k] && !h[k]) missing = 1;
+            }
+            if (!missing && nc && vkGetPhysicalDeviceFeatures2) {
+                VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+                void *qb[32] = { 0 };
+                size_t qs[32] = { 0 };
+                void **ql = &f2.pNext;
+                for (uint32_t i = 0; i < nc && i < 32; i++) {
+                    size_t total = blk_sz[i]; // 届いた構造体の大きさ（頭の sType と pNext を含む）
+                    VkBaseOutStructure *c = malloc(total);
+                    if (!c) continue;
+                    memset(c, 0xFF, total);
+                    c->sType = ((VkBaseOutStructure *) blocks[i])->sType;
+                    c->pNext = NULL;
+                    qb[i] = c;
+                    qs[i] = total;
+                    *ql = c;
+                    ql = (void **) &c->pNext;
+                }
+                vkGetPhysicalDeviceFeatures2(g_pd, &f2);
+                for (uint32_t i = 0; i < nc && i < 32; i++) {
+                    if (!qb[i]) continue;
+                    const uint32_t *hw = (const uint32_t *) ((uint8_t *) qb[i] + sizeof(VkBaseOutStructure));
+                    const uint32_t *rq = (const uint32_t *) ((uint8_t *) blocks[i] + sizeof(VkBaseOutStructure));
+                    size_t nw = (qs[i] - sizeof(VkBaseOutStructure)) / 4;
+                    int filled = 0;
+                    for (size_t k = 0; k < nw; k++) if (hw[k] != 0xFFFFFFFFu) filled = 1;
+                    if (filled)
+                        for (size_t k = 0; k < nw; k++)
+                            if (rq[k] == VK_TRUE && hw[k] == VK_FALSE) missing = 1;
+                    free(qb[i]);
+                }
+            }
+            if (missing) {
+                vlog("装置を作る：GPU が持たない機能を頼まれたので断る（VK_ERROR_FEATURE_NOT_PRESENT）");
+                for (uint32_t i = 0; i < nc && i < 32; i++) free(blocks[i]);
+                return reply(s, VK_ERROR_FEATURE_NOT_PRESENT);
+            }
         }
         VkPhysicalDeviceRobustness2FeaturesEXT r2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, .nullDescriptor = VK_TRUE };
         if (g_nulldesc_gpu) {
@@ -2883,10 +2934,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         return 1;
     }
     case VR_DESTROY_DSL: {
-        VkDevice d = DEV(vr_ru64(r));
-        uint64_t id = vr_ru64(r);
-        vkDestroyDescriptorSetLayout(d, OBJ(VkDescriptorSetLayout, id), NULL);
-        del(id);
+        // 消さずに残し、装置を消すときにまとめて消す。作る・消す・set を取る命令の届く順がアプリの順とずれると、
+        // 消した layout で set を取って MoltenVK が落ちる（iPhone の実機の CTS で MVKDescriptorPool::allocateDescriptorSets）。
+        // 番号は使い回されないので、残しても取り違えない
+        (void) DEV(vr_ru64(r));
+        (void) vr_ru64(r);
         return 1;
     }
     case VR_CREATE_PIPELINE_LAYOUT: {
@@ -3025,6 +3077,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                                                                       .descriptorSetCount = 1, .pDescriptorCounts = vcount ? &vcount[i] : NULL };
             if (vcount) ai.pNext = &vai;
             VkDescriptorSet ds;
+            if (!d || !pool || !l) { vlog("descriptor set：装置・pool・layout のどれかが無いので取らない"); continue; }
             VkResult res = vkAllocateDescriptorSets(d, &ai, &ds);
             if (res == VK_SUCCESS) {
                 put(id, (uint64_t) ds, K_DSET);
