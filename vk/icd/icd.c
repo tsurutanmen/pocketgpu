@@ -7782,10 +7782,41 @@ static uint64_t VKAPI_CALL get_memory_capture_address(VkDevice dv, const VkDevic
 
 // ---- query（GPU に数えさせる：遮蔽・時刻） ----
 // 受け手の VR_CREATE_QUERY_POOL などに送る。結果は受け手が出した仕事を全部待ってから読む
+// query pool ごとの、1 つの query の値の数（結果を取るときに、終わっていない query の欄を書かないために使う）。0 は分からない
+static struct { uint64_t id; int nv; } g_qpv[256];
+static SRWLOCK g_qpv_lock = SRWLOCK_INIT;
+
+static void qpv_put(uint64_t id, int nv) {
+    AcquireSRWLockExclusive(&g_qpv_lock);
+    int k = -1;
+    for (int i = 0; i < 256 && k < 0; i++) if (!g_qpv[i].id) k = i;
+    if (k < 0) k = (int) (id % 256); // 満ちていれば押し出す（押し出された pool は前のやり方に戻るだけ）
+    g_qpv[k].id = id;
+    g_qpv[k].nv = nv;
+    ReleaseSRWLockExclusive(&g_qpv_lock);
+}
+
+static int qpv_get(uint64_t id, int del) {
+    int nv = 0;
+    AcquireSRWLockExclusive(&g_qpv_lock);
+    for (int i = 0; i < 256; i++)
+        if (g_qpv[i].id == id) {
+            nv = g_qpv[i].nv;
+            if (del) g_qpv[i].id = 0;
+            break;
+        }
+    ReleaseSRWLockExclusive(&g_qpv_lock);
+    return nv;
+}
+
 static VkResult VKAPI_CALL create_qpool(VkDevice dv, const VkQueryPoolCreateInfo *ci, const VkAllocationCallbacks *a, VkQueryPool *out) {
     (void) a;
     if (!(g_hw.caps & VR_CAP_QUERY)) return VK_ERROR_FEATURE_NOT_PRESENT;
     uint64_t id = new_id();
+    int nv = 0;
+    if (ci->queryType == VK_QUERY_TYPE_OCCLUSION || ci->queryType == VK_QUERY_TYPE_TIMESTAMP) nv = 1;
+    else if (ci->queryType == VK_QUERY_TYPE_PIPELINE_STATISTICS) nv = __builtin_popcount(ci->pipelineStatistics);
+    if (nv > 0) qpv_put(id, nv);
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, id);
@@ -7801,6 +7832,7 @@ static VkResult VKAPI_CALL create_qpool(VkDevice dv, const VkQueryPoolCreateInfo
 static void VKAPI_CALL destroy_qpool(VkDevice dv, VkQueryPool qp, const VkAllocationCallbacks *a) {
     (void) a;
     if (!qp) return;
+    qpv_get(ID(qp), 1);
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, ID(qp));
@@ -7811,6 +7843,37 @@ static void VKAPI_CALL destroy_qpool(VkDevice dv, VkQueryPool qp, const VkAlloca
 static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32_t first, uint32_t n, size_t size, void *data,
                                              VkDeviceSize stride, VkQueryResultFlags flags) {
     vr_buf b = { 0 }, out = { 0 };
+    // 待たず（WAIT 無し）途中の値も要らない（PARTIAL 無し）なら、終わっていない query の欄は書いてはいけない（Vulkan の決まり）。
+    // 前は受け手が 0 で埋めた並びをそのまま写し、アプリの欄を 0 で上書きしていた（CTS の query・timestamp の 65 件）。
+    // 受け手には「終わったか」も付けて頼み、終わった query の値だけを写す。「終わったか」はアプリが頼んでいれば書く
+    int nv = qpv_get(ID(qp), 0);
+    if (nv > 0 && n && !(flags & (VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_PARTIAL_BIT))) {
+        size_t es = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
+        uint64_t ts = (uint64_t) (nv + 1) * es, tsize = (uint64_t) n * ts;
+        int want_av = (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) != 0;
+        vr_u64(&b, ID(dv));
+        vr_u64(&b, ID(qp));
+        vr_u32(&b, first);
+        vr_u32(&b, n);
+        vr_u64(&b, tsize);
+        vr_u64(&b, ts);
+        vr_u32(&b, flags | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        VkResult r = rpc_call(VR_GET_QUERY_POOL_RESULTS, &b, &out);
+        free(b.p);
+        if (r >= 0 && out.p && out.n >= tsize)
+            for (uint32_t i = 0; i < n; i++) {
+                const uint8_t *src = (const uint8_t *) out.p + (size_t) i * ts;
+                uint64_t av = 0;
+                memcpy(&av, src + (size_t) nv * es, es);
+                uint64_t at = (uint64_t) i * stride;
+                if (at + (uint64_t) (nv + want_av) * es > size) break;
+                uint8_t *dst = (uint8_t *) data + at;
+                if (av) memcpy(dst, src, (size_t) nv * es);
+                if (want_av) memcpy(dst + (size_t) nv * es, &av, es);
+            }
+        free(out.p);
+        return r;
+    }
     vr_u64(&b, ID(dv));
     vr_u64(&b, ID(qp));
     vr_u32(&b, first);
