@@ -2056,8 +2056,9 @@ static void *vid_open(uint32_t ew, uint32_t eh, uint32_t kbps, uint32_t fps, uin
     const void *sk[] = { kVTVideoEncoderSpecification_EnableLowLatencyRateControl };
     const void *sv[] = { kCFBooleanTrue };
     CFDictionaryRef spec = CFDictionaryCreate(NULL, sk, sv, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-    // 入れる絵：NV12（狭い幅）。IOSurface つきにすると、専用回路に写さずに渡せる
-    int32_t pf = (int32_t) kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, iw = (int32_t) ew, ih = (int32_t) eh;
+    // 入れる絵：BGRA のまま。NV12 への色の直しは VideoToolbox（専用回路）に任せる。前は CPU で 1 画素ずつ直していて、
+    // 1280x720 で縮める 1 コマ 10 ms のうちかなりを占め、100 コマ/秒前後で頭打ちだった。IOSurface つきにすると写さずに渡せる
+    int32_t pf = (int32_t) kCVPixelFormatType_32BGRA, iw = (int32_t) ew, ih = (int32_t) eh;
     CFNumberRef npf = CFNumberCreate(NULL, kCFNumberSInt32Type, &pf), nw = CFNumberCreate(NULL, kCFNumberSInt32Type, &iw),
                 nh = CFNumberCreate(NULL, kCFNumberSInt32Type, &ih);
     CFDictionaryRef ios = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -2073,6 +2074,7 @@ static void *vid_open(uint32_t ew, uint32_t eh, uint32_t kbps, uint32_t fps, uin
     }
     VTSessionSetProperty(e->s, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(e->s, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse); // B フレームなし
+    VTSessionSetProperty(e->s, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue); // 質より速さ（iOS 14.5 から）
     // 低遅延の作り方は Constrained High（B フレームの無い High）を使う。断られたら High
     if (VTSessionSetProperty(e->s, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_ConstrainedHigh_AutoLevel) != noErr)
         VTSessionSetProperty(e->s, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
@@ -2109,8 +2111,19 @@ static int vid_encode(void *p, const uint8_t *px, uint32_t w, uint32_t h, uint32
     CVPixelBufferRef pb = NULL;
     if (!pool || CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb) != kCVReturnSuccess || !pb) return 0;
     CVPixelBufferLockBaseAddress(pb, 0);
-    vid_rgb_to_nv12(px, w, h, stride, bgra, (uint8_t *) CVPixelBufferGetBaseAddressOfPlane(pb, 0), (uint32_t) CVPixelBufferGetBytesPerRowOfPlane(pb, 0),
-                    (uint8_t *) CVPixelBufferGetBaseAddressOfPlane(pb, 1), (uint32_t) CVPixelBufferGetBytesPerRowOfPlane(pb, 1));
+    {
+        // BGRA の行を写す（RGBA なら R と B を入れ替える）。色の直しは専用回路がする
+        uint8_t *dst = (uint8_t *) CVPixelBufferGetBaseAddress(pb);
+        size_t dstr = CVPixelBufferGetBytesPerRow(pb);
+        uint32_t cw = w < e->ew ? w : e->ew, ch = h < e->eh ? h : e->eh;
+        for (uint32_t y = 0; dst && y < ch; y++) {
+            const uint8_t *sr = px + (size_t) y * stride;
+            uint8_t *dr = dst + (size_t) y * dstr;
+            if (bgra) memcpy(dr, sr, (size_t) cw * 4);
+            else
+                for (uint32_t x = 0; x < cw; x++) { dr[4 * x] = sr[4 * x + 2]; dr[4 * x + 1] = sr[4 * x + 1]; dr[4 * x + 2] = sr[4 * x]; dr[4 * x + 3] = 255; }
+        }
+    }
     CVPixelBufferUnlockBaseAddress(pb, 0);
     CFDictionaryRef opt = NULL;
     if (key || e->force_key) {
