@@ -529,7 +529,10 @@ static int vk_init(void) {
 // 待つのは、出した仕事が使っている物を変えるときだけ（その仕事まで待つ）。
 // 関係の無い物を変える命令は待たないので、GPU が計算している間に次の命令を作れる
 static VkDevice g_dev;
-typedef struct { VkFence f; int own; uint64_t cbs[64]; uint32_t ncb; uint64_t *snap; uint32_t nsnap; } inflight; // snap：調べ用、submit した時点の set
+typedef struct { VkSemaphore s; uint64_t v; } tlv;
+// tw・ts：timeline の値の待ちと知らせ（8 を超えたら tl_over を立て、止まっているかを調べずに前のやり方で待つ）
+typedef struct { VkFence f; int own; uint64_t cbs[64]; uint32_t ncb; uint64_t *snap; uint32_t nsnap;
+                 VkQueue q; tlv tw[8], ts[8]; uint8_t ntw, nts, tl_over; } inflight; // snap：調べ用、submit した時点の set
 static inflight g_fl[256];
 static int g_nfl;
 static VkResult g_err;          // GPU を失ったなど。次に返事をするときに伝える
@@ -660,31 +663,79 @@ static VkFence own_fence(void) {
     return f;
 }
 
-// k 番目までに出した仕事が終わるのを待って、一覧から外す
+// CPU からの合図（vkSignalSemaphore）をまだ待っていて始まれない仕事に印を付ける。
+// 同じ queue でその後ろに出した物も、それが済むまで始まれないので印を付ける。
+// 値に届く道：いまの値か、印の付かない前の仕事が知らせる値
+static void mark_blocked(uint8_t *blk) {
+    tlv reach[64];
+    int nr = 0;
+    VkQueue bq[16];
+    int nbq = 0;
+    // 覚えきれなかった仕事があれば、どれが止まっているか分からないので、前のやり方で全部を待つ
+    for (int i = 0; i < g_nfl; i++) if (g_fl[i].tl_over) { memset(blk, 0, (size_t) g_nfl); return; }
+    for (int i = 0; i < g_nfl; i++) {
+        inflight *e = &g_fl[i];
+        int b = 0;
+        for (int j = 0; j < nbq && !b; j++) if (bq[j] == e->q) b = 1;
+        for (int k = 0; k < e->ntw && !b; k++) {
+            int at = -1;
+            for (int j = 0; j < nr; j++) if (reach[j].s == e->tw[k].s) { at = j; break; }
+            if (at < 0) {
+                uint64_t now = 0;
+                if (vkGetSemaphoreCounterValue(g_dev, e->tw[k].s, &now) != VK_SUCCESS) now = UINT64_MAX; // 分からなければ前のやり方で待つ
+                if (nr < 64) { reach[nr] = (tlv) { e->tw[k].s, now }; at = nr++; }
+                else if (now < e->tw[k].v) b = 1;
+            }
+            if (at >= 0 && reach[at].v < e->tw[k].v) b = 1;
+        }
+        blk[i] = (uint8_t) b;
+        if (b) {
+            if (nbq < 16) bq[nbq++] = e->q;
+            continue;
+        }
+        for (int k = 0; k < e->nts; k++) {
+            int at = -1;
+            for (int j = 0; j < nr; j++) if (reach[j].s == e->ts[k].s) { at = j; break; }
+            if (at >= 0) { if (e->ts[k].v > reach[at].v) reach[at].v = e->ts[k].v; }
+            else if (nr < 64) reach[nr++] = e->ts[k];
+        }
+    }
+}
+
+// k 番目までに出した仕事が終わるのを待って、一覧から外す。CPU からの合図を待っている物は待たずに残す
 static void drain_upto(int k) {
     if (k < 0 || !g_nfl) return;
     if (!g_dev) { g_nfl = 0; return; }
     if (k >= g_nfl) k = g_nfl - 1;
+    uint8_t blk[256] = { 0 };
+    int anytw = 0;
+    for (int i = 0; i <= k && !anytw; i++) anytw = g_fl[i].ntw != 0;
+    if (anytw) mark_blocked(blk);
     VkFence fs[256];
-    for (int i = 0; i <= k; i++) fs[i] = g_fl[i].f;
-    double t0 = t_ms();
-    VkResult r = vkWaitForFences(g_dev, (uint32_t) (k + 1), fs, VK_TRUE, UINT64_MAX);
-    g_st.wait_ms += t_ms() - t0;
-    g_st.waits++;
-    if (g_cur_op < 64) g_st.wait_by_op[g_cur_op]++;
-    if (r != VK_SUCCESS) {
-        vlog("出した仕事を待てない (%d)", r);
-        if (r < 0) g_err = r;
+    uint32_t nf = 0;
+    for (int i = 0; i <= k; i++) if (!blk[i]) fs[nf++] = g_fl[i].f;
+    if (nf) {
+        double t0 = t_ms();
+        VkResult r = vkWaitForFences(g_dev, nf, fs, VK_TRUE, UINT64_MAX);
+        g_st.wait_ms += t_ms() - t0;
+        g_st.waits++;
+        if (g_cur_op < 64) g_st.wait_by_op[g_cur_op]++;
+        if (r != VK_SUCCESS) {
+            vlog("出した仕事を待てない (%d)", r);
+            if (r < 0) g_err = r;
+        }
     }
-    for (int i = 0; i <= k; i++) { free(g_fl[i].snap); g_fl[i].snap = NULL; }
-    for (int i = 0; i <= k; i++) {
+    int w = 0;
+    for (int i = 0; i < g_nfl; i++) {
+        if (i > k || blk[i]) { g_fl[w++] = g_fl[i]; continue; }
+        free(g_fl[i].snap);
+        g_fl[i].snap = NULL;
         if (!g_fl[i].own) continue;
         vkResetFences(g_dev, 1, &g_fl[i].f);
         if (g_nfpool < 64) g_fpool[g_nfpool++] = g_fl[i].f;
         else vkDestroyFence(g_dev, g_fl[i].f, NULL);
     }
-    memmove(g_fl, g_fl + k + 1, (size_t) (g_nfl - k - 1) * sizeof *g_fl);
-    g_nfl -= k + 1;
+    g_nfl = w;
 }
 
 static void drain(void) { drain_upto(g_nfl - 1); }
@@ -3356,7 +3407,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         ti.initialValue = vr_ru64(r);
         VkSemaphoreCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ti };
         VkSemaphore sm;
-        if (vkCreateSemaphore(d, &ci, NULL, &sm) == VK_SUCCESS) put(id, (uint64_t) sm, K_SEM);
+        if (vkCreateSemaphore(d, &ci, NULL, &sm) == VK_SUCCESS) {
+            put(id, (uint64_t) sm, K_SEM);
+            ent *e = find(id);
+            if (e) e->aux = (uint64_t) ti.semaphoreType;
+        }
         return 1;
     }
     case VR_DESTROY_SEMAPHORE: {
@@ -3374,6 +3429,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         // でたらめなハンドルで vkQueueSubmit を呼んでいた。CTS の synchronization で見つかった）。
         // semaphore の並びは、つなぎの印（chain）のために 1 つ多く取る
         typedef struct { VkSemaphore *ws, *ss; uint64_t *wv, *sv; VkPipelineStageFlags *wst; VkCommandBuffer *cbs; } subm;
+        tlv ftw[8] = { 0 }, fts[8] = { 0 };
+        uint8_t fntw = 0, fnts = 0, fover = 0;
         VkSubmitInfo *si = calloc(ns ? ns : 1, sizeof *si);
         VkTimelineSemaphoreSubmitInfo *tl = calloc(ns ? ns : 1, sizeof *tl);
         subm *sm = calloc(ns ? ns : 1, sizeof *sm);
@@ -3387,7 +3444,17 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             sm[i].ws = calloc(nw + 1, sizeof *sm[i].ws);
             sm[i].wst = calloc(nw + 1, sizeof *sm[i].wst);
             sm[i].wv = calloc(nw + 1, sizeof *sm[i].wv);
-            for (uint32_t k = 0; k < nw; k++) { sm[i].ws[k] = OBJ(VkSemaphore, vr_ru64(r)); sm[i].wst[k] = vr_ru32(r); sm[i].wv[k] = vr_ru64(r); }
+            for (uint32_t k = 0; k < nw; k++) {
+                uint64_t sid = vr_ru64(r);
+                sm[i].ws[k] = OBJ(VkSemaphore, sid);
+                sm[i].wst[k] = vr_ru32(r);
+                sm[i].wv[k] = vr_ru64(r);
+                ent *se = find(sid);
+                if (se && se->kind == K_SEM && se->aux == VK_SEMAPHORE_TYPE_TIMELINE && sm[i].wv[k]) {
+                    if (fntw < 8) ftw[fntw++] = (tlv) { sm[i].ws[k], sm[i].wv[k] };
+                    else fover = 1;
+                }
+            }
             si[i].waitSemaphoreCount = tl[i].waitSemaphoreValueCount = nw;
             si[i].pWaitSemaphores = sm[i].ws;
             si[i].pWaitDstStageMask = sm[i].wst;
@@ -3407,7 +3474,16 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             if (nsg > r->n - r->at) { r->bad = 1; break; }
             sm[i].ss = calloc(nsg + 1, sizeof *sm[i].ss);
             sm[i].sv = calloc(nsg + 1, sizeof *sm[i].sv);
-            for (uint32_t k = 0; k < nsg; k++) { sm[i].ss[k] = OBJ(VkSemaphore, vr_ru64(r)); sm[i].sv[k] = vr_ru64(r); }
+            for (uint32_t k = 0; k < nsg; k++) {
+                uint64_t sid = vr_ru64(r);
+                sm[i].ss[k] = OBJ(VkSemaphore, sid);
+                sm[i].sv[k] = vr_ru64(r);
+                ent *se = find(sid);
+                if (se && se->kind == K_SEM && se->aux == VK_SEMAPHORE_TYPE_TIMELINE) {
+                    if (fnts < 8) fts[fnts++] = (tlv) { sm[i].ss[k], sm[i].sv[k] };
+                    else fover = 1;
+                }
+            }
             si[i].signalSemaphoreCount = tl[i].signalSemaphoreValueCount = nsg;
             si[i].pSignalSemaphores = sm[i].ss;
             tl[i].pSignalSemaphoreValues = sm[i].sv;
@@ -3455,6 +3531,12 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         int own = 0;
         if (!f) { f = own_fence(); own = 1; }
         if (g_nfl == 256) drain();
+        if (g_nfl == 256) {
+            // 合図を待つ仕事で一覧が埋まった。覚えきれないので、前のやり方で全部を待つ
+            vlog("合図を待っている仕事が 256 本たまったので、全部を待つ");
+            for (int i = 0; i < g_nfl; i++) g_fl[i].tl_over = 1;
+            drain();
+        }
         // iPhone のアプリが前にいない間は GPU を使えない。出すと GPU を失うので、前に戻るまで待つ（PC は待たされるだけ）
         if (g_paused) {
             vlog("アプリが前にいないので、前に戻るまで GPU に仕事を出さずに待つ");
@@ -3485,6 +3567,12 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             e->f = f;
             e->own = own;
             e->ncb = ncid;
+            e->q = q;
+            e->ntw = fntw;
+            e->nts = fnts;
+            e->tl_over = fover;
+            memcpy(e->tw, ftw, sizeof ftw);
+            memcpy(e->ts, fts, sizeof fts);
             e->snap = NULL;
             e->nsnap = 0;
             if (getenv("VKR_CHECK")) {
