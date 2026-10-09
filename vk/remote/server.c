@@ -1068,6 +1068,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
     // 有効な描き方・計算の仕方がつながっていない draw と dispatch は飛ばす
     // （作れなかった pipeline のまま描くと、iPhone の MoltenVK は描く所で落ちる。10/7 に zink で起きた）
     int gfx = 0, cmp = 0;
+    int rp_off = 0; // 始められなかった render pass の中（次の subpass・終わり・draw を飛ばす）
     uint32_t skipped = 0;
     while (r->at < r->n && !r->bad) {
         uint32_t op = vr_ru32(r);
@@ -1235,10 +1236,11 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             bi.framebuffer = OBJ(VkFramebuffer, fid);
             vr_rcopy(r, &bi.renderArea, sizeof bi.renderArea);
             uint32_t nc = vr_ru32(r);
-            VkClearValue cv[16];
-            for (uint32_t i = 0; i < nc && i < 16; i++) vr_rcopy(r, &cv[i], sizeof cv[i]);
-            for (uint32_t i = 16; i < nc; i++) vr_take(r, sizeof(VkClearValue));
-            bi.clearValueCount = nc < 16 ? nc : 16;
+            if (nc > (r->n - r->at) / sizeof(VkClearValue)) { r->bad = 1; break; }
+            VkClearValue cv16[16], *cv = nc <= 16 ? cv16 : malloc(nc * sizeof *cv);
+            if (!cv) { r->bad = 1; break; }
+            for (uint32_t i = 0; i < nc; i++) vr_rcopy(r, &cv[i], sizeof cv[i]);
+            bi.clearValueCount = nc;
             bi.pClearValues = cv;
             uint32_t contents = vr_ru32(r);
             // 描く先の画像のメモリを「使う」として覚える
@@ -1248,20 +1250,33 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
                     ent *ve = find(fe->list->ids[k]);
                     if (ve) use_buffer_mem(ci, ve->aux);
                 }
-            if (bi.renderPass && bi.framebuffer) vkCmdBeginRenderPass(cb, &bi, (VkSubpassContents) contents);
+            if (bi.renderPass && bi.framebuffer) {
+                vkCmdBeginRenderPass(cb, &bi, (VkSubpassContents) contents);
+                rp_off = 0;
+            } else {
+                vlog("render pass を始めない（%s が無い）。中の命令も飛ばす", bi.renderPass ? "framebuffer" : "render pass");
+                rp_off = 1;
+            }
+            if (cv != cv16) free(cv);
         } break;
-        case VR_CMD_END_RENDER_PASS: vkCmdEndRenderPass(cb); break;
-        case VR_CMD_NEXT_SUBPASS: vkCmdNextSubpass(cb, (VkSubpassContents) vr_ru32(r)); break;
+        case VR_CMD_END_RENDER_PASS:
+            if (!rp_off) vkCmdEndRenderPass(cb);
+            rp_off = 0;
+            break;
+        case VR_CMD_NEXT_SUBPASS: {
+            uint32_t contents = vr_ru32(r);
+            if (!rp_off) vkCmdNextSubpass(cb, (VkSubpassContents) contents);
+        } break;
         case VR_CMD_DRAW: {
             uint32_t a = vr_ru32(r), b = vr_ru32(r), c = vr_ru32(r), d = vr_ru32(r);
-            if (!gfx) { skipped++; break; }
+            if (!gfx || rp_off) { skipped++; break; }
             vkCmdDraw(cb, a, b, c, d);
         } break;
         case VR_CMD_DRAW_INDEXED: {
             uint32_t a = vr_ru32(r), b = vr_ru32(r), c = vr_ru32(r);
             int32_t d = (int32_t) vr_ru32(r);
             uint32_t e = vr_ru32(r);
-            if (!gfx) { skipped++; break; }
+            if (!gfx || rp_off) { skipped++; break; }
             vkCmdDrawIndexed(cb, a, b, c, d, e);
         } break;
         case VR_CMD_DRAW_INDIRECT:
@@ -1271,7 +1286,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             VkBuffer b = OBJ(VkBuffer, bid);
             uint64_t off = vr_ru64(r);
             uint32_t n = vr_ru32(r), stride = vr_ru32(r);
-            if (!gfx || !b) { skipped++; break; }
+            if (!gfx || !b || rp_off) { skipped++; break; }
             if (op == VR_CMD_DRAW_INDIRECT) vkCmdDrawIndirect(cb, b, off, n, stride);
             else vkCmdDrawIndexedIndirect(cb, b, off, n, stride);
         } break;
