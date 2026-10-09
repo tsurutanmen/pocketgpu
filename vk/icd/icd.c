@@ -3870,9 +3870,24 @@ static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCach
 }
 
 // ---- サンプラー ----
+// 深さを比べる sampler の滑らかな読み方を、1 点で読む形に直すか。iPhone の GPU は D32_SFLOAT を滑らかに読めず
+// （形式の性質でも名乗っている）、確かめずに滑らかに読むアプリは 0 を受け取って影が真っ黒になる（0 A.D. の PCF）。
+// 受け手が Apple の GPU なら直す。IPHONE_VK_CMP_NEAREST=1 で必ず・0 で直さない
+static int cmp_nearest(void) {
+    const char *e = getenv("IPHONE_VK_CMP_NEAREST");
+    if (e && *e) return *e == '1';
+    return g_hw.props.vendorID == 0x106b;
+}
+
 static VkResult VKAPI_CALL create_sampler(VkDevice dv, const VkSamplerCreateInfo *ci, const VkAllocationCallbacks *a, VkSampler *out) {
     (void) a;
     uint64_t id = new_id();
+    VkSamplerCreateInfo fixed;
+    if (ci->compareEnable && (ci->magFilter == VK_FILTER_LINEAR || ci->minFilter == VK_FILTER_LINEAR) && cmp_nearest()) {
+        fixed = *ci;
+        fixed.magFilter = fixed.minFilter = VK_FILTER_NEAREST;
+        ci = &fixed;
+    }
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, id);
