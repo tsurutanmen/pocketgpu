@@ -740,6 +740,19 @@ static void drain_upto(int k) {
 
 static void drain(void) { drain_upto(g_nfl - 1); }
 
+// 待たれている timeline の値のうち、まだ届いていない物を受け手が合図する（つなぎが切れたあとだけ使う）
+static int unblock_waits(void) {
+    int n = 0;
+    for (int i = 0; i < g_nfl; i++)
+        for (int k = 0; k < g_fl[i].ntw; k++) {
+            uint64_t now = 0;
+            if (vkGetSemaphoreCounterValue(g_dev, g_fl[i].tw[k].s, &now) != VK_SUCCESS || now >= g_fl[i].tw[k].v) continue;
+            VkSemaphoreSignalInfo si = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g_fl[i].tw[k].s, .value = g_fl[i].tw[k].v };
+            if (vkSignalSemaphore(g_dev, &si) == VK_SUCCESS) n++;
+        }
+    return n;
+}
+
 // その物を使う仕事のうち、いちばん後に出したものの番号（無ければ -1）
 static int last_with_cb(uint64_t cb) {
     for (int i = g_nfl - 1; i >= 0; i--)
@@ -935,6 +948,17 @@ static void dev_free(VkDevice dev, int last) {
 
 static void cleanup(void) {
     drain();
+    // 合図を待ったまま残った仕事は、待たれている値を受け手が合図して流してから待つ
+    for (int round = 0; g_nfl && g_dev && round < 8; round++) {
+        int n = unblock_waits();
+        if (n) vlog("切れたあとに合図を待っていた仕事が残ったので、受け手が %d 個合図した", n);
+        drain();
+        if (!n) break;
+    }
+    if (g_nfl) {
+        vlog("合図を待つ仕事が %d 本残ったまま片づける", g_nfl);
+        g_nfl = 0;
+    }
     jp_reset();
     vid_reset();
     for (size_t i = 0; i < g_ncbi; i++) { free(g_cbi[i].sets); idlist_free(&g_cbi[i].mems); }
@@ -976,6 +1000,17 @@ static const char *rd_str(vr_rd *r) {
 
 // ---- 返事 ----
 static vr_buf g_out;
+// PC が切れたか（読む物があるのに 0 バイト＝相手が閉じた）。待たずに調べる
+static int peer_gone(vr_sock s) {
+    fd_set rf;
+    FD_ZERO(&rf);
+    FD_SET(s, &rf);
+    struct timeval tv = { 0, 0 };
+    if (select((int) s + 1, &rf, NULL, NULL, &tv) != 1) return 0;
+    char b;
+    return recv(s, &b, 1, MSG_PEEK) == 0;
+}
+
 static int reply(vr_sock s, int32_t result) {
     uint32_t h[2] = { (uint32_t) result, (uint32_t) g_out.n };
     int ok = vr_send_all(s, h, 8) && vr_send_all(s, g_out.p, g_out.n);
@@ -3407,7 +3442,16 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         }
         uint32_t all = vr_ru32(r);
         uint64_t timeout = vr_ru64(r);
-        return reply(s, vkWaitForFences(d, n, f, all, timeout));
+        // 100 ms ずつ待ち、PC が切れていたらやめる
+        double t0 = t_ms();
+        for (;;) {
+            double gone = (t_ms() - t0) * 1e6;
+            uint64_t left = timeout == UINT64_MAX ? UINT64_MAX : (gone >= (double) timeout ? 0 : timeout - (uint64_t) gone);
+            uint64_t slice = left < 100000000ull ? left : 100000000ull;
+            VkResult wr = vkWaitForFences(d, n < 64 ? n : 64, f, all, slice);
+            if (wr != VK_TIMEOUT || slice == left) return reply(s, wr);
+            if (peer_gone(s)) { vlog("fence を待つ間に PC が切れた"); return 0; }
+        }
     }
     case VR_GET_FENCE_STATUS: {
         VkDevice d = DEV(vr_ru64(r));
@@ -3623,7 +3667,18 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         wi.semaphoreCount = n;
         wi.pSemaphores = sm;
         wi.pValues = v;
-        VkResult wr = vkWaitSemaphores(d, &wi, vr_ru64(r));
+        uint64_t timeout = vr_ru64(r);
+        // 100 ms ずつ待ち、PC が切れていたらやめる（合図するはずの PC のアプリがもういない）
+        double t0 = t_ms();
+        VkResult wr;
+        for (;;) {
+            double gone = (t_ms() - t0) * 1e6;
+            uint64_t left = timeout == UINT64_MAX ? UINT64_MAX : (gone >= (double) timeout ? 0 : timeout - (uint64_t) gone);
+            uint64_t slice = left < 100000000ull ? left : 100000000ull;
+            wr = vkWaitSemaphores(d, &wi, slice);
+            if (wr != VK_TIMEOUT || slice == left) break;
+            if (peer_gone(s)) { vlog("semaphore を待つ間に PC が切れた"); free(sm); free(v); return 0; }
+        }
         free(sm);
         free(v);
         return reply(s, wr);
