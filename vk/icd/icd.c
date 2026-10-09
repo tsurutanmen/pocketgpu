@@ -2251,6 +2251,27 @@ static void fix_ids(VkBaseOutStructure *s) {
     *luid_valid = VK_FALSE;
 }
 
+// 鎖の構造体の中身（sType と pNext の後ろ）の、受け手（64 ビット）での長さ。
+// 32 ビットでは頭が 8 バイト短く、末尾の詰め物も 8 にそろわないことがあるので、中身を 8 の倍数に切り上げる
+// （伝えた大きさの箱に受け手の GPU が書くので、小さく伝えると受け手ではみ出す）
+static uint32_t wire_body(uint32_t sz) {
+#if UINTPTR_MAX == 0xffffffffu
+    return (sz - (uint32_t) sizeof(VkBaseOutStructure) + 7u) & ~7u;
+#else
+    return sz - (uint32_t) sizeof(VkBaseOutStructure);
+#endif
+}
+
+// 中身を受け手の長さで送る（足りない分は 0 で埋める）
+static void put_body(vr_buf *b, const void *body, uint32_t sz) {
+    uint32_t n = sz - (uint32_t) sizeof(VkBaseOutStructure), w = wire_body(sz);
+    if (w == n) { vr_bytes(b, body, n); return; }
+    uint8_t tmp[1024] = { 0 };
+    if (w > sizeof tmp) w = sizeof tmp;
+    memcpy(tmp, body, n < w ? n : w);
+    vr_bytes(b, tmp, w);
+}
+
 // pNext の鎖のうち、知っている構造体だけを受け手に尋ねて埋める
 static void query_chain(uint32_t op, void *pnext, const stinfo *t, size_t nt, void *base, size_t base_size) {
     vr_buf b = { 0 }, out = { 0 };
@@ -2259,13 +2280,17 @@ static void query_chain(uint32_t op, void *pnext, const stinfo *t, size_t nt, vo
     for (VkBaseOutStructure *s = pnext; s && n < 64; s = s->pNext)
         if (st_size(t, nt, s->sType)) items[n++] = s;
     vr_u32(&b, n);
-    for (uint32_t i = 0; i < n; i++) { vr_u32(&b, items[i]->sType); vr_u32(&b, st_size(t, nt, items[i]->sType)); }
+    for (uint32_t i = 0; i < n; i++) { vr_u32(&b, items[i]->sType); vr_u32(&b, 16u + wire_body(st_size(t, nt, items[i]->sType))); }
+#if UINTPTR_MAX == 0xffffffffu
+    if (base_size == sizeof(VkPhysicalDeviceProperties)) base_size = 824; // 受け手（64 ビット）の並びの大きさ
+#endif
     if (rpc_call(op, &b, &out) == VK_SUCCESS) {
         vr_rd rd = { out.p, out.n, 0, 0 };
         vr_take(&rd, base_size); // 土台の部分は手元のものを使う
         for (uint32_t i = 0; i < n; i++) {
-            uint32_t sz = st_size(t, nt, items[i]->sType);
-            vr_rcopy(&rd, BODY(items[i]), sz - sizeof(VkBaseOutStructure));
+            uint32_t sz = st_size(t, nt, items[i]->sType), nb = sz - (uint32_t) sizeof(VkBaseOutStructure), w = wire_body(sz);
+            vr_rcopy(&rd, BODY(items[i]), nb);
+            if (w > nb) vr_take(&rd, w - nb);
             if (op == VR_GET_FEATURES2) mask_ext_features(items[i]);
             else fix_ids(items[i]);
         }
@@ -2623,9 +2648,9 @@ static VkResult VKAPI_CALL create_device(VkPhysicalDevice pd, const VkDeviceCrea
             for (uint32_t k = h; k < nw; k++) want[k] &= ok[k];
             // private data はドライバの中で扱うので、受け手では有効にしない
             if (chain[i]->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES) ((VkPhysicalDeviceVulkan13Features *) want)->privateData = VK_FALSE;
-            vr_bytes(&b, want + h, sz - sizeof(VkBaseOutStructure));
+            put_body(&b, want + h, sz);
         } else {
-            vr_bytes(&b, BODY(chain[i]), sz - sizeof(VkBaseOutStructure));
+            put_body(&b, BODY(chain[i]), sz);
         }
     }
     VkResult r = rpc_call(VR_CREATE_DEVICE, &b, NULL);
