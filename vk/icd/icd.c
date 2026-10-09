@@ -979,6 +979,9 @@ struct dev {
     size_t npend, cappend;
     uint64_t serial;   // submit の通し番号
     SRWLOCK lock;
+    volatile LONG skipped_wait; // 往復を省いて「終わった」と答えた待ちがあった（受け手はまだ仕事をしているかもしれない）
+    struct pbatch *pb;          // まだ始まれないかもしれない submit（CPU からの合図を待つ timeline の値がある）
+    size_t npb, cpb;
 };
 
 struct queue { VK_LOADER_DATA loader; struct dev *d; uint32_t fam, idx; };
@@ -1062,6 +1065,7 @@ struct cb {
     size_t nwc, cwc;
     uint64_t bpl[64];         // つないだ pipeline の番号（書く場所かどうかを、その pipeline のシェーダーで決める）
     int nbpl, bpl_over;       // 64 を超えたら、全部のシェーダーで決める前のやり方に戻す
+    int qcopy_nowait;         // WAIT を付けない query の結果の写しがある（前の仕事が終わっている前提で読む）
 };
 struct pushheld { struct dsl *l; VkDescriptorSet s; };
 struct wrcand { struct buf *b; uint64_t off, len; uint32_t set, binding; int done; };
@@ -1076,6 +1080,51 @@ struct fence { uint64_t serial; struct queue *q; double last_poll; };
 // timeline semaphore は、どの値をどのキューの何番目の submit が知らせるかを覚える（待ちが済んだら引き取りに使う）
 typedef struct { uint64_t value, serial; struct queue *q; } sigrec;
 struct sem { int timeline; sigrec *sig; size_t n, cap; uint64_t reached; };
+
+// CPU からの合図を待つかもしれない submit。合図の前に GPU は始まれないので、
+// その submit とそれより後に同じ queue に出した物は、終わったと答えず、書いた所も引き取らない。
+// 合図のときに、アプリが合図の前に書いたメモリを送る（submit のときにはまだ書かれていない）
+typedef struct { struct sem *s; uint64_t v; } semval;
+struct pbatch { uint64_t serial; struct queue *q; semval *w; uint32_t nw; struct cb **cbs; uint32_t ncb; };
+
+// q の serial 以前に、まだ止まっている submit があるか（d->lock を持って呼ぶ）
+static int pb_blocks(struct dev *d, struct queue *q, uint64_t serial) {
+    for (size_t i = 0; i < d->npb; i++)
+        if ((!q || d->pb[i].q == q) && d->pb[i].serial <= serial) return 1;
+    return 0;
+}
+
+// 待つ値に届く道が分かった submit を、一覧から外して out に移す（d->lock を持って呼ぶ）。
+// 届く道：その値まで届いたと分かっている（GPU が知らせた・CPU が合図した）か、止まっていない submit が知らせる
+static void pb_resolve_locked(struct dev *d, struct pbatch **out, size_t *nout) {
+    *out = NULL;
+    *nout = 0;
+    for (int changed = 1; changed;) {
+        changed = 0;
+        for (size_t i = 0; i < d->npb; i++) {
+            struct pbatch *b = &d->pb[i];
+            int ok = 1;
+            for (size_t j = 0; j < d->npb && ok; j++)
+                if (j != i && d->pb[j].q == b->q && d->pb[j].serial < b->serial) ok = 0;
+            for (uint32_t k = 0; k < b->nw && ok; k++) {
+                struct sem *sm = b->w[k].s;
+                uint64_t v = b->w[k].v;
+                if (v <= sm->reached) continue;
+                int found = 0;
+                for (size_t r = 0; r < sm->n && !found; r++)
+                    if (sm->sig[r].value >= v && !pb_blocks(d, sm->sig[r].q, sm->sig[r].serial)) found = 1;
+                if (!found) ok = 0;
+            }
+            if (!ok) continue;
+            *out = realloc(*out, (*nout + 1) * sizeof **out);
+            (*out)[(*nout)++] = *b;
+            memmove(b, b + 1, (d->npb - i - 1) * sizeof *b);
+            d->npb--;
+            changed = 1;
+            break;
+        }
+    }
+}
 
 // ---- 範囲の並び ----
 static void rng_add(rng **a, size_t *n, size_t *cap, struct mem *m, uint64_t off, uint64_t len, uint64_t serial) {
@@ -1853,7 +1902,42 @@ static void read_back_many(rng *r, size_t n) {
 }
 
 // キュー q（NULL なら全部）の serial までの submit が終わった：GPU が書いた範囲を引き取る
+static void send_dirty(struct mem *m, uint64_t off, uint64_t len);
+static void pb_release(struct pbatch *fr, size_t nfr) {
+    for (size_t i = 0; i < nfr; i++) {
+        for (uint32_t j = 0; j < fr[i].ncb; j++) {
+            struct cb *c = fr[i].cbs[j];
+            for (size_t k = 0; k < c->nrd; k++) send_dirty(c->rd[k].m, c->rd[k].off, c->rd[k].len);
+            for (size_t k = 0; k < c->nr; k++) send_dirty(c->r[k].m, c->r[k].off, c->r[k].len);
+        }
+        free(fr[i].w);
+        free(fr[i].cbs);
+    }
+    free(fr);
+}
+
+// q の upto までの submit が始まれるようになるまで待つ（ほかのスレッドの合図を待つので、錠は持たずに待つ）。
+// ms 待っても解けなければ 0。ドライバの読み違いで固まらないよう、complete からは 10 秒で諦めて前のやり方に戻る
+static int pb_wait(struct dev *d, struct queue *q, uint64_t upto, double ms) {
+    double t0 = now_ms();
+    int said = 0;
+    for (;;) {
+        AcquireSRWLockExclusive(&d->lock);
+        struct pbatch *fr;
+        size_t nfr;
+        pb_resolve_locked(d, &fr, &nfr);
+        int blocked = pb_blocks(d, q, upto);
+        ReleaseSRWLockExclusive(&d->lock);
+        pb_release(fr, nfr);
+        if (!blocked) return 1;
+        if (now_ms() - t0 >= ms) return 0;
+        if (!said && now_ms() - t0 > 1000) { say("CPU からの合図を待っている submit がある（ほかのスレッドの vkSignalSemaphore を待つ）"); said = 1; }
+        Sleep(1);
+    }
+}
+
 static void complete(struct dev *d, struct queue *q, uint64_t upto) {
+    if (d->npb && !pb_wait(d, q, upto, 10000)) say("合図が 10 秒来ないので、待たずに進める");
     AcquireSRWLockExclusive(&d->lock);
     rng *take = NULL;
     size_t nt = 0, ct = 0, k = 0;
@@ -6406,7 +6490,7 @@ static void bct_free(struct cb *c) {
     c->bct = NULL;
 }
 
-static void cb_clear(struct cb *c) { push_release(c); c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; c->nwc = 0; c->nbpl = 0; c->bpl_over = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
+static void cb_clear(struct cb *c) { push_release(c); c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; c->nwc = 0; c->nbpl = 0; c->bpl_over = 0; c->qcopy_nowait = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
 
 static void cb_free(struct cb *c) { push_release(c); free(c->ph); free(c->wc); gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c->ev); free(c); }
 
@@ -6784,6 +6868,7 @@ static void VKAPI_CALL cmd_exec(VkCommandBuffer cbh, uint32_t n, const VkCommand
         for (size_t k = 0; k < s->nwc; k++) wr_cand(c, s->wc[k].set, s->wc[k].binding, s->wc[k].b, s->wc[k].off, s->wc[k].len);
         for (int k = 0; k < s->nbpl; k++) cb_note_pipe(c, s->bpl[k]);
         if (s->bpl_over) c->bpl_over = 1;
+        if (s->qcopy_nowait) c->qcopy_nowait = 1;
     }
 }
 
@@ -7375,8 +7460,35 @@ static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *f
     // DXVK は「1 秒の期限で待つ」を繰り返す。0.1 秒以上の期限は、期限なしと同じに扱う
     int known = timeout >= 100000000ull;
     for (uint32_t i = 0; i < n && known; i++) known = ((struct fence *) fs[i])->q != NULL;
+    if (known && ((struct dev *) dv)->npb) {
+        // CPU からの合図を待つ submit の fence なら、合図が来るまで（期限までは）待つ
+        struct dev *d = (struct dev *) dv;
+        double ms = timeout >= 0x7fffffffffffffffull ? 1e300 : timeout / 1e6, t0 = now_ms();
+        if (all) {
+            for (uint32_t i = 0; i < n; i++) {
+                double left = ms - (now_ms() - t0);
+                if (!pb_wait(d, ((struct fence *) fs[i])->q, ((struct fence *) fs[i])->serial, left > 0 ? left : 0)) return VK_TIMEOUT;
+            }
+        } else {
+            // どれか 1 つ：始まれる物が出るまで待ち、それだけを終わったことにする
+            for (;;) {
+                for (uint32_t i = 0; i < n; i++) {
+                    struct fence *fc = (struct fence *) fs[i];
+                    if (pb_wait(d, fc->q, fc->serial, 0)) {
+                        complete(d, fc->q, fc->serial);
+                        d->skipped_wait = 1;
+                        g_stat.skipped++;
+                        return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+                    }
+                }
+                if (now_ms() - t0 >= ms) return VK_TIMEOUT;
+                Sleep(1);
+            }
+        }
+    }
     if (known) {
         for (uint32_t i = 0; i < n; i++) complete((struct dev *) dv, ((struct fence *) fs[i])->q, ((struct fence *) fs[i])->serial);
+        ((struct dev *) dv)->skipped_wait = 1;
         g_stat.skipped++;
         return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
     }
@@ -7414,8 +7526,11 @@ static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *f
 static VkResult VKAPI_CALL fence_status(VkDevice dv, VkFence fh) {
     struct fence *fc = (struct fence *) fh;
     if (fc->q) {
+        struct dev *d = (struct dev *) dv;
+        if (d->npb && !pb_wait(d, fc->q, fc->serial, 0)) return VK_NOT_READY;
         // submit に付けた fence は「終わった」と答える（版 3 の待ち方）
         complete((struct dev *) dv, fc->q, fc->serial);
+        ((struct dev *) dv)->skipped_wait = 1;
         g_stat.skipped++;
         return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
     }
@@ -7534,18 +7649,29 @@ static VkResult VKAPI_CALL wait_sems(VkDevice dv, const VkSemaphoreWaitInfo *wi,
         if (ok) {
             for (uint32_t i = 0; i < wi->semaphoreCount; i++)
                 if (need[i]) sem_reached(d, (struct sem *) wi->pSemaphores[i], need[i]);
+            d->skipped_wait = 1;
             g_stat.skipped++;
             return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
         }
     }
-    vr_buf b = { 0 };
-    vr_u64(&b, ID(dv));
-    vr_u32(&b, wi->flags);
-    vr_u32(&b, wi->semaphoreCount);
-    for (uint32_t i = 0; i < wi->semaphoreCount; i++) { vr_u64(&b, ID(wi->pSemaphores[i])); vr_u64(&b, wi->pValues[i]); }
-    vr_u64(&b, timeout);
-    VkResult r = rpc_call(VR_WAIT_SEMAPHORES, &b, NULL);
-    free(b.p);
+    // 受け手は 1 本の流れで命令を順に片づけるので、長く待たせるとほかのスレッドの合図（vkSignalSemaphore）が届かない。
+    // 2 ms ずつに区切って聞き直し、そのたびに錠を放す
+    VkResult r;
+    double t0 = now_ms();
+    for (;;) {
+        double gone = (now_ms() - t0) * 1e6;
+        uint64_t left = timeout == UINT64_MAX ? UINT64_MAX : (gone >= (double) timeout ? 0 : timeout - (uint64_t) gone);
+        uint64_t slice = left < 2000000ull ? left : 2000000ull;
+        vr_buf b = { 0 };
+        vr_u64(&b, ID(dv));
+        vr_u32(&b, wi->flags);
+        vr_u32(&b, wi->semaphoreCount);
+        for (uint32_t i = 0; i < wi->semaphoreCount; i++) { vr_u64(&b, ID(wi->pSemaphores[i])); vr_u64(&b, wi->pValues[i]); }
+        vr_u64(&b, slice);
+        r = rpc_call(VR_WAIT_SEMAPHORES, &b, NULL);
+        free(b.p);
+        if (r != VK_TIMEOUT || slice == left) break;
+    }
     if (r != VK_SUCCESS) return r;
     if (wi->flags & VK_SEMAPHORE_WAIT_ANY_BIT) {
         // どれが届いたか分からないので、いまの値を尋ねる
@@ -7560,12 +7686,22 @@ static VkResult VKAPI_CALL wait_sems(VkDevice dv, const VkSemaphoreWaitInfo *wi,
 }
 
 static VkResult VKAPI_CALL signal_sem(VkDevice dv, const VkSemaphoreSignalInfo *si) {
+    struct dev *d = (struct dev *) dv;
+    struct sem *sm = (struct sem *) si->semaphore;
+    AcquireSRWLockExclusive(&d->lock);
+    if (sm && si->value > sm->reached) sm->reached = si->value;
+    struct pbatch *fr = NULL;
+    size_t nfr = 0;
+    if (d->npb) pb_resolve_locked(d, &fr, &nfr);
+    ReleaseSRWLockExclusive(&d->lock);
+    pb_release(fr, nfr);
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, ID(si->semaphore));
     vr_u64(&b, si->value);
     rpc_send(VR_SIGNAL_SEMAPHORE, &b);
     free(b.p);
+    rpc_flush(); // 待っている GPU の仕事があるので、ためずにすぐ送る
     return VK_SUCCESS;
 }
 
@@ -7587,9 +7723,98 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
         for (size_t k = 0; k < nrd; k++) send_dirty(rd[k].m, rd[k].off, rd[k].len);
         free(rd);
     }
+    // WAIT を付けない query の結果の写しは、アプリが前の仕事の終わりを待ってから出す前提で読む。
+    // ドライバはその待ちに往復せず答えているので、受け手ではまだ前の仕事が動いていて、写しが 0 を書く
+    // （CTS の query_pool.occlusion_query の wait_queue など）。その時だけ、受け手に本当に待たせる
+    static int qw = -1;
+    if (qw < 0) { const char *e = getenv("IPHONE_VK_QCOPY_WAIT"); qw = !(e && *e == '0'); }
+    if (qw && d->skipped_wait && !d->npb) {
+        int need = 0;
+        for (uint32_t i = 0; i < n && !need; i++)
+            for (uint32_t j = 0; j < si[i].commandBufferCount && !need; j++)
+                need = ((struct cb *) si[i].pCommandBuffers[j])->qcopy_nowait;
+        if (need) {
+            vr_buf w = { 0 };
+            vr_u64(&w, ID(q));
+            rpc_call(VR_QUEUE_WAIT_IDLE, &w, NULL);
+            free(w.p);
+            d->skipped_wait = 0;
+        }
+    }
+    // timeline の値を待つ submit（まだ届いていない値）があるか。あれば 1 つずつ送る。
+    // 受け手は送られた 1 回ごとに終わりを追うので、合図を待つ物と待たない物を同じ回に入れると、待たない物の終わりも分からなくなる
+    int tlw = 0;
+    for (uint32_t i = 0; i < n && !tlw; i++) {
+        const VkTimelineSemaphoreSubmitInfo *tl = NULL;
+        for (const VkBaseInStructure *x = si[i].pNext; x; x = x->pNext)
+            if (x->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) tl = (const VkTimelineSemaphoreSubmitInfo *) x;
+        for (uint32_t j = 0; tl && j < si[i].waitSemaphoreCount && j < tl->waitSemaphoreValueCount; j++) {
+            struct sem *sm = (struct sem *) si[i].pWaitSemaphores[j];
+            if (sm->timeline && tl->pWaitSemaphoreValues[j] > sm->reached) tlw = 1;
+        }
+    }
+    uint32_t per = tlw ? 1 : 8;
+    for (uint32_t i = 0; i < n; i++)
+        for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
+            struct cb *c = (struct cb *) si[i].pCommandBuffers[j];
+            ev_fire(c);
+            wr_resolve(c);
+        }
+    // 帳簿は送る前に付け、送り終わるまで錠を持つ（ほかのスレッドが、帳簿の無いまま「届いた」を受け取らないように）
+    AcquireSRWLockExclusive(&d->lock);
+    // 通し番号は submit の 1 つずつに振る（timeline の値は、その submit とそれより前のものが終わったことだけを知らせる）
+    uint64_t base = d->serial + 1, serial = base;
+    d->serial += n ? n : 1;
+    for (uint32_t i = 0; i < n; i++) {
+        serial = base + i;
+        for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
+            struct cb *c = (struct cb *) si[i].pCommandBuffers[j];
+            for (size_t k = 0; k < c->nr; k++) {
+                size_t before = d->npend;
+                rng_add(&d->pend, &d->npend, &d->cappend, c->r[k].m, c->r[k].off, c->r[k].len, serial);
+                if (d->npend > before) { d->pend[before].q = q; d->pend[before].lazy = c->r[k].lazy; }
+            }
+        }
+        const VkTimelineSemaphoreSubmitInfo *tl = NULL;
+        for (const VkBaseInStructure *s = si[i].pNext; s; s = s->pNext)
+            if (s->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) tl = (const VkTimelineSemaphoreSubmitInfo *) s;
+        for (uint32_t j = 0; tl && j < si[i].signalSemaphoreCount && j < tl->signalSemaphoreValueCount; j++) {
+            struct sem *sm = (struct sem *) si[i].pSignalSemaphores[j];
+            if (!sm->timeline) continue;
+            if (sm->n == sm->cap) { sm->cap = sm->cap ? sm->cap * 2 : 8; sm->sig = realloc(sm->sig, sm->cap * sizeof *sm->sig); }
+            sm->sig[sm->n++] = (sigrec) { tl->pSignalSemaphoreValues[j], serial, q };
+        }
+        // まだ届いていない timeline の値を待つ submit は、止まっているかもしれない物として覚える
+        if (tlw && tl) {
+            semval *w = NULL;
+            uint32_t nw = 0;
+            for (uint32_t j = 0; j < si[i].waitSemaphoreCount && j < tl->waitSemaphoreValueCount; j++) {
+                struct sem *sm = (struct sem *) si[i].pWaitSemaphores[j];
+                if (!sm->timeline || tl->pWaitSemaphoreValues[j] <= sm->reached) continue;
+                w = realloc(w, (nw + 1) * sizeof *w);
+                w[nw++] = (semval) { sm, tl->pWaitSemaphoreValues[j] };
+            }
+            if (nw) {
+                if (d->npb == d->cpb) { d->cpb = d->cpb ? d->cpb * 2 : 16; d->pb = realloc(d->pb, d->cpb * sizeof *d->pb); }
+                struct pbatch *pb = &d->pb[d->npb++];
+                pb->serial = serial;
+                pb->q = q;
+                pb->w = w;
+                pb->nw = nw;
+                pb->ncb = si[i].commandBufferCount;
+                pb->cbs = malloc((pb->ncb ? pb->ncb : 1) * sizeof *pb->cbs);
+                for (uint32_t j = 0; j < pb->ncb; j++) pb->cbs[j] = (struct cb *) si[i].pCommandBuffers[j];
+            }
+        }
+    }
+    serial = base + (n ? n - 1 : 0);
+    // 出したばかりで、もう道の分かる物は外す（読むメモリは submit の前に送ってある）
+    struct pbatch *fr0 = NULL;
+    size_t nfr0 = 0;
+    if (d->npb) pb_resolve_locked(d, &fr0, &nfr0);
     // 受け手は 1 回に 8 まで受け取るので、分けて送る（fence は最後にだけ付ける）
-    for (uint32_t at = 0; at < n || (n == 0 && at == 0); at += 8) {
-        uint32_t k = n - at < 8 ? n - at : 8;
+    for (uint32_t at = 0; at < n || (n == 0 && at == 0); at += per) {
+        uint32_t k = n - at < per ? n - at : per;
         vr_buf b = { 0 };
         vr_u64(&b, ID(q));
         vr_u32(&b, k);
@@ -7611,40 +7836,15 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
                 vr_u64(&b, tl && j < tl->signalSemaphoreValueCount ? tl->pSignalSemaphoreValues[j] : 0);
             }
         }
-        vr_u64(&b, at + 8 >= n ? ID(f) : 0);
+        vr_u64(&b, at + per >= n ? ID(f) : 0);
         rpc_send(VR_QUEUE_SUBMIT, &b);
         free(b.p);
         if (n == 0) break;
     }
     rpc_flush();
-    for (uint32_t i = 0; i < n; i++)
-        for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
-            struct cb *c = (struct cb *) si[i].pCommandBuffers[j];
-            ev_fire(c);
-            wr_resolve(c);
-        }
-    AcquireSRWLockExclusive(&d->lock);
-    uint64_t serial = ++d->serial;
-    for (uint32_t i = 0; i < n; i++) {
-        for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
-            struct cb *c = (struct cb *) si[i].pCommandBuffers[j];
-            for (size_t k = 0; k < c->nr; k++) {
-                size_t before = d->npend;
-                rng_add(&d->pend, &d->npend, &d->cappend, c->r[k].m, c->r[k].off, c->r[k].len, serial);
-                if (d->npend > before) { d->pend[before].q = q; d->pend[before].lazy = c->r[k].lazy; }
-            }
-        }
-        const VkTimelineSemaphoreSubmitInfo *tl = NULL;
-        for (const VkBaseInStructure *s = si[i].pNext; s; s = s->pNext)
-            if (s->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) tl = (const VkTimelineSemaphoreSubmitInfo *) s;
-        for (uint32_t j = 0; tl && j < si[i].signalSemaphoreCount && j < tl->signalSemaphoreValueCount; j++) {
-            struct sem *sm = (struct sem *) si[i].pSignalSemaphores[j];
-            if (!sm->timeline) continue;
-            if (sm->n == sm->cap) { sm->cap = sm->cap ? sm->cap * 2 : 8; sm->sig = realloc(sm->sig, sm->cap * sizeof *sm->sig); }
-            sm->sig[sm->n++] = (sigrec) { tl->pSignalSemaphoreValues[j], serial, q };
-        }
-    }
     ReleaseSRWLockExclusive(&d->lock);
+    for (size_t i = 0; i < nfr0; i++) { free(fr0[i].w); free(fr0[i].cbs); }
+    free(fr0);
     if (f) { ((struct fence *) f)->serial = serial; ((struct fence *) f)->q = q; }
     return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
@@ -7652,6 +7852,7 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
 static VkResult VKAPI_CALL queue_wait_idle(VkQueue qh) {
     struct queue *q = (struct queue *) qh;
     complete(q->d, q, q->d->serial);
+    q->d->skipped_wait = 1;
     g_stat.skipped++;
     return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
     vr_buf b = { 0 };
@@ -7665,6 +7866,7 @@ static VkResult VKAPI_CALL queue_wait_idle(VkQueue qh) {
 static VkResult VKAPI_CALL device_wait_idle(VkDevice dv) {
     struct dev *d = (struct dev *) dv;
     complete(d, NULL, d->serial);
+    d->skipped_wait = 1;
     g_stat.skipped++;
     return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
     vr_buf b = { 0 };
@@ -7978,6 +8180,7 @@ static void VKAPI_CALL cmd_copy_qpool_results(VkCommandBuffer cbh, VkQueryPool q
     vr_u64(&c->s, off);
     vr_u64(&c->s, stride);
     vr_u32(&c->s, flags);
+    if (!(flags & VK_QUERY_RESULT_WAIT_BIT)) c->qcopy_nowait = 1;
     // GPU が書く範囲として覚える（CPU から見えるメモリなら、待ちのあとに引き取る）
     g_wr_why = 4;
     cb_writes(c, (struct buf *) dst, off, n ? stride * (n - 1) + ((flags & VK_QUERY_RESULT_64_BIT) ? 16 : 8) : 0);
