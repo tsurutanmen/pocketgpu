@@ -38,7 +38,12 @@
 
 #define EXPORT __declspec(dllexport)
 #define PAGE 4096u
+// handle → 受け手と取り決めた 64 ビットの番号。32 ビットでは non-dispatchable の handle は uint64_t なので、uintptr_t を通すと上の桁が消える
+#if UINTPTR_MAX == 0xffffffffu
+#define ID(h) ((uint64_t) (h))
+#else
 #define ID(h) ((uint64_t) (uintptr_t) (h))
+#endif
 
 // ---- 記録 ----
 static int g_verbose = -1;
@@ -856,7 +861,23 @@ static int hello(void) {
         VkResult r = rpc_call(VR_HELLO, &b, &out);
         if (r == VK_SUCCESS) {
             vr_rd rd = { out.p, out.n, 0, 0 };
+#if UINTPTR_MAX == 0xffffffffu
+            // 32 ビットのドライバ：受け手は 64 ビットなので、VkPhysicalDeviceProperties は 824 バイトで届く。
+            // limits の中の size_t の minMemoryMapAlignment が 8 バイト（前に 4 バイトの詰め物）なので、その後ろを 8 バイト前に詰める
+            {
+                uint8_t p64[824];
+                vr_rcopy(&rd, p64, sizeof p64);
+                uint8_t *d = (uint8_t *) &g_hw.props;
+                size_t lim = offsetof(VkPhysicalDeviceProperties, limits), mm = offsetof(VkPhysicalDeviceLimits, minMemoryMapAlignment);
+                memcpy(d, p64, lim + mm);
+                uint64_t al;
+                memcpy(&al, p64 + lim + 304, 8);
+                g_hw.props.limits.minMemoryMapAlignment = (size_t) al;
+                memcpy(d + lim + mm + sizeof(size_t), p64 + lim + 312, sizeof g_hw.props - (lim + mm + sizeof(size_t)));
+            }
+#else
             vr_rcopy(&rd, &g_hw.props, sizeof g_hw.props);
+#endif
             vr_rcopy(&rd, &g_hw.feats, sizeof g_hw.feats);
             g_hw.real = g_hw.feats;
             vr_rcopy(&rd, &g_hw.mem, sizeof g_hw.mem);
@@ -3034,7 +3055,7 @@ static VkResult VKAPI_CALL create_view(VkDevice dv, const VkImageViewCreateInfo 
     vr_put(&b, &ci->subresourceRange, sizeof ci->subresourceRange);
     rpc_send(VR_CREATE_IMAGE_VIEW, &b);
     free(b.p);
-    *out = (VkImageView) (uintptr_t) id;
+    *out = (VkImageView) id;
     return VK_SUCCESS;
 }
 
@@ -3138,7 +3159,7 @@ static VkResult VKAPI_CALL create_rpass(VkDevice dv, const VkRenderPassCreateInf
     vr_put(&b, ci->pDependencies, ci->dependencyCount * sizeof *ci->pDependencies);
     rpc_send(VR_CREATE_RENDER_PASS, &b);
     free(b.p);
-    *out = (VkRenderPass) (uintptr_t) id;
+    *out = (VkRenderPass) id;
     return VK_SUCCESS;
 }
 
@@ -3228,7 +3249,7 @@ static VkResult VKAPI_CALL create_rpass2(VkDevice dv, const VkRenderPassCreateIn
     vr_put(&b, ci->pCorrelatedViewMasks, ci->correlatedViewMaskCount * sizeof(uint32_t));
     rpc_send(VR_CREATE_RENDER_PASS2, &b);
     free(b.p);
-    *out = (VkRenderPass) (uintptr_t) id;
+    *out = (VkRenderPass) id;
     return VK_SUCCESS;
 }
 
@@ -3251,7 +3272,7 @@ static VkResult VKAPI_CALL create_fb(VkDevice dv, const VkFramebufferCreateInfo 
     vr_u32(&b, ci->layers);
     rpc_send(VR_CREATE_FRAMEBUFFER, &b);
     free(b.p);
-    *out = (VkFramebuffer) (uintptr_t) id;
+    *out = (VkFramebuffer) id;
     return VK_SUCCESS;
 }
 
@@ -3457,7 +3478,7 @@ static VkResult VKAPI_CALL create_graphics_pipelines_raw(VkDevice dv, VkPipeline
         free(b.p);
         for (uint32_t k = 0; k < 8; k++) if (tmps[k]) destroy_shader(dv, tmps[k], NULL); // 一時のシェーダーは作り終えたら消す
         if (r != VK_SUCCESS) { say("graphics pipeline を作れない (%d)", r); out[i] = VK_NULL_HANDLE; worst = r; continue; }
-        out[i] = (VkPipeline) (uintptr_t) id;
+        out[i] = (VkPipeline) id;
     }
     return worst;
 }
@@ -3894,7 +3915,7 @@ static VkResult VKAPI_CALL create_sampler(VkDevice dv, const VkSamplerCreateInfo
     vr_put(&b, (const uint8_t *) ci + offsetof(VkSamplerCreateInfo, flags), sizeof *ci - offsetof(VkSamplerCreateInfo, flags));
     rpc_send(VR_CREATE_SAMPLER, &b);
     free(b.p);
-    *out = (VkSampler) (uintptr_t) id;
+    *out = (VkSampler) id;
     return VK_SUCCESS;
 }
 
@@ -5686,7 +5707,7 @@ static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreate
     gs_keep(id, code, size);
     vf_keep(id, code, size);
     free(fix);
-    *out = (VkShaderModule) (uintptr_t) id;
+    *out = (VkShaderModule) id;
     return VK_SUCCESS;
 }
 
@@ -5835,14 +5856,14 @@ static VkResult VKAPI_CALL create_playout(VkDevice dv, const VkPipelineLayoutCre
     free(b.p);
     gs_note_layout(dv, id, ci);
     pl_note(id, ci);
-    *out = (VkPipelineLayout) (uintptr_t) id;
+    *out = (VkPipelineLayout) id;
     return VK_SUCCESS;
 }
 
 // パイプラインの置き場（受け手には送らない。中身は空のまま）
 static VkResult VKAPI_CALL create_pcache(VkDevice dv, const VkPipelineCacheCreateInfo *ci, const VkAllocationCallbacks *a, VkPipelineCache *out) {
     (void) dv; (void) ci; (void) a;
-    *out = (VkPipelineCache) (uintptr_t) new_id();
+    *out = (VkPipelineCache) new_id();
     return VK_SUCCESS;
 }
 static void VKAPI_CALL destroy_pcache(VkDevice dv, VkPipelineCache c, const VkAllocationCallbacks *a) { (void) dv; (void) c; (void) a; }
@@ -5894,7 +5915,7 @@ static VkResult VKAPI_CALL create_compute_pipelines(VkDevice dv, VkPipelineCache
         free(b.p);
         if (tmp) destroy_shader(dv, tmp, NULL);
         if (r != VK_SUCCESS) { say("compute pipeline を作れない (%d)", r); out[i] = VK_NULL_HANDLE; worst = r; continue; }
-        out[i] = (VkPipeline) (uintptr_t) id;
+        out[i] = (VkPipeline) id;
         struct wrinfo *u = calloc(1, sizeof *u);
         if (u) wri_stage(&ci[i].stage, u);
         wrm_put(id, u);
@@ -6173,10 +6194,10 @@ static void copy_dsets(VkDevice dv, uint32_t nc, const VkCopyDescriptorSet *c) {
             w[n] = (VkWriteDescriptorSet) { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c[i].dstSet, .dstBinding = c[i].dstBinding,
                                             .dstArrayElement = c[i].dstArrayElement + k, .descriptorCount = 1, .descriptorType = (VkDescriptorType) e->type };
             if (is_image_desc(e->type)) {
-                ii[n] = (VkDescriptorImageInfo) { (VkSampler) (uintptr_t) e->h0, (VkImageView) (uintptr_t) e->h1, (VkImageLayout) e->layout };
+                ii[n] = (VkDescriptorImageInfo) { (VkSampler) e->h0, (VkImageView) e->h1, (VkImageLayout) e->layout };
                 w[n].pImageInfo = &ii[n];
             } else if (is_texel_desc(e->type)) {
-                tv[n] = (VkBufferView) (uintptr_t) e->h0;
+                tv[n] = (VkBufferView) e->h0;
                 w[n].pTexelBufferView = &tv[n];
             } else if (is_buffer_desc(e->type)) {
                 if (!e->b) { missing++; continue; } // 消えたバッファ
@@ -8042,7 +8063,7 @@ static VkResult VKAPI_CALL create_qpool(VkDevice dv, const VkQueryPoolCreateInfo
     vr_u32(&b, ci->pipelineStatistics);
     rpc_send(VR_CREATE_QUERY_POOL, &b);
     free(b.p);
-    *out = (VkQueryPool) (uintptr_t) id;
+    *out = (VkQueryPool) id;
     return VK_SUCCESS;
 }
 

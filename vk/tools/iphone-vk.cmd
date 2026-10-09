@@ -5,7 +5,7 @@ rem このアプリにだけ効く（レジストリには入れない。ゲームなどほかのアプリには何も
 rem 日本語の Windows の cmd は Shift_JIS で読むので、このファイルも Shift_JIS で保存する
 rem iphone_icd.json と iphone_icd.dll は、この cmd と同じ場所に置く
 setlocal
-set "VK_ADD_DRIVER_FILES=%~dp0iphone_icd.json"
+set "VK_ADD_DRIVER_FILES=%~dp0iphone_icd.json;%~dp0x86\iphone_icd.json"
 rem Twitch のオーバーレイは iPhone の装置作りを止めるので、このアプリでは挟まない
 set DISABLE_TWITCH_VULKAN_OVERLAY=1
 rem OBS の画面取り込みの部品（OBS と Overwolf の 2 つ）は、OBS が起動している間 iPhone の装置で止まるので、挟まない

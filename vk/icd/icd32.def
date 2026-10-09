@@ -1,0 +1,6 @@
+; 32 ビットの Windows 用。ローダーは飾りの無い名前で探すので、stdcall の @数字 を外した名前で書き出す
+LIBRARY iphone_icd
+EXPORTS
+    vk_icdGetInstanceProcAddr = vk_icdGetInstanceProcAddr@8
+    vk_icdGetPhysicalDeviceProcAddr = vk_icdGetPhysicalDeviceProcAddr@8
+    vk_icdNegotiateLoaderICDInterfaceVersion = vk_icdNegotiateLoaderICDInterfaceVersion@4

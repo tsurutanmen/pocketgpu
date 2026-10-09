@@ -21,6 +21,14 @@ for w in $WHAT; do
             -lws2_32 -lgdi32 -luser32 -ldbghelp -lole32 -loleaut32 -lwindowscodecs -luuid -lwinmm
         echo "ドライバ：$OUT/iphone_icd.dll"
         ;;
+    icd32)
+        # 32 ビットのアプリ用（Unigine Heaven など）。$OUT/x86 に置く。stdcall の @数字 を外した名前で書き出すため icd32.def を渡す
+        mkdir -p "$OUT/x86"
+        zig cc -target x86-windows-gnu -O2 -g -Wall -Wextra -Wno-unused-parameter -shared $VKH icd/icd.c icd/icd32.def -o "$OUT/x86/iphone_icd.dll" \
+            -lws2_32 -lgdi32 -luser32 -ldbghelp -lole32 -loleaut32 -lwindowscodecs -luuid -lwinmm
+        cp -f "$OUT/iphone_icd.json" "$OUT/x86/" # 中身は同じ（横の iphone_icd.dll を指す）
+        echo "32 ビットのドライバ：$OUT/x86/iphone_icd.dll"
+        ;;
     server)
         $CC -Wall -Wextra -Wno-unused-parameter $VKH -DVR_SERVER_MAIN remote/server.c -o "$OUT/vk_server_new.exe" \
             -lws2_32 -lole32 -loleaut32 -lwindowscodecs -luuid -ldbghelp
