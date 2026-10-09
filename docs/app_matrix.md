@@ -26,6 +26,7 @@
 | Godot 4.7.2 の Forward+（机の上の PC 向けの描き方） | ✅ ふり：squash_the_creeps 174・volumetric_fog 148 | 未 | |
 | SuperTuxKart 1.5（Vulkan・本物のゲーム） | ✅ ふり 110 コマ/秒（RTX 直 107.9）・lighthouse を 4 台で自動走行 | ✅ **93.7 コマ/秒**（10/8・3005 コマ 32 秒） | 22 本の糸で command buffer を捨てる順のずれを直して落ちなくなった |
 | Veloren（ボクセルの RPG・wgpu の Vulkan） | ✅ ふり：最初のメニュー画面 49.7 コマ/秒 | ✅ メニュー 59.6 コマ/秒（10/8・60 で止まる） | 遊ぶところまでは試していない |
+| 0 A.D. 0.28.0（RTS・Vulkan の描き方・本物のゲーム） | ✅ ふり 55.4 コマ/秒 | ✅ 1280×720・Arcadia を 60 秒 | **56.7 コマ/秒**（10/9・読み込み込みの平均。ゲームが 60 前後に抑えている見込み）。影の中が真っ黒だった＝iPhone の GPU は D32_SFLOAT を滑らかに読めないのに、PCF が滑らかに読んでいた → 受け手が Apple のとき、深さを比べる sampler を 1 点で読む形に直した |
 
 ## DirectX 11（DXVK-macOS 1.10.3 と DXVK 3.1.1）
 | アプリ | 代役 | iPhone のふり | iPhone | 数字（iPhone） |
