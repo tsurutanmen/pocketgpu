@@ -2776,9 +2776,11 @@ static VkResult VKAPI_CALL create_device(VkPhysicalDevice pd, const VkDeviceCrea
     return VK_SUCCESS;
 }
 
+static void push_forget_dev(VkDevice dv);
 static void VKAPI_CALL destroy_device(VkDevice dv, const VkAllocationCallbacks *a) {
     (void) a;
     if (!dv) return;
+    push_forget_dev(dv);
     struct dev *d = (struct dev *) dv;
     vr_buf b = { 0 };
     vr_u64(&b, ID(d));
@@ -6490,6 +6492,14 @@ static void pl_forget(uint64_t id) {
 static SRWLOCK g_push_lock = SRWLOCK_INIT;
 static VkDescriptorPool g_push_pool;
 static VkDevice g_push_dev;
+
+// 装置を消したら、その装置の隠しの pool を忘れる。次の装置が同じ番地に作られると、消えた pool を使い回して
+// 受け手で set が取れず、そのあとの書き換えで落ちていた（CTS の push_descriptor を続けて流したときだけ）
+static void push_forget_dev(VkDevice dv) {
+    AcquireSRWLockExclusive(&g_push_lock);
+    if (g_push_dev == dv) { g_push_pool = VK_NULL_HANDLE; g_push_dev = VK_NULL_HANDLE; }
+    ReleaseSRWLockExclusive(&g_push_lock);
+}
 
 static VkResult VKAPI_CALL alloc_dsets(VkDevice dv, const VkDescriptorSetAllocateInfo *ai, VkDescriptorSet *out);
 static VkResult VKAPI_CALL create_dpool(VkDevice dv, const VkDescriptorPoolCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorPool *out);

@@ -3309,7 +3309,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     if (se && ve && ve->aux) idlist_add(&se->list, ve->aux); // 見え方の aux はもとの buffer
                 }
                 w.pTexelBufferView = tv;
-                if (!r->bad) vkUpdateDescriptorSets(d, 1, &w, 0, NULL);
+                if (!r->bad && w.dstSet) vkUpdateDescriptorSets(d, 1, &w, 0, NULL);
                 free(tv);
                 continue;
             }
@@ -3339,7 +3339,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     if (se && vid) idlist_add(&se->list, vid); // 見え方の aux はもとの画像のメモリ
                 }
                 w.pImageInfo = ii;
-                vkUpdateDescriptorSets(d, 1, &w, 0, NULL);
+                if (w.dstSet) vkUpdateDescriptorSets(d, 1, &w, 0, NULL); // 取れなかった set（layout が無いなど）には書かない（NVIDIA は落ちる）
                 free(ii);
                 continue;
             }
@@ -3369,7 +3369,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     bi[k].range = ubo ? 16384 : VK_WHOLE_SIZE; // uniform は仕様の下限の 16 KiB に収める
                 }
             w.pBufferInfo = bi;
-            vkUpdateDescriptorSets(d, 1, &w, 0, NULL);
+            if (w.dstSet) vkUpdateDescriptorSets(d, 1, &w, 0, NULL); // 取れなかった set（layout が無いなど）には書かない（NVIDIA は落ちる）
             free(bi);
         }
         return 1;
