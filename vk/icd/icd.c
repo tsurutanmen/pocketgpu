@@ -141,7 +141,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_DESTROY_BUFFER_VIEW] = "DESTROY_BUFFER_VIEW", [VR_GET_IMAGE_SUBRESOURCE_LAYOUT] = "GET_IMAGE_SUBRESOURCE_LAYOUT",
     [VR_READ_JPEG_PIPE] = "READ_JPEG_PIPE", [VR_GET_BUFFER_ADDRESS] = "GET_BUFFER_ADDRESS",
     [VR_PACKED] = "PACKED", [VR_CREATE_BUFFER_NR] = "CREATE_BUFFER_NR", [VR_CREATE_IMAGE_NR] = "CREATE_IMAGE_NR", [VR_GET_STATUS] = "GET_STATUS",
-    [VR_READ_H264] = "READ_H264",
+    [VR_READ_H264] = "READ_H264", [VR_GET_PROGRESS] = "GET_PROGRESS",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -990,8 +990,62 @@ struct mem {
     uint8_t *sent;     // 受け手が持っている中身の写し。書かれたページは、これと比べて変わった所だけ送る
     uint8_t *known;    // ページごとの「受け手の中身を知っている」印。知らないページは丸ごと送る
     struct lazy *lz;   // 読み戻しを遅らせている所（IPHONE_VK_LAZY_RB）
+    struct muse { uint64_t off, end, msg; } *use; // GPU が読む・書く範囲と、それを使う submit の番号（いちばん後の物）
+    uint32_t nuse, cuse;
     struct mem *prev, *next;
 };
+static SRWLOCK g_muse_lock = SRWLOCK_INIT;
+
+// m の off から len バイトを、submit の番号 msg が使う。重なる・隣り合う範囲とはまとめる。64 を超えたら 1 つにまとめる（多めに待つだけ）
+static void mu_note(struct mem *m, uint64_t off, uint64_t len, uint64_t msg) {
+    if (!m || !len) return;
+    uint64_t end = off + len;
+    AcquireSRWLockExclusive(&g_muse_lock);
+    uint32_t i;
+    for (i = 0; i < m->nuse; i++)
+        if (m->use[i].off <= end && off <= m->use[i].end) {
+            if (off < m->use[i].off) m->use[i].off = off;
+            if (end > m->use[i].end) m->use[i].end = end;
+            if (msg > m->use[i].msg) m->use[i].msg = msg;
+            break;
+        }
+    if (i == m->nuse) {
+        if (m->nuse == m->cuse) {
+            uint32_t cap = m->cuse ? m->cuse * 2 : 8;
+            void *q = realloc(m->use, cap * sizeof *m->use);
+            if (q) { m->use = q; m->cuse = cap; }
+        }
+        if (m->nuse < m->cuse) m->use[m->nuse++] = (struct muse) { off, end, msg };
+    }
+    if (m->nuse > 64) {
+        struct muse u = m->use[0];
+        for (uint32_t k = 1; k < m->nuse; k++) {
+            if (m->use[k].off < u.off) u.off = m->use[k].off;
+            if (m->use[k].end > u.end) u.end = m->use[k].end;
+            if (m->use[k].msg > u.msg) u.msg = m->use[k].msg;
+        }
+        m->use[0] = u;
+        m->nuse = 1;
+    }
+    ReleaseSRWLockExclusive(&g_muse_lock);
+}
+
+// m の off から len バイトを使う submit の番号のうち、いちばん後の物（使う物が無ければ 0）
+static uint64_t mu_upto(struct mem *m, uint64_t off, uint64_t len) {
+    uint64_t w = 0, end = off + len;
+    AcquireSRWLockShared(&g_muse_lock);
+    for (uint32_t i = 0; i < m->nuse; i++)
+        if (m->use[i].off < end && off < m->use[i].end && m->use[i].msg > w) w = m->use[i].msg;
+    ReleaseSRWLockShared(&g_muse_lock);
+    return w;
+}
+
+// IPHONE_VK_MEMW_UPTO=0 で付けない（受け手は前のやり方で、そのメモリを使う仕事を全部待つ）
+static int memw_upto_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("IPHONE_VK_MEMW_UPTO"); on = !(e && *e == '0'); }
+    return on;
+}
 
 struct buf { uint64_t size; VkMemoryRequirements req; struct mem *m; uint64_t memoff; uint64_t addr; }; // addr：受け手の GPU の中のアドレス
 
@@ -1010,7 +1064,7 @@ struct dev {
     size_t npb, cpb;
 };
 
-struct queue { VK_LOADER_DATA loader; struct dev *d; uint32_t fam, idx; };
+struct queue { VK_LOADER_DATA loader; struct dev *d; uint32_t fam, idx; uint64_t last_msg; }; // last_msg：このキューに最後に送った submit の番号
 
 struct dent { uint32_t binding, elem, type; struct buf *b; uint64_t off, range; uint64_t h0, h1; uint32_t layout; };
 // h0・h1：画像なら sampler と image view、texel buffer なら buffer view（descriptor の写しを、ふつうの書き込みに直すのに使う）
@@ -1115,7 +1169,7 @@ struct evact { struct event *e; int val; };
 static void ev_fire(struct cb *c);
 struct bctmp { VkBuffer b; VkDeviceMemory m; struct bctmp *next; };
 
-struct fence { uint64_t serial; struct queue *q; double last_poll; };
+struct fence { uint64_t serial; struct queue *q; double last_poll; uint64_t msg; }; // msg：その submit を送った VR_QUEUE_SUBMIT の番号
 
 // timeline semaphore は、どの値をどのキューの何番目の submit が知らせるかを覚える（待ちが済んだら引き取りに使う）
 typedef struct { uint64_t value, serial; struct queue *q; } sigrec;
@@ -1763,6 +1817,7 @@ static void send_write(vr_buf *b, struct mem *m, uint64_t off, uint64_t len) {
     vr_u64(b, ID(m));
     vr_u64(b, off);
     vr_bytes(b, m->shadow + off, (uint32_t) len);
+    if (memw_upto_on()) vr_u64(b, mu_upto(m, off, len)); // 古い受け手は読まない
     rpc_send(VR_MEM_WRITE, b);
     b->n = 0;
 }
@@ -1836,6 +1891,7 @@ static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
         vr_u64(&b, ID(m));
         vr_u64(&b, off);
         vr_bytes(&b, m->shadow + off, (uint32_t) len);
+        if (memw_upto_on()) vr_u64(&b, mu_upto(m, off, len));
         rpc_send(VR_MEM_WRITE, &b);
         i = j;
     }
@@ -1976,6 +2032,45 @@ static int pb_wait(struct dev *d, struct queue *q, uint64_t upto, double ms) {
     }
 }
 
+// ---- fence を本当の進み具合で答える ----
+static volatile uint64_t g_done_msg; // 受け手が「終わった」と答えた submit の番号
+static int g_engine_dxvk_any;        // アプリのエンジンが DXVK（版を問わない）
+
+static int real_fence(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("IPHONE_VK_REAL_FENCE");
+        on = e && *e ? *e == '1' : g_engine_dxvk_any;
+        on = on && (g_hw.caps & VR_CAP_PROGRESS);
+        if (on) say("fence は受け手の本当の進み具合で答える");
+    }
+    return on;
+}
+
+// 受け手に終わった submit の番号を聞く（GPU は待たない）
+static void progress_poll(void) {
+    vr_buf b = { 0 }, out = { 0 };
+    if (rpc_call(VR_GET_PROGRESS, &b, &out) == VK_SUCCESS && out.n >= 8) {
+        uint64_t v;
+        memcpy(&v, out.p, 8);
+        if (v > g_done_msg) g_done_msg = v;
+    }
+    free(b.p);
+    free(out.p);
+}
+
+// submit の番号 msg まで終わるのを待つ（錠を持たずに聞き直す）。ms 待っても終わらなければ 0
+static int progress_wait(uint64_t msg, double ms) {
+    if (!msg || g_done_msg >= msg) return 1;
+    double t0 = now_ms();
+    for (int n = 0;; n++) {
+        progress_poll();
+        if (g_done_msg >= msg || g_dead) return 1;
+        if (now_ms() - t0 >= ms) return 0;
+        if (n > 2) Sleep(1);
+    }
+}
+
 static void complete(struct dev *d, struct queue *q, uint64_t upto) {
     if (d->npb && !pb_wait(d, q, upto, 10000)) say("合図が 10 秒来ないので、待たずに進める");
     AcquireSRWLockExclusive(&d->lock);
@@ -2011,6 +2106,7 @@ static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *ci, const
         uint32_t major = (ai->engineVersion >> 22) & 0x7F; // VK_MAKE_VERSION の形
         say("アプリのエンジン：%s %u.%u.%u", ai->pEngineName, major, (ai->engineVersion >> 12) & 0x3FF, ai->engineVersion & 0xFFF);
         if (!strcmp(ai->pEngineName, "DXVK") && major >= 2) g_engine_dxvk2 = 1;
+        if (!strcmp(ai->pEngineName, "DXVK")) g_engine_dxvk_any = 1;
         if (!strcmp(ai->pEngineName, "mesa zink")) g_engine_zink = 1;
         if (!strcmp(ai->pEngineName, "vkd3d")) g_engine_vkd3d = 1;
     }
@@ -2802,6 +2898,11 @@ static void VKAPI_CALL free_memory(VkDevice dv, VkDeviceMemory mm, const VkAlloc
     d->npend = k;
     ReleaseSRWLockExclusive(&d->lock);
     lz_forget(m);
+    AcquireSRWLockExclusive(&g_muse_lock);
+    free(m->use);
+    m->use = NULL;
+    m->nuse = m->cuse = 0;
+    ReleaseSRWLockExclusive(&g_muse_lock);
     if (m->shadow) VirtualFree(m->shadow, 0, MEM_RELEASE);
     free(m->addrs);
     free(m->dirty);
@@ -4435,7 +4536,24 @@ struct swapchain {
     VkQueue q;
     uint64_t frames;
     double t0;
+    double fps_t;      // IPHONE_VK_FPS_LOG：直近の数え始めの時刻とコマ数
+    uint64_t fps_f;
 };
+
+// コマを 1 つ数える。IPHONE_VK_FPS_LOG=1 なら、5 秒ごとに直近のコマ数を記録に出す（読み込みの時間を混ぜずに速さを見る）
+static void sc_tick(struct swapchain *sc) {
+    sc->frames++;
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("IPHONE_VK_FPS_LOG"); on = e && *e == '1'; }
+    if (!on) return;
+    double t = now_ms();
+    if (!sc->fps_t) { sc->fps_t = t; sc->fps_f = sc->frames; return; }
+    if (t - sc->fps_t >= 5000) {
+        say("直近 %.1f 秒：%.1f コマ/秒", (t - sc->fps_t) / 1000, (sc->frames - sc->fps_f) * 1000.0 / (t - sc->fps_t));
+        sc->fps_t = t;
+        sc->fps_f = sc->frames;
+    }
+}
 
 static uint32_t pick_mem(uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t t = 0; t < g_hw.mem.memoryTypeCount; t++)
@@ -4840,7 +4958,7 @@ static DWORD WINAPI disp_thread(LPVOID arg) {
             g_stat.lat_n++;
             if (lat > g_stat.lat_max) g_stat.lat_max = lat;
         }
-        sc->frames++;
+        sc_tick(sc);
         dump_frame(sc, px);
     }
     free(px);
@@ -5027,7 +5145,7 @@ static DWORD WINAPI vdisp_thread(LPVOID arg) {
             g_stat.lat_n++;
             if (lat > g_stat.lat_max) g_stat.lat_max = lat;
         }
-        sc->frames++;
+        sc_tick(sc);
     }
     free(px);
     free(mine.p);
@@ -5206,7 +5324,7 @@ static VkResult blit(struct swapchain *sc, uint32_t j, uint64_t serial) {
     SetStretchBltMode(dc, COLORONCOLOR);
     StretchDIBits(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, 0, 0, (int) sc->w, (int) sc->h, px, &bmi, DIB_RGB_COLORS, SRCCOPY);
     ReleaseDC(sc->hwnd, dc);
-    sc->frames++;
+    sc_tick(sc);
     dump_frame(sc, px);
     // 窓の大きさが変わったら、作り直してもらう
     if (ask_resize(sc, &rc)) return VK_SUBOPTIMAL_KHR;
@@ -7567,6 +7685,16 @@ static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *f
             }
         }
     }
+    if (known && real_fence()) {
+        // 受け手の本当の進み具合で待つ（どれか 1 つなら、いちばん早く終わる物＝番号のいちばん小さい物を待てばよい）
+        double ms = timeout >= 0x7fffffffffffffffull ? 1e300 : timeout / 1e6;
+        uint64_t need = all ? 0 : UINT64_MAX;
+        for (uint32_t i = 0; i < n; i++) {
+            uint64_t m = ((struct fence *) fs[i])->msg;
+            if (all ? m > need : m < need) need = m;
+        }
+        if (!progress_wait(need, ms)) return VK_TIMEOUT;
+    }
     if (known) {
         for (uint32_t i = 0; i < n; i++) complete((struct dev *) dv, ((struct fence *) fs[i])->q, ((struct fence *) fs[i])->serial);
         ((struct dev *) dv)->skipped_wait = 1;
@@ -7609,6 +7737,10 @@ static VkResult VKAPI_CALL fence_status(VkDevice dv, VkFence fh) {
     if (fc->q) {
         struct dev *d = (struct dev *) dv;
         if (d->npb && !pb_wait(d, fc->q, fc->serial, 0)) return VK_NOT_READY;
+        if (real_fence() && fc->msg > g_done_msg) {
+            progress_poll();
+            if (fc->msg > g_done_msg) return VK_NOT_READY;
+        }
         // submit に付けた fence は「終わった」と答える（版 3 の待ち方）
         complete((struct dev *) dv, fc->q, fc->serial);
         ((struct dev *) dv)->skipped_wait = 1;
@@ -7835,6 +7967,7 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
         }
     }
     uint32_t per = tlw ? 1 : 8;
+    uint64_t last_msg = 0;
     for (uint32_t i = 0; i < n; i++)
         for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
             struct cb *c = (struct cb *) si[i].pCommandBuffers[j];
@@ -7920,12 +8053,15 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
         vr_u64(&b, at + per >= n ? ID(f) : 0);
         rpc_send(VR_QUEUE_SUBMIT, &b);
         free(b.p);
+        last_msg = g_submit_msgs;
         {
             uint64_t m = g_submit_msgs; // いま送った submit の番号（d->lock を持っているので、同じ装置の submit とは混ざらない）
             for (uint32_t i = at; i < at + k; i++)
                 for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
                     struct cb *c = (struct cb *) si[i].pCommandBuffers[j];
                     for (size_t x = 0; x < c->nqw; x++) qpv_wrote(c->qw[x].qp, c->qw[x].first, c->qw[x].n, m);
+                    for (size_t x = 0; x < c->nrd; x++) mu_note(c->rd[x].m, c->rd[x].off, c->rd[x].len, m);
+                    for (size_t x = 0; x < c->nr; x++) mu_note(c->r[x].m, c->r[x].off, c->r[x].len, m);
                 }
         }
         if (n == 0) break;
@@ -7934,12 +8070,14 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
     ReleaseSRWLockExclusive(&d->lock);
     for (size_t i = 0; i < nfr0; i++) { free(fr0[i].w); free(fr0[i].cbs); }
     free(fr0);
-    if (f) { ((struct fence *) f)->serial = serial; ((struct fence *) f)->q = q; }
+    if (f) { ((struct fence *) f)->serial = serial; ((struct fence *) f)->q = q; ((struct fence *) f)->msg = last_msg; }
+    if (last_msg) q->last_msg = last_msg;
     return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
 static VkResult VKAPI_CALL queue_wait_idle(VkQueue qh) {
     struct queue *q = (struct queue *) qh;
+    if (real_fence()) progress_wait(q->last_msg, 1e300);
     complete(q->d, q, q->d->serial);
     q->d->skipped_wait = 1;
     g_stat.skipped++;
@@ -7954,6 +8092,7 @@ static VkResult VKAPI_CALL queue_wait_idle(VkQueue qh) {
 
 static VkResult VKAPI_CALL device_wait_idle(VkDevice dv) {
     struct dev *d = (struct dev *) dv;
+    if (real_fence()) progress_wait(g_submit_msgs, 1e300);
     complete(d, NULL, d->serial);
     d->skipped_wait = 1;
     g_stat.skipped++;

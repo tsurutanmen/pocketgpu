@@ -421,6 +421,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
         g_nulldesc_gpu = r2.nullDescriptor == VK_TRUE && !like_ios();
     }
     caps |= VR_CAP_NULL_DESC;
+    caps |= VR_CAP_PROGRESS; // 終わった submit の番号を、GPU を待たずに答える
     caps |= VR_CAP_DESC_FLAGS; // binding の flags と set ごとの数を読む（vkd3d-proton）
     // 調べ用：VKR_CAPS=数 で名乗る印を絞る（古い受け手のふりをする）
     const char *mask = getenv("VKR_CAPS");
@@ -588,7 +589,7 @@ static void sleep_ms(int ms) {
 }
 
 // 1 つの接続の間に、どこに時間がかかったか
-static struct { double wait_ms, record_ms, submit_ms, paused_ms; uint64_t waits, records, submits; uint64_t wait_by_op[64]; } g_st;
+static struct { double wait_ms, record_ms, submit_ms, paused_ms; uint64_t waits, records, submits; uint64_t wait_by_op[64]; double wait_ms_by_op[64]; } g_st;
 static uint32_t g_cur_op; // いま処理している命令（どの命令で GPU を待ったかを数える）
 // アプリの画面のファンを回すための数。アプリが少しずつ読んで、増えた速さで回す
 static volatile uint64_t g_ops_total;
@@ -717,9 +718,10 @@ static void drain_upto(int k) {
     if (nf) {
         double t0 = t_ms();
         VkResult r = vkWaitForFences(g_dev, nf, fs, VK_TRUE, UINT64_MAX);
-        g_st.wait_ms += t_ms() - t0;
+        double dt = t_ms() - t0;
+        g_st.wait_ms += dt;
         g_st.waits++;
-        if (g_cur_op < 64) g_st.wait_by_op[g_cur_op]++;
+        if (g_cur_op < 64) { g_st.wait_by_op[g_cur_op]++; g_st.wait_ms_by_op[g_cur_op] += dt; }
         if (r != VK_SUCCESS) {
             vlog("出した仕事を待てない (%d)", r);
             if (r < 0) g_err = r;
@@ -2847,11 +2849,19 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     }
     case VR_MEM_WRITE: {
         uint64_t mid = vr_ru64(r);
-        drain_upto(last_with_mem(mid));
-        ent *e = find(mid);
         uint64_t off = vr_ru64(r);
         uint32_t n;
         const void *d = vr_rbytes(r, &n);
+        // ドライバが「書く範囲を GPU が使う submit の番号」を付けていれば、そこまでだけ待つ（付いていなければ、そのメモリを使う仕事を全部待つ）
+        int k = last_with_mem(mid);
+        if (r->at + 8 <= r->n) {
+            uint64_t upto = vr_ru64(r);
+            int u = -1;
+            for (int i = 0; i < g_nfl; i++) if (g_fl[i].msg <= upto) u = i;
+            if (u < k) k = u;
+        }
+        drain_upto(k);
+        ent *e = find(mid);
         if (e && e->map && d && off <= e->size && n <= e->size - off) {
             memcpy((uint8_t *) e->map + off, d, n);
             if (e->last) memcpy(e->last + off, d, n);
@@ -3748,6 +3758,18 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         vkSignalSemaphore(d, &si);
         return 1;
     }
+    case VR_GET_PROGRESS: {
+        // 終わった所までの仕事を一覧から外し（もう終わっているので待たない）、終わった submit の番号を返す
+        int k = -1;
+        for (int i = 0; i < g_nfl; i++) {
+            if (vkGetFenceStatus(g_dev, g_fl[i].f) != VK_SUCCESS) break;
+            k = i;
+        }
+        if (k >= 0) drain_upto(k);
+        grave_sweep(VK_NULL_HANDLE);
+        vr_u64(&g_out, g_nfl ? (g_fl[0].msg ? g_fl[0].msg - 1 : 0) : g_submit_msgs);
+        return reply(s, g_err);
+    }
     case VR_GET_LINK: {
         // USB の口からだけ答える（インターネット共有の口から来た相手には、合言葉を教えない）
         struct in_addr ia = { 0 };
@@ -4459,9 +4481,9 @@ static void serve_client(vr_sock c) {
              (unsigned long long) g_st.waits, g_st.wait_ms, g_st.paused_ms);
     if (g_st.waits) {
         char line[400];
-        int at = snprintf(line, sizeof line, "GPU を待った命令（命令の番号:回数）");
-        for (int i = 0; i < 64 && at < (int) sizeof line - 16; i++)
-            if (g_st.wait_by_op[i]) at += snprintf(line + at, sizeof line - at, " %d:%llu", i, (unsigned long long) g_st.wait_by_op[i]);
+        int at = snprintf(line, sizeof line, "GPU を待った命令（命令の番号:回数:ms）");
+        for (int i = 0; i < 64 && at < (int) sizeof line - 24; i++)
+            if (g_st.wait_by_op[i]) at += snprintf(line + at, sizeof line - at, " %d:%llu:%.0f", i, (unsigned long long) g_st.wait_by_op[i], g_st.wait_ms_by_op[i]);
         vlog("%s", line);
     }
     memset(&g_st, 0, sizeof g_st);

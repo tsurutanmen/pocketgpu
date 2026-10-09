@@ -31,6 +31,7 @@
 #define VR_CAP_NULL_DESC 2048u      // 空（VK_NULL_HANDLE）の descriptor と頂点バッファを受ける。GPU が持たなければ受け手が代わりの物を使う
 #define VR_CAP_D3D 512u              // DirectX（DXVK）の土台：VR_CREATE_BUFFER_VIEW・texel buffer の descriptor・VR_GET_IMAGE_SUBRESOURCE_LAYOUT
 #define VR_CAP_DESC_FLAGS 524288u   // VR_CREATE_DSL の末尾の binding ごとの flags と、VR_ALLOC_DESCRIPTOR_SETS の末尾の set ごとの数（variable descriptor count）を読む
+#define VR_CAP_PROGRESS 1048576u    // VR_GET_PROGRESS：GPU を待たずに、終わった submit の番号を返す（ドライバが fence を本当の進み具合で答える）
 #define VR_CAP_H264 262144u          // VR_READ_H264：窓に出すコマを受け手が H.264 に縮めて、1 コマずつ返す（iPhone は VideoToolbox、PC の代役は Media Foundation）
 // VR_READ_H264 の印
 #define VR_H264_KEY 1u               // このコマをキーフレーム（IDR）にする。ドライバがほどき直すとき
@@ -126,6 +127,7 @@ enum vr_op {
     VR_GET_LINK,                 // [同期] → 使えるか（u32）・合言葉（16 バイト）・住所（u32・IPv4 をネットワークの並びで）・ポート（u32）。USB の口からだけ答える（VR_CAP_LINK）
     VR_READ_H264,                // [同期] memory・offset・幅・高さ・行の長さ・BGRA か・印（VR_H264_*）・kbps・コマ/秒・キーフレームの間隔（コマ）・
                                  // 流れの番号（u64）・札（u64）→ 頭（VR_H264_HEAD）と 1 コマぶんの H.264。先送りの最初は空（VR_CAP_H264）
+    VR_GET_PROGRESS,             // [同期] → 終わった VR_QUEUE_SUBMIT の番号（u64。その番号までの submit は全部終わっている）。GPU は待たない（VR_CAP_PROGRESS）
     VR_OP_COUNT
 };
 
