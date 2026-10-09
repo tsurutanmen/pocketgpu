@@ -279,10 +279,14 @@ static void put_msg_locked(uint32_t op, const vr_buf *b) {
     vr_put(&g_q, b->p, b->n);
 }
 
+// 送った VR_QUEUE_SUBMIT の数。受け手も届いた順に数えるので、何番目の submit かで話が通じる
+static uint64_t g_submit_msgs;
+
 // 送りっぱなし（ためておいて、返事の要る命令や submit のときにまとめて送る）
 static void rpc_send(uint32_t op, vr_buf *b) {
     AcquireSRWLockExclusive(&g_lock);
     if (op < VR_OP_COUNT) g_stat.sends[op]++;
+    if (op == VR_QUEUE_SUBMIT) g_submit_msgs++;
     put_msg_locked(op, b);
     if (g_q.n > (8u << 20)) flush_locked();
     ReleaseSRWLockExclusive(&g_lock);
@@ -613,6 +617,7 @@ static vr_sock link_connect(const char *boot, char *host, size_t nhost, char *po
 }
 
 static int connect_locked(void) {
+    g_submit_msgs = 0; // 受け手もつながるたびに数え直す
     WSADATA w;
     WSAStartup(MAKEWORD(2, 2), &w);
     // IPHONE_VK：「usb」か「usb:番号」なら USB の iPhone に直接。「link」ならインターネット共有の口。それ以外は host:port
@@ -1087,8 +1092,22 @@ struct cb {
     uint64_t bpl[64];         // つないだ pipeline の番号（書く場所かどうかを、その pipeline のシェーダーで決める）
     int nbpl, bpl_over;       // 64 を超えたら、全部のシェーダーで決める前のやり方に戻す
     int qcopy_nowait;         // WAIT を付けない query の結果の写しがある（前の仕事が終わっている前提で読む）
+    struct qwr { uint64_t qp; uint32_t first, n; } *qw; // query を書いた（始め・終わり・時刻・reset した）範囲
+    size_t nqw, cqw;
 };
 struct pushheld { struct dsl *l; VkDescriptorSet s; };
+static void qpv_wrote(uint64_t id, uint32_t first, uint32_t n, uint64_t m);
+static void cb_note_q(struct cb *c, uint64_t qp, uint32_t first, uint32_t n) {
+    if (c->nqw && c->qw[c->nqw - 1].qp == qp && c->qw[c->nqw - 1].first + c->qw[c->nqw - 1].n == first) { c->qw[c->nqw - 1].n += n; return; }
+    if (c->nqw == c->cqw) {
+        size_t cap = c->cqw ? c->cqw * 2 : 16;
+        void *p = realloc(c->qw, cap * sizeof *c->qw);
+        if (!p) return;
+        c->qw = p;
+        c->cqw = cap;
+    }
+    c->qw[c->nqw++] = (struct qwr) { qp, first, n };
+}
 struct wrcand { struct buf *b; uint64_t off, len; uint32_t set, binding; int done; };
 static void push_release(struct cb *c);
 struct event;
@@ -6551,7 +6570,7 @@ static void bct_free(struct cb *c) {
     c->bct = NULL;
 }
 
-static void cb_clear(struct cb *c) { push_release(c); c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; c->nwc = 0; c->nbpl = 0; c->bpl_over = 0; c->qcopy_nowait = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
+static void cb_clear(struct cb *c) { push_release(c); c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; c->nwc = 0; c->nbpl = 0; c->bpl_over = 0; c->qcopy_nowait = 0; c->nqw = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
 
 static void cb_free(struct cb *c) { push_release(c); free(c->ph); free(c->wc); gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c->ev); free(c); }
 
@@ -6930,6 +6949,7 @@ static void VKAPI_CALL cmd_exec(VkCommandBuffer cbh, uint32_t n, const VkCommand
         for (int k = 0; k < s->nbpl; k++) cb_note_pipe(c, s->bpl[k]);
         if (s->bpl_over) c->bpl_over = 1;
         if (s->qcopy_nowait) c->qcopy_nowait = 1;
+        for (size_t k = 0; k < s->nqw; k++) cb_note_q(c, s->qw[k].qp, s->qw[k].first, s->qw[k].n);
     }
 }
 
@@ -7900,6 +7920,14 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
         vr_u64(&b, at + per >= n ? ID(f) : 0);
         rpc_send(VR_QUEUE_SUBMIT, &b);
         free(b.p);
+        {
+            uint64_t m = g_submit_msgs; // いま送った submit の番号（d->lock を持っているので、同じ装置の submit とは混ざらない）
+            for (uint32_t i = at; i < at + k; i++)
+                for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
+                    struct cb *c = (struct cb *) si[i].pCommandBuffers[j];
+                    for (size_t x = 0; x < c->nqw; x++) qpv_wrote(c->qw[x].qp, c->qw[x].first, c->qw[x].n, m);
+                }
+        }
         if (n == 0) break;
     }
     rpc_flush();
@@ -8046,17 +8074,47 @@ static uint64_t VKAPI_CALL get_memory_capture_address(VkDevice dv, const VkDevic
 // ---- query（GPU に数えさせる：遮蔽・時刻） ----
 // 受け手の VR_CREATE_QUERY_POOL などに送る。結果は受け手が出した仕事を全部待ってから読む
 // query pool ごとの、1 つの query の値の数（結果を取るときに、終わっていない query の欄を書かないために使う）。0 は分からない
-static struct { uint64_t id; int nv; } g_qpv[256];
+static struct { uint64_t id; int nv; uint32_t count; uint64_t *wmsg; int occ; } g_qpv[256]; // occ：1＝遮蔽・2＝パイプラインの統計 // wmsg：query ごとに書いた submit の番号
 static SRWLOCK g_qpv_lock = SRWLOCK_INIT;
 
-static void qpv_put(uint64_t id, int nv) {
+static void qpv_put(uint64_t id, int nv, uint32_t count, int occ) {
     AcquireSRWLockExclusive(&g_qpv_lock);
     int k = -1;
     for (int i = 0; i < 256 && k < 0; i++) if (!g_qpv[i].id) k = i;
     if (k < 0) k = (int) (id % 256); // 満ちていれば押し出す（押し出された pool は前のやり方に戻るだけ）
     g_qpv[k].id = id;
     g_qpv[k].nv = nv;
+    g_qpv[k].count = count;
+    g_qpv[k].occ = occ;
+    free(g_qpv[k].wmsg);
+    g_qpv[k].wmsg = calloc(count ? count : 1, sizeof *g_qpv[k].wmsg);
     ReleaseSRWLockExclusive(&g_qpv_lock);
+}
+
+// submit の番号 m で、pool id の first から n 個の query を書いた
+static void qpv_wrote(uint64_t id, uint32_t first, uint32_t n, uint64_t m) {
+    AcquireSRWLockExclusive(&g_qpv_lock);
+    for (int i = 0; i < 256; i++)
+        if (g_qpv[i].id == id) {
+            for (uint32_t q = first; q < first + n && q < g_qpv[i].count && g_qpv[i].wmsg; q++) g_qpv[i].wmsg[q] = m;
+            break;
+        }
+    ReleaseSRWLockExclusive(&g_qpv_lock);
+}
+
+// pool id の first から n 個の query を、最後に書いた submit の番号（覚えていない pool なら UINT64_MAX＝全部待ってもらう）
+static uint64_t qpv_wmsg(uint64_t id, uint32_t first, uint32_t n) {
+    uint64_t w = UINT64_MAX;
+    AcquireSRWLockShared(&g_qpv_lock);
+    for (int i = 0; i < 256; i++)
+        if (g_qpv[i].id == id) {
+            if (!g_qpv[i].wmsg) break;
+            w = 0;
+            for (uint32_t q = first; q < first + n && q < g_qpv[i].count; q++) if (g_qpv[i].wmsg[q] > w) w = g_qpv[i].wmsg[q];
+            break;
+        }
+    ReleaseSRWLockShared(&g_qpv_lock);
+    return w;
 }
 
 static int qpv_get(uint64_t id, int del) {
@@ -8065,7 +8123,7 @@ static int qpv_get(uint64_t id, int del) {
     for (int i = 0; i < 256; i++)
         if (g_qpv[i].id == id) {
             nv = g_qpv[i].nv;
-            if (del) g_qpv[i].id = 0;
+            if (del) { g_qpv[i].id = 0; free(g_qpv[i].wmsg); g_qpv[i].wmsg = NULL; }
             break;
         }
     ReleaseSRWLockExclusive(&g_qpv_lock);
@@ -8079,7 +8137,8 @@ static VkResult VKAPI_CALL create_qpool(VkDevice dv, const VkQueryPoolCreateInfo
     int nv = 0;
     if (ci->queryType == VK_QUERY_TYPE_OCCLUSION || ci->queryType == VK_QUERY_TYPE_TIMESTAMP) nv = 1;
     else if (ci->queryType == VK_QUERY_TYPE_PIPELINE_STATISTICS) nv = __builtin_popcount(ci->pipelineStatistics);
-    if (nv > 0) qpv_put(id, nv);
+    if (nv > 0) qpv_put(id, nv, ci->queryCount, ci->queryType == VK_QUERY_TYPE_OCCLUSION ? 1 : ci->queryType == VK_QUERY_TYPE_PIPELINE_STATISTICS ? 2 : 0);
+    if (getenv("IPHONE_VK_QUERY_LOG")) say("query pool %llu：種類 %d・%u 個・統計 0x%x", (unsigned long long) id, ci->queryType, ci->queryCount, ci->pipelineStatistics);
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, id);
@@ -8103,9 +8162,55 @@ static void VKAPI_CALL destroy_qpool(VkDevice dv, VkQueryPool qp, const VkAlloca
     free(b.p);
 }
 
+// IPHONE_VK_OCC_VISIBLE=1：遮蔽の query に、往復せず「見えている（大きな数）」と答える。
+// 毎コマその場で結果を待つゲーム（Unigine Heaven など）で、CPU と GPU が交互にしか動けなくなるのを避ける。
+// 隠れた物も描くので GPU の仕事は増えるが、絵は変わらない。数を正しく数える試験（CTS）は落ちるので既定は切る
+// パイプラインの統計の query は、往復せず「0・数え終わった」と答える（受け手が Apple の GPU なら既定で。IPHONE_VK_PSTAT_LOCAL=1 で必ず・0 でしない）。
+// iPhone の MoltenVK は統計を正しく数えられない。一方で Unigine Heaven は画面の数字のために毎コマ結果が出るまで読み直し、
+// そのたびに USB を往復していた（ふりで 1 コマに 80 回）
+// 返り値：1＝遮蔽で「見えている」と答える・2＝統計で 0 と答える・0＝受け手に聞く
+static int q_local(uint64_t qp) {
+    static int occ_on = -1, ps_on = -1;
+    if (occ_on < 0) { const char *e = getenv("IPHONE_VK_OCC_VISIBLE"); occ_on = e && *e == '1'; if (occ_on) say("遮蔽の query は往復せず「見えている」と答える"); }
+    if (ps_on < 0) {
+        const char *e = getenv("IPHONE_VK_PSTAT_LOCAL");
+        ps_on = e && *e ? *e == '1' : g_hw.props.vendorID == 0x106b;
+    }
+    int kind = 0;
+    AcquireSRWLockShared(&g_qpv_lock);
+    for (int i = 0; i < 256; i++) if (g_qpv[i].id == qp) { kind = g_qpv[i].occ; break; }
+    ReleaseSRWLockShared(&g_qpv_lock);
+    if (kind == 1 && occ_on) return 1;
+    if (kind == 2 && ps_on) return 2;
+    return 0;
+}
+
 static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32_t first, uint32_t n, size_t size, void *data,
                                              VkDeviceSize stride, VkQueryResultFlags flags) {
     vr_buf b = { 0 }, out = { 0 };
+    if (getenv("IPHONE_VK_QUERY_LOG")) {
+        static uint64_t last;
+        static unsigned cnt;
+        if (ID(qp) != last || ++cnt % 5000 == 0) say("結果を読む pool %llu・%u から %u 個・flags 0x%x（%u 回目）", (unsigned long long) ID(qp), first, n, flags, cnt);
+        last = ID(qp);
+    }
+    int local = q_local(ID(qp));
+    if (local) {
+        size_t es = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
+        int want_av = (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) != 0;
+        int nv = qpv_get(ID(qp), 0);
+        if (nv < 1) nv = 1;
+        for (uint32_t i = 0; i < n; i++) {
+            uint64_t at = (uint64_t) i * stride;
+            if (at + (uint64_t) (nv + want_av) * es > size) break;
+            uint8_t *dst = (uint8_t *) data + at;
+            uint64_t v = local == 1 ? (1u << 20) : 0, one = 1;
+            for (int k = 0; k < nv; k++) memcpy(dst + (size_t) k * es, &v, es);
+            if (want_av) memcpy(dst + (size_t) nv * es, &one, es);
+        }
+        g_stat.skipped++;
+        return VK_SUCCESS;
+    }
     // 待たず（WAIT 無し）途中の値も要らない（PARTIAL 無し）なら、終わっていない query の欄は書いてはいけない（Vulkan の決まり）。
     // 前は受け手が 0 で埋めた並びをそのまま写し、アプリの欄を 0 で上書きしていた（CTS の query・timestamp の 65 件）。
     // 受け手には「終わったか」も付けて頼み、終わった query の値だけを写す。「終わったか」はアプリが頼んでいれば書く
@@ -8121,6 +8226,11 @@ static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32
         vr_u64(&b, tsize);
         vr_u64(&b, ts);
         vr_u32(&b, flags | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        {
+            static int qw = -1;
+            if (qw < 0) { const char *e = getenv("IPHONE_VK_QUERY_UPTO"); qw = !(e && *e == '0'); }
+            vr_u64(&b, qw ? qpv_wmsg(ID(qp), first, n) : UINT64_MAX);
+        }
         VkResult r = rpc_call(VR_GET_QUERY_POOL_RESULTS, &b, &out);
         free(b.p);
         if (r >= 0 && out.p && out.n >= tsize)
@@ -8144,6 +8254,7 @@ static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32
     vr_u64(&b, size);
     vr_u64(&b, stride);
     vr_u32(&b, flags);
+    vr_u64(&b, qpv_wmsg(ID(qp), first, n));
     VkResult r = rpc_call(VR_GET_QUERY_POOL_RESULTS, &b, &out);
     free(b.p);
     if (r >= 0 && out.p) memcpy(data, out.p, out.n < size ? out.n : size);
@@ -8163,6 +8274,7 @@ static void VKAPI_CALL reset_qpool(VkDevice dv, VkQueryPool qp, uint32_t first, 
 
 static void VKAPI_CALL cmd_reset_qpool(VkCommandBuffer cbh, VkQueryPool qp, uint32_t first, uint32_t n) {
     struct cb *c = (struct cb *) cbh;
+    cb_note_q(c, ID(qp), first, n);
     vr_u32(&c->s, VR_CMD_RESET_QUERY_POOL);
     vr_u64(&c->s, ID(qp));
     vr_u32(&c->s, first);
@@ -8179,6 +8291,7 @@ static void VKAPI_CALL cmd_begin_query(VkCommandBuffer cbh, VkQueryPool qp, uint
 
 static void VKAPI_CALL cmd_end_query(VkCommandBuffer cbh, VkQueryPool qp, uint32_t q) {
     struct cb *c = (struct cb *) cbh;
+    cb_note_q(c, ID(qp), q, 1);
     vr_u32(&c->s, VR_CMD_END_QUERY);
     vr_u64(&c->s, ID(qp));
     vr_u32(&c->s, q);
@@ -8217,6 +8330,7 @@ static void VKAPI_CALL cmd_draw_xfb_count(VkCommandBuffer cbh, uint32_t ninst, u
 
 static void VKAPI_CALL cmd_write_timestamp(VkCommandBuffer cbh, VkPipelineStageFlagBits st, VkQueryPool qp, uint32_t q) {
     struct cb *c = (struct cb *) cbh;
+    cb_note_q(c, ID(qp), q, 1);
     vr_u32(&c->s, VR_CMD_WRITE_TIMESTAMP);
     vr_u32(&c->s, st);
     vr_u64(&c->s, ID(qp));

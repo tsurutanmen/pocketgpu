@@ -532,7 +532,7 @@ static VkDevice g_dev;
 typedef struct { VkSemaphore s; uint64_t v; } tlv;
 // tw・ts：timeline の値の待ちと知らせ（8 を超えたら tl_over を立て、止まっているかを調べずに前のやり方で待つ）
 typedef struct { VkFence f; int own; uint64_t cbs[64]; uint32_t ncb; uint64_t *snap; uint32_t nsnap;
-                 VkQueue q; tlv tw[8], ts[8]; uint8_t ntw, nts, tl_over; } inflight; // snap：調べ用、submit した時点の set
+                 VkQueue q; tlv tw[8], ts[8]; uint8_t ntw, nts, tl_over; uint64_t msg; } inflight; // msg：届いた VR_QUEUE_SUBMIT の番号 // snap：調べ用、submit した時点の set
 static inflight g_fl[256];
 static int g_nfl;
 static VkResult g_err;          // GPU を失ったなど。次に返事をするときに伝える
@@ -738,7 +738,49 @@ static void drain_upto(int k) {
     g_nfl = w;
 }
 
-static void drain(void) { drain_upto(g_nfl - 1); }
+static uint64_t g_submit_msgs; // このつなぎで届いた VR_QUEUE_SUBMIT の数
+
+// 消すのを遅らせた物。msg：消すと言われた時点で届いていた submit の数（そこまでが全部終わったら消してよい）
+typedef struct { uint64_t msg; VkDevice d; uint64_t h; uint32_t kind; } grave;
+static grave *g_grave;
+static size_t g_ngrave, g_cgrave;
+
+static void grave_destroy(const grave *gv) {
+    if (gv->kind == K_FB) vkDestroyFramebuffer(gv->d, (VkFramebuffer) (uintptr_t) gv->h, NULL);
+    else vkDestroyImageView(gv->d, (VkImageView) (uintptr_t) gv->h, NULL);
+}
+
+static int grave_add(VkDevice d, uint64_t h, uint32_t kind) {
+    if (g_ngrave == g_cgrave) {
+        size_t cap = g_cgrave ? g_cgrave * 2 : 64;
+        grave *q = realloc(g_grave, cap * sizeof *q);
+        if (!q) return 0;
+        g_grave = q;
+        g_cgrave = cap;
+    }
+    g_grave[g_ngrave++] = (grave) { g_submit_msgs, d, h, kind };
+    return 1;
+}
+
+// 終わった submit の番号（その番号までの submit は全部終わっている）
+static uint64_t done_msg(void) {
+    for (int i = 0; i < g_nfl; i++)
+        if (vkGetFenceStatus(g_dev, g_fl[i].f) != VK_SUCCESS) return g_fl[i].msg ? g_fl[i].msg - 1 : 0;
+    return g_submit_msgs;
+}
+
+// 消してよくなった物を消す。dev を渡せば、その装置の物を全部消す（装置を消す前）
+static void grave_sweep(VkDevice dev) {
+    if (!g_ngrave) return;
+    uint64_t done = dev ? 0 : done_msg();
+    size_t w = 0;
+    for (size_t i = 0; i < g_ngrave; i++)
+        if ((dev && g_grave[i].d == dev) || (!dev && g_grave[i].msg <= done)) grave_destroy(&g_grave[i]);
+        else g_grave[w++] = g_grave[i];
+    g_ngrave = w;
+}
+
+static void drain(void) { drain_upto(g_nfl - 1); grave_sweep(VK_NULL_HANDLE); }
 
 // 待たれている timeline の値のうち、まだ届いていない物を受け手が合図する（つなぎが切れたあとだけ使う）
 static int unblock_waits(void) {
@@ -897,6 +939,7 @@ static void helpers_free(VkDevice dev) {
 // 装置 dev の物を全部消してから dev を消し、表からも外す。last なら持ち主の分からない物もここで消す
 static void dev_free(VkDevice dev, int last) {
     vkDeviceWaitIdle(dev);
+    grave_sweep(dev);
     uint64_t me = (uint64_t) (uintptr_t) dev;
     static const int order[] = { K_PIPELINE, K_FB, K_RPASS, K_PLAYOUT, K_SHADER, K_DPOOL, K_DSL, K_SAMPLER, K_CPOOL, K_FENCE, K_SEM,
                                  K_QPOOL, K_VIEW, K_BVIEW, K_IMAGE, K_BUFFER, K_MEMORY };
@@ -948,6 +991,7 @@ static void dev_free(VkDevice dev, int last) {
 
 static void cleanup(void) {
     drain();
+    g_submit_msgs = 0;
     // 合図を待ったまま残った仕事は、待たれている値を受け手が合図して流してから待つ
     for (int round = 0; g_nfl && g_dev && round < 8; round++) {
         int n = unblock_waits();
@@ -2457,10 +2501,12 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_DESTROY_DESCRIPTOR_POOL: case VR_FREE_MEMORY: case VR_DESTROY_BUFFER: case VR_DESTROY_PIPELINE:
     case VR_DESTROY_PIPELINE_LAYOUT: case VR_DESTROY_SHADER_MODULE: case VR_DESTROY_DSL: case VR_DESTROY_FENCE:
     case VR_DESTROY_SEMAPHORE: case VR_DESTROY_DEVICE: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE:
-    case VR_DESTROY_IMAGE: case VR_DESTROY_IMAGE_VIEW: case VR_DESTROY_RENDER_PASS: case VR_DESTROY_FRAMEBUFFER:
+    // （VR_DESTROY_IMAGE_VIEW と VR_DESTROY_FRAMEBUFFER は待たずに、消すのを遅らせる）
+    case VR_DESTROY_IMAGE: case VR_DESTROY_RENDER_PASS:
     case VR_DESTROY_SAMPLER: case VR_DESTROY_BUFFER_VIEW:
     // query の結果は、出した仕事が全部終わってから読む（ドライバは fence を待たずに「終わった」と答えているので）
-    case VR_DESTROY_QUERY_POOL: case VR_GET_QUERY_POOL_RESULTS: case VR_RESET_QUERY_POOL:
+    // （VR_GET_QUERY_POOL_RESULTS は、その query を書いた submit までだけ待つ。中で待つ）
+    case VR_DESTROY_QUERY_POOL: case VR_RESET_QUERY_POOL:
         drain();
         break;
     default:
@@ -3481,6 +3527,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         return 1;
     }
     case VR_QUEUE_SUBMIT: {
+        // 届いた順の番号（ドライバも送った順に数える。query の結果を読むとき「何番の submit まで待つか」に使う）
+        grave_sweep(VK_NULL_HANDLE);
+        uint64_t my_msg = ++g_submit_msgs;
         VkQueue q = (VkQueue) (uintptr_t) H(vr_ru64(r));
         uint32_t ns = vr_ru32(r);
         if (ns > r->n - r->at) return 1; // 1 つの submit は 12 バイト以上あるので、残りより多いことはない
@@ -3627,6 +3676,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             e->own = own;
             e->ncb = ncid;
             e->q = q;
+            e->msg = my_msg;
             e->ntw = fntw;
             e->nts = fnts;
             e->tl_over = fover;
@@ -3765,7 +3815,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkDevice d = DEV(vr_ru64(r));
         uint64_t id = vr_ru64(r);
         ent *e = find(id);
-        if (e) {
+        if (e && (op == VR_DESTROY_FRAMEBUFFER || op == VR_DESTROY_IMAGE_VIEW) && g_nfl && grave_add(d, e->h, op == VR_DESTROY_FRAMEBUFFER ? K_FB : K_VIEW)) {
+            if (g_ngrave > 4096) drain(); // たまりすぎたら待って消す
+            idlist_free(&e->list);
+            del(id);
+        } else if (e) {
             if (op == VR_DESTROY_IMAGE) vkDestroyImage(d, (VkImage) e->h, NULL);
             else if (op == VR_DESTROY_IMAGE_VIEW) vkDestroyImageView(d, (VkImageView) e->h, NULL);
             else if (op == VR_DESTROY_RENDER_PASS) vkDestroyRenderPass(d, (VkRenderPass) e->h, NULL);
@@ -4283,6 +4337,15 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t first = vr_ru32(r), n = vr_ru32(r);
         uint64_t size = vr_ru64(r), stride = vr_ru64(r);
         uint32_t flags = vr_ru32(r);
+        // ドライバが付けた「その query を書いた submit の番号」までだけ待つ。付いていなければ（古いドライバ）出した仕事を全部待つ
+        uint64_t upto = r->at + 8 <= r->n ? vr_ru64(r) : UINT64_MAX;
+        if (upto == UINT64_MAX) drain();
+        else {
+            int k = -1;
+            for (int i = 0; i < g_nfl; i++) if (g_fl[i].msg <= upto) k = i;
+            drain_upto(k);
+        }
+        if (g_err != VK_SUCCESS) return reply(s, g_err);
         if (!qp || !size || size > (64u << 20) || (uint64_t) n * stride > size) return reply(s, VK_ERROR_INITIALIZATION_FAILED);
         vr_reserve(&g_out, (size_t) size);
         memset(g_out.p, 0, (size_t) size);
