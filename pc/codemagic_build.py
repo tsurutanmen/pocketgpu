@@ -9,6 +9,7 @@ APP = "6ac774f493969192923e8eaa"   # iphone-rpc
 WORKFLOW = "ios-app"               # codemagic.yaml の workflows の名前
 TOKEN_FILE = r"D:\iphone-rpc\secrets\codemagic_token.txt"
 IPA_DIR = r"D:\iphone-rpc\ipa"
+IPA_URL_FILE = r"D:\iphone-rpc\secrets\ipa_url_base.txt"
 
 
 def token():
@@ -57,7 +58,9 @@ def fetch(b):
     name = f"RpcServer-{ver}.ipa"
     shutil.move(tmp, os.path.join(d, name))
     shutil.copy(os.path.join(d, name), os.path.join(IPA_DIR, "serve", name))
-    print(f"{ver}（{num}）を {d} と配り口に置いた：http://127.0.0.1:8766/{name}")
+    # 配り口の住所はリポジトリに書かない。環境変数 IPA_URL_BASE か、secrets の ipa_url_base.txt から読む
+    base = os.environ.get("IPA_URL_BASE") or (open(IPA_URL_FILE, encoding="utf-8").read().strip() if os.path.exists(IPA_URL_FILE) else "")
+    print(f"{ver}（{num}）を {d} と配り口に置いた：{base}/{name}" if base else f"{ver}（{num}）を {d} と配り口に置いた：{name}")
     return 0
 
 
