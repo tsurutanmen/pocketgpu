@@ -2,7 +2,7 @@
 
 目標は「iPhone を USB でつなぐと、Windows の PC が GPU を 1 枚増やしたように使える」。
 比べる相手は RTX ではなく、GPU の無い PC やノート（CPU と内蔵 GPU）。そこで目に見えて得をすることを目指す。
-2026-10-08 夕方の見立ては **Lv 12**。Lv 10 の残りだった DXVK 3 の流体も iPhone で直り、Lv 10〜30 のうち DirectX 12 と OpenGL が iPhone の実機で動いた。
+2026-10-09 夕方の見立ては **Lv 15**。iPhone の実機で CTS の全 62,081 件を最後まで流して 98.77%、Sascha の Vulkan 見本が実機で 66 本動いた。Lv 10〜30 の残りは DirectX 11 のゲーム 10 本と、本物のゲームを広げること。
 
 ## 段階と、クリアの条件
 
@@ -18,10 +18,10 @@
 - [x] geometry shader の真似：三角・線を受ける形、番号つき・インスタンスつきの描画、層への描き分け。iPhone のふりで試験 6 場面がふつうの DirectX と同じ。間接の描画と transform feedback はまだ・iPhone の実機はこれから
 
 ### Lv 10〜30 正しさと広さ
-- [ ] Vulkan の公式の適合試験（CTS）の合格率を数字で出す：62,081 件で NotSupported を除いた合格率は RTX 直 99.7%・代役 92.7%・iPhone のふり 94.1%（10/8）。見つかった不具合を直して、synchronization は受け手の落ちが 181→4 件に。iPhone の実機（0.7.27）は 13 分野 1,560 件が落ち 0 で、合格 94.2%。落ちるのは std140 の 8・16 ビット型の配列だけ（MoltenVK の中の訳し方の誤り）。10/8 夜、iPhone のふりの全件は 98.82%・受け手の落ち 362→0（装置をいくつも持つ・render pass の参照を全部読む・消された pipeline layout を残す・無い set layout を埋める）。残りは query の返し方 94 件と、ホストの signal を待つ timeline semaphore で固まる 13 件。実機の全件は 0.7.29 で
+- [x] Vulkan の公式の適合試験（CTS）の合格率を数字で出す：**iPhone の実機（0.7.31）で全 62,081 件を最後まで流し、NotSupported を除く 20,581 件の 98.77% が合格**（10/9）。ふりは 98.82%・RTX 直は 99.7%。10/9 に直した物：WAIT なしの query の写し（ドライバが待ちに往復せず答えるので、前の仕事が終わる前に写していた）・ホストの signal を待つ timeline semaphore で固まる件（ドライバは合図を待つ submit を合図まで引き取らない・受け手は合図を待つ仕事を待つ相手にしない）・始められなかった render pass の中の命令。残りの不合格 250 件は、std140 の 8・16 ビット型の配列（MoltenVK の中の訳し方）・射影つき mipmap の 9 件（Apple の GPU の細かさ）など。止まる・落ちるのは 4 件まで減った（うち 2 件は形式の問い合わせを 14 万回往復するだけで、上限を延ばせば合格）
 - [x] DirectX 11 の機能 29 場面の自前の試験（vk/tests/feat）：DXVK 1.10 で RTX 直と違うのは、任意のボーダー色（iPhone の Metal の限界）と stream output（未対応）だけ。見つかったドライバの不具合 3 つと、運んでいなかった頂点の step rate を直した
 - [x] DirectX 12 の下ごしらえ：push descriptor と descriptor の写しをドライバの中で直す（vkd3d-proton はほかに、空の descriptor と大きな descriptor の数が要る）
-- [ ] 試すアプリの表を 50 本にして、動く・動かないを毎回測る
+- [x] 試すアプリの表を 50 本にして、動く・動かないを毎回測る：Sascha Willems の Vulkan 見本が iPhone の実機で 66 本動いた（10/9・ふり 68・RTX 直 99。見本は小さい試しの物）。中央は 442 コマ/秒。GPU を失うのは pbribl・pbrtexture の 2 本。台本は scratchpad の sascha/run_iphone.py（--cfg iphone）
 - [ ] DirectX 11 のゲームを 10 本
 - [x] DirectX 12（vkd3d-proton）：自作の 5 場面が iPhone の実機（0.7.26・11_0）で全部正しい。ベクトルの要素への atomic を配列への atomic にドライバで直した。12_0 には tiled resources が要る
 - [x] OpenGL（Zink）：OpenGL 2.1 が iPhone の実機で合格（10/8：Metal の型の名前とぶつかるシェーダーの名前をドライバで外した）。3.0 より上は transform feedback が要る

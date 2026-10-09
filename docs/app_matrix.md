@@ -6,7 +6,7 @@
 - iPhone：iPhone 17 Pro（A19 Pro）・アプリ 0.7.23・USB
 - 絵の比べ方：ふつうの DirectX か RTX 直との差。PSNR 40dB 以上なら見た目では区別できない
 
-最終更新 2026-10-07
+最終更新 2026-10-09
 
 数（10/7 夜）：代役か iPhone のふりで動いた物 41 本（Vulkan 20・DirectX 11 20・DirectX 12 1）。iPhone の実機で動いた物 23 本（Vulkan 10・DirectX 11 13）。目標は 50 本
 
@@ -49,6 +49,7 @@
 | MultithreadedRendering11 | 素材が足りない | | | |
 
 ## Sascha Willems の Vulkan の見本 99 本（10/8・zig で組んだ）
+- **10/9 iPhone の実機で 66 本動いた**（0.7.31・1 本 5 秒の計測）。中央 442 コマ/秒・速い物は gltfskinning 815・pushconstants 774、遅い物は computecullandlod 25・indirectdraw 50。ふりで動いて実機で動かないのは、GPU を失う pbribl・pbrtexture（環境の光を cubemap に焼き込む所）と、検証レイヤーが要る debugprintf
 - RTX 直 99 本・代役 71 本・iPhone のふり 68 本が動いた（KHR の名前を足して dynamicrendering 2 本が増えた）。落ちた物は 0 本
 - 動かない物のうち 19 本は iPhone の MoltenVK にも無い拡張（ray tracing・mesh shader・descriptor buffer など）なので対象外
 - ほかはドライバが名乗っていない拡張（buffer device address・descriptor indexing・multiview など 7 本）と、geometry shader の真似が DXVK だけの物（3 本・ふり）
