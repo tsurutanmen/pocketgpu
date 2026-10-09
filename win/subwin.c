@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
+#include <string.h>
 
 static RECT g_work;
 static DWORD g_root;
@@ -107,6 +108,49 @@ int wmain(int argc, wchar_t **argv) {
     while (*cl == L' ' || *cl == L'\t') cl++;
     wchar_t *line = _wcsdup(cl);
 
+#ifdef _WIN64
+    // 32 ビットのアプリには、64 ビットの受け口（subwin_hook.dll）を差し込めない。横の x86\subwin.exe（32 ビット版）があれば任せる
+    {
+        wchar_t exe[MAX_PATH];
+        const wchar_t *p = line;
+        size_t k = 0;
+        if (*p == L'"') { p++; while (*p && *p != L'"' && k < MAX_PATH - 1) exe[k++] = *p++; }
+        else while (*p && *p != L' ' && *p != L'\t' && k < MAX_PATH - 1) exe[k++] = *p++;
+        exe[k] = 0;
+        int is32 = 0;
+        FILE *f = _wfopen(exe, L"rb");
+        if (f) {
+            unsigned char h[1024];
+            size_t got = fread(h, 1, sizeof h, f);
+            fclose(f);
+            if (got >= 0x40) {
+                DWORD pe = *(DWORD *) (h + 0x3c);
+                if (pe + 6 <= got && !memcmp(h + pe, "PE\0\0", 4)) is32 = *(WORD *) (h + pe + 4) == 0x14c;
+            }
+        }
+        wchar_t me[MAX_PATH];
+        DWORD n = GetModuleFileNameW(NULL, me, MAX_PATH);
+        while (n && me[n - 1] != L'\\' && me[n - 1] != L'/') n--;
+        wcscpy(me + n, L"x86\\subwin.exe");
+        if (is32 && GetFileAttributesW(me) != INVALID_FILE_ATTRIBUTES) {
+            size_t len = wcslen(me) + wcslen(line) + 8;
+            wchar_t *cl2 = malloc(len * sizeof *cl2);
+            swprintf(cl2, len, L"\"%ls\" %ls", me, line);
+            STARTUPINFOW s2 = { .cb = sizeof s2 };
+            PROCESS_INFORMATION p2;
+            if (CreateProcessW(NULL, cl2, NULL, NULL, TRUE, 0, NULL, NULL, &s2, &p2)) {
+                WaitForSingleObject(p2.hProcess, INFINITE);
+                DWORD code = 1;
+                GetExitCodeProcess(p2.hProcess, &code);
+                CloseHandle(p2.hThread);
+                CloseHandle(p2.hProcess);
+                return (int) code;
+            }
+            free(cl2);
+        }
+    }
+#endif
+
     g_on = pick_monitor();
     STARTUPINFOW si = { .cb = sizeof si };
     if (g_on) {
@@ -148,6 +192,7 @@ int wmain(int argc, wchar_t **argv) {
         wcscpy(dll + n, L"subwin_hook.dll");
         HMODULE hm = LoadLibraryW(dll);
         WINEVENTPROC fn = hm ? (WINEVENTPROC) GetProcAddress(hm, "subwin_ev") : NULL;
+        if (hm && !fn) fn = (WINEVENTPROC) GetProcAddress(hm, "subwin_ev@28"); // 32 ビットの stdcall は @数字 の付いた名前で書き出される
         if (fn) hin = SetWinEventHook(EVENT_OBJECT_CREATE, EVENT_OBJECT_CREATE, hm, fn, pi.dwProcessId, 0, WINEVENT_INCONTEXT);
         if (getenv("SUBWIN_DBG"))
             fprintf(stderr, "subwin: dll %ls hm %p fn %p hook %p err %lu\n", dll, (void *) hm, (void *) fn, (void *) hin, GetLastError());

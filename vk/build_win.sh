@@ -41,7 +41,12 @@ for w in $WHAT; do
         $CC -Wall -municode ../win/subwin.c -o "$OUT/subwin.exe" -luser32
         $CC -Wall -shared ../win/subwin_hook.c -o "$OUT/subwin_hook.dll" -luser32
         rm -f "$OUT/subwin_hook.lib"
-        echo "道具：stackdump・vklist・subwin"
+        # 32 ビットのアプリ用（64 ビットの subwin.exe が x86 に任せる）
+        mkdir -p "$OUT/x86"
+        zig cc -target x86-windows-gnu -O2 -Wall -municode ../win/subwin.c -o "$OUT/x86/subwin.exe" -luser32
+        zig cc -target x86-windows-gnu -O2 -Wall -shared ../win/subwin_hook.c -o "$OUT/x86/subwin_hook.dll" -luser32
+        rm -f "$OUT/x86/subwin_hook.lib" "$OUT/x86/subwin.pdb" "$OUT/x86/subwin_hook.pdb"
+        echo "道具：stackdump・vklist・subwin（x86 も）"
         ;;
     tests)
         for t in tri tri13 vecadd pushdesc copydesc copyimg extlist; do $CC $VKH tests/$t.c -o "$OUT/$t.exe" $VKLIB; done
