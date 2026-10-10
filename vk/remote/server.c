@@ -567,6 +567,13 @@ void vkr_set_token(const char *hex) { g_token_ok = vr_token_parse(hex, g_token);
 static volatile int g_thermal; // iPhone の熱の状態（0 ふつう・1 やや熱い・2 熱い・3 とても熱い）。アプリが知らせる
 void vkr_set_thermal(int state) { g_thermal = state; }
 
+// 調べ用の VKR_CHECK。命令ごとに getenv を呼ぶと、環境変数の多い PC では 1 コマに 5,000 回・約 10 ms 食っていたので、最初の 1 回だけ読む
+static int vkr_check(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("VKR_CHECK") != NULL;
+    return on;
+}
+
 static double t_ms(void) {
 #ifdef _WIN32
     LARGE_INTEGER f, c;
@@ -589,7 +596,7 @@ static void sleep_ms(int ms) {
 }
 
 // 1 つの接続の間に、どこに時間がかかったか
-static struct { double wait_ms, record_ms, submit_ms, paused_ms; uint64_t waits, records, submits; uint64_t wait_by_op[64]; double wait_ms_by_op[64]; } g_st;
+static struct { double wait_ms, record_ms, submit_ms, paused_ms; uint64_t waits, records, submits; uint64_t wait_by_op[128]; double wait_ms_by_op[128]; } g_st; // 命令の番号は 64 を超える（READ_JPEG_PIPE 73・GET_PROGRESS 81 など）ので 128 まで数える
 static uint32_t g_cur_op; // いま処理している命令（どの命令で GPU を待ったかを数える）
 // アプリの画面のファンを回すための数。アプリが少しずつ読んで、増えた速さで回す
 static volatile uint64_t g_ops_total;
@@ -788,7 +795,7 @@ static void drain_upto(int k) {
         double dt = t_ms() - t0;
         g_st.wait_ms += dt;
         g_st.waits++;
-        if (g_cur_op < 64) { g_st.wait_by_op[g_cur_op]++; g_st.wait_ms_by_op[g_cur_op] += dt; }
+        if (g_cur_op < 128) { g_st.wait_by_op[g_cur_op]++; g_st.wait_ms_by_op[g_cur_op] += dt; }
         if (r != VK_SUCCESS) {
             vlog("出した仕事を待てない (%d)", r);
             if (r < 0) g_err = r;
@@ -3338,7 +3345,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
             uint64_t sid = vr_ru64(r);
             if (dbg_on() && sid != dbg_prev) { dset_of(sid)->n = 0; dbg_prev = sid; }
-            if (getenv("VKR_CHECK")) {
+            if (vkr_check()) {
                 int k1 = last_with_set(sid), k2 = -1;
                 for (int q = g_nfl - 1; q >= 0 && k2 < 0; q--)
                     for (uint32_t j = 0; j < g_fl[q].nsnap; j++) if (g_fl[q].snap[j] == sid) { k2 = q; break; }
@@ -3697,7 +3704,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             int k = -1;
             for (uint32_t i = 0; i < ncid; i++) { int q = last_with_cb(cids[i]); if (q > k) k = q; }
             if (k >= 0) {
-                if (getenv("VKR_CHECK")) vlog("submit %llu：まだ走っている command buffer をもう一度出そうとした（%d 番目まで待つ）", (unsigned long long) g_st.submits + 1, k);
+                if (vkr_check()) vlog("submit %llu：まだ走っている command buffer をもう一度出そうとした（%d 番目まで待つ）", (unsigned long long) g_st.submits + 1, k);
                 drain_upto(k);
             }
         }
@@ -3766,7 +3773,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             memcpy(e->ts, fts, sizeof fts);
             e->snap = NULL;
             e->nsnap = 0;
-            if (getenv("VKR_CHECK")) {
+            if (vkr_check()) {
                 uint32_t tot = 0;
                 for (uint32_t k = 0; k < ncid; k++) { cbinfo *c = cbi(cids[k], 0); if (c) tot += c->n; }
                 e->snap = malloc((tot ? tot : 1) * sizeof *e->snap);
@@ -4554,7 +4561,7 @@ static void serve_client(vr_sock c) {
     if (g_st.waits) {
         char line[400];
         int at = snprintf(line, sizeof line, "GPU を待った命令（命令の番号:回数:ms）");
-        for (int i = 0; i < 64 && at < (int) sizeof line - 24; i++)
+        for (int i = 0; i < 128 && at < (int) sizeof line - 24; i++)
             if (g_st.wait_by_op[i]) at += snprintf(line + at, sizeof line - at, " %d:%llu:%.0f", i, (unsigned long long) g_st.wait_by_op[i], g_st.wait_ms_by_op[i]);
         vlog("%s", line);
     }

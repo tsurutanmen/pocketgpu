@@ -8344,7 +8344,9 @@ static int q_local(uint64_t qp) {
 static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32_t first, uint32_t n, size_t size, void *data,
                                              VkDeviceSize stride, VkQueryResultFlags flags) {
     vr_buf b = { 0 }, out = { 0 };
-    if (getenv("IPHONE_VK_QUERY_LOG")) {
+    static int qlog = -1; // 毎回 getenv を呼ばない（query の結果は 1 コマに何十回も読まれる）
+    if (qlog < 0) qlog = getenv("IPHONE_VK_QUERY_LOG") != NULL;
+    if (qlog) {
         static uint64_t last;
         static unsigned cnt;
         if (ID(qp) != last || ++cnt % 5000 == 0) say("結果を読む pool %llu・%u から %u 個・flags 0x%x（%u 回目）", (unsigned long long) ID(qp), first, n, flags, cnt);
