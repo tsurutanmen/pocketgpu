@@ -136,6 +136,10 @@ struct ContentView: View {
     // 全画面にしたとき、絵を 90 度回して横向きで固定する（FramePreview.swift と同じ鍵）
     @AppStorage("fullLandscape") private var fullLandscape = true
     @StateObject private var preview = FramePreviewModel()
+    // PC の画面そのものを、この iPhone に映す（ScreenMirror.swift。PC は app/pc/screen_mirror.py）。オンの間だけ USB の 50062 番で待つ。
+    // コマが届くたびに描き直すのは絵の所だけにしたいので、ここでは見張らない
+    @AppStorage("screenMirror") private var mirrorOn = false
+    private let mirror = ScreenMirrorModel.shared
     // 画面の言葉（自動・日本語・English）。ここで読むと、変えたときに画面が描き直される
     @AppStorage("lang") private var lang = AppLang.auto.rawValue
     @Environment(\.scenePhase) private var scenePhase
@@ -166,6 +170,15 @@ struct ContentView: View {
                     if showFrames {
                         Toggle(L("全画面は横向きで固定", "Full screen: lock to landscape"), isOn: $fullLandscape)
                         FramePreviewView(model: preview, status: status)
+                    }
+                    Toggle(L("PC の画面を映す", "Mirror the PC screen"), isOn: $mirrorOn)
+                        .onChange(of: mirrorOn) { _, on in setMirror(on) }
+                    if mirrorOn {
+                        if !showFrames {
+                            Toggle(L("全画面は横向きで固定", "Full screen: lock to landscape"), isOn: $fullLandscape)
+                        }
+                        ScreenMirrorStatusRow(model: mirror)
+                        ScreenMirrorView(model: mirror)
                     }
                     ShareLink(item: diagnosticsText(status: status, log: log)) {
                         Label(L("記録を送る", "Send diagnostics"), systemImage: "square.and.arrow.up")
@@ -238,6 +251,7 @@ struct ContentView: View {
             host = addrs.first(where: { $0.ip.hasPrefix("100.") })?.ip ?? addrs.first(where: { $0.name == "en0" })?.ip ?? addrs.first?.ip ?? ""
             // 前にオンにしたまま閉じたなら、開いたときから出す
             preview.setOn(showFrames)
+            setMirror(mirrorOn)
         }
         .onChange(of: scenePhase) { _, phase in
             // 後ろに回ると GPU が使えない。前に戻ったら GPU に戻す
@@ -248,6 +262,7 @@ struct ContentView: View {
         .onReceive(tick) { _ in
             vkr_set_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
             status.tick()
+            mirror.tick()
             // インターネット共有の口が出たら、そこでも待つ（消えたら閉じる）
             if vkStarted {
                 let h = hotspotAddress() ?? ""
@@ -273,6 +288,16 @@ struct ContentView: View {
                     }
                 }
             }
+        }
+    }
+
+    private func setMirror(_ on: Bool) {
+        mirror.setOn(on)
+        // 映している間は画面を消さない。受け手が動いている間は受け手がつけたままにしているので、そのままにする
+        if on {
+            UIApplication.shared.isIdleTimerDisabled = true
+        } else if !running {
+            UIApplication.shared.isIdleTimerDisabled = false
         }
     }
 
