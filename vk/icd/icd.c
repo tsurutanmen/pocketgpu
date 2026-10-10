@@ -2450,6 +2450,14 @@ static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *ci, const
         if (!strcmp(ai->pEngineName, "DXVK")) g_engine_dxvk_any = 1;
         if (!strcmp(ai->pEngineName, "mesa zink")) g_engine_zink = 1;
         if (!strcmp(ai->pEngineName, "vkd3d")) g_engine_vkd3d = 1;
+        // DirectX 12 の feature level 12_0 を名乗らせる。vkd3d-proton は tiled resources（sparse）が無いと 11_x までにするが、
+        // 起動時に 12_0 が作れるかだけを見るゲームがある。VKD3D_FEATURE_LEVEL は装置を作るときに読まれる。
+        // 名乗るだけで sparse の中身は無い。利用者が自分で値を入れていれば触らない。IPHONE_VK_FL12=0 で立てない
+        const char *fl = getenv("IPHONE_VK_FL12");
+        if (g_engine_vkd3d && !(fl && *fl == '0') && !GetEnvironmentVariableA("VKD3D_FEATURE_LEVEL", NULL, 0)) {
+            SetEnvironmentVariableA("VKD3D_FEATURE_LEVEL", "12_0");
+            say("DirectX 12 の feature level 12_0 を名乗らせる（VKD3D_FEATURE_LEVEL=12_0・sparse の中身は無い）");
+        }
     }
     struct inst *i = calloc(1, sizeof *i);
     if (!i) return VK_ERROR_OUT_OF_HOST_MEMORY;
