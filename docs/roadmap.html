@@ -42,7 +42,7 @@ h1 { font-size: 24px; }
 </head>
 <body>
 <h1>iPhone を Windows の GPU に：ロードマップ</h1>
-<p class="lead">上が Lv 1、下が Lv 100 で、10 段に分けた。はじめは 1 本の道で、進むほど枝分かれして、最後にゴールへ集まる。2026 年 10 月 10 日の時点。</p>
+<p class="lead">上が Lv 1、下が Lv 100 で、10 段に分けた。はじめは 1 本の道で、進むほど枝分かれして、最後にゴールへ集まる。2026 年 10 月 10 日の夜の時点。</p>
 <div class="legend"><span class="l-done">できた</span><span class="l-now">いま</span><span class="l-next">これから</span><span class="l-idea">案・まだ試していない</span><span class="l-cross">ほかの枝の成果を使うところ</span></div>
 
 <div class="wrap"><div class="map">
@@ -61,7 +61,7 @@ h1 { font-size: 24px; }
 
   <div class="lv"><b>Lv 21〜30</b>60 コマ</div>
   <div class="cell" style="grid-column:4"><div class="node done"><span class="tag">広さ・済み</span><b>DirectX 11 のゲーム 10 本</b><small>3060 の代役で 20 本を試し、13 本が絵を返した。ほかに Heaven と Valley</small></div></div>
-  <div class="cell" style="grid-column:5"><div class="node now"><span class="tag">速さ・いま Lv 20</span><b>フル HD で毎秒 60 コマ</b><small>待ちを減らす。fence を本当に待つ・書き込みの待ちを絞る</small></div></div>
+  <div class="cell" style="grid-column:5"><div class="node now"><span class="tag">速さ・いま Lv 20</span><b>フル HD で毎秒 60 コマ</b><small>10/10 に Heaven 1080p は毎秒 23。iPhone の GPU は画面の読み書きが多い描き方が苦手。720p で描いて MetalFX で広げると 33</small></div></div>
   <div class="cell" style="grid-column:7"><div class="node done"><span class="tag">映像と音・済み</span><b>描いた絵を iPhone に出す</b><small>0.7.36 で iPhone の画面に出た。全画面は横向きで固定できる</small></div></div>
 
   <div class="link"><svg viewBox="0 0 600 44" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke"
@@ -69,7 +69,7 @@ h1 { font-size: 24px; }
 
   <div class="lv"><b>Lv 31〜40</b>重いゲーム</div>
   <div class="cell" style="grid-column:2"><div class="node now"><span class="tag">仲間・ほぼ済み</span><b>招待制で試す人を集める</b><small>報告の道具・配る物に人ごとの印・中核は渡さない・Discord</small></div></div>
-  <div class="cell h1" style="grid-column:4"><div class="node now"><span class="tag">広さ・半分済み</span><b>DirectX 12 の 12_0・OpenGL 3 以上</b><small>OpenGL は 10/10 に本物の iPhone で 3.3 が出て絵も正しい。代役では 4.4。Chrome の WebGL 2 も iPhone で動いた。DirectX 12 の 12_0 は tiled resources を真似る</small></div></div>
+  <div class="cell h1" style="grid-column:4"><div class="node now"><span class="tag">広さ・ほぼ済み</span><b>DirectX 12 の 12_0・OpenGL 3 以上</b><small>OpenGL は 10/10 に本物の iPhone で 3.3 が出て絵も正しい。代役では 4.4。Chrome の WebGL 2 も iPhone で動いた。DirectX 12 は 12_0 を名乗れた。中身の tiled resources はまだ</small></div></div>
   <div class="cell" style="grid-column:5"><div class="node"><span class="tag">速さ</span><b>重いゲームも動く速さ</b><small>大きいデータの往復を減らす</small></div></div>
   <div class="cell" style="grid-column:7"><div class="node idea"><span class="tag">映像と音</span><b>iPhone の GPU のモニターが 1 枚</b><small>仮のモニター。触るとマウスになる</small></div></div>
 
@@ -79,7 +79,7 @@ h1 { font-size: 24px; }
   <div class="lv"><b>Lv 41〜50</b>見せる</div>
   <div class="cell" style="grid-column:2"><div class="node idea"><span class="tag">宣伝</span><b>同じものさしで点数を出す</b><small>Geekbench などで測って、iPhone が RTX の何番くらいかを示す</small></div></div>
   <div class="cell" style="grid-column:4"><div class="node idea"><span class="tag">広さ</span><b>Steam Deck と Linux</b><small>Windows 以外にも iPhone を差せる</small></div></div>
-  <div class="cell" style="grid-column:5"><div class="node idea"><span class="tag">速さ</span><b>MetalFX で小さく描いて広げる</b><small>DLSS と同じ考え方。4K への近道</small></div></div>
+  <div class="cell" style="grid-column:5"><div class="node now"><span class="tag">速さ・動いた</span><b>MetalFX で小さく描いて広げる</b><small>10/10 の 0.7.42 で、720p を iPhone で 1080p に広げて約 1.5 倍。4K への近道</small></div></div>
   <div class="cell" style="grid-column:6"><div class="node"><span class="tag">つなぎ方</span><b>USB を太くする</b><small>インターネット共有の有線のつながり。PC のネットは Wi-Fi のまま</small></div></div>
   <div class="cell" style="grid-column:7"><div class="node idea"><span class="tag">映像と音</span><b>iPhone をスピーカーに</b><small>PC の音を iPhone から出す</small></div></div>
 
@@ -100,7 +100,7 @@ h1 { font-size: 24px; }
   <div class="lv"><b>Lv 61〜70</b>120 コマ</div>
   <div class="cell pass" style="grid-column:2"></div>
   <div class="cell" style="grid-column:3"><div class="node idea"><span class="tag">計算</span><b>圧縮と解凍を iPhone に</b><small>弱いノート PC の代わりに重い圧縮をする。7z の最高圧縮のように遅い物ほど効く</small></div></div>
-  <div class="cell" style="grid-column:4"><div class="node"><span class="tag">広さ</span><b>Android</b><small>Vulkan をそのまま使える</small></div></div>
+  <div class="cell" style="grid-column:4"><div class="node now"><span class="tag">広さ・動き始めた</span><b>Android</b><small>10/10 にエミュレーターで受け手が動き、絵も H.264 で返せた。試す人のキットにも入った</small></div></div>
   <div class="cell" style="grid-column:5"><div class="node idea"><span class="tag">速さ</span><b>毎秒 120 コマ</b><small>MetalFX でコマとコマの間の絵を作る</small></div></div>
   <div class="cell" style="grid-column:6"><div class="node"><span class="tag">つなぎ方</span><b>App Store に出す</b><small>誰でも入れられる。7 日ごとの入れ直しが無くなる</small></div></div>
   <div class="cell" style="grid-column:7"><div class="node idea"><span class="tag">映像と音</span><b>OBS の録画と配信を iPhone で</b><small>PC の画面を iPhone で動画にして OBS に渡す。iPhone の回線から YouTube や Twitch にそのまま配信する</small></div></div>
