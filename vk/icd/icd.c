@@ -295,6 +295,49 @@ static void put_msg_locked(uint32_t op, const vr_buf *b) {
 // 送った VR_QUEUE_SUBMIT の数。受け手も届いた順に数えるので、何番目の submit かで話が通じる
 static uint64_t g_submit_msgs;
 
+// query 1 個の読みが「まだ（VK_NOT_READY）」だったら、その query を最後に書いた submit の番号（wmsg）と、
+// それまでに送った submit の数が変わらないあいだは、読み直しても答えは変わらない
+// （受け手は wmsg の submit までを待ち切ってから読んでおり、それより後の submit はその query を書かないから）。
+// 結果を待ち続けるアプリ（Unreal Engine は 0.5 秒まで回り続ける）の読み直しを、往復せずに答える。
+// 往復のたびに g_lock を持ち続けるので、前は回り続ける糸が g_lock を離さず、
+// 「その query を書く submit」を送る糸が錠を取れずに 0.5 秒待たされていた（1 コマに数回）。IPHONE_VK_QUERY_NR_CACHE=0 で切る
+static struct { uint64_t qp, wmsg, nsub; uint32_t q; } g_qnr[16];
+static unsigned g_qnr_next;
+static SRWLOCK g_qnr_lock = SRWLOCK_INIT;
+static uint64_t g_qnr_hits; // 往復せずに「まだ」と答えた回数
+static void qnr_print(void) {
+    if (g_qnr_hits) fprintf(stderr, "[iphone-vk] query の「まだ」を往復せずに答えた回数 %llu\n", (unsigned long long) g_qnr_hits);
+}
+static int qnr_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_QUERY_NR_CACHE"); v = !(e && *e == '0'); }
+    return v;
+}
+static int qnr_hit(uint64_t qp, uint32_t q, uint64_t wmsg, uint64_t nsub) {
+    int hit = 0;
+    AcquireSRWLockShared(&g_qnr_lock);
+    for (int i = 0; i < 16; i++)
+        if (g_qnr[i].qp == qp && g_qnr[i].q == q && g_qnr[i].wmsg == wmsg && g_qnr[i].nsub == nsub) { hit = 1; break; }
+    ReleaseSRWLockShared(&g_qnr_lock);
+    return hit;
+}
+static void qnr_put(uint64_t qp, uint32_t q, uint64_t wmsg, uint64_t nsub) {
+    static LONG reg;
+    if (!InterlockedExchange(&reg, 1)) {
+        const char *e = getenv("IPHONE_VK_STATS");
+        if (e && *e && *e != '0') atexit(qnr_print);
+    }
+    AcquireSRWLockExclusive(&g_qnr_lock);
+    int k = -1;
+    for (int i = 0; i < 16 && k < 0; i++) if (g_qnr[i].qp == qp && g_qnr[i].q == q) k = i;
+    if (k < 0) k = (int) (g_qnr_next++ % 16);
+    g_qnr[k].qp = qp;
+    g_qnr[k].q = q;
+    g_qnr[k].wmsg = wmsg;
+    g_qnr[k].nsub = nsub;
+    ReleaseSRWLockExclusive(&g_qnr_lock);
+}
+
 // 送りっぱなし（ためておいて、返事の要る命令や submit のときにまとめて送る）
 static void rpc_send(uint32_t op, vr_buf *b) {
     AcquireSRWLockExclusive(&g_lock);
@@ -8818,6 +8861,17 @@ static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32
         size_t es = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
         uint64_t ts = (uint64_t) (nv + 1) * es, tsize = (uint64_t) n * ts;
         int want_av = (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) != 0;
+        // 先に書き手の番号と submit の数を読む（読んだあとに submit が来ても、覚えが古くなる向きにしかならない）
+        uint64_t wm = qpv_wmsg(ID(qp), first, n), nsub = g_submit_msgs;
+        int nrc = n == 1 && qnr_on();
+        if (nrc && qnr_hit(ID(qp), first, wm, nsub)) {
+            // まだ。欄の値は書かず、「終わったか」だけ 0 を書く（受け手に聞いたときと同じ）
+            if ((uint64_t) (nv + want_av) * es <= size && want_av) memset((uint8_t *) data + (size_t) nv * es, 0, es);
+            g_stat.skipped++;
+            g_qnr_hits++;
+            free(b.p);
+            return VK_NOT_READY;
+        }
         vr_u64(&b, ID(dv));
         vr_u64(&b, ID(qp));
         vr_u32(&b, first);
@@ -8828,10 +8882,11 @@ static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32
         {
             static int qw = -1;
             if (qw < 0) { const char *e = getenv("IPHONE_VK_QUERY_UPTO"); qw = !(e && *e == '0'); }
-            vr_u64(&b, qw ? qpv_wmsg(ID(qp), first, n) : UINT64_MAX);
+            vr_u64(&b, qw ? wm : UINT64_MAX);
         }
         VkResult r = rpc_call(VR_GET_QUERY_POOL_RESULTS, &b, &out);
         free(b.p);
+        if (nrc && r == VK_NOT_READY) qnr_put(ID(qp), first, wm, nsub);
         if (r >= 0 && out.p && out.n >= tsize)
             for (uint32_t i = 0; i < n; i++) {
                 const uint8_t *src = (const uint8_t *) out.p + (size_t) i * ts;
