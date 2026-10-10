@@ -325,6 +325,11 @@ static PFN_vkVoidFunction load_opt(int core, const char *name, const char *suffi
     return f;
 }
 
+// 窓に出す絵を広げる関数（iPhone のアプリが MetalFX で登録する）。無ければ広げない
+typedef int (*vkr_upscale_fn)(const uint8_t *src, uint32_t w, uint32_t h, uint32_t stride, uint8_t *dst, uint32_t dw, uint32_t dh, uint32_t dstride);
+static vkr_upscale_fn g_upscale;
+void vkr_set_upscaler(vkr_upscale_fn fn) { g_upscale = fn; }
+
 static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t api) {
 #define CLEAR(n) n = NULL;
     VKFUNCS_OPT(CLEAR)
@@ -414,6 +419,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
 #if defined(__APPLE__) || defined(_WIN32)
     caps |= VR_CAP_JPEG | VR_CAP_JPEG_PIPE; // 窓に出すコマを JPEG に縮められる（iPhone は ImageIO、PC の代役は WIC）
 #endif
+    if (g_upscale) caps |= VR_CAP_UPSCALE; // 縮める前に MetalFX で広げられる（アプリが関数を登録したとき）
     if (vid_probe()) caps |= VR_CAP_H264; // 窓に出すコマを H.264 に縮められる（iPhone は VideoToolbox、PC の代役は Media Foundation）
     // buffer device address（GPU の中のバッファのアドレス）
     if (fbda.bufferDeviceAddress && (v12 || e_bda)) {
@@ -2465,6 +2471,7 @@ static struct venc *venc_get(uint64_t stream, uint32_t w, uint32_t h, uint32_t k
 }
 
 // 1 コマを縮めて、頭（VR_H264_HEAD）と NAL の並びを out に足す。縮められなければ 0
+// VR_H264_UP15 なら、縮める前に登録された関数（iPhone は MetalFX の空間の拡大）で 1.5 倍に広げる。広げられなければそのまま縮める
 static int h264_frame(const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, int bgra, uint32_t flags, uint32_t kbps, uint32_t fps, uint32_t gop,
                       uint64_t stream, uint64_t tag, vr_buf *out) {
     // 調べ用：VKR_VIDEO_FAIL=n なら、n コマ目から縮められないふりをする（ドライバが JPEG に戻るかを試す）
@@ -2472,6 +2479,21 @@ static int h264_frame(const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride
     static uint64_t seen;
     if (fail_at < 0) { const char *e = getenv("VKR_VIDEO_FAIL"); fail_at = e ? atol(e) : 0; }
     if (fail_at > 0 && ++seen >= (uint64_t) fail_at) return 0;
+    if ((flags & VR_H264_UP15) && g_upscale) {
+        static uint8_t *ub;
+        static size_t ucap;
+        static double ums;
+        static uint64_t un;
+        uint32_t dw = (w * 3 / 2 + 1) & ~1u, dh = (h * 3 / 2 + 1) & ~1u;
+        size_t need = (size_t) dw * dh * 4;
+        if (need > ucap) { free(ub); ub = malloc(need); ucap = ub ? need : 0; }
+        double tu = t_ms();
+        if (ub && g_upscale(px, w, h, stride, ub, dw, dh, dw * 4)) {
+            px = ub, w = dw, h = dh, stride = dw * 4;
+            ums += t_ms() - tu;
+            if (++un % 100 == 0) { vlog("MetalFX で広げた：%u x %u・1 コマ %.1f ms（100 コマの平均）", dw, dh, ums / 100); ums = 0; }
+        }
+    }
     const size_t at = out->n;
     uint8_t head[VR_H264_HEAD];
     memset(head, 0, sizeof head);
@@ -4810,9 +4832,21 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
 }
 #endif
 
+// 試験用：VKR_FAKE_UPSCALE=1 で、PC の代役でも「広げる」を名乗る（CPU で最近傍に広げるだけ。iPhone の MetalFX の代わり）。
+// ドライバの IPHONE_VK_UPSCALE と、返事の大きさの約束を、iPhone の版を作る前に確かめるため
+static int fake_upscale(const uint8_t *src, uint32_t w, uint32_t h, uint32_t stride, uint8_t *dst, uint32_t dw, uint32_t dh, uint32_t dstride) {
+    for (uint32_t y = 0; y < dh; y++) {
+        const uint32_t *sr = (const uint32_t *) (src + (size_t) (y * h / dh) * stride);
+        uint32_t *dr = (uint32_t *) (dst + (size_t) y * dstride);
+        for (uint32_t x = 0; x < dw; x++) dr[x] = sr[x * w / dw];
+    }
+    return 1;
+}
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     AddVectoredExceptionHandler(1, crash_handler);
+    { const char *fu = getenv("VKR_FAKE_UPSCALE"); if (fu && *fu == '1') { vkr_set_upscaler(fake_upscale); vlog("試験用：CPU で広げる（VKR_FAKE_UPSCALE）"); } }
     SetConsoleOutputCP(CP_UTF8);
     // PC で代役をするときは、画面取り込みなどの部品（暗黙のレイヤー）を挟まない。
     // OBS が起動している間、OBS の部品が vkCreateDevice から戻ってこなかった

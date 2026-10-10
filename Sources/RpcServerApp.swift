@@ -11,6 +11,8 @@ struct RpcServerApp: App {
             setenv("GGML_METAL_TENSOR_DISABLE", "1", 1)
         }
         rpc_bridge_init()
+        // 窓に出す絵を MetalFX で広げる関数を、受け手に先に渡しておく（PC が頼んだときだけ使う）
+        FXUpscaler.register()
         // 記録を PC から読めるようにする（USB の 50059 番。PC は app/pc/iphone_applog.py）
         let t = Thread { rpc_bridge_serve_log(50059) }
         t.start()

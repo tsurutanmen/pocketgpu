@@ -7,6 +7,9 @@ extern "C" {
 
 // 受け手を始める。戻ってこない（アプリを閉じるまで待ち受け続ける）ので、別のスレッドで呼ぶ
 int vkr_serve(const char * host, int port);
+// 窓に出す絵を広げる関数（Swift の MetalFX）を登録する。受け手の糸から呼ばれる。成功で 1。vkr_serve の前に呼ぶ
+typedef int (*vkr_upscale_fn)(const uint8_t * src, uint32_t w, uint32_t h, uint32_t stride, uint8_t * dst, uint32_t dw, uint32_t dh, uint32_t dstride);
+void vkr_set_upscaler(vkr_upscale_fn fn);
 // アプリが前にいないときは 1。その間は GPU に新しい仕事を出さずに待つ（出すと GPU を失う）
 void vkr_set_paused(int on);
 // iPhone の熱の状態（ProcessInfo.thermalState の 0〜3）。PC のドライバが聞いて、熱いときはコマ数を落とす

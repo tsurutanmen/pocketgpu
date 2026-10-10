@@ -32,10 +32,12 @@
 #define VR_CAP_D3D 512u              // DirectX（DXVK）の土台：VR_CREATE_BUFFER_VIEW・texel buffer の descriptor・VR_GET_IMAGE_SUBRESOURCE_LAYOUT
 #define VR_CAP_DESC_FLAGS 524288u   // VR_CREATE_DSL の末尾の binding ごとの flags と、VR_ALLOC_DESCRIPTOR_SETS の末尾の set ごとの数（variable descriptor count）を読む
 #define VR_CAP_PROGRESS 1048576u    // VR_GET_PROGRESS：GPU を待たずに、終わった submit の番号を返す（ドライバが fence を本当の進み具合で答える）
+#define VR_CAP_UPSCALE 2097152u     // VR_READ_H264 の印 VR_H264_UP15 を受ける：縮める前に MetalFX で 1.5 倍に広げる（iPhone だけ）
 #define VR_CAP_H264 262144u          // VR_READ_H264：窓に出すコマを受け手が H.264 に縮めて、1 コマずつ返す（iPhone は VideoToolbox、PC の代役は Media Foundation）
 // VR_READ_H264 の印
 #define VR_H264_KEY 1u               // このコマをキーフレーム（IDR）にする。ドライバがほどき直すとき
-#define VR_H264_PIPE 2u              // 先送り：今のコマを後ろで縮め始めて、ひとつ前に頼んだコマを返す（最初は空）
+#define VR_H264_PIPE 2u
+#define VR_H264_UP15 4u              // 縮める前に、絵を 1.5 倍（720p なら 1080p）に広げる（VR_CAP_UPSCALE）。返事の頭の幅と高さは広げた後の物              // 先送り：今のコマを後ろで縮め始めて、ひとつ前に頼んだコマを返す（最初は空）
 // VR_READ_H264 の返事の頭（32 バイト）：流れの番号（u64）・札（u64）・幅・高さ・印（u32。1 ならキーフレーム）・空き（u32）。
 // そのあとに 1 コマぶんの NAL の並び（Annex B。00 00 00 01 で区切る。キーフレームには SPS と PPS が付く）
 #define VR_H264_HEAD 32u
