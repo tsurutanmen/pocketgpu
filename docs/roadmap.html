@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iPhone GPU ロードマップ</title>
+<style>
+:root { --bg: #f6f5f1; --card: #ffffff; --ink: #1d1f22; --sub: #6b7076; --line: #aeb4ba; --main: #2f7fc1; --done: #3a9a5b; --idea: #c98a1a; --cross: #8a63d2; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #121416; --card: #1b1e21; --ink: #eceae6; --sub: #9aa0a6; --line: #59606a; --main: #5aa9e6; --done: #5cc27f; --idea: #e6b35a; --cross: #a98be8; } }
+:root[data-theme="dark"] { --bg: #121416; --card: #1b1e21; --ink: #eceae6; --sub: #9aa0a6; --line: #59606a; --main: #5aa9e6; --done: #5cc27f; --idea: #e6b35a; --cross: #a98be8; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--ink); font-family: "Noto Sans JP", "Yu Gothic UI", sans-serif; padding: 28px 16px 60px; }
+h1 { font-size: 24px; }
+.lead { color: var(--sub); margin-top: 6px; font-size: 14px; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 12px 0 18px; font-size: 13px; color: var(--sub); }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
+.l-done::before { background: var(--done); } .l-now::before { background: var(--main); } .l-next::before { background: var(--line); } .l-idea::before { background: var(--idea); }
+.legend .l-cross::before { width: 22px; height: 0; border-radius: 0; border-top: 3px dashed var(--cross); vertical-align: 3px; }
+.wrap { overflow-x: auto; }
+/* 列：1 レベル・2 仲間と宣伝・3 AI・4 広さ・5 速さ＝幹・6 つなぎ方・7 映像と音。列の間はすき間なしなので、線の位置は列の真ん中＝50・150・250・350・450・550 */
+.map { display: grid; grid-template-columns: 104px repeat(6, minmax(200px, 1fr)); min-width: 1330px; }
+.lv { grid-column: 1; white-space: nowrap; font-size: 13px; color: var(--sub); text-align: right; padding-right: 12px; align-self: center; }
+.lv b { display: block; color: var(--ink); font-size: 15px; }
+.cell { padding: 0 9px; display: flex; position: relative; }
+/* 横のつながり：右どなりの箱まで */
+.h1::after { content: ""; position: absolute; z-index: 1; top: 50%; left: calc(100% - 9px); width: 18px; border-top: 3px dashed var(--cross); margin-top: -1.5px; }
+.pass { background: linear-gradient(var(--line), var(--line)) center / 3px 100% no-repeat; }
+.node { flex: 1; background: var(--card); border: 1px solid var(--line); border-left: 6px solid var(--line); border-radius: 9px; padding: 10px 12px; font-size: 14px; }
+.node b { display: block; font-size: 15px; margin-bottom: 3px; }
+.node small { display: block; color: var(--sub); font-size: 12px; margin-top: 3px; line-height: 1.5; }
+.node.done { border-left-color: var(--done); }
+.node.now { border-left-color: var(--main); border-color: var(--main); box-shadow: 0 0 0 2px var(--main) inset; }
+.node.idea { border-left-color: var(--idea); }
+.node.goal { border: 2px solid var(--done); }
+.tag { display: inline-block; font-size: 11px; color: var(--sub); border: 1px solid var(--line); border-radius: 10px; padding: 1px 8px; margin-bottom: 6px; }
+.link { grid-column: 2 / 8; height: 44px; }
+.link svg { width: 100%; height: 100%; display: block; }
+.link path { fill: none; stroke: var(--line); stroke-width: 3; }
+.link path.x { stroke: var(--cross); stroke-dasharray: 7 5; }
+.mid { grid-column: 4 / 7; }
+</style>
+</head>
+<body>
+<h1>iPhone を Windows の GPU に：ロードマップ</h1>
+<p class="lead">上が Lv 1、下が Lv 100 で、10 段に分けた。はじめは 1 本の道で、進むほど枝分かれして、最後にゴールへ集まる。2026 年 10 月 10 日の時点。</p>
+<div class="legend"><span class="l-done">できた</span><span class="l-now">いま</span><span class="l-next">これから</span><span class="l-idea">案・まだ試していない</span><span class="l-cross">ほかの枝の成果を使うところ</span></div>
+
+<div class="wrap"><div class="map">
+  <div class="lv"><b>Lv 1〜10</b>試作</div>
+  <div class="cell mid"><div class="node done"><b>Windows に iPhone の GPU が見える</b>
+    <small>10/5 自作のドライバと受け手のアプリを USB でつないだ。10/6 画像の生成と言葉のモデルが動いた。10/6〜7 DirectX 11 が描けた。iPhone に無い機能はドライバで真似る</small></div></div>
+
+  <div class="link"><svg viewBox="0 0 600 44" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke" d="M350,0 L350,44"/></svg></div>
+
+  <div class="lv"><b>Lv 11〜20</b>正しさ</div>
+  <div class="cell mid"><div class="node done"><span class="tag">Lv 15 で済み</span><b>正しく、広く動く</b>
+    <small>Vulkan の公式の適合試験 6 万件以上を実機で 98% 以上。DirectX 12 と OpenGL も。0 A.D. と Unigine Heaven が実機で動く。32 ビットのアプリも。Heaven 720p で毎秒 30→68 コマ</small></div></div>
+
+  <div class="link"><svg viewBox="0 0 600 44" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke"
+    d="M350,0 C350,22 250,22 250,44 M350,0 L350,44 M350,0 C350,22 550,22 550,44"/></svg></div>
+
+  <div class="lv"><b>Lv 21〜30</b>60 コマ</div>
+  <div class="cell" style="grid-column:4"><div class="node done"><span class="tag">広さ・済み</span><b>DirectX 11 のゲーム 10 本</b><small>3060 の代役で 21 本を試し、14 本が絵を返した。ほかに Heaven と Valley</small></div></div>
+  <div class="cell" style="grid-column:5"><div class="node now"><span class="tag">速さ・いま Lv 20</span><b>フル HD で毎秒 60 コマ</b><small>待ちを減らす。fence を本当に待つ・書き込みの待ちを絞る</small></div></div>
+  <div class="cell" style="grid-column:7"><div class="node done"><span class="tag">映像と音・済み</span><b>描いた絵を iPhone に出す</b><small>0.7.36 で iPhone の画面に出た。全画面は横向きで固定できる</small></div></div>
+
+  <div class="link"><svg viewBox="0 0 600 44" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke"
+    d="M250,0 C250,22 50,22 50,44 M250,0 L250,44 M350,0 L350,44 M550,0 L550,44"/></svg></div>
+
+  <div class="lv"><b>Lv 31〜40</b>重いゲーム</div>
+  <div class="cell" style="grid-column:2"><div class="node now"><span class="tag">仲間・ほぼ済み</span><b>招待制で試す人を集める</b><small>報告の道具・配る物に人ごとの印・中核は渡さない・Discord</small></div></div>
+  <div class="cell h1" style="grid-column:4"><div class="node"><span class="tag">広さ</span><b>DirectX 12 の 12_0・OpenGL 3 以上</b><small>tiled resources と transform feedback を真似る</small></div></div>
+  <div class="cell" style="grid-column:5"><div class="node"><span class="tag">速さ</span><b>重いゲームも動く速さ</b><small>大きいデータの往復を減らす</small></div></div>
+  <div class="cell" style="grid-column:7"><div class="node idea"><span class="tag">映像と音</span><b>iPhone の GPU のモニターが 1 枚</b><small>仮のモニター。触るとマウスになる</small></div></div>
+
+  <div class="link"><svg viewBox="0 0 600 44" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke"
+    d="M50,0 L50,44 M250,0 L250,44 M350,0 L350,44 M350,0 C350,22 450,22 450,44 M550,0 L550,44"/><path class="x" vector-effect="non-scaling-stroke" d="M50,0 C50,22 250,22 250,44"/></svg></div>
+
+  <div class="lv"><b>Lv 41〜50</b>見せる</div>
+  <div class="cell" style="grid-column:2"><div class="node idea"><span class="tag">宣伝</span><b>同じものさしで点数を出す</b><small>Geekbench などで測って、iPhone が RTX の何番くらいかを示す</small></div></div>
+  <div class="cell" style="grid-column:4"><div class="node"><span class="tag">広さ</span><b>試すアプリの表 100 本</b><small>動く・動かないを毎回測る</small></div></div>
+  <div class="cell" style="grid-column:5"><div class="node idea"><span class="tag">速さ</span><b>MetalFX で小さく描いて広げる</b><small>DLSS と同じ考え方。4K への近道</small></div></div>
+  <div class="cell" style="grid-column:6"><div class="node"><span class="tag">つなぎ方</span><b>USB を太くする</b><small>インターネット共有の有線のつながり。PC のネットは Wi-Fi のまま</small></div></div>
+  <div class="cell" style="grid-column:7"><div class="node idea"><span class="tag">映像と音</span><b>iPhone をスピーカーに</b><small>PC の音を iPhone から出す</small></div></div>
+
+  <div class="link"><svg viewBox="0 0 600 44" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke"
+    d="M50,0 L50,44 M250,0 C250,22 150,22 150,44 M250,0 L250,44 M350,0 L350,44 M450,0 L450,44 M550,0 L550,44"/><path class="x" vector-effect="non-scaling-stroke" d="M450,0 C450,22 350,22 350,44"/></svg></div>
+
+  <div class="lv"><b>Lv 51〜60</b>4K</div>
+  <div class="cell" style="grid-column:2"><div class="node"><span class="tag">仲間</span><b>公開するかを決める</b><small>名前・ライセンス</small></div></div>
+  <div class="cell" style="grid-column:3"><div class="node idea"><span class="tag">AI</span><b>iPhone の AI の回路を PC から</b><small>文字起こしや画像生成を Neural Engine で</small></div></div>
+  <div class="cell" style="grid-column:4"><div class="node idea"><span class="tag">広さ</span><b>Steam Deck と Linux</b><small>Windows 以外にも iPhone を差せる</small></div></div>
+  <div class="cell" style="grid-column:5"><div class="node"><span class="tag">速さ</span><b>4K で毎秒 60 コマ</b><small>フル HD の 4 倍の絵</small></div></div>
+  <div class="cell" style="grid-column:6"><div class="node"><span class="tag">つなぎ方</span><b>入れる手順が 1 回</b><small>抜き差しでつなぎ直せる</small></div></div>
+  <div class="cell" style="grid-column:7"><div class="node idea"><span class="tag">映像と音</span><b>PC・iPhone・モニター</b><small>iPhone に差したモニターに、iPhone が描いた絵を出す</small></div></div>
+
+  <div class="link"><svg viewBox="0 0 600 44" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke"
+    d="M50,0 L50,44 M150,0 L150,44 M250,0 L250,44 M350,0 L350,44 M450,0 L450,44 M550,0 L550,44"/></svg></div>
+
+  <div class="lv"><b>Lv 61〜70</b>120 コマ</div>
+  <div class="cell pass" style="grid-column:2"></div>
+  <div class="cell pass" style="grid-column:3"></div>
+  <div class="cell" style="grid-column:4"><div class="node"><span class="tag">広さ</span><b>Android</b><small>Vulkan をそのまま使える</small></div></div>
+  <div class="cell" style="grid-column:5"><div class="node idea"><span class="tag">速さ</span><b>毎秒 120 コマ</b><small>MetalFX でコマとコマの間の絵を作る</small></div></div>
+  <div class="cell" style="grid-column:6"><div class="node"><span class="tag">つなぎ方</span><b>App Store に出す</b><small>誰でも入れられる。7 日ごとの入れ直しが無くなる</small></div></div>
+  <div class="cell" style="grid-column:7"><div class="node idea"><span class="tag">映像と音</span><b>OBS の録画を iPhone で</b><small>PC の録画と配信の重い処理を iPhone にまかせる</small></div></div>
+
+  <div class="link"><svg viewBox="0 0 600 44" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke"
+    d="M50,0 L50,44 M150,0 L150,44 M250,0 L250,44 M350,0 L350,44 M450,0 L450,44 M550,0 L550,44"/></svg></div>
+
+  <div class="lv"><b>Lv 71〜80</b>ケーブルなし</div>
+  <div class="cell" style="grid-column:2"><div class="node"><span class="tag">仲間</span><b>手伝う人が直せる</b><small>設定・報告・互換の調べ</small></div></div>
+  <div class="cell pass" style="grid-column:3"></div>
+  <div class="cell" style="grid-column:4"><div class="node idea"><span class="tag">広さ</span><b>レイトレーシング</b><small>新しい iPhone の光の計算の回路を使う</small></div></div>
+  <div class="cell" style="grid-column:5"><div class="node"><span class="tag">速さ</span><b>4K で毎秒 120 コマ</b><small>4K と 120 コマを両方</small></div></div>
+  <div class="cell" style="grid-column:6"><div class="node"><span class="tag">つなぎ方</span><b>ケーブルなしで</b><small>家の Wi-Fi でつなぐ</small></div></div>
+  <div class="cell" style="grid-column:7"><div class="node idea"><span class="tag">映像と音</span><b>iPad を大きいモニターに</b><small>同じ仕組みで</small></div></div>
+
+  <div class="link"><svg viewBox="0 0 600 44" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke"
+    d="M50,0 L50,44 M150,0 L150,44 M250,0 L250,44 M350,0 L350,44 M450,0 L450,44 M550,0 L550,44"/><path class="x" vector-effect="non-scaling-stroke" d="M450,0 C450,22 350,22 350,44"/></svg></div>
+
+  <div class="lv"><b>Lv 81〜90</b>何台も</div>
+  <div class="cell pass" style="grid-column:2"></div>
+  <div class="cell pass" style="grid-column:3"></div>
+  <div class="cell h1" style="grid-column:4"><div class="node"><span class="tag">広さ</span><b>古いスマホを計算機に</b><small>使わなくなった端末</small></div></div>
+  <div class="cell h1" style="grid-column:5"><div class="node"><span class="tag">速さ</span><b>iPhone を何台も</b><small>GPU を 2 枚・3 枚</small></div></div>
+  <div class="cell" style="grid-column:6"><div class="node idea"><span class="tag">つなぎ方</span><b>友達の iPhone の GPU を借りる</b><small>家の外からネット越しにつなぐ</small></div></div>
+  <div class="cell" style="grid-column:7"><div class="node idea"><span class="tag">映像と音</span><b>GPU を足すとモニターも増える</b><small>送り返しが無いので速い</small></div></div>
+
+  <div class="link"><svg viewBox="0 0 600 44" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke"
+    d="M50,0 C50,22 350,22 350,44 M150,0 C150,22 350,22 350,44 M250,0 C250,22 350,22 350,44 M350,0 L350,44 M450,0 C450,22 350,22 350,44 M550,0 C550,22 350,22 350,44"/></svg></div>
+
+  <div class="lv"><b>Lv 91〜100</b>ゴール</div>
+  <div class="cell mid"><div class="node goal"><b>差すだけで、普通の GPU とモニターとスピーカー</b>
+    <small>Windows のアプリやゲームが、iPhone を 2 枚目の GPU として普通に使い、目に見えて得をする。いずれはケーブルなしで</small></div></div>
+</div></div>
+</body>
+</html>
