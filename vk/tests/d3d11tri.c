@@ -1,6 +1,6 @@
 // DirectX 11 で、窓を使わずに三角形を 1 枚描いて、絵を PC に持ち帰る試験。
 // 横に DXVK の d3d11.dll・dxgi.dll を置くと、DirectX の頼みが Vulkan に直される。
-// DXVK_FILTER_DEVICE_NAME=iPhone-RPC を付けると、iPhone のドライバ越しの GPU を選ぶ。
+// DXVK_FILTER_DEVICE_NAME=iPhone を付けると、iPhone のドライバ越しの GPU を選ぶ。
 //   d3d11tri.exe [出す PPM のファイル名]
 // 描いた絵の「色のついた画素の数」と「全部の画素から作った検算の値」を出す
 #define COBJMACROS

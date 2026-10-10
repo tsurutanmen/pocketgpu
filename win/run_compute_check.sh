@@ -26,7 +26,7 @@ FT=$VKB/d3d11/feat.exe
 cp -f "$FT" "$VKB/d3d11native/"
 for sc in cs_uav cs_atomic cs_shared cs_struct cs_append so indirect query deferred; do
     (cd "$VKB/d3d11native" && timeout 60 "$VKB/subwin.exe" ./feat.exe "$sc" "$(cygpath -w "$OUT/feat_native/$sc.ppm")") > "$OUT/feat_native/$sc.txt" 2>&1
-    (cd "$VKB/d3d11" && DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=none \
+    (cd "$VKB/d3d11" && DXVK_FILTER_DEVICE_NAME="iPhone" DXVK_LOG_LEVEL=none \
         run 120 "$(cygpath -m "$FT")" "$sc" "$(cygpath -w "$OUT/feat_dev/$sc.ppm")") > "$OUT/feat_dev/$sc.txt" 2>&1
     echo "$sc：$(PYTHONIOENCODING=utf-8 python /d/iphone-rpc/app/vk/tools/imgdiff.py "$OUT/feat_native/$sc.ppm" "$OUT/feat_dev/$sc.ppm" 2>&1 | sed 's/^[^：]*：//')"
 done

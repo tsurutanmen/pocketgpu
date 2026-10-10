@@ -57,12 +57,12 @@ done
 
 echo "== 4. DirectX 11（DXVK-macOS）"
 D=$VKB/d3d11
-(cd "$D" && DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=info DXVK_LOG_PATH=none IPHONE_VK_LOG=1 \
+(cd "$D" && DXVK_FILTER_DEVICE_NAME="iPhone" DXVK_LOG_LEVEL=info DXVK_LOG_PATH=none IPHONE_VK_LOG=1 \
     run 180 "D:/iphone-rpc/vkbuild/d3d11/d3d11tri.exe" "$WOUT\\d3d11tri.ppm") > "$OUT/d3d11tri.txt" 2>&1
 echo "三角形：$(grep -a '検算\|失敗\|not supported' "$OUT/d3d11tri.txt" | head -3 | tr '\n' ' ')（代役とふつうの DirectX は 7a12ddcb）"
 for m in plain bc1; do
     arg=""; [ $m = bc1 ] && arg=bc1
-    (cd "$D" && DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=info DXVK_LOG_PATH=none IPHONE_VK_LOG=1 IPHONE_VK_STATS=1 \
+    (cd "$D" && DXVK_FILTER_DEVICE_NAME="iPhone" DXVK_LOG_LEVEL=info DXVK_LOG_PATH=none IPHONE_VK_LOG=1 IPHONE_VK_STATS=1 \
         run 300 "D:/iphone-rpc/vkbuild/d3d11/d3d11cube.exe" 300 "$WOUT\\d3d11cube_$m.ppm" $arg) > "$OUT/d3d11cube_$m.txt" 2>&1
     echo "立方体 $m：$(grep -a 'コマ/秒\|検算\|失敗' "$OUT/d3d11cube_$m.txt" | grep -av '^\[iphone-vk\]' | tr '\n' ' ')"
 done
@@ -71,7 +71,7 @@ echo "（代役とふつうの DirectX は d760538a・BC1 はふつう 139f0d27�
 D3=$VKB/dxvk3
 for m in plain bc1; do
     arg=""; [ $m = bc1 ] && arg=bc1
-    (cd "$D3" && IPHONE_VK_DXVK3=1 DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=info DXVK_LOG_PATH=none IPHONE_VK_LOG=1 \
+    (cd "$D3" && IPHONE_VK_DXVK3=1 DXVK_FILTER_DEVICE_NAME="iPhone" DXVK_LOG_LEVEL=info DXVK_LOG_PATH=none IPHONE_VK_LOG=1 \
         run 300 "D:/iphone-rpc/vkbuild/dxvk3/d3d11cube.exe" 300 "$WOUT\\dxvk3cube_$m.ppm" $arg) > "$OUT/d3d11dxvk3_$m.txt" 2>&1
     echo "DXVK 3 の立方体 $m：$(grep -a 'コマ/秒\|検算\|失敗' "$OUT/d3d11dxvk3_$m.txt" | grep -av '^\[iphone-vk\]' | tr '\n' ' ')"
 done
@@ -79,7 +79,7 @@ done
 for dx in d3d11 dxvk3; do
     [ -f "$VKB/$dx/d3d11event.exe" ] || cp -f "$VKB/d3d11/d3d11event.exe" "$VKB/$dx/"
     flag=""; [ $dx = dxvk3 ] && flag=1
-    (cd "$VKB/$dx" && IPHONE_VK_DXVK3=$flag DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=none run 120 "D:/iphone-rpc/vkbuild/$dx/d3d11event.exe" 20) > "$OUT/event_$dx.txt" 2>&1
+    (cd "$VKB/$dx" && IPHONE_VK_DXVK3=$flag DXVK_FILTER_DEVICE_NAME="iPhone" DXVK_LOG_LEVEL=none run 120 "D:/iphone-rpc/vkbuild/$dx/d3d11event.exe" 20) > "$OUT/event_$dx.txt" 2>&1
     echo "EVENT のクエリ $dx：$(tail -1 "$OUT/event_$dx.txt")"
 done
 # DXVK が「足りない」と言った機能を拾う
@@ -107,7 +107,7 @@ mkdir -p "$OUT/feat_native" "$OUT/feat_iphone" "$VKB/d3d11native"
 cp -f "$FT" "$VKB/d3d11native/"
 for sc in $("$FT" list | tr -d '\r'); do
     (cd "$VKB/d3d11native" && timeout 60 "$VKB/subwin.exe" ./feat.exe "$sc" "$(cygpath -w "$OUT/feat_native/$sc.ppm")") > "$OUT/feat_native/$sc.txt" 2>&1
-    (cd "$VKB/d3d11" && DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=none IPHONE_VK_LOG=1 \
+    (cd "$VKB/d3d11" && DXVK_FILTER_DEVICE_NAME="iPhone" DXVK_LOG_LEVEL=none IPHONE_VK_LOG=1 \
         run 120 "$(cygpath -m "$FT")" "$sc" "$(cygpath -w "$OUT/feat_iphone/$sc.ppm")") > "$OUT/feat_iphone/$sc.txt" 2>&1
     if [ -s "$OUT/feat_native/$sc.ppm" ] && [ -s "$OUT/feat_iphone/$sc.ppm" ]; then
         echo "$sc：$(PYTHONIOENCODING=utf-8 python /d/iphone-rpc/app/vk/tools/imgdiff.py "$OUT/feat_native/$sc.ppm" "$OUT/feat_iphone/$sc.ppm" 2>&1 | sed 's/^[^：]*：//')"
@@ -125,7 +125,7 @@ D3=$VKB/d3d11_dx3
 mkdir -p "$D3" "$OUT/feat_dx3"
 cp -f "$FT" "$D3/" && cp -f "$VKB/dxvk3/d3d11.dll" "$VKB/dxvk3/dxgi.dll" "$D3/"
 for sc in $("$FT" list | tr -d '\r'); do
-    (cd "$D3" && IPHONE_VK_DXVK3=1 DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=none IPHONE_VK_LOG=1 \
+    (cd "$D3" && IPHONE_VK_DXVK3=1 DXVK_FILTER_DEVICE_NAME="iPhone" DXVK_LOG_LEVEL=none IPHONE_VK_LOG=1 \
         run 120 "$(cygpath -m "$D3/feat.exe")" "$sc" "$(cygpath -w "$OUT/feat_dx3/$sc.ppm")") > "$OUT/feat_dx3/$sc.txt" 2>&1
     if [ -s "$OUT/feat_native/$sc.ppm" ] && [ -s "$OUT/feat_dx3/$sc.ppm" ]; then
         echo "$sc：$(PYTHONIOENCODING=utf-8 python /d/iphone-rpc/app/vk/tools/imgdiff.py "$OUT/feat_native/$sc.ppm" "$OUT/feat_dx3/$sc.ppm" 2>&1 | sed 's/^[^：]*：//')"

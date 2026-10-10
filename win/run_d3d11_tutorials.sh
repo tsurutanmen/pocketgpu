@@ -21,7 +21,7 @@ for n in 1 2 3 4 5 6 7; do
         vk=$REF; [ $tag = cmp ] && vk=$CMP
         rm -f "$OUT/${name}_$tag.ppm"
         # 入門サンプルは自分では終わらないので、絵を書いたら止める
-        (cd "$dir" && IPHONE_VK=$vk IPHONE_VK_LOG=1 IPHONE_VK_DUMP="60:$(cygpath -w "$OUT")\\${name}_$tag.ppm" DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=none \
+        (cd "$dir" && IPHONE_VK=$vk IPHONE_VK_LOG=1 IPHONE_VK_DUMP="60:$(cygpath -w "$OUT")\\${name}_$tag.ppm" DXVK_FILTER_DEVICE_NAME="iPhone" DXVK_LOG_LEVEL=none \
             cmd.exe //c "$VKCMD" "$(cygpath -m "$S/x64/DXVK/$name.exe")" > "$OUT/${name}_$tag.log" 2>&1) &
         for i in $(seq 1 60); do [ -s "$OUT/${name}_$tag.ppm" ] && break; sleep 0.5; done
         sleep 0.5

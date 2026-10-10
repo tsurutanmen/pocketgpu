@@ -28,7 +28,7 @@ run() { # 名前 形 フォルダ 記録の印 追加の引数
     local exe="$dir/$name.exe" t0 t1
     t0=$(date +%s.%N)
     if [ "$mode" = icd ]; then
-        (cd "$dir" && IPHONE_VK=$VK IPHONE_VK_LOG=1 DXVK_FILTER_DEVICE_NAME="iPhone-RPC" DXVK_LOG_LEVEL=none \
+        (cd "$dir" && IPHONE_VK=$VK IPHONE_VK_LOG=1 DXVK_FILTER_DEVICE_NAME="iPhone" DXVK_LOG_LEVEL=none \
             timeout 180 cmd.exe //c "$VKCMD" "$(cygpath -m "$exe")" $ARGS "$extra") > "$OUT/${name}_${mode}_$tag.log" 2>&1
     elif [ "$mode" = dxvk ]; then
         (cd "$dir" && DXVK_FILTER_DEVICE_NAME="NVIDIA GeForce RTX 3060" DXVK_LOG_LEVEL=none timeout 180 /d/iphone-rpc/vkbuild/subwin.exe "./$name.exe" $ARGS "$extra") > /dev/null 2>&1
