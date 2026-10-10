@@ -38,6 +38,21 @@
 #include <unistd.h>
 #endif
 #include "video.h"
+#ifdef __ANDROID__
+#include <android/log.h>
+// Android には ImageIO も WIC も無いので、JPEG は stb_image_write（public domain / MIT・https://github.com/nothings/stb）の小さな書き手で縮める
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STBIW_ASSERT(x) ((void) 0)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#include "../third_party/stb/stb_image_write.h"
+#pragma GCC diagnostic pop
+#endif
+// 窓に出すコマを JPEG に縮められる機械（iPhone は ImageIO、PC の代役は WIC、Android は stb）
+#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
+#define VR_HAVE_JPEG 1
+#endif
 
 // 記録。iPhone ではアプリの中の printf が見えないので os_log に出す（PC から USB で読める）
 static void vlog(const char *fmt, ...) {
@@ -57,6 +72,10 @@ static void vlog(const char *fmt, ...) {
     fputs(line, stdout);
     fputc('\n', stdout);
     fflush(stdout);
+#ifdef __ANDROID__
+    // アプリ（APK）にしたときは stdout が見えないので logcat にも出す（adb logcat -s iphone-rpc-vk）
+    __android_log_print(ANDROID_LOG_INFO, "iphone-rpc-vk", "%s", line);
+#endif
 #endif
 }
 
@@ -114,6 +133,14 @@ static int vid_probe(void);            // 窓に出すコマを H.264 に縮め�
 // 持たなければ（MoltenVK）、空の頂点バッファだけは 0 で埋めた代わりのバッファに差し替える
 static int g_nulldesc_gpu;
 static int g_divisor; // GPU が VK_EXT_vertex_attribute_divisor を持つ
+// 試験用（Android 版）：VKR_FAKE_DIVISOR=1 なら、GPU が VK_EXT_vertex_attribute_divisor を持たなくても持つと名乗る。
+// Android エミュレーターの Vulkan（gfxstream）はこの拡張を隠すが、DirectX 12（vkd3d-proton）は無いと装置を作らない。
+// 名乗るだけで、装置にも pipeline にも渡さない（step rate が 1 でない描画は正しくならない）。本物の端末で使う物ではない
+static int fake_divisor(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("VKR_FAKE_DIVISOR") != NULL;
+    return on && !g_divisor;
+}
 // 調べ用：VKR_LIKE_IOS=1 で、PC の代役が iPhone の GPU のふりをする（BC・geometry shader・cull distance・空の descriptor を持たない）。
 // 持たない機能を有効にして装置を作ろうとすると、MoltenVK と同じように断る
 static int like_ios(void) {
@@ -330,6 +357,68 @@ typedef int (*vkr_upscale_fn)(const uint8_t *src, uint32_t w, uint32_t h, uint32
 static vkr_upscale_fn g_upscale;
 void vkr_set_upscaler(vkr_upscale_fn fn) { g_upscale = fn; }
 
+#ifdef __ANDROID__
+// Android の Vulkan（とくにエミュレーターの gfxstream）は、1.2・1.3 の本体に取り込まれた拡張の名前を一覧から外す。
+// DXVK（DirectX 11）は VK_KHR_sampler_mirror_clamp_to_edge・VK_EXT_shader_viewport_index_layer などを名前で探すので、
+// 本体が持っているのに名前が無いと装置を作らない。そこで、GPU の版で本体になっている拡張の名前を一覧に足す。
+// 頼まれたら（足した名前は GPU の一覧に無いので）装置を作るときに外す。機能の有る無しは足さずに、アプリが機能の構造体で調べる
+static const struct { const char *name; int minor; } g_promoted[] = {
+    { "VK_KHR_sampler_mirror_clamp_to_edge", 2 }, { "VK_EXT_shader_viewport_index_layer", 2 }, { "VK_KHR_timeline_semaphore", 2 },
+    { "VK_KHR_create_renderpass2", 2 }, { "VK_KHR_depth_stencil_resolve", 2 }, { "VK_KHR_draw_indirect_count", 2 },
+    { "VK_KHR_driver_properties", 2 }, { "VK_KHR_8bit_storage", 2 }, { "VK_KHR_16bit_storage", 1 }, { "VK_EXT_descriptor_indexing", 2 },
+    { "VK_EXT_host_query_reset", 2 }, { "VK_EXT_scalar_block_layout", 2 }, { "VK_KHR_shader_atomic_int64", 2 }, { "VK_KHR_shader_float_controls", 2 },
+    { "VK_KHR_spirv_1_4", 2 }, { "VK_KHR_uniform_buffer_standard_layout", 2 }, { "VK_KHR_imageless_framebuffer", 2 },
+    { "VK_KHR_separate_depth_stencil_layouts", 2 }, { "VK_KHR_buffer_device_address", 2 }, { "VK_EXT_separate_stencil_usage", 2 },
+    { "VK_KHR_multiview", 1 }, { "VK_KHR_shader_draw_parameters", 1 }, { "VK_KHR_variable_pointers", 1 }, { "VK_KHR_relaxed_block_layout", 1 },
+    { "VK_KHR_dynamic_rendering", 3 }, { "VK_KHR_synchronization2", 3 }, { "VK_KHR_copy_commands2", 3 }, { "VK_EXT_extended_dynamic_state", 3 },
+    { "VK_EXT_extended_dynamic_state2", 3 }, { "VK_KHR_shader_integer_dot_product", 3 }, { "VK_KHR_maintenance4", 3 }, { "VK_EXT_private_data", 3 },
+    { "VK_EXT_subgroup_size_control", 3 }, { "VK_EXT_shader_demote_to_helper_invocation", 3 }, { "VK_KHR_shader_non_semantic_info", 3 },
+    { "VK_KHR_shader_terminate_invocation", 3 }, { "VK_EXT_image_robustness", 3 }, { "VK_EXT_inline_uniform_block", 3 },
+    { "VK_EXT_pipeline_creation_cache_control", 3 }, { "VK_EXT_4444_formats", 3 }, { "VK_KHR_zero_initialize_workgroup_memory", 3 },
+};
+static int promoted_minor(const char *name) {
+    for (size_t i = 0; i < sizeof g_promoted / sizeof *g_promoted; i++) if (!strcmp(g_promoted[i].name, name)) return g_promoted[i].minor;
+    return 0;
+}
+static int dev_has_real_ext(const char *name) {
+    uint32_t ne = 0;
+    vkEnumerateDeviceExtensionProperties(g_pd, NULL, &ne, NULL);
+    VkExtensionProperties *e = calloc(ne ? ne : 1, sizeof *e);
+    vkEnumerateDeviceExtensionProperties(g_pd, NULL, &ne, e);
+    int has = has_ext(e, ne, name);
+    free(e);
+    return has;
+}
+// 一覧 *pe（*pne 個・malloc）に、本体になっている拡張の名前を足す
+static void add_promoted_exts(VkExtensionProperties **pe, uint32_t *pne) {
+    VkPhysicalDeviceProperties p;
+    vkGetPhysicalDeviceProperties(g_pd, &p);
+    int minor = VK_API_VERSION_MAJOR(p.apiVersion) > 1 ? 99 : (int) VK_API_VERSION_MINOR(p.apiVersion);
+    if (minor < 1) return;
+    // 本体の機能がなければ名乗らない物（DXVK が名前だけで頼りにするもの）
+    int mirror = 0, vil = 0;
+    if (minor >= 2 && vkGetPhysicalDeviceFeatures2) {
+        VkPhysicalDeviceVulkan12Features f12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+        VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f12 };
+        vkGetPhysicalDeviceFeatures2(g_pd, &f2);
+        mirror = f12.samplerMirrorClampToEdge;
+        vil = f12.shaderOutputViewportIndex && f12.shaderOutputLayer;
+    }
+    for (size_t i = 0; i < sizeof g_promoted / sizeof *g_promoted; i++) {
+        const char *nm = g_promoted[i].name;
+        if (g_promoted[i].minor > minor || has_ext(*pe, *pne, nm)) continue;
+        if (!strcmp(nm, "VK_KHR_sampler_mirror_clamp_to_edge") && !mirror) continue;
+        if (!strcmp(nm, "VK_EXT_shader_viewport_index_layer") && !vil) continue;
+        *pe = realloc(*pe, sizeof **pe * (*pne + 1));
+        memset(&(*pe)[*pne], 0, sizeof **pe);
+        snprintf((*pe)[*pne].extensionName, sizeof (*pe)[*pne].extensionName, "%s", nm);
+        (*pe)[(*pne)].specVersion = !strcmp(nm, "VK_KHR_sampler_mirror_clamp_to_edge") ? 3 : !strcmp(nm, "VK_KHR_shader_float_controls") ? 4
+                                    : !strcmp(nm, "VK_KHR_timeline_semaphore") ? 2 : !strcmp(nm, "VK_KHR_driver_properties") ? 1 : 1;
+        (*pne)++;
+    }
+}
+#endif
+
 static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t api) {
 #define CLEAR(n) n = NULL;
     VKFUNCS_OPT(CLEAR)
@@ -414,9 +503,9 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
         for (uint32_t i = 0; i < ne; i++)
             if (!strcmp(ex[i].extensionName, "VK_EXT_vertex_attribute_divisor")) g_divisor = 1;
         free(ex);
-        if (g_divisor) caps |= VR_CAP_DIVISOR;
+        if (g_divisor || fake_divisor()) caps |= VR_CAP_DIVISOR;
     }
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef VR_HAVE_JPEG
     caps |= VR_CAP_JPEG | VR_CAP_JPEG_PIPE; // 窓に出すコマを JPEG に縮められる（iPhone は ImageIO、PC の代役は WIC）
 #endif
     if (g_upscale) caps |= VR_CAP_UPSCALE; // 縮める前に MetalFX で広げられる（アプリが関数を登録したとき）
@@ -1834,6 +1923,23 @@ done:
     free(rgb);
     return ok;
 }
+#elif defined(__ANDROID__)
+// Android：stb_image_write の JPEG 書き手。BGRA/RGBA を RGB に並べ直してから渡す（stb は 3 バイトの RGB を受け取る）。
+// 色は 4:2:0 に間引く（stb は質 90 以下で自動）。縮めるのは CPU 1 本
+static void stb_to_vr(void *ctx, void *data, int size) { vr_put((vr_buf *) ctx, data, (size_t) size); }
+static int jpeg_encode(const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, int bgra, int q, vr_buf *out) {
+    uint8_t *rgb = malloc((size_t) w * 3 * h);
+    if (!rgb) return 0;
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t *s = px + (size_t) y * stride;
+        uint8_t *d = rgb + (size_t) y * w * 3;
+        if (bgra) for (uint32_t x = 0; x < w; x++, s += 4, d += 3) { d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; }
+        else for (uint32_t x = 0; x < w; x++, s += 4, d += 3) { d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; }
+    }
+    int ok = stbi_write_jpg_to_func(stb_to_vr, out, (int) w, (int) h, 3, rgb, q < 1 ? 1 : q > 100 ? 100 : q);
+    free(rgb);
+    return ok != 0;
+}
 #endif
 
 // ---- 空の頂点バッファの代わり ----
@@ -1942,7 +2048,7 @@ static VkBuffer dummy_vb(void) {
 // ---- 先送りの JPEG（VR_READ_JPEG_PIPE） ----
 // 今のコマを写して別の糸で縮め始め、返事にはひとつ前のコマの JPEG を入れる。
 // 縮めている間に、受け手は次のコマの仕事を進められる（窓に出るのは 1 コマ遅れる）
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef VR_HAVE_JPEG
 static struct {
     uint8_t *px;
     size_t cap;
@@ -2696,6 +2802,15 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         vkEnumerateDeviceExtensionProperties(g_pd, NULL, &ne, NULL);
         VkExtensionProperties *e = calloc(ne ? ne : 1, sizeof *e);
         vkEnumerateDeviceExtensionProperties(g_pd, NULL, &ne, e);
+        if (fake_divisor()) {
+            e = realloc(e, sizeof *e * (ne + 1));
+            memset(&e[ne], 0, sizeof *e);
+            snprintf(e[ne].extensionName, sizeof e[ne].extensionName, "VK_EXT_vertex_attribute_divisor");
+            e[ne++].specVersion = 3;
+        }
+#ifdef __ANDROID__
+        add_promoted_exts(&e, &ne);
+#endif
         vr_u32(&g_out, ne);
         vr_put(&g_out, e, sizeof *e * ne);
         free(e);
@@ -2713,6 +2828,12 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = chain };
             vkGetPhysicalDeviceFeatures2(g_pd, &f2);
             like_ios_mask(&f2.features);
+            if (fake_divisor())
+                for (uint32_t i = 0; i < n; i++) {
+                    VkBaseOutStructure *b = blocks[i];
+                    if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT)
+                        ((VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT *) b)->vertexAttributeInstanceRateDivisor = VK_TRUE;
+                }
             vr_put(&g_out, &f2.features, sizeof f2.features);
         } else {
             VkPhysicalDeviceProperties2 p2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = chain };
@@ -2720,6 +2841,12 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             like_ios_limits(&p2.properties.limits);
             like_ios_vendor(&p2.properties);
             for (uint32_t i = 0; i < n; i++) like_ios_props2(blocks[i]);
+            if (fake_divisor())
+                for (uint32_t i = 0; i < n; i++) {
+                    VkBaseOutStructure *b = blocks[i];
+                    if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT)
+                        ((VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT *) b)->maxVertexAttribDivisor = 0x7fffffffu;
+                }
             vr_put(&g_out, &p2.properties, sizeof p2.properties);
         }
         for (uint32_t i = 0; i < n; i++) {
@@ -2763,7 +2890,14 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t ne = vr_ru32(r);
         const char *names[64];
         uint32_t n_names = 0;
-        for (uint32_t i = 0; i < ne && i < 63; i++) names[n_names++] = rd_str(r);
+        for (uint32_t i = 0; i < ne && i < 63; i++) {
+            const char *nm = rd_str(r);
+            if (fake_divisor() && nm && !strcmp(nm, "VK_EXT_vertex_attribute_divisor")) continue; // 名乗りだけ（上の fake_divisor）。装置には頼まない
+#ifdef __ANDROID__
+            if (nm && promoted_minor(nm) && !dev_has_real_ext(nm)) continue; // 本体になっている拡張の名前だけ足した物（add_promoted_exts）。装置には頼まない
+#endif
+            names[n_names++] = nm;
+        }
         if (g_portability) names[n_names++] = "VK_KHR_portability_subset";
         uint32_t has_f = vr_ru32(r);
         VkPhysicalDeviceFeatures feats;
@@ -2789,6 +2923,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             b->sType = (VkStructureType) st;
             if (d) memcpy((uint8_t *) b + sizeof(VkBaseOutStructure), d, sz);
             blocks[i] = b;
+            if (fake_divisor() && (VkStructureType) st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT) continue; // 装置には渡さない
             *link = b;
             link = (void **) &b->pNext;
         }
@@ -3037,7 +3172,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t w = vr_ru32(r), h = vr_ru32(r), stride = vr_ru32(r), bgra = vr_ru32(r), q = vr_ru32(r);
         if (!e || !e->map || w == 0 || h == 0 || stride < (uint64_t) w * 4 || off > e->size || (uint64_t) stride * h > e->size - off)
             return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef VR_HAVE_JPEG
         double jt1 = t_ms();
         size_t before = g_out.n;
         if (!jpeg_encode((const uint8_t *) e->map + off, w, h, stride, (int) bgra, (int) (q ? q : 80), &g_out)) return reply(s, VK_ERROR_UNKNOWN);
@@ -3067,7 +3202,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t w = vr_ru32(r), h = vr_ru32(r), stride = vr_ru32(r), bgra = vr_ru32(r), q = vr_ru32(r);
         if (!e || !e->map || w == 0 || h == 0 || stride < (uint64_t) w * 4 || off > e->size || (uint64_t) stride * h > e->size - off)
             return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
-#if defined(__APPLE__) || defined(_WIN32)
+#ifdef VR_HAVE_JPEG
         // ひとつ前のコマの JPEG ができあがるのを待って、返事に入れる
         double t1 = t_ms();
         jp_join();
