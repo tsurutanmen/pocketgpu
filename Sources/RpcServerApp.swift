@@ -133,6 +133,8 @@ struct ContentView: View {
     @StateObject private var status = DeviceStatus()
     // PC から来た命令で描いた絵を、この iPhone の画面にも出す。出している間だけ受け手が 1 枚写す
     @AppStorage("showFrames") private var showFrames = false
+    // 全画面にしたとき、絵を 90 度回して横向きで固定する（FramePreview.swift と同じ鍵）
+    @AppStorage("fullLandscape") private var fullLandscape = true
     @StateObject private var preview = FramePreviewModel()
     // 画面の言葉（自動・日本語・English）。ここで読むと、変えたときに画面が描き直される
     @AppStorage("lang") private var lang = AppLang.auto.rawValue
@@ -162,6 +164,7 @@ struct ContentView: View {
                     Toggle(L("iPhone に絵を出す", "Show frames on this iPhone"), isOn: $showFrames)
                         .onChange(of: showFrames) { _, on in preview.setOn(on) }
                     if showFrames {
+                        Toggle(L("全画面は横向きで固定", "Full screen: lock to landscape"), isOn: $fullLandscape)
                         FramePreviewView(model: preview, status: status)
                     }
                     ShareLink(item: diagnosticsText(status: status, log: log)) {

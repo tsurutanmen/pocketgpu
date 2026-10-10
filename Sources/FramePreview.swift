@@ -108,19 +108,32 @@ struct FramePreviewView: View {
     }
 }
 
-// 全画面。背景は黒。もう一度タップで戻る
+// 全画面。背景は黒。もう一度タップで戻る。
+// 横向きで固定のときは、画面の向きは縦のまま、絵だけを 90 度回して画面いっぱいに出す（iPhone を回しても向きが変わらない）
 struct FrameFullScreenView: View {
     @ObservedObject var model: FramePreviewModel
     @ObservedObject var status: DeviceStatus
+    @AppStorage("fullLandscape") private var landscape = true
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            FrameImageView(model: model, status: status, textColor: Color(white: 0.7))
+        GeometryReader { g in
+            ZStack {
+                Color.black
+                if landscape {
+                    FrameImageView(model: model, status: status, textColor: Color(white: 0.7))
+                        .frame(width: g.size.height, height: g.size.width)
+                        .rotationEffect(.degrees(90))
+                } else {
+                    FrameImageView(model: model, status: status, textColor: Color(white: 0.7))
+                }
+            }
+            .frame(width: g.size.width, height: g.size.height)
         }
+        .ignoresSafeArea()
         .contentShape(Rectangle())
         .onTapGesture { dismiss() }
         .statusBarHidden()
+        .persistentSystemOverlays(.hidden)
     }
 }
