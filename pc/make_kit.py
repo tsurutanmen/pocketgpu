@@ -76,6 +76,7 @@ Reporting
 
 If the connection keeps dropping
 - Restart the iPhone first, then plug it in again and reopen the app.
+- More answers are in FAQ.txt.
 
 Third-party software
 - dxvk\\: DXVK (macOS async build 1.10.3, by Gcenx), zlib license. See dxvk\\LICENSE.
@@ -107,6 +108,7 @@ PocketGPU 試験用のまとめ（下書き）
 
 つながりが何度も切れるとき
 - まず iPhone を再起動して、差し直してから、アプリを開き直してください
+- ほかの困りごとは FAQ.txt に書いてあります
 
 ほかの人が作ったもの
 - dxvk\\：DXVK（Gcenx さんの macOS async 版 1.10.3）・zlib ライセンス。dxvk\\LICENSE を見てください
@@ -164,6 +166,7 @@ def main():
     for name, text in (('pocketgpu.cmd', LAUNCH), ('check.cmd', CHECK), ('report.cmd', REPORT)):
         open(os.path.join(kit, name), 'w', encoding='ascii', newline='\r\n').write(text)
     shutil.copy2(os.path.join(HERE, 'kit', 'report.ps1'), os.path.join(kit, 'report.ps1'))
+    shutil.copy2(os.path.join(HERE, 'kit', 'FAQ.txt'), os.path.join(kit, 'FAQ.txt'))
     open(os.path.join(kit, 'README.txt'), 'w', encoding='utf-8-sig', newline='\r\n').write(README)
 
     # iPhone のアプリ：Payload/RpcServer.app/ に印のファイルを足した IPA
