@@ -82,6 +82,7 @@ static void where(const char *tag, void *addr) {
     }
 }
 
+static void print_stats_fwd(void);
 static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
@@ -99,6 +100,7 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     USHORT n = RtlCaptureStackBackTrace(0, 40, fr, NULL);
     for (USHORT i = 0; i < n; i++) where("  呼び出し元", fr[i]);
     fflush(stderr);
+    { if (getenv("IPHONE_VK_STATS")) print_stats_fwd(); }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -184,6 +186,10 @@ static double proc_cpu_ms(void);
 
 static void lz_print(void);
 
+static void ls_print(void);
+static inline int ls_on(void);
+static volatile long g_lso_n[2];
+static int g_lso_fix;
 static void print_stats(void) {
     uint64_t ts = 0, tc = 0, tb = 0;
     double tw = 0;
@@ -221,6 +227,8 @@ static void print_stats(void) {
                 (unsigned long long) g_stat.rp_load, (unsigned long long) g_stat.rp_store, (unsigned long long) g_stat.rp_clear,
                 (unsigned long long) g_stat.rp_dload, (unsigned long long) g_stat.rp_dstore, (unsigned long long) g_stat.rp_same, g_stat.rp_px / per / 1e6);
     }
+    if (ls_on()) ls_print();
+    if (g_lso_n[0] || g_lso_n[1]) fprintf(stderr, "  load_store_op_none：アプリが渡した NONE は LOAD %ld 個・STORE %ld 個（%s）\n", g_lso_n[0], g_lso_n[1], g_lso_fix ? "LOAD・STORE に直して送った" : "そのまま送った");
     fprintf(stderr, "  往復せずに済ませた待ち %llu\n", (unsigned long long) g_stat.skipped);
     if (g_stat.presents)
         fprintf(stderr, "  present %llu 回 %.1f ms（うち窓に描く %llu 回 %.1f ms）\n", (unsigned long long) g_stat.presents, g_stat.present_ms,
@@ -240,6 +248,8 @@ static void print_stats(void) {
         fprintf(stderr, "  違う所だけ送ったページ %llu・送ったバイト %llu・丸ごとなら %llu\n", (unsigned long long) g_stat.wdiff_pages,
                 (unsigned long long) g_stat.wdiff_sent, (unsigned long long) g_stat.wdiff_pages * PAGE);
 }
+
+static void print_stats_fwd(void) { print_stats(); }
 
 // ---- 受け手との通り道 ----
 static SRWLOCK g_lock = SRWLOCK_INIT;
@@ -912,7 +922,15 @@ static int has_ext(const char *name) {
 }
 
 // 受け手に渡す拡張の名前（KHR の divisor は、受け手が持つ EXT の名前に替える）。重ねて頼まないように、替えた結果が重なれば NULL
+// VK_KHR_load_store_op_none：受け手の GPU が持たない（または IPHONE_VK_LSO=1）ときは、アプリには持つと名乗り、受け手には拡張を頼まず、
+// 値を安全な物に直して送る。LOAD_OP_NONE は LOAD（前の中身を残す・読んでよい）、STORE_OP_NONE は STORE（中身は変わっていないので、書き戻しても同じ）。
+static int g_lso_fix;
+static int g_srv_lso;
+static volatile long g_lso_n[2]; // アプリが渡した NONE の数（LOAD・STORE）
+static inline uint32_t lso_load(uint32_t o) { if (o == 1000400000u) { g_lso_n[0]++; if (g_lso_fix) return (uint32_t) VK_ATTACHMENT_LOAD_OP_LOAD; } return o; }
+static inline uint32_t lso_store(uint32_t o) { if (o == 1000301000u) { g_lso_n[1]++; if (g_lso_fix) return (uint32_t) VK_ATTACHMENT_STORE_OP_STORE; } return o; }
 static const char *fwd_ext(const char *name, const char *const *all, uint32_t n) {
+    if (g_lso_fix && (!strcmp(name, "VK_KHR_load_store_op_none") || !strcmp(name, "VK_EXT_load_store_op_none"))) return NULL;
     if (!strcmp(name, "VK_KHR_vertex_attribute_divisor") && !g_hw_ext_khr_div()) {
         for (uint32_t k = 0; k < n; k++)
             if (!strcmp(all[k], "VK_EXT_vertex_attribute_divisor")) return NULL;
@@ -1068,8 +1086,23 @@ static int hello(void) {
                 VkExtensionProperties x;
                 vr_rcopy(&rd, &x, sizeof x);
                 if (!strcmp(x.extensionName, "VK_EXT_dynamic_rendering_unused_attachments")) g_srv_unused_att = 1;
+                if (!strcmp(x.extensionName, "VK_KHR_load_store_op_none") || !strcmp(x.extensionName, "VK_EXT_load_store_op_none")) g_srv_lso = 1;
                 if (allowed_ext(x.extensionName) && g_hw.ne < 62) g_hw.ext[g_hw.ne++] = x;
                 if (!strcmp(x.extensionName, "VK_KHR_vertex_attribute_divisor")) g_khr_div_native = 1;
+            }
+            {   // load_store_op_none：受け手が持たない（か、IPHONE_VK_LSO=1 で試す）ときは、値を直して送る
+                const char *lso = getenv("IPHONE_VK_LSO");
+                g_lso_fix = lso && *lso ? *lso == '1' : !g_srv_lso;
+                if (g_lso_fix) {
+                    int has_khr = 0, has_ext = 0;
+                    for (uint32_t z = 0; z < g_hw.ne; z++) {
+                        has_khr |= !strcmp(g_hw.ext[z].extensionName, "VK_KHR_load_store_op_none");
+                        has_ext |= !strcmp(g_hw.ext[z].extensionName, "VK_EXT_load_store_op_none");
+                    }
+                    if (!has_khr && g_hw.ne < 63) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_load_store_op_none", 1 };
+                    if (!has_ext && g_hw.ne < 63) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_load_store_op_none", 1 };
+                    say("load_store_op_none：受け手%sので、NONE を LOAD・STORE に直して送る", g_srv_lso ? "は持つが試す" : "が持たない");
+                }
             }
             if (g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_swapchain", 70 };
             // ドライバの中だけで済む拡張（受け手には送らない）
@@ -1449,6 +1482,7 @@ struct cb {
     // 結んだ update after bind の set と、結んだときの通し番号（submit のときに、そのあとに書かれた descriptor を足す）
     struct uabref { struct dset *s; uint64_t gen; uint32_t set; } *ub;
     size_t nub, cub;
+    struct lsev *lse; size_t nlse, clse; // LOAD・STORE を調べる・減らすための、この command buffer の出来事（ls.inc）
     int psb_done, psb_any, psb_whole; // psb_collect を済ませた（記録し直すまで）・アドレスで読み書きする・出どころの分からないアドレスを使う
 };
 struct pushheld { struct dsl *l; VkDescriptorSet s; };
@@ -3453,7 +3487,13 @@ static VkResult VKAPI_CALL bind_buffer2(VkDevice dv, uint32_t n, const VkBindBuf
 }
 
 // ---- 画像 ----
-struct img { VkMemoryRequirements req; struct mem *m; uint64_t memoff; VkFormat bc; }; // bc：ほどいて持つ BC の形式
+struct img { VkMemoryRequirements req; struct mem *m; uint64_t memoff; VkFormat bc; // bc：ほどいて持つ BC の形式
+    uint32_t ls_fmt, ls_w, ls_h, ls_mips, ls_layers, ls_usage, ls_samples; }; // LOAD・STORE を調べる・減らすために覚える（ls.inc）
+static void ls_note_rp1(uint64_t id, const VkRenderPassCreateInfo *ci, const vr_buf *pay);
+static void ls_note_rp2(uint64_t id, const VkRenderPassCreateInfo2 *ci, const vr_buf *pay);
+static void ls_note_fb(uint64_t id, const VkFramebufferCreateInfo *ci);
+static void ls_note_view(uint64_t id, const VkImageViewCreateInfo *ci);
+static void ls_drop(uint64_t id);
 
 
 // 受け手の装置では swapchain を使わないので、PRESENT_SRC の形は GENERAL に読み替える
@@ -3465,6 +3505,8 @@ static VkResult VKAPI_CALL create_image(VkDevice dv, const VkImageCreateInfo *ci
     (void) a;
     struct img *im = calloc(1, sizeof *im);
     if (!im) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    im->ls_fmt = ci->format; im->ls_w = ci->extent.width; im->ls_h = ci->extent.height; im->ls_mips = ci->mipLevels; im->ls_layers = ci->arrayLayers;
+    im->ls_usage = ci->usage; im->ls_samples = ci->samples;
     VkImageCreateInfo bci;
     if (g_bc && bc_sub(ci->format)) {
         bci = *ci;
@@ -3592,11 +3634,12 @@ static VkResult VKAPI_CALL create_view(VkDevice dv, const VkImageViewCreateInfo 
     vr_put(&b, &ci->subresourceRange, sizeof ci->subresourceRange);
     rpc_send(VR_CREATE_IMAGE_VIEW, &b);
     free(b.p);
+    ls_note_view(id, ci);
     *out = (VkImageView) id;
     return VK_SUCCESS;
 }
 
-static void VKAPI_CALL destroy_view(VkDevice dv, VkImageView h, const VkAllocationCallbacks *a) { (void) a; if (h) send_destroy(VR_DESTROY_IMAGE_VIEW, dv, ID(h)); }
+static void VKAPI_CALL destroy_view(VkDevice dv, VkImageView h, const VkAllocationCallbacks *a) { (void) a; if (h) { send_destroy(VR_DESTROY_IMAGE_VIEW, dv, ID(h)); ls_drop(ID(h)); } }
 
 // ---- buffer の見え方（texel buffer。DirectX の型付きの buffer はこれになる） ----
 // どの buffer のどこを見ているかを覚えておく（descriptor に入ったとき、GPU が書く範囲として使う）
@@ -3691,6 +3734,8 @@ static VkResult VKAPI_CALL create_rpass(VkDevice dv, const VkRenderPassCreateInf
     vr_u32(&b, ci->attachmentCount);
     for (uint32_t i = 0; i < ci->attachmentCount; i++) {
         VkAttachmentDescription ad = ci->pAttachments[i];
+        ad.loadOp = (VkAttachmentLoadOp) lso_load((uint32_t) ad.loadOp); ad.stencilLoadOp = (VkAttachmentLoadOp) lso_load((uint32_t) ad.stencilLoadOp);
+        ad.storeOp = (VkAttachmentStoreOp) lso_store((uint32_t) ad.storeOp); ad.stencilStoreOp = (VkAttachmentStoreOp) lso_store((uint32_t) ad.stencilStoreOp);
         ad.initialLayout = fix_layout(ad.initialLayout);
         ad.finalLayout = fix_layout(ad.finalLayout);
         vr_put(&b, &ad, sizeof ad);
@@ -3725,6 +3770,7 @@ static VkResult VKAPI_CALL create_rpass(VkDevice dv, const VkRenderPassCreateInf
     }
     vr_u32(&b, ci->dependencyCount);
     vr_put(&b, ci->pDependencies, ci->dependencyCount * sizeof *ci->pDependencies);
+    ls_note_rp1(id, ci, &b);
     rpc_send(VR_CREATE_RENDER_PASS, &b);
     free(b.p);
     *out = (VkRenderPass) id;
@@ -3755,10 +3801,10 @@ static VkResult VKAPI_CALL create_rpass2(VkDevice dv, const VkRenderPassCreateIn
         vr_u32(&b, ad->flags);
         vr_u32(&b, ad->format);
         vr_u32(&b, ad->samples);
-        vr_u32(&b, ad->loadOp);
-        vr_u32(&b, ad->storeOp);
-        vr_u32(&b, ad->stencilLoadOp);
-        vr_u32(&b, ad->stencilStoreOp);
+        vr_u32(&b, lso_load((uint32_t) ad->loadOp));
+        vr_u32(&b, lso_store((uint32_t) ad->storeOp));
+        vr_u32(&b, lso_load((uint32_t) ad->stencilLoadOp));
+        vr_u32(&b, lso_store((uint32_t) ad->stencilStoreOp));
         vr_u32(&b, fix_layout(ad->initialLayout));
         vr_u32(&b, fix_layout(ad->finalLayout));
     }
@@ -3827,13 +3873,15 @@ static VkResult VKAPI_CALL create_rpass2(VkDevice dv, const VkRenderPassCreateIn
     }
     vr_u32(&b, ci->correlatedViewMaskCount);
     vr_put(&b, ci->pCorrelatedViewMasks, ci->correlatedViewMaskCount * sizeof(uint32_t));
+    ls_note_rp2(id, ci, &b);
     rpc_send(VR_CREATE_RENDER_PASS2, &b);
     free(b.p);
     *out = (VkRenderPass) id;
     return VK_SUCCESS;
 }
 
-static void VKAPI_CALL destroy_rpass(VkDevice dv, VkRenderPass h, const VkAllocationCallbacks *a) { (void) a; if (h) send_destroy(VR_DESTROY_RENDER_PASS, dv, ID(h)); }
+static void ls_destroy_rp_variants(VkDevice dv, uint64_t id);
+static void VKAPI_CALL destroy_rpass(VkDevice dv, VkRenderPass h, const VkAllocationCallbacks *a) { (void) a; if (h) { ls_destroy_rp_variants(dv, ID(h)); send_destroy(VR_DESTROY_RENDER_PASS, dv, ID(h)); ls_drop(ID(h)); } }
 
 static void VKAPI_CALL render_area_granularity(VkDevice dv, VkRenderPass rp, VkExtent2D *g) { (void) dv; (void) rp; g->width = g->height = 1; }
 
@@ -3852,11 +3900,12 @@ static VkResult VKAPI_CALL create_fb(VkDevice dv, const VkFramebufferCreateInfo 
     vr_u32(&b, ci->layers);
     rpc_send(VR_CREATE_FRAMEBUFFER, &b);
     free(b.p);
+    ls_note_fb(id, ci);
     *out = (VkFramebuffer) id;
     return VK_SUCCESS;
 }
 
-static void VKAPI_CALL destroy_fb(VkDevice dv, VkFramebuffer h, const VkAllocationCallbacks *a) { (void) a; if (h) send_destroy(VR_DESTROY_FRAMEBUFFER, dv, ID(h)); }
+static void VKAPI_CALL destroy_fb(VkDevice dv, VkFramebuffer h, const VkAllocationCallbacks *a) { (void) a; if (h) { send_destroy(VR_DESTROY_FRAMEBUFFER, dv, ID(h)); ls_drop(ID(h)); } }
 
 // geometry shader を頂点シェーダーで真似る。受け手の GPU が持たないときだけ働く
 #include "gs/gs_emu.c"
@@ -4452,11 +4501,13 @@ static const VkGraphicsPipelineCreateInfo *vf_pipeline(VkDevice dv, const VkGrap
 }
 
 static void wr_pipes(uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkPipeline *out);
+static void ls_note_pipes(uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkPipeline *out);
 
 static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCache cache, uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
     if (!vf_on()) {
         VkResult r = create_graphics_pipelines_raw(dv, cache, n, ci, a, out);
         wr_pipes(n, ci, out);
+        ls_note_pipes(n, ci, out);
         return r;
     }
     VkResult worst = VK_SUCCESS;
@@ -4467,6 +4518,7 @@ static VkResult VKAPI_CALL create_graphics_pipelines(VkDevice dv, VkPipelineCach
         if (r != VK_SUCCESS) worst = r;
     }
     wr_pipes(n, ci, out);
+    ls_note_pipes(n, ci, out);
     return worst;
 }
 
@@ -5008,6 +5060,8 @@ static void VKAPI_CALL destroy_fence(VkDevice dv, VkFence f, const VkAllocationC
 static VkResult VKAPI_CALL create_cpool(VkDevice dv, const VkCommandPoolCreateInfo *ci, const VkAllocationCallbacks *a, VkCommandPool *out);
 static void VKAPI_CALL destroy_cpool(VkDevice dv, VkCommandPool pp, const VkAllocationCallbacks *a);
 static VkResult VKAPI_CALL alloc_cbs(VkDevice dv, const VkCommandBufferAllocateInfo *ai, VkCommandBuffer *out);
+#include "ls.inc"
+
 static VkResult VKAPI_CALL begin_cb(VkCommandBuffer cbh, const VkCommandBufferBeginInfo *bi);
 static VkResult VKAPI_CALL end_cb(VkCommandBuffer cbh);
 static void VKAPI_CALL cmd_barrier(VkCommandBuffer cbh, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep,
@@ -5454,6 +5508,7 @@ static void dump_frame_at(struct swapchain *sc, const uint8_t *px, uint64_t fram
             say("%llu コマ目を %s に書いた", (unsigned long long) frame, strchr(dump, ':') + 1);
         }
     }
+    ls_ctl_dump(sc->w, sc->h, px);
 }
 
 // 窓の大きさが swapchain と違い、しかもその窓の大きさでまだ頼んでいなければ、作り直しを 1 回だけ頼む。
@@ -7350,9 +7405,9 @@ static void bct_free(struct cb *c) {
     c->bct = NULL;
 }
 
-static void cb_clear(struct cb *c) { push_release(c); c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; c->nwc = 0; c->nbpl = 0; c->bpl_over = 0; c->qcopy_nowait = 0; c->nqw = 0; c->npv = 0; c->nub = 0; c->psb_done = c->psb_any = c->psb_whole = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
+static void cb_clear(struct cb *c) { push_release(c); c->s.n = 0; c->nlse = 0; c->nr = 0; c->nrd = 0; c->nev = 0; c->nwc = 0; c->nbpl = 0; c->bpl_over = 0; c->qcopy_nowait = 0; c->nqw = 0; c->npv = 0; c->nub = 0; c->psb_done = c->psb_any = c->psb_whole = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
 
-static void cb_free(struct cb *c) { push_release(c); free(c->ph); free(c->wc); free(c->pv); free(c->ub); gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c->ev); free(c); }
+static void cb_free(struct cb *c) { push_release(c); free(c->lse); free(c->ph); free(c->wc); free(c->pv); free(c->ub); gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c->ev); free(c); }
 
 static void VKAPI_CALL destroy_cpool(VkDevice dv, VkCommandPool pp, const VkAllocationCallbacks *a) {
     (void) a;
@@ -7437,6 +7492,7 @@ static VkResult VKAPI_CALL end_cb(VkCommandBuffer cbh) {
     struct cb *c = (struct cb *) cbh;
     rng_merge(c->r, &c->nr);
     rng_merge(c->rd, &c->nrd);
+    if (c->level != VK_COMMAND_BUFFER_LEVEL_SECONDARY && ls_on()) { double ls_t0 = now_ms(); ls_process(c); g_lsst.proc_ms += now_ms() - ls_t0; g_lsst.proc_n++; }
     // 2 次の command buffer は、呼んだ側（1 次）に中身を写して送るので、ここでは送らない
     if (c->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) return VK_SUCCESS;
     vr_buf b = { 0 };
@@ -7665,7 +7721,9 @@ static void VKAPI_CALL cmd_bind_pipeline(VkCommandBuffer cbh, VkPipelineBindPoin
     vr_u32(&c->s, VR_CMD_BIND_PIPELINE);
     vr_u32(&c->s, bp);
     vr_u64(&c->s, ID(p));
+    if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) { ls_ev(c, LE_PIPE, ID(p), 0, 0, 0, 0, 0); ls_ev(c, LE_ST, 0, 0, 0, 0, 0, 0); }
     gs_bind(c, bp, p);
+    if (c->gs) ls_ev(c, LE_RISK, 0, 0, 0, 0, 0, 0);
     cb_note_pipe(c, ID(p));
 }
 
@@ -7680,6 +7738,7 @@ static void VKAPI_CALL cmd_bind_sets(VkCommandBuffer cbh, VkPipelineBindPoint bp
     vr_u32(&c->s, nd);
     for (uint32_t i = 0; i < nd; i++) vr_u32(&c->s, dyn[i]);
     gs_track_sets(c, bp, l, first, n, sets, nd, dyn);
+    if (ls_on()) for (uint32_t i = 0; i < n; i++) { ls_ev(c, LE_BIND, (uint64_t) (uintptr_t) sets[i], 0, 0, 0, 0, 0); ls_ev(c, LE_ST, 0, 0, 1 + (first + i < 8 ? first + i : 8), 0, 0, 0); }
     // storage buffer は GPU が書くかもしれない
     for (uint32_t i = 0; i < n; i++) {
         struct dset *s = (struct dset *) sets[i];
@@ -7692,6 +7751,7 @@ static void VKAPI_CALL cmd_bind_sets(VkCommandBuffer cbh, VkPipelineBindPoint bp
 
 static void VKAPI_CALL cmd_push(VkCommandBuffer cbh, VkPipelineLayout l, VkShaderStageFlags st, uint32_t off, uint32_t size, const void *v) {
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_ST, 0, 0, 10, 0, 0, 0);
     vr_u32(&c->s, VR_CMD_PUSH_CONSTANTS);
     vr_u64(&c->s, ID(l));
     vr_u32(&c->s, gs_stages(st));
@@ -7702,6 +7762,7 @@ static void VKAPI_CALL cmd_push(VkCommandBuffer cbh, VkPipelineLayout l, VkShade
 
 static void VKAPI_CALL cmd_dispatch(VkCommandBuffer cbh, uint32_t x, uint32_t y, uint32_t z) {
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_DISP, 0, 0, 0, 0, 0, 0);
     vr_u32(&c->s, VR_CMD_DISPATCH);
     vr_u32(&c->s, x);
     vr_u32(&c->s, y);
@@ -7710,6 +7771,7 @@ static void VKAPI_CALL cmd_dispatch(VkCommandBuffer cbh, uint32_t x, uint32_t y,
 
 static void VKAPI_CALL cmd_dispatch_base(VkCommandBuffer cbh, uint32_t bx, uint32_t by, uint32_t bz, uint32_t x, uint32_t y, uint32_t z) {
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_DISP, 0, 0, 0, 0, 0, 0);
     vr_u32(&c->s, VR_CMD_DISPATCH_BASE);
     vr_u32(&c->s, bx);
     vr_u32(&c->s, by);
@@ -7721,6 +7783,7 @@ static void VKAPI_CALL cmd_dispatch_base(VkCommandBuffer cbh, uint32_t bx, uint3
 
 static void VKAPI_CALL cmd_dispatch_indirect(VkCommandBuffer cbh, VkBuffer bb, VkDeviceSize off) {
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_DISP, 0, 0, 0, 0, 0, 0);
     vr_u32(&c->s, VR_CMD_DISPATCH_INDIRECT);
     vr_u64(&c->s, ID(bb));
     vr_u64(&c->s, off);
@@ -7804,6 +7867,7 @@ static void VKAPI_CALL cmd_barrier(VkCommandBuffer cbh, VkPipelineStageFlags src
 // ---- 描画の命令 ----
 static void VKAPI_CALL cmd_begin_rp(VkCommandBuffer cbh, const VkRenderPassBeginInfo *bi, VkSubpassContents contents) {
     struct cb *c = (struct cb *) cbh;
+    size_t ls_off = c->s.n;
     vr_u32(&c->s, VR_CMD_BEGIN_RENDER_PASS);
     if (g_stats > 0) {
         rpl_count(ID(bi->renderPass), &bi->renderArea);
@@ -7818,13 +7882,15 @@ static void VKAPI_CALL cmd_begin_rp(VkCommandBuffer cbh, const VkRenderPassBegin
     // 2 次の command buffer の中身はここに写して送るので、受け手では常に INLINE
     (void) contents;
     vr_u32(&c->s, VK_SUBPASS_CONTENTS_INLINE);
+    ls_ev(c, LE_RPB, ID(bi->renderPass), ID(bi->framebuffer), (uint32_t) ls_off, (uint32_t) c->s.n, 0, 0);
 }
 
-static void VKAPI_CALL cmd_end_rp(VkCommandBuffer cbh) { vr_u32(&((struct cb *) cbh)->s, VR_CMD_END_RENDER_PASS); }
+static void VKAPI_CALL cmd_end_rp(VkCommandBuffer cbh) { ls_ev((struct cb *) cbh, LE_RPE, 0, 0, (uint32_t) ((struct cb *) cbh)->s.n, 0, 0, 0); vr_u32(&((struct cb *) cbh)->s, VR_CMD_END_RENDER_PASS); }
 
 static void VKAPI_CALL cmd_next_subpass(VkCommandBuffer cbh, VkSubpassContents contents) {
     struct cb *c = (struct cb *) cbh;
     (void) contents;
+    ls_ev(c, LE_NEXT, 0, 0, 0, 0, 0, 0);
     vr_u32(&c->s, VR_CMD_NEXT_SUBPASS);
     vr_u32(&c->s, VK_SUBPASS_CONTENTS_INLINE);
 }
@@ -7848,6 +7914,7 @@ static void VKAPI_CALL cmd_exec(VkCommandBuffer cbh, uint32_t n, const VkCommand
     for (uint32_t i = 0; i < n; i++) {
         struct cb *s = (struct cb *) sec[i];
         if (!s) continue;
+        ls_ev(c, LE_UNK, 0, 0, 0, 0, 0, 0);
         vr_put(&c->s, s->s.p, s->s.n);
         for (size_t k = 0; k < s->nr; k++) rng_add(&c->r, &c->nr, &c->capr, s->r[k].m, s->r[k].off, s->r[k].len, 0);
         for (size_t k = 0; k < s->nrd; k++) rng_add(&c->rd, &c->nrd, &c->caprd, s->rd[k].m, s->rd[k].off, s->rd[k].len, 0);
@@ -7864,7 +7931,8 @@ static void VKAPI_CALL cmd_exec(VkCommandBuffer cbh, uint32_t n, const VkCommand
 
 static void VKAPI_CALL cmd_draw(VkCommandBuffer cbh, uint32_t vc, uint32_t ic, uint32_t fv, uint32_t fi) {
     struct cb *c = (struct cb *) cbh;
-    if (gs_draw(c, vc, ic, fv, fi)) return;
+    if (gs_draw(c, vc, ic, fv, fi)) { ls_ev(c, LE_DRAW, 0, 0, 1, 0, 0, 0); return; }
+    ls_ev(c, LE_DRAW, 0, 0, 1, 0, 0, 0);
     vr_u32(&c->s, VR_CMD_DRAW);
     vr_u32(&c->s, vc);
     vr_u32(&c->s, ic);
@@ -7874,6 +7942,7 @@ static void VKAPI_CALL cmd_draw(VkCommandBuffer cbh, uint32_t vc, uint32_t ic, u
 
 static void VKAPI_CALL cmd_draw_indexed(VkCommandBuffer cbh, uint32_t n, uint32_t ic, uint32_t first, int32_t vo, uint32_t fi) {
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_DRAW, 0, 0, 1, 0, 0, 0);
     if (gs_draw_indexed(c, n, ic, first, vo, fi)) return;
     vr_u32(&c->s, VR_CMD_DRAW_INDEXED);
     vr_u32(&c->s, n);
@@ -7885,6 +7954,7 @@ static void VKAPI_CALL cmd_draw_indexed(VkCommandBuffer cbh, uint32_t n, uint32_
 
 static void draw_indirect(VkCommandBuffer cbh, uint32_t op, VkBuffer bb, VkDeviceSize off, uint32_t n, uint32_t stride) {
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_DRAW, 0, 0, 1, 0, 0, 0);
     if (gs_skip(c, "間接")) return;
     vr_u32(&c->s, op);
     vr_u64(&c->s, ID(bb));
@@ -7904,6 +7974,7 @@ static void VKAPI_CALL cmd_draw_indexed_indirect(VkCommandBuffer cbh, VkBuffer b
 
 static void VKAPI_CALL cmd_bind_vbs(VkCommandBuffer cbh, uint32_t first, uint32_t n, const VkBuffer *bs, const VkDeviceSize *offs) {
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_ST, 0, 0, 11, 0, 0, 0);
     vr_u32(&c->s, VR_CMD_BIND_VERTEX_BUFFERS);
     vr_u32(&c->s, first);
     vr_u32(&c->s, n);
@@ -7917,6 +7988,7 @@ static void VKAPI_CALL cmd_bind_vbs(VkCommandBuffer cbh, uint32_t first, uint32_
 
 static void VKAPI_CALL cmd_bind_ib(VkCommandBuffer cbh, VkBuffer bb, VkDeviceSize off, VkIndexType t) {
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_ST, 0, 0, 12, 0, 0, 0);
     vr_u32(&c->s, VR_CMD_BIND_INDEX_BUFFER);
     vr_u64(&c->s, ID(bb));
     vr_u64(&c->s, off);
@@ -7927,6 +7999,7 @@ static void VKAPI_CALL cmd_bind_ib(VkCommandBuffer cbh, VkBuffer bb, VkDeviceSiz
 
 static void VKAPI_CALL cmd_set_viewport(VkCommandBuffer cbh, uint32_t first, uint32_t n, const VkViewport *v) {
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_ST, 0, 0, 13, 0, 0, 0);
     vr_u32(&c->s, VR_CMD_SET_VIEWPORT);
     vr_u32(&c->s, first);
     vr_u32(&c->s, n);
@@ -7935,6 +8008,7 @@ static void VKAPI_CALL cmd_set_viewport(VkCommandBuffer cbh, uint32_t first, uin
 
 static void VKAPI_CALL cmd_set_scissor(VkCommandBuffer cbh, uint32_t first, uint32_t n, const VkRect2D *v) {
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_ST, 0, 0, 14, 0, 0, 0);
     vr_u32(&c->s, VR_CMD_SET_SCISSOR);
     vr_u32(&c->s, first);
     vr_u32(&c->s, n);
@@ -7944,6 +8018,7 @@ static void VKAPI_CALL cmd_set_scissor(VkCommandBuffer cbh, uint32_t first, uint
 static void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cbh, VkImage im, VkImageLayout l, VkBuffer bb, uint32_t n, const VkBufferImageCopy *rg) {
     struct cb *c = (struct cb *) cbh;
     if (im && ((struct img *) im)->bc) { say("BC：ほどいた画像を BC のままバッファへ読み出すことはまだできない（飛ばした）"); return; }
+    ls_ev_xfer(c, VK_NULL_HANDLE, im);
     vr_u32(&c->s, VR_CMD_COPY_IMAGE_TO_BUFFER);
     vr_u64(&c->s, ID(im));
     vr_u64(&c->s, ID(bb));
@@ -8011,6 +8086,7 @@ static VkBuffer bc_tmp(struct cb *c, uint64_t size, uint8_t **ptr) {
 static void VKAPI_CALL cmd_copy_buffer_to_image(VkCommandBuffer cbh, VkBuffer bb, VkImage im, VkImageLayout l, uint32_t n, const VkBufferImageCopy *rg) {
     struct cb *c = (struct cb *) cbh;
     cb_img_writes(c, im);
+    ls_ev_xfer(c, im, VK_NULL_HANDLE);
     struct img *ii = (struct img *) im;
     if (ii && ii->bc) {
         // 全部の範囲をほどいて 1 つの一時バッファに並べ、そこから 1 回で写す（一時バッファを作る往復を 1 回にする）
@@ -8052,6 +8128,15 @@ static void VKAPI_CALL cmd_copy_buffer_to_image(VkCommandBuffer cbh, VkBuffer bb
 static void VKAPI_CALL cmd_clear_color(VkCommandBuffer cbh, VkImage im, VkImageLayout l, const VkClearColorValue *col, uint32_t n, const VkImageSubresourceRange *rg) {
     struct cb *c = (struct cb *) cbh;
     cb_img_writes(c, im);
+    {   // 画像全体を消すか：全部の mip と layer を含む範囲が 1 つでもあれば全体
+        struct img *ii = (struct img *) im;
+        uint32_t whole = 0;
+        for (uint32_t k = 0; k < n; k++)
+            if (rg[k].baseMipLevel == 0 && (rg[k].levelCount == VK_REMAINING_MIP_LEVELS || rg[k].levelCount >= ii->ls_mips) && rg[k].baseArrayLayer == 0 &&
+                (rg[k].layerCount == VK_REMAINING_ARRAY_LAYERS || rg[k].layerCount >= ii->ls_layers) &&
+                (rg[k].aspectMask & ls_aspect_of((VkFormat) ii->ls_fmt)) == ls_aspect_of((VkFormat) ii->ls_fmt)) whole = 1;
+        ls_ev(c, LE_CLRIMG, ID(im), 0, 1, whole, (uint32_t) c->s.n, n);
+    }
     vr_u32(&c->s, VR_CMD_CLEAR_COLOR_IMAGE);
     vr_u64(&c->s, ID(im));
     vr_u32(&c->s, fix_layout(l));
@@ -8063,6 +8148,7 @@ static void VKAPI_CALL cmd_clear_color(VkCommandBuffer cbh, VkImage im, VkImageL
 static void VKAPI_CALL cmd_copy_image(VkCommandBuffer cbh, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageCopy *rg) {
     struct cb *c = (struct cb *) cbh;
     cb_img_writes(c, d);
+    ls_ev_xfer(c, d, s);
     vr_u32(&c->s, VR_CMD_COPY_IMAGE);
     vr_u64(&c->s, ID(s));
     vr_u32(&c->s, fix_layout(sl));
@@ -8075,6 +8161,7 @@ static void VKAPI_CALL cmd_copy_image(VkCommandBuffer cbh, VkImage s, VkImageLay
 static void VKAPI_CALL cmd_blit_image(VkCommandBuffer cbh, VkImage s, VkImageLayout sl, VkImage d, VkImageLayout dl, uint32_t n, const VkImageBlit *rg, VkFilter f) {
     struct cb *c = (struct cb *) cbh;
     cb_img_writes(c, d);
+    ls_ev_xfer(c, d, s);
     vr_u32(&c->s, VR_CMD_BLIT_IMAGE);
     vr_u64(&c->s, ID(s));
     vr_u32(&c->s, fix_layout(sl));
@@ -8101,6 +8188,7 @@ static void VKAPI_CALL cmd_resolve(VkCommandBuffer cbh, VkImage s, VkImageLayout
     if (!need_cap(VR_CAP_CMD10, "vkCmdResolveImage")) return;
     struct cb *c = (struct cb *) cbh;
     cb_img_writes(c, d);
+    ls_ev_xfer(c, d, s);
     vr_u32(&c->s, VR_CMD_RESOLVE_IMAGE);
     vr_u64(&c->s, ID(s));
     vr_u32(&c->s, fix_layout(sl));
@@ -8114,6 +8202,15 @@ static void VKAPI_CALL cmd_clear_ds(VkCommandBuffer cbh, VkImage im, VkImageLayo
     if (!need_cap(VR_CAP_CMD10, "vkCmdClearDepthStencilImage")) return;
     struct cb *c = (struct cb *) cbh;
     cb_img_writes(c, im);
+    {
+        struct img *ii = (struct img *) im;
+        uint32_t whole = 0;
+        for (uint32_t k = 0; k < n; k++)
+            if (rg[k].baseMipLevel == 0 && (rg[k].levelCount == VK_REMAINING_MIP_LEVELS || rg[k].levelCount >= ii->ls_mips) && rg[k].baseArrayLayer == 0 &&
+                (rg[k].layerCount == VK_REMAINING_ARRAY_LAYERS || rg[k].layerCount >= ii->ls_layers) &&
+                (rg[k].aspectMask & ls_aspect_of((VkFormat) ii->ls_fmt)) == ls_aspect_of((VkFormat) ii->ls_fmt)) whole = 1;
+        ls_ev(c, LE_CLRIMG, ID(im), 0, 2, whole, (uint32_t) c->s.n, n);
+    }
     vr_u32(&c->s, VR_CMD_CLEAR_DEPTH_STENCIL_IMAGE);
     vr_u64(&c->s, ID(im));
     vr_u32(&c->s, fix_layout(l));
@@ -8125,6 +8222,7 @@ static void VKAPI_CALL cmd_clear_ds(VkCommandBuffer cbh, VkImage im, VkImageLayo
 static void VKAPI_CALL cmd_clear_atts(VkCommandBuffer cbh, uint32_t na, const VkClearAttachment *a, uint32_t nr, const VkClearRect *rc) {
     if (!need_cap(VR_CAP_CMD10, "vkCmdClearAttachments")) return;
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_CLRATT, 0, 0, na, nr, (uint32_t) c->s.n, 0);
     vr_u32(&c->s, VR_CMD_CLEAR_ATTACHMENTS);
     vr_u32(&c->s, na);
     vr_put(&c->s, a, na * sizeof *a);
@@ -8196,6 +8294,7 @@ static void VKAPI_CALL cmd_resolve2(VkCommandBuffer cbh, const VkResolveImageInf
 static void put_dyn(VkCommandBuffer cbh, uint32_t cap, VkDynamicState st, uint32_t n, const void *v) {
     if (!need_cap(cap, cap == VR_CAP_CMD10 ? "1.0 の値の変え方" : "extended dynamic state")) return;
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_ST, 0, 0, 16 + (uint32_t) st % 40, 0, 0, 0);
     vr_u32(&c->s, VR_CMD_SET_DYNAMIC);
     vr_u32(&c->s, st);
     vr_u32(&c->s, n);
@@ -8254,6 +8353,7 @@ static void VKAPI_CALL cmd_bind_vbs2(VkCommandBuffer cbh, uint32_t first, uint32
     if (!sizes && !strides) { cmd_bind_vbs(cbh, first, n, bs, offs); return; }
     if (!need_cap(VR_CAP_EXT_DYNAMIC_STATE, "vkCmdBindVertexBuffers2")) return;
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_ST, 0, 0, 11, 0, 0, 0);
     vr_u32(&c->s, VR_CMD_BIND_VERTEX_BUFFERS2);
     vr_u32(&c->s, first);
     vr_u32(&c->s, n);
@@ -8276,14 +8376,15 @@ static void put_rendering_att(vr_buf *s, const VkRenderingAttachmentInfo *a) {
     vr_u32(s, a->resolveMode);
     vr_u64(s, ID(a->resolveImageView));
     vr_u32(s, fix_layout(a->resolveImageLayout));
-    vr_u32(s, a->loadOp);
-    vr_u32(s, a->storeOp);
+    vr_u32(s, lso_load((uint32_t) a->loadOp));
+    vr_u32(s, lso_store((uint32_t) a->storeOp));
     vr_put(s, &a->clearValue, sizeof a->clearValue);
 }
 
 static void VKAPI_CALL cmd_begin_rendering(VkCommandBuffer cbh, const VkRenderingInfo *ri) {
     if (!need_cap(VR_CAP_DYNAMIC_RENDERING, "dynamic rendering")) return;
     struct cb *c = (struct cb *) cbh;
+    ls_ev(c, LE_UNK, 0, 0, 0, 0, 0, 0);
     vr_u32(&c->s, VR_CMD_BEGIN_RENDERING);
     if (g_stats > 0) {
         int nl = 0, ns = 0, nc = 0;
@@ -9394,6 +9495,7 @@ static void VKAPI_CALL reset_qpool(VkDevice dv, VkQueryPool qp, uint32_t first, 
 }
 
 static void VKAPI_CALL cmd_reset_qpool(VkCommandBuffer cbh, VkQueryPool qp, uint32_t first, uint32_t n) {
+    ls_ev((struct cb *) cbh, LE_RISK, 0, 0, 1, 0, 0, 0);
     struct cb *c = (struct cb *) cbh;
     cb_note_q(c, ID(qp), first, n);
     vr_u32(&c->s, VR_CMD_RESET_QUERY_POOL);
@@ -9403,6 +9505,7 @@ static void VKAPI_CALL cmd_reset_qpool(VkCommandBuffer cbh, VkQueryPool qp, uint
 }
 
 static void VKAPI_CALL cmd_begin_query(VkCommandBuffer cbh, VkQueryPool qp, uint32_t q, VkQueryControlFlags flags) {
+    ls_ev((struct cb *) cbh, LE_RISK, 0, 0, 2, 0, 0, 0);
     struct cb *c = (struct cb *) cbh;
     vr_u32(&c->s, VR_CMD_BEGIN_QUERY);
     vr_u64(&c->s, ID(qp));
@@ -9411,6 +9514,7 @@ static void VKAPI_CALL cmd_begin_query(VkCommandBuffer cbh, VkQueryPool qp, uint
 }
 
 static void VKAPI_CALL cmd_end_query(VkCommandBuffer cbh, VkQueryPool qp, uint32_t q) {
+    ls_ev((struct cb *) cbh, LE_RISK, 0, 0, 3, 0, 0, 0);
     struct cb *c = (struct cb *) cbh;
     cb_note_q(c, ID(qp), q, 1);
     vr_u32(&c->s, VR_CMD_END_QUERY);
@@ -9425,31 +9529,38 @@ static void xfb_note(const char *what) {
     if (!InterlockedExchange(&once, 1)) say("transform feedback の命令（%s）は飛ばす（名乗りだけ）", what);
 }
 static void VKAPI_CALL cmd_bind_xfb(VkCommandBuffer cbh, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *o, const VkDeviceSize *s) {
+    ls_ev((struct cb *) cbh, LE_RISK, 0, 0, 6, 0, 0, 0);
     (void) cbh; (void) first; (void) n; (void) b; (void) o; (void) s;
     xfb_note("つなぐ");
 }
 static void VKAPI_CALL cmd_begin_xfb(VkCommandBuffer cbh, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *o) {
+    ls_ev((struct cb *) cbh, LE_RISK, 0, 0, 4, 0, 0, 0);
     (void) cbh; (void) first; (void) n; (void) b; (void) o;
     xfb_note("始める");
 }
 static void VKAPI_CALL cmd_end_xfb(VkCommandBuffer cbh, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *o) {
+    ls_ev((struct cb *) cbh, LE_RISK, 0, 0, 5, 0, 0, 0);
     (void) cbh; (void) first; (void) n; (void) b; (void) o;
     xfb_note("終える");
 }
 // 番号つきの query：0 番の stream はふつうの query と同じ。ほかの stream は飛ばす
 static void VKAPI_CALL cmd_begin_query_indexed(VkCommandBuffer cbh, VkQueryPool qp, uint32_t q, VkQueryControlFlags flags, uint32_t index) {
+    ls_ev((struct cb *) cbh, LE_RISK, 0, 0, 7, 0, 0, 0);
     if (index == 0) cmd_begin_query(cbh, qp, q, flags);
     else xfb_note("番号つきの query");
 }
 static void VKAPI_CALL cmd_end_query_indexed(VkCommandBuffer cbh, VkQueryPool qp, uint32_t q, uint32_t index) {
+    ls_ev((struct cb *) cbh, LE_RISK, 0, 0, 8, 0, 0, 0);
     if (index == 0) cmd_end_query(cbh, qp, q);
 }
 static void VKAPI_CALL cmd_draw_xfb_count(VkCommandBuffer cbh, uint32_t ninst, uint32_t first, VkBuffer b, VkDeviceSize off, uint32_t coff, uint32_t stride) {
+    ls_ev((struct cb *) cbh, LE_DRAW, 0, 0, 1, 0, 0, 0);
     (void) cbh; (void) ninst; (void) first; (void) b; (void) off; (void) coff; (void) stride;
     xfb_note("書いた数で描く");
 }
 
 static void VKAPI_CALL cmd_write_timestamp(VkCommandBuffer cbh, VkPipelineStageFlagBits st, VkQueryPool qp, uint32_t q) {
+    ls_ev((struct cb *) cbh, LE_RISK, 0, 0, 9, 0, 0, 0);
     struct cb *c = (struct cb *) cbh;
     cb_note_q(c, ID(qp), q, 1);
     vr_u32(&c->s, VR_CMD_WRITE_TIMESTAMP);
@@ -9459,6 +9570,7 @@ static void VKAPI_CALL cmd_write_timestamp(VkCommandBuffer cbh, VkPipelineStageF
 }
 
 static void VKAPI_CALL cmd_write_timestamp2(VkCommandBuffer cbh, VkPipelineStageFlags2 st, VkQueryPool qp, uint32_t q) {
+    ls_ev((struct cb *) cbh, LE_RISK, 0, 0, 10, 0, 0, 0);
     // 2 の stage は、1 の形のいちばん後ろの段にまとめる
     VkPipelineStageFlagBits s1 = (st >> 32) ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : (VkPipelineStageFlagBits) (st ? st : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     if (st & (st - 1)) s1 = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT; // 複数の段なら一番後ろ
@@ -9467,6 +9579,7 @@ static void VKAPI_CALL cmd_write_timestamp2(VkCommandBuffer cbh, VkPipelineStage
 
 static void VKAPI_CALL cmd_copy_qpool_results(VkCommandBuffer cbh, VkQueryPool qp, uint32_t first, uint32_t n, VkBuffer dst,
                                               VkDeviceSize off, VkDeviceSize stride, VkQueryResultFlags flags) {
+    ls_ev((struct cb *) cbh, LE_RISK, 0, 0, 11, 0, 0, 0);
     struct cb *c = (struct cb *) cbh;
     vr_u32(&c->s, VR_CMD_COPY_QUERY_RESULTS);
     vr_u64(&c->s, ID(qp));
