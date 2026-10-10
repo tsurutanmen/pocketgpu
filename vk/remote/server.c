@@ -1118,6 +1118,34 @@ static const char *rd_str(vr_rd *r) {
     return p && l && p[l - 1] == 0 ? p : "";
 }
 
+// descriptor の書き込みを、1 つの知らせの中でためて 1 回の vkUpdateDescriptorSets にまとめる。
+// 1 個ずつ渡すと 1 コマに 5,000 回呼んでいた（MoltenVK は 1 回ごとが重い）。順番はためた順のまま（仕様でも順に書かれる）
+typedef struct { VkWriteDescriptorSet *w; void **info; uint32_t n, cap; } uds_batch;
+static uds_batch g_uds;
+static void uds_add(uds_batch *b, VkDevice d, const VkWriteDescriptorSet *w, void *info) {
+    if (b->n == b->cap) {
+        uint32_t c = b->cap ? b->cap * 2 : 256;
+        VkWriteDescriptorSet *nw = realloc(b->w, (size_t) c * sizeof *nw);
+        if (nw) b->w = nw;
+        void **ni = nw ? realloc(b->info, (size_t) c * sizeof *ni) : NULL;
+        if (ni) b->info = ni;
+        if (!nw || !ni) { // 置き場が取れないときは、今までどおりその場で 1 個書く
+            vkUpdateDescriptorSets(d, 1, w, 0, NULL);
+            free(info);
+            return;
+        }
+        b->cap = c;
+    }
+    b->w[b->n] = *w;
+    b->info[b->n] = info;
+    b->n++;
+}
+static void uds_flush(uds_batch *b, VkDevice d, int apply) {
+    if (apply && b->n) vkUpdateDescriptorSets(d, b->n, b->w, 0, NULL);
+    for (uint32_t i = 0; i < b->n; i++) free(b->info[i]);
+    b->n = 0;
+}
+
 // ---- 返事 ----
 static vr_buf g_out;
 // PC が切れたか（読む物があるのに 0 バイト＝相手が閉じた）。待たずに調べる
@@ -3373,7 +3401,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             w.dstArrayElement = vr_ru32(r);
             w.descriptorType = (VkDescriptorType) vr_ru32(r);
             w.descriptorCount = vr_ru32(r);
-            if (w.descriptorCount > r->n - r->at) return 1;
+            if (w.descriptorCount > r->n - r->at) { uds_flush(&g_uds, d, !r->bad); return 1; }
             ent *se = find(sid);
             int image = w.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER || w.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
                         w.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
@@ -3388,8 +3416,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     if (se && ve && ve->aux) idlist_add(&se->list, ve->aux); // 見え方の aux はもとの buffer
                 }
                 w.pTexelBufferView = tv;
-                if (!r->bad && w.dstSet) vkUpdateDescriptorSets(d, 1, &w, 0, NULL);
-                free(tv);
+                if (!r->bad && w.dstSet) uds_add(&g_uds, d, &w, tv); else free(tv);
                 continue;
             }
             if (image) {
@@ -3418,8 +3445,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     if (se && vid) idlist_add(&se->list, vid); // 見え方の aux はもとの画像のメモリ
                 }
                 w.pImageInfo = ii;
-                if (w.dstSet) vkUpdateDescriptorSets(d, 1, &w, 0, NULL); // 取れなかった set（layout が無いなど）には書かない（NVIDIA は落ちる）
-                free(ii);
+                if (w.dstSet) uds_add(&g_uds, d, &w, ii); else free(ii); // 取れなかった set（layout が無いなど）には書かない（NVIDIA は落ちる）
                 continue;
             }
             VkDescriptorBufferInfo *bi = calloc(w.descriptorCount ? w.descriptorCount : 1, sizeof *bi);
@@ -3448,9 +3474,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     bi[k].range = ubo ? 16384 : VK_WHOLE_SIZE; // uniform は仕様の下限の 16 KiB に収める
                 }
             w.pBufferInfo = bi;
-            if (w.dstSet) vkUpdateDescriptorSets(d, 1, &w, 0, NULL); // 取れなかった set（layout が無いなど）には書かない（NVIDIA は落ちる）
-            free(bi);
+            if (w.dstSet) uds_add(&g_uds, d, &w, bi); else free(bi); // 取れなかった set（layout が無いなど）には書かない（NVIDIA は落ちる）
         }
+        uds_flush(&g_uds, d, !r->bad);
         return 1;
     }
     case VR_CREATE_COMMAND_POOL: {
