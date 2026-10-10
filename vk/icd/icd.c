@@ -521,9 +521,33 @@ static void rpc_call_deferred(uint32_t op, vr_buf *b) {
 }
 
 // あとで受け取る返事を受け取る。まだ届いていなければ待つ。頼んでいなければ VK_NOT_READY
+// 届くのを待つ間は錠を放す（IPHONE_VK_DEFER_UNLOCKED=0 で前のやり方）。前は錠を持ったまま待ち、
+// iPhone が前のコマを描き終えるまで、DXVK の命令を組み立てる糸も fence を待つ糸も止めていた（1080p の Heaven で両方が暇になっていた）
+static int defer_unlocked(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_DEFER_UNLOCKED"); v = !(e && *e == '0'); }
+    return v;
+}
+
 static VkResult rpc_take_deferred(vr_buf *out) {
-    AcquireSRWLockExclusive(&g_lock);
     double t0 = now_ms();
+    if (defer_unlocked()) {
+        // 返事が届いた分だけ錠の中で読み、まだなら錠の外で 1 ms ずつ待つ。待つ間にほかの糸が先に読んでもよい（g_defer.ready に入る）
+        for (;;) {
+            AcquireSRWLockExclusive(&g_lock);
+            if (g_defer.active && flush_locked()) {
+                WSAPOLLFD pf = { .fd = g_sock, .events = POLLRDNORM };
+                while (g_defer.active && g_pend_n && !g_dead && WSAPoll(&pf, 1, 0) > 0)
+                    if (!pend_read_one_locked()) break;
+            }
+            int done = !g_defer.active || g_dead;
+            ReleaseSRWLockExclusive(&g_lock);
+            if (done) break;
+            WSAPOLLFD pf = { .fd = g_sock, .events = POLLRDNORM };
+            WSAPoll(&pf, 1, 1);
+        }
+    }
+    AcquireSRWLockExclusive(&g_lock);
     if (g_defer.active && flush_locked()) read_deferred_locked();
     VkResult r = VK_NOT_READY;
     if (g_defer.ready) {
