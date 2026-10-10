@@ -2968,9 +2968,12 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         int k = last_with_mem(mid);
         if (r->at + 8 <= r->n) {
             uint64_t upto = vr_ru64(r);
+            // いちばん上の桁：このメモリは、ここの帳簿に載らない使い方（アドレスで読む・結んだあとに書いた descriptor）をされたので、番号の方が後なら、そこまで待つ（u1）
+            int wide = (int) (upto >> 63);
+            upto &= ~(1ull << 63);
             int u = -1;
             for (int i = 0; i < g_nfl; i++) if (g_fl[i].msg <= upto) u = i;
-            if (u < k) k = u;
+            if (wide ? u > k : u < k) k = u;
         }
         drain_upto(k);
         ent *e = find(mid);
@@ -2982,10 +2985,19 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     }
     case VR_MEM_READ: {
         uint64_t mid = vr_ru64(r);
-        drain_upto(last_with_mem(mid));
+        uint64_t off = vr_ru64(r), n = vr_ru64(r);
+        int k = last_with_mem(mid);
+        // 末尾の番号（いちばん上の桁つき）：アドレスで書かれうるメモリ。ここの帳簿は書き手を知らないので、番号の方が後なら、そこまで待つ（u1）
+        if (r->at + 8 <= r->n) {
+            uint64_t upto = vr_ru64(r);
+            if (upto >> 63) {
+                upto &= ~(1ull << 63);
+                for (int i = 0; i < g_nfl; i++) if (g_fl[i].msg <= upto && i > k) k = i;
+            }
+        }
+        drain_upto(k);
         if (g_err != VK_SUCCESS) return reply(s, g_err);
         ent *e = find(mid);
-        uint64_t off = vr_ru64(r), n = vr_ru64(r);
         if (!e || !e->map || off > e->size || n > e->size - off) return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
         vr_put(&g_out, (uint8_t *) e->map + off, (size_t) n);
         return reply(s, 0);

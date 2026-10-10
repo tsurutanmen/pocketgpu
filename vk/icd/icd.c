@@ -161,6 +161,8 @@ static struct {
     uint64_t wr_bytes[6], wr_n[6]; // GPU が書くかもしれない CPU から見える範囲（読み戻す元）を理由別に
     double cpu0;                   // 最初の present のときのプロセスの CPU 時間（ms）
 } g_stat;
+// u1（アドレスで読み書きする buffer・結んだあとに書いた descriptor）の数。数えるだけ
+static struct { volatile LONG64 pv, rd_n, wr_n, whole, ub_sets, ub_ents; } g_u1;
 static int g_stats = -1;
 // 試す人に配るまとめの印。pc/make_kit.py が「#」の 32 文字を人ごとの番号に書き換える（長さは変えない）。
 // 配った物が外に出たとき、誰に渡した分かを見分ける。ふだん組んだ物は「#」のまま
@@ -205,6 +207,10 @@ static void print_stats(void) {
     }
     fprintf(stderr, "  書き込み監視 %llu 回 %.1f ms 書いたページ %llu / 引き取り %.1f ms\n", (unsigned long long) g_stat.ww_calls, g_stat.ww_ms,
             (unsigned long long) g_stat.ww_pages, g_stat.rb_ms);
+    if (g_u1.pv || g_u1.ub_sets || g_u1.whole)
+        fprintf(stderr, "  u1：push constant のアドレス %lld 回・submit で足した 読む範囲 %lld・書く範囲 %lld・メモリ全体に広げた submit %lld・"
+                        "結んだあとに書かれた set %lld 回（descriptor %lld 個）\n",
+                (long long) g_u1.pv, (long long) g_u1.rd_n, (long long) g_u1.wr_n, (long long) g_u1.whole, (long long) g_u1.ub_sets, (long long) g_u1.ub_ents);
     lz_print();
     fprintf(stderr, "  往復せずに済ませた待ち %llu\n", (unsigned long long) g_stat.skipped);
     if (g_stat.presents)
@@ -1008,6 +1014,9 @@ struct mem {
     struct muse { uint64_t off, end, msg; } *use; // GPU が読む・書く範囲と、それを使う submit の番号（いちばん後の物）
     uint32_t nuse, cuse;
     struct mem *prev, *next;
+    uint32_t aflags;   // VkMemoryAllocateFlagsInfo の flags（DEVICE_ADDRESS なら、シェーダーがアドレスで読み書きしうる）
+    volatile LONG wide; // 受け手の帳簿に載らない使い方（アドレスで読み書き・結んだあとに書いた descriptor）をされた。
+                        // MEM_WRITE・MEM_READ に「受け手の判定より短くせず、ドライバの番号までは必ず待つ」の印を付ける
 };
 static SRWLOCK g_muse_lock = SRWLOCK_INIT;
 
@@ -1062,7 +1071,98 @@ static int memw_upto_on(void) {
     return on;
 }
 
+// MEM_WRITE・MEM_READ に付ける番号。受け手の帳簿に載らない使い方をされたメモリ（wide）は、いちばん上の桁を立てる。
+// 受け手はそのとき、自分の判定とこの番号の大きい方まで待つ（ふだんは小さい方）。古い受け手は、桁が立つと今までどおりの待ち方になる
+#define MEMW_WIDE (1ull << 63)
+static uint64_t memw_upto(struct mem *m, uint64_t off, uint64_t len) {
+    uint64_t u = mu_upto(m, off, len);
+    return m->wide ? u | MEMW_WIDE : u;
+}
+
 struct buf { uint64_t size; VkMemoryRequirements req; struct mem *m; uint64_t memoff; uint64_t addr; }; // addr：受け手の GPU の中のアドレス
+
+// ---- アドレスで読み書きされる buffer の見張り（u1。kit_extra/research/uab_tracking.md の筋書き 3） ----
+// vkd3d-proton は root の SRV・UAV（Apple なら CBV も）を、set に載せずにアドレス（buffer device address）で渡す。
+// そのままだと、そこに CPU が書いた中身を送らず、GPU が書いた中身を読み戻さず、受け手も待たない。
+// アドレスを尋ねられた buffer のうち CPU から見えるメモリの物を、アドレスの順に覚えておき、push constant に入った値から引く
+struct vab { uint64_t a, e; struct buf *b; };
+static struct vab *g_vab;
+static size_t g_nvab, g_cvab;
+static SRWLOCK g_vab_lock = SRWLOCK_INIT;
+static volatile uint64_t g_vab_lo = UINT64_MAX, g_vab_hi; // 表に入ったアドレスの端（外れた値をすぐ捨てる。消しても縮めない）
+static volatile LONG g_bda_host;                          // DEVICE_ADDRESS の印の付いた、CPU から見えるメモリの数（0 なら何もしない）
+
+// IPHONE_VK_BDA_SYNC=0 でアドレスの見張りをしない・IPHONE_VK_UAB_SYNC=0 で結んだあとに書いた descriptor を見ない（前のやり方）
+static int bda_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_BDA_SYNC"); v = !(e && *e == '0'); }
+    return v;
+}
+static int uab_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_UAB_SYNC"); v = !(e && *e == '0'); }
+    return v;
+}
+
+// 並びの中で、アドレス a より前に入る位置（a 以上の最初）
+static size_t vab_lower(uint64_t a) {
+    size_t lo = 0, hi = g_nvab;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (g_vab[mid].a < a) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+static void vab_add(struct buf *bf) {
+    if (!bf || !bf->addr || !bf->m || !bf->m->host || !bf->size) return;
+    AcquireSRWLockExclusive(&g_vab_lock);
+    if (g_nvab == g_cvab) {
+        size_t cap = g_cvab ? g_cvab * 2 : 64;
+        struct vab *p = realloc(g_vab, cap * sizeof *p);
+        if (!p) { ReleaseSRWLockExclusive(&g_vab_lock); return; }
+        g_vab = p;
+        g_cvab = cap;
+    }
+    size_t at = vab_lower(bf->addr);
+    for (size_t i = at; i < g_nvab && g_vab[i].a == bf->addr; i++)
+        if (g_vab[i].b == bf) { ReleaseSRWLockExclusive(&g_vab_lock); return; } // ほかの糸と同時に尋ねた：もう入っている
+    memmove(g_vab + at + 1, g_vab + at, (g_nvab - at) * sizeof *g_vab);
+    g_vab[at] = (struct vab) { bf->addr, bf->addr + bf->size, bf };
+    g_nvab++;
+    if (bf->addr < g_vab_lo) g_vab_lo = bf->addr;
+    if (bf->addr + bf->size > g_vab_hi) g_vab_hi = bf->addr + bf->size;
+    ReleaseSRWLockExclusive(&g_vab_lock);
+}
+
+static void vab_del(struct buf *bf) {
+    if (!bf || !bf->addr || !g_nvab) return;
+    AcquireSRWLockExclusive(&g_vab_lock);
+    for (size_t i = vab_lower(bf->addr); i < g_nvab && g_vab[i].a == bf->addr; i++)
+        if (g_vab[i].b == bf) {
+            memmove(g_vab + i, g_vab + i + 1, (g_nvab - i - 1) * sizeof *g_vab);
+            g_nvab--;
+            break;
+        }
+    ReleaseSRWLockExclusive(&g_vab_lock);
+}
+
+// アドレス v を含む buffer を探し、そのメモリと、メモリの中の v の位置・buffer の終わりを返す。
+// 同じメモリに重ねてつないだ buffer もあるので、手前を少し見る（いちばん長く後ろへ続く物を取る）
+static int vab_find(uint64_t v, struct mem **m, uint64_t *off, uint64_t *end) {
+    int hit = 0;
+    AcquireSRWLockShared(&g_vab_lock);
+    size_t i = vab_lower(v + 1); // a <= v の最後の次
+    for (size_t k = 0; i > 0 && k < 64; k++, i--) {
+        const struct vab *x = &g_vab[i - 1];
+        if (v >= x->e) continue;
+        struct buf *b = x->b;
+        uint64_t o = b->memoff + (v - x->a), e = b->memoff + b->size;
+        if (!hit || e - o > *end - *off) { *m = b->m; *off = o; *end = e; hit = 1; }
+    }
+    ReleaseSRWLockShared(&g_vab_lock);
+    return hit;
+}
 
 typedef struct { struct mem *m; uint64_t off, len, serial; struct queue *q; int lazy; } rng; // lazy：読み戻しを遅らせてよい
 
@@ -1081,8 +1181,9 @@ struct dev {
 
 struct queue { VK_LOADER_DATA loader; struct dev *d; uint32_t fam, idx; uint64_t last_msg; }; // last_msg：このキューに最後に送った submit の番号
 
-struct dent { uint32_t binding, elem, type; struct buf *b; uint64_t off, range; uint64_t h0, h1; uint32_t layout; };
+struct dent { uint32_t binding, elem, type; struct buf *b; uint64_t off, range; uint64_t h0, h1; uint32_t layout; uint64_t wg; };
 // h0・h1：画像なら sampler と image view、texel buffer なら buffer view（descriptor の写しを、ふつうの書き込みに直すのに使う）
+// wg：update after bind の set に書いた通し番号（g_dgen。結んだあとに書かれた物を submit のときに見分ける）
 struct dpool;
 // descriptor set の形。pool の残りを数えるため、種類ごとの数を覚えておく。
 // 形を消したあとも、その形で取った set が残っていれば数を使うので、数え札（refs）で持つ
@@ -1099,10 +1200,13 @@ struct dsl {
     // 数を確保のときに決める binding（VARIABLE_DESCRIPTOR_COUNT）。var_max は形の数（上限）
     int var;
     uint32_t var_type, var_max;
+    int uab; // update after bind（結んだあとに書き換えてよい）の binding がある
 };
 // var_count：数を確保のときに決めた set の、その binding の数（pool の残りを数えるのに使う）
 // hx：(binding, 番号) から e の位置（+1）を引く表（hcap は 2 の累乗）。vkd3d-proton の set は 100 万個の大きさなので、並びを頭から探すと遅い
-struct dset { struct dpool *pool; struct dset *next; uint32_t n, cap; struct dent *e; struct dsl *layout; uint32_t var_count; uint32_t *hx, hcap; };
+// gen：update after bind の set に最後に書いた通し番号
+struct dset { struct dpool *pool; struct dset *next; uint32_t n, cap; struct dent *e; struct dsl *layout; uint32_t var_count; uint32_t *hx, hcap; uint64_t gen; };
+static volatile LONG64 g_dgen; // update after bind の set に書いた通し番号
 // 受け手に頼まずに set を取るので、pool の残り（set の数と種類ごとの数）はドライバが数える
 struct dpool { struct dset *head; uint32_t max_sets, used_sets, nsz; struct { uint32_t type, total, used; } sz[16]; };
 
@@ -1163,6 +1267,13 @@ struct cb {
     int qcopy_nowait;         // WAIT を付けない query の結果の写しがある（前の仕事が終わっている前提で読む）
     struct qwr { uint64_t qp; uint32_t first, n; } *qw; // query を書いた（始め・終わり・時刻・reset した）範囲
     size_t nqw, cqw;
+    // push constant に入っていたアドレスのうち、CPU から見えるメモリの buffer を指す物（u1）。メモリの中の位置・buffer の終わり・push constant の 4 バイトごとの番号
+    struct pva { struct mem *m; uint64_t off, end; uint32_t slot; } *pv;
+    size_t npv, cpv;
+    // 結んだ update after bind の set と、結んだときの通し番号（submit のときに、そのあとに書かれた descriptor を足す）
+    struct uabref { struct dset *s; uint64_t gen; uint32_t set; } *ub;
+    size_t nub, cub;
+    int psb_done, psb_any, psb_whole; // psb_collect を済ませた（記録し直すまで）・アドレスで読み書きする・出どころの分からないアドレスを使う
 };
 struct pushheld { struct dsl *l; VkDescriptorSet s; };
 static void qpv_wrote(uint64_t id, uint32_t first, uint32_t n, uint64_t m);
@@ -1461,6 +1572,7 @@ static int lz_read(struct mem *m, const struct lzr *p, size_t n, uint8_t *dst) {
             vr_u64(&b, ID(m));
             vr_u64(&b, at);
             vr_u64(&b, k);
+            if (m->wide && memw_upto_on()) vr_u64(&b, memw_upto(m, at, k)); // アドレスで書かれうるメモリ：書いた submit まで待ってもらう（read_back_many と同じ）
             g_stat.calls[VR_MEM_READ]++;
             put_msg_locked(VR_MEM_READ, &b);
             b.n = 0;
@@ -1832,7 +1944,7 @@ static void send_write(vr_buf *b, struct mem *m, uint64_t off, uint64_t len) {
     vr_u64(b, ID(m));
     vr_u64(b, off);
     vr_bytes(b, m->shadow + off, (uint32_t) len);
-    if (memw_upto_on()) vr_u64(b, mu_upto(m, off, len)); // 古い受け手は読まない
+    if (memw_upto_on()) vr_u64(b, memw_upto(m, off, len)); // 古い受け手は読まない
     rpc_send(VR_MEM_WRITE, b);
     b->n = 0;
 }
@@ -1906,7 +2018,7 @@ static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
         vr_u64(&b, ID(m));
         vr_u64(&b, off);
         vr_bytes(&b, m->shadow + off, (uint32_t) len);
-        if (memw_upto_on()) vr_u64(&b, mu_upto(m, off, len));
+        if (memw_upto_on()) vr_u64(&b, memw_upto(m, off, len));
         rpc_send(VR_MEM_WRITE, &b);
         i = j;
     }
@@ -1934,6 +2046,8 @@ static void read_back_many(rng *r, size_t n) {
             vr_u64(&b, at);
             vr_u64(&b, k);
             uint32_t op = r[i].m->delta && (g_hw.caps & VR_CAP_DELTA) ? VR_MEM_READ_DELTA : VR_MEM_READ;
+            // アドレスで書かれうるメモリは、受け手がその書き手を知らないので、書いた submit の番号まで待ってもらう（古い受け手は末尾を読まない）
+            if (op == VR_MEM_READ && r[i].m->wide && memw_upto_on()) vr_u64(&b, memw_upto(r[i].m, at, k));
             g_stat.calls[op]++;
             put_msg_locked(op, &b);
             b.n = 0;
@@ -2887,6 +3001,7 @@ static VkResult VKAPI_CALL alloc_memory(VkDevice dv, const VkMemoryAllocateInfo 
         for (const VkBaseInStructure *x = ai->pNext; x; x = x->pNext)
             if (x->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO) fl = ((const VkMemoryAllocateFlagsInfo *) x)->flags;
         vr_u32(&b, fl);
+        m->aflags = fl;
     }
     VkResult r = rpc_call(VR_ALLOC_MEMORY, &b, NULL);
     free(b.p);
@@ -2897,7 +3012,9 @@ static VkResult VKAPI_CALL alloc_memory(VkDevice dv, const VkMemoryAllocateInfo 
         free(m);
         return r;
     }
-    say("メモリ %.1f MiB（種類 %u%s）", m->size / 1048576.0, m->type, m->host ? "・CPU から見える" : "");
+    say("メモリ %.1f MiB（種類 %u%s%s）", m->size / 1048576.0, m->type, m->host ? "・CPU から見える" : "",
+        (m->aflags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT) ? "・アドレスで使う" : "");
+    if (m->host && (m->aflags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)) InterlockedIncrement(&g_bda_host);
     if (m->host) {
         AcquireSRWLockExclusive(&d->lock);
         m->next = d->mems;
@@ -2923,6 +3040,7 @@ static void VKAPI_CALL free_memory(VkDevice dv, VkDeviceMemory mm, const VkAlloc
     if (m->host) {
         if (m->prev) m->prev->next = m->next; else if (d->mems == m) d->mems = m->next;
         if (m->next) m->next->prev = m->prev;
+        if (m->aflags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT) InterlockedDecrement(&g_bda_host);
     }
     size_t k = 0;
     for (size_t i = 0; i < d->npend; i++) if (d->pend[i].m != m) d->pend[k++] = d->pend[i];
@@ -3053,6 +3171,7 @@ static void VKAPI_CALL destroy_buffer(VkDevice dv, VkBuffer bb, const VkAllocati
     if (!bb) return;
     lz_buffer_gone((struct dev *) dv, (struct buf *) bb);
     forget_buffer_in_sets((struct buf *) bb);
+    vab_del((struct buf *) bb);
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, ID(bb));
@@ -5484,7 +5603,9 @@ static volatile LONG g_wr_all;
 // ---- shader module と pipeline ごとの、書く場所の一覧 ----
 // 全部のシェーダーをまとめて (set, binding) で覚えると、同じ場所を計算のシェーダーでは書き、描くシェーダーでは読むだけに使う
 // アプリ（Godot など）で、読むだけの buffer まで毎回読み戻してしまう。pipeline ごとに覚え、command buffer でつないだ物だけで決める
-struct wrinfo { int all; uint32_t n, cap; uint32_t *sb; }; // sb：set << 16 | binding。all は「分からないので全部書く」
+struct wrinfo { int all; uint32_t n, cap; uint32_t *sb; int psb; uint64_t pcr, pcw; }; // sb：set << 16 | binding。all は「分からないので全部書く」
+// psb：1 アドレス（PhysicalStorageBuffer）で読み書きする・2 出どころの分からないアドレスに書く・4 出どころの分からないアドレスから読む。
+// pcr・pcw：アドレスで読む・書くとき、そのアドレスが入っていた push constant の 4 バイトごとの印（63 番は 252 バイト目より後の全部）
 #define WRM_N 4096
 static struct wrnode { uint64_t id; struct wrinfo *w; struct wrnode *next; } *g_wrm[WRM_N];
 static SRWLOCK g_wrm_lock = SRWLOCK_INIT;
@@ -5511,6 +5632,9 @@ static int wri_has(const struct wrinfo *w, uint32_t set, uint32_t binding) {
 static void wri_merge(struct wrinfo *u, const struct wrinfo *w) {
     if (!w) { u->all = 1; return; }
     if (w->all) u->all = 1;
+    u->psb |= w->psb;
+    u->pcr |= w->pcr;
+    u->pcw |= w->pcw;
     for (uint32_t i = 0; i < w->n; i++) wri_add(u, w->sb[i] >> 16, w->sb[i] & 0xffff);
 }
 static void wri_free(struct wrinfo *w) { if (w) { free(w->sb); free(w); } }
@@ -5571,6 +5695,137 @@ static int wr_deep(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("IPHONE_VK_RO_DEEP"); v = !(e && *e == '0'); }
     return v;
+}
+
+// ---- アドレス（PhysicalStorageBuffer）で読み書きする所の、アドレスの出どころ（u1） ----
+// vkd3d-proton は root の CBV・SRV・UAV のアドレスを push constant に入れる。シェーダーはそれを読み（Load）、PSB のポインタに直し
+// （Bitcast・ConvertUToPtr）、足し算や access chain で進めてから読み書きする。関数の中の変数にいったん入れて取り出す形もある（vkd3d-proton の中のシェーダー）。
+// push constant の欄（何バイト目か）を印にしてその筋を追い、アドレスで書く・読む所の印を info に足す。追えないアドレスで書く・読む物があれば psb の 2・4 を立てる。
+// w は wr_scan が形を確かめた物（命令の語の数が 0 でなく、はみ出さない）
+static uint64_t psb_slot(uint32_t off) { return 1ull << (off / 4 < 63 ? off / 4 : 63); }
+static void psb_scan(const uint32_t *w, size_t nw, struct wrinfo *info) {
+    if (!info) return;
+    int cap = 0;
+    for (size_t i = 5; i < nw; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (op == 17 && wc >= 2 && w[i + 1] == 5347) cap = 1; // OpCapability PhysicalStorageBufferAddresses
+        if (op == 54) break;                                  // 関数より前に書く決まり
+    }
+    if (!cap) return;
+    info->psb |= 1;
+    uint32_t bound = w[3];
+    uint64_t *tag = calloc(bound, 8), *mtag = calloc(bound, 8);
+    uint32_t *psc = calloc(bound, 4), *rty = calloc(bound, 4), *vbase = calloc(bound, 4), *cval = calloc(bound, 4), *pcs = calloc(bound, 4);
+    uint8_t *isc = calloc(bound, 1), *ispcs = calloc(bound, 1);
+    struct { uint32_t s, m, off; } *mo = NULL;
+    size_t nmo = 0;
+    if (!tag || !mtag || !psc || !rty || !vbase || !cval || !pcs || !isc || !ispcs) { info->psb |= 6; info->pcr = info->pcw = ~0ull; goto out; }
+    // 型・定数・変数と、ポインタを作る命令の結果の型
+    for (size_t i = 5; i < nw; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        const uint32_t *x = &w[i];
+        if (op == 32 && wc >= 4 && x[1] < bound) psc[x[1]] = x[2] + 1;      // OpTypePointer（+1 で 0 と分ける）
+        else if (op == 39 && wc >= 3 && x[1] < bound) psc[x[1]] = x[2] + 1; // OpTypeForwardPointer
+        else if (op == 43 && wc >= 4 && x[2] < bound) { cval[x[2]] = x[3]; isc[x[2]] = 1; }
+        else if (op == 59 && wc >= 4 && x[2] < bound) {
+            if (x[3] == 9) { // PushConstant：中の struct の型を覚える
+                uint32_t t = 0;
+                for (size_t j = 5; j < i; j += w[j] >> 16)
+                    if ((w[j] & 0xffff) == 32 && (w[j] >> 16) >= 4 && w[j + 1] == x[1]) t = w[j + 3];
+                if (t && t < bound) { pcs[x[2]] = t; ispcs[t] = 1; }
+            } else if (x[3] == 7 || x[3] == 6 || x[3] == 4) vbase[x[2]] = x[2]; // Function・Private・Workgroup の変数
+        }
+        switch (op) {
+        case 1: case 46: case 55: case 57: case 59: case 61: case 65: case 66: case 67: case 70: case 81: case 83: case 120: case 124: case 169: case 245: case 400:
+            if (wc >= 3 && x[2] < bound) rty[x[2]] = x[1];
+            break;
+        default: break;
+        }
+    }
+    // push constant の struct の欄の位置（OpMemberDecorate Offset）
+    for (size_t i = 5; i < nw; i += w[i] >> 16) {
+        const uint32_t *x = &w[i];
+        if ((x[0] & 0xffff) == 72 && (x[0] >> 16) >= 5 && x[3] == 35 && x[1] < bound && ispcs[x[1]]) {
+            void *p = realloc(mo, (nmo + 1) * sizeof *mo);
+            if (!p) { info->psb |= 6; info->pcr = info->pcw = ~0ull; goto out; }
+            mo = p;
+            mo[nmo].s = x[1];
+            mo[nmo].m = x[2];
+            mo[nmo].off = x[4];
+            nmo++;
+        }
+    }
+    // 変数を指すポインタの元の変数
+    for (size_t i = 5; i < nw; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        const uint32_t *x = &w[i];
+        if ((op == 65 || op == 66 || op == 67 || op == 70 || op == 83) && wc >= 4 && x[2] < bound && x[3] < bound && vbase[x[3]]) vbase[x[2]] = vbase[x[3]];
+    }
+#define PSB_ADD(d, s) do { if ((d) < bound && (s) < bound && (tag[s] & ~tag[d])) { tag[d] |= tag[s]; ch = 1; } } while (0)
+    // 印を広げる（phi は後ろで作られる物も指すので、変わらなくなるまで何回か回す）
+    for (int pass = 0; pass < 16; pass++) {
+        int ch = 0;
+        for (size_t i = 5; i < nw; i += w[i] >> 16) {
+            uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+            const uint32_t *x = &w[i];
+            if ((op == 65 || op == 66) && wc >= 4 && x[2] < bound && x[3] < bound && pcs[x[3]]) {
+                // push constant の欄を指す：欄の番号が定数で、その先を掘らなければ、その欄の位置
+                uint64_t t = ~0ull;
+                if (wc == 5 && x[4] < bound && isc[x[4]])
+                    for (size_t k = 0; k < nmo; k++)
+                        if (mo[k].s == pcs[x[3]] && mo[k].m == cval[x[4]]) { t = psb_slot(mo[k].off); break; }
+                if (t & ~tag[x[2]]) { tag[x[2]] |= t; ch = 1; }
+                continue;
+            }
+            switch (op) {
+            case 61: case 124: case 120: case 83: case 113: case 114: case 81: case 65: case 66: case 67: case 70:
+                if (wc >= 4) PSB_ADD(x[2], x[3]);
+                if (op == 61 && wc >= 4 && x[3] < bound && vbase[x[3]] && x[2] < bound && (mtag[vbase[x[3]]] & ~tag[x[2]])) { tag[x[2]] |= mtag[vbase[x[3]]]; ch = 1; }
+                break;
+            case 128: case 130: case 197: case 198: case 199: case 79: case 82:
+                if (wc >= 5) { PSB_ADD(x[2], x[3]); PSB_ADD(x[2], x[4]); }
+                break;
+            case 80:
+                for (uint32_t k = 3; k < wc; k++) PSB_ADD(x[2], x[k]);
+                break;
+            case 245:
+                for (uint32_t k = 3; k < wc; k += 2) PSB_ADD(x[2], x[k]);
+                break;
+            case 169:
+                if (wc >= 6) { PSB_ADD(x[2], x[4]); PSB_ADD(x[2], x[5]); }
+                break;
+            case 62: // 関数の中の変数にしまう
+                if (wc >= 3 && x[1] < bound && x[2] < bound && vbase[x[1]] && (tag[x[2]] & ~mtag[vbase[x[1]]])) { mtag[vbase[x[1]]] |= tag[x[2]]; ch = 1; }
+                break;
+            default: break;
+            }
+        }
+        if (!ch) break;
+    }
+#undef PSB_ADD
+    // アドレスで書く・読む所
+    for (size_t i = 5; i < nw; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        const uint32_t *x = &w[i];
+        uint32_t pw = 0, pr = 0; // 書く先・読む元のポインタ（0 は無し）
+        if ((op == 62 || op == 228) && wc >= 3) pw = x[1];                       // OpStore・OpAtomicStore
+        else if ((op == 63 || op == 64) && wc >= 3) { pw = x[1]; pr = x[2]; }    // OpCopyMemory(Sized)
+        else if (((op >= 229 && op <= 242) || op == 318 || op == 5614 || op == 5615 || op == 6035) && wc >= 4) pw = pr = x[3]; // 読んで書く atomic
+        else if ((op == 61 || op == 227) && wc >= 4) pr = x[3];                 // OpLoad・OpAtomicLoad
+        // PSB のポインタだけを見る（push constant そのものや関数の中の変数への読み書きは数えない）。型の分からない物は、印があれば数える
+        if (pw && pw < bound) {
+            int isp = rty[pw] && rty[pw] < bound && psc[rty[pw]] == 5349 + 1;
+            if (tag[pw] && (isp || !rty[pw])) info->pcw |= tag[pw];
+            else if (isp) info->psb |= 2;
+        }
+        if (pr && pr < bound) {
+            int isp = rty[pr] && rty[pr] < bound && psc[rty[pr]] == 5349 + 1;
+            if (tag[pr] && (isp || !rty[pr])) info->pcr |= tag[pr];
+            else if (isp) info->psb |= 4;
+        }
+    }
+out:
+    free(tag); free(mtag); free(psc); free(rty); free(vbase); free(cval); free(pcs); free(isc); free(ispcs); free(mo);
 }
 
 static void wr_scan(const uint32_t *w, size_t nw, struct wrinfo *info) {
@@ -5640,6 +5895,7 @@ static void wr_scan(const uint32_t *w, size_t nw, struct wrinfo *info) {
             writable = !(fl[v] & 4);
         if (writable) { wr_mark(set[v], bnd[v]); wri_add(info, set[v], bnd[v]); }
     }
+    psb_scan(w, nw, info); // ここまで来たら、形は確かめてある
 out:
     free(set); free(bnd); free(memnw); free(memn); free(ptr_t); free(ptr_sc); free(elem); free(imgw); free(fl); free(vars);
     free(root); free(stored);
@@ -5882,6 +6138,14 @@ static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreate
     struct wrinfo *wi = calloc(1, sizeof *wi);
     wr_scan(code, size / 4, wi);
     uint64_t id = new_id();
+    // 調べ用：IPHONE_VK_PSB_DBG=1 で、アドレスで読み書きするシェーダーの印を記録に出す（u1）
+    {
+        static int dbg = -1;
+        if (dbg < 0) { const char *e = getenv("IPHONE_VK_PSB_DBG"); dbg = e && *e == '1'; }
+        if (dbg && wi && wi->psb)
+            say("アドレスで読み書きするシェーダー %llu：印 %d・書く欄 %016llx・読む欄 %016llx", (unsigned long long) id, wi->psb,
+                (unsigned long long) wi->pcw, (unsigned long long) wi->pcr);
+    }
     wrm_put(id, wi);
     // 調べ用：IPHONE_VK_SPV_DUMP=フォルダ で、受け手に送るシェーダーを番号ごとに書き出す
     const char *dump = getenv("IPHONE_VK_SPV_DUMP");
@@ -5986,6 +6250,10 @@ static VkResult VKAPI_CALL create_dsl(VkDevice dv, const VkDescriptorSetLayoutCr
     const VkDescriptorSetLayoutBindingFlagsCreateInfo *bfl = NULL;
     for (const VkBaseInStructure *x = ci->pNext; x; x = x->pNext)
         if (x->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO) bfl = (const void *) x;
+    // update after bind の印（結んだあとに書いた descriptor を、submit のときに見直す。u1）
+    if (ci->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT) l->uab = 1;
+    for (uint32_t i = 0; bfl && i < bfl->bindingCount && i < ci->bindingCount; i++)
+        if (bfl->pBindingFlags && (bfl->pBindingFlags[i] & VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT)) l->uab = 1;
     if (bfl && (bfl->bindingCount != ci->bindingCount || !vkd3d())) bfl = NULL; // DXVK・zink には今まで通り運ばない
     for (uint32_t i = 0; bfl && i < ci->bindingCount; i++)
         if (bfl->pBindingFlags[i] & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) {
@@ -6343,6 +6611,8 @@ static int dset_rehash(struct dset *s, uint32_t cap) {
 
 static void dset_put_full(struct dset *s, struct dent d) {
     if ((!s->hx || (s->n + 1) * 2 > s->hcap) && !dset_rehash(s, s->hcap ? s->hcap * 2 : 16)) return;
+    // update after bind の set：書いた順の番号を付ける（submit のとき、結んだあとに書かれた物だけを足す）
+    if (s->layout && s->layout->uab) s->gen = d.wg = (uint64_t) InterlockedIncrement64(&g_dgen);
     uint32_t *slot = dset_slot(s, d.binding, d.elem);
     if (*slot) { s->e[*slot - 1] = d; return; }
     if (s->n == s->cap) {
@@ -6357,7 +6627,7 @@ static void dset_put_full(struct dset *s, struct dent d) {
 }
 
 static void dset_put(struct dset *s, uint32_t binding, uint32_t elem, uint32_t type, struct buf *bf, uint64_t off, uint64_t range) {
-    dset_put_full(s, (struct dent) { binding, elem, type, bf, off, range, 0, 0, 0 });
+    dset_put_full(s, (struct dent) { binding, elem, type, bf, off, range, 0, 0, 0, 0 });
 }
 
 static const struct dent *dset_get(const struct dset *s, uint32_t binding, uint32_t elem) {
@@ -6442,7 +6712,7 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
                 vr_u64(&b, smp);
                 vr_u64(&b, view);
                 vr_u32(&b, fix_layout(ii->imageLayout));
-                dset_put_full(s, (struct dent) { w[i].dstBinding, w[i].dstArrayElement + k, w[i].descriptorType, NULL, 0, 0, smp, view, (uint32_t) ii->imageLayout });
+                dset_put_full(s, (struct dent) { w[i].dstBinding, w[i].dstArrayElement + k, w[i].descriptorType, NULL, 0, 0, smp, view, (uint32_t) ii->imageLayout, 0 });
             }
             continue;
         }
@@ -6451,7 +6721,7 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
                 struct bview *v = (struct bview *) w[i].pTexelBufferView[k];
                 if (!v) note_null_desc(w[i].descriptorType);
                 vr_u64(&b, ID(v));
-                if (v) dset_put_full(s, (struct dent) { w[i].dstBinding, w[i].dstArrayElement + k, w[i].descriptorType, v->b, v->off, v->range, ID(v), 0, 0 });
+                if (v) dset_put_full(s, (struct dent) { w[i].dstBinding, w[i].dstArrayElement + k, w[i].descriptorType, v->b, v->off, v->range, ID(v), 0, 0, 0 });
             }
             continue;
         }
@@ -6727,9 +6997,9 @@ static void bct_free(struct cb *c) {
     c->bct = NULL;
 }
 
-static void cb_clear(struct cb *c) { push_release(c); c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; c->nwc = 0; c->nbpl = 0; c->bpl_over = 0; c->qcopy_nowait = 0; c->nqw = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
+static void cb_clear(struct cb *c) { push_release(c); c->s.n = 0; c->nr = 0; c->nrd = 0; c->nev = 0; c->nwc = 0; c->nbpl = 0; c->bpl_over = 0; c->qcopy_nowait = 0; c->nqw = 0; c->npv = 0; c->nub = 0; c->psb_done = c->psb_any = c->psb_whole = 0; bct_free(c); c->gs = NULL; c->app_topo_set = 0; gs_cb_clear(c); }
 
-static void cb_free(struct cb *c) { push_release(c); free(c->ph); free(c->wc); gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c->ev); free(c); }
+static void cb_free(struct cb *c) { push_release(c); free(c->ph); free(c->wc); free(c->pv); free(c->ub); gs_cb_free(c); bct_free(c); free(c->s.p); free(c->r); free(c->rd); free(c->ev); free(c); }
 
 static void VKAPI_CALL destroy_cpool(VkDevice dv, VkCommandPool pp, const VkAllocationCallbacks *a) {
     (void) a;
@@ -6912,6 +7182,131 @@ static void cb_reads(struct cb *c, struct buf *bf, uint64_t off, uint64_t len) {
     rng_add(&c->rd, &c->nrd, &c->caprd, bf->m, bf->memoff + off, len, 0);
 }
 
+// ---- u1：アドレスで読み書きする buffer と、結んだあとに書いた descriptor ----
+// push constant に入っていたアドレスを覚える。同じ buffer・同じ欄なら 1 つにまとめる（始まりは手前の方を取る。輪のように進む upload の置き場で増えないように）
+static void pv_add(struct cb *c, struct mem *m, uint64_t off, uint64_t end, uint32_t slot) {
+    for (size_t i = c->npv; i-- > 0 && i + 16 >= c->npv;)
+        if (c->pv[i].m == m && c->pv[i].end == end && c->pv[i].slot == slot) {
+            if (off < c->pv[i].off) c->pv[i].off = off;
+            return;
+        }
+    if (c->npv == c->cpv) {
+        size_t cap = c->cpv ? c->cpv * 2 : 8;
+        struct pva *p = realloc(c->pv, cap * sizeof *p);
+        if (!p) return;
+        c->pv = p;
+        c->cpv = cap;
+    }
+    c->pv[c->npv++] = (struct pva) { m, off, end, slot };
+}
+
+// vkCmdPushConstants の中身から、表にあるアドレス（CPU から見えるメモリの buffer）を探す。8 バイトの値を 4 バイトずつずらして見る
+static void pv_scan(struct cb *c, uint32_t off, uint32_t size, const void *v) {
+    if (!g_bda_host || !g_nvab || size < 8 || !bda_on()) return;
+    const uint8_t *p = v;
+    for (uint32_t k = (4 - off % 4) % 4; k + 8 <= size; k += 4) {
+        uint64_t x;
+        memcpy(&x, p + k, 8);
+        if (x < g_vab_lo || x >= g_vab_hi) continue;
+        struct mem *m;
+        uint64_t mo, me;
+        if (vab_find(x, &m, &mo, &me)) { pv_add(c, m, mo, me, (off + k) / 4); InterlockedIncrement64(&g_u1.pv); }
+    }
+}
+
+// update after bind の set を結んだ：結んだ時点の通し番号を覚える（同じ set を前に結んでいれば、前の番号のまま）
+static void ub_note(struct cb *c, struct dset *s, uint32_t set, uint64_t gen) {
+    if (!s || !uab_on()) return;
+    for (size_t i = 0; i < c->nub; i++)
+        if (c->ub[i].s == s && c->ub[i].set == set) {
+            if (gen < c->ub[i].gen) c->ub[i].gen = gen;
+            return;
+        }
+    if (c->nub == c->cub) {
+        size_t cap = c->cub ? c->cub * 2 : 4;
+        struct uabref *p = realloc(c->ub, cap * sizeof *p);
+        if (!p) return;
+        c->ub = p;
+        c->cub = cap;
+    }
+    c->ub[c->nub++] = (struct uabref) { s, gen, set };
+}
+
+// set の 1 つの descriptor が指す buffer を、GPU が読む範囲・書くかもしれない候補にする（cmd_bind_sets と同じ決め方）
+static void dent_track(struct cb *c, uint32_t set, const struct dent *e) {
+    if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) wr_cand(c, set, e->binding, e->b, e->off, e->range);
+    else if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && e->b) wr_cand(c, set, e->binding, e->b, 0, e->b->size);
+    if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) cb_reads(c, e->b, e->off, e->range);
+    else if (e->b) cb_reads(c, e->b, 0, e->b->size);
+}
+
+// submit のとき：結んだあとに書かれた descriptor の buffer を足す（uab_tracking.md の筋書き 1）。
+// 受け手の帳簿（結んだ時点の set の中身）には載らないので、そのメモリには「ドライバの番号まで待つ」印を付ける
+static void uab_resolve(struct cb *c) {
+    for (size_t i = 0; i < c->nub; i++) {
+        struct uabref *u = &c->ub[i];
+        struct dset *s = u->s;
+        uint64_t g = s->gen;
+        if (g <= u->gen) continue;
+        InterlockedIncrement64(&g_u1.ub_sets);
+        for (uint32_t k = 0; k < s->n; k++) {
+            const struct dent *e = &s->e[k];
+            if (e->wg <= u->gen || !e->b) continue;
+            dent_track(c, u->set, e);
+            if (e->b->m && e->b->m->host) e->b->m->wide = 1;
+            InterlockedIncrement64(&g_u1.ub_ents);
+        }
+        u->gen = g;
+    }
+}
+
+// この command buffer でつないだ pipeline のシェーダーが、アドレスで読み書きするか（psb の印）と、そのアドレスの入る push constant の欄
+static int cb_psb(struct cb *c, uint64_t *pr, uint64_t *pw) {
+    int f = 0;
+    *pr = *pw = 0;
+    if (c->bpl_over) { *pr = *pw = ~0ull; return 7; }
+    AcquireSRWLockShared(&g_wrm_lock);
+    for (int i = 0; i < c->nbpl; i++) {
+        const struct wrinfo *w = wrm_find(c->bpl[i]);
+        if (!w || w->all) { f = 7; *pr = *pw = ~0ull; break; } // 分からない pipeline：アドレスで何でも読み書きするとみなす
+        f |= w->psb;
+        *pr |= w->pcr;
+        *pw |= w->pcw;
+    }
+    ReleaseSRWLockShared(&g_wrm_lock);
+    return f;
+}
+
+// submit のとき（記録し直すまでに 1 回）：push constant に入っていたアドレスのうち、シェーダーが読む欄の物は GPU が読む範囲（rd）に、
+// 書く欄の物は書くかもしれない範囲（r。CPU が触るまで読み戻しを遅らせる）に足す。どちらも、そのアドレスから buffer の終わりまで
+// （D3D12 のリソースの大きさはここからは分からない）。rd・r に入れれば、送る・帳簿・引き取り・合図のときの送り直し（pb_release）は今までの道で済む。
+// 出どころの分からないアドレスで読む・書くシェーダーがあれば psb_whole を立てる（queue_submit が、アドレスで使うメモリを全部見る）
+static void psb_collect(struct cb *c) {
+    if (c->psb_done || !g_bda_host || !bda_on()) return;
+    c->psb_done = 1;
+    uint64_t pr, pw;
+    int f = cb_psb(c, &pr, &pw);
+    if (!(f & 1)) return;
+    c->psb_any = 1;
+    c->psb_whole = (f & 6) != 0;
+    for (size_t k = 0; k < c->npv; k++) {
+        const struct pva *v = &c->pv[k];
+        uint64_t bit = 1ull << (v->slot < 63 ? v->slot : 63);
+        // 出どころの分からないアドレス（メモリから読んだアドレス）への書き込みは、push constant のアドレスとは別の所なので、ここでは足さない
+        int wr = (pw & bit) != 0, rd = wr || (pr & bit);
+        if (!rd) continue;
+        rng_add(&c->rd, &c->nrd, &c->caprd, v->m, v->off, v->end - v->off, 0);
+        if (wr) {
+            size_t b0 = c->nr;
+            rng_add(&c->r, &c->nr, &c->capr, v->m, v->off, v->end - v->off, 0);
+            if (c->nr > b0) c->r[b0].lazy = lz_why_ok(0); // storage buffer と同じく、CPU が触るまで読み戻しを遅らせる
+            InterlockedIncrement64(&g_u1.wr_n);
+        }
+        InterlockedIncrement64(&g_u1.rd_n);
+        v->m->wide = 1;
+    }
+}
+
 static void VKAPI_CALL cmd_bind_pipeline(VkCommandBuffer cbh, VkPipelineBindPoint bp, VkPipeline p) {
     struct cb *c = (struct cb *) cbh;
     vr_u32(&c->s, VR_CMD_BIND_PIPELINE);
@@ -6936,13 +7331,9 @@ static void VKAPI_CALL cmd_bind_sets(VkCommandBuffer cbh, VkPipelineBindPoint bp
     for (uint32_t i = 0; i < n; i++) {
         struct dset *s = (struct dset *) sets[i];
         if (!s) continue;
-        for (uint32_t k = 0; k < s->n; k++) {
-            struct dent *e = &s->e[k];
-            if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) wr_cand(c, first + i, e->binding, e->b, e->off, e->range);
-            else if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && e->b) wr_cand(c, first + i, e->binding, e->b, 0, e->b->size);
-            if (e->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) cb_reads(c, e->b, e->off, e->range);
-            else if (e->b) cb_reads(c, e->b, 0, e->b->size);
-        }
+        uint64_t gen = s->gen; // 見る前に取る（見ている間にほかの糸が書いた物は、submit のときに足す）
+        for (uint32_t k = 0; k < s->n; k++) dent_track(c, first + i, &s->e[k]);
+        if (s->layout && s->layout->uab) ub_note(c, s, first + i, gen);
     }
 }
 
@@ -6953,6 +7344,7 @@ static void VKAPI_CALL cmd_push(VkCommandBuffer cbh, VkPipelineLayout l, VkShade
     vr_u32(&c->s, gs_stages(st));
     vr_u32(&c->s, off);
     vr_bytes(&c->s, v, size);
+    pv_scan(c, off, size, v); // root の CBV・SRV・UAV のアドレス（vkd3d-proton）を覚える
 }
 
 static void VKAPI_CALL cmd_dispatch(VkCommandBuffer cbh, uint32_t x, uint32_t y, uint32_t z) {
@@ -7105,6 +7497,8 @@ static void VKAPI_CALL cmd_exec(VkCommandBuffer cbh, uint32_t n, const VkCommand
         for (size_t k = 0; k < s->nwc; k++) wr_cand(c, s->wc[k].set, s->wc[k].binding, s->wc[k].b, s->wc[k].off, s->wc[k].len);
         for (int k = 0; k < s->nbpl; k++) cb_note_pipe(c, s->bpl[k]);
         if (s->bpl_over) c->bpl_over = 1;
+        for (size_t k = 0; k < s->npv; k++) pv_add(c, s->pv[k].m, s->pv[k].off, s->pv[k].end, s->pv[k].slot);
+        for (size_t k = 0; k < s->nub; k++) ub_note(c, s->ub[k].s, s->ub[k].set, s->ub[k].gen);
         if (s->qcopy_nowait) c->qcopy_nowait = 1;
         for (size_t k = 0; k < s->nqw; k++) cb_note_q(c, s->qw[k].qp, s->qw[k].first, s->qw[k].n);
     }
@@ -7960,6 +8354,17 @@ static VkResult VKAPI_CALL signal_sem(VkDevice dv, const VkSemaphoreSignalInfo *
 static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitInfo *si, VkFence f) {
     struct queue *q = (struct queue *) qh;
     struct dev *d = q->d;
+    // u1：結んだあとに書いた descriptor（update after bind）と、アドレスで読み書きする buffer を、command buffer の読む・書く範囲に足す。
+    // whole：出どころの分からないアドレスを使うシェーダーがある
+    int whole = 0;
+    for (uint32_t i = 0; i < n; i++)
+        for (uint32_t j = 0; j < si[i].commandBufferCount; j++) {
+            struct cb *c = (struct cb *) si[i].pCommandBuffers[j];
+            if (c->nub) uab_resolve(c);
+            psb_collect(c);
+            whole |= c->psb_whole;
+        }
+    if (!g_bda_host || !bda_on()) whole = 0;
     // GPU が読む範囲のうち、アプリが書いたページを先に送る
     {
         rng *rd = NULL;
@@ -7971,8 +8376,17 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
                 // GPU が書く範囲でも、アプリが書いたページは先に送る（GPU が書かなかった所を、読み戻しで古い値に戻さないため）
                 for (size_t k = 0; k < c->nr; k++) rng_add(&rd, &nrd, &crd, c->r[k].m, c->r[k].off, c->r[k].len, 0);
             }
+        // u1：出どころの分からないアドレスがあれば、アドレスで使うメモリを全部見る
+        // （この submit が使わないメモリにも触るので、ほかの糸に放されないよう、送り終わるまで錠を持つ）
+        if (whole) {
+            AcquireSRWLockShared(&d->lock);
+            for (struct mem *m = d->mems; m; m = m->next)
+                if ((m->aflags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT) && !m->jpeg && !m->delta) rng_add(&rd, &nrd, &crd, m, 0, m->size, 0);
+            InterlockedIncrement64(&g_u1.whole);
+        }
         rng_merge(rd, &nrd);
         for (size_t k = 0; k < nrd; k++) send_dirty(rd[k].m, rd[k].off, rd[k].len);
+        if (whole) ReleaseSRWLockShared(&d->lock);
         free(rd);
     }
     // WAIT を付けない query の結果の写しは、アプリが前の仕事の終わりを待ってから出す前提で読む。
@@ -8101,6 +8515,10 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
                     for (size_t x = 0; x < c->nqw; x++) qpv_wrote(c->qw[x].qp, c->qw[x].first, c->qw[x].n, m);
                     for (size_t x = 0; x < c->nrd; x++) mu_note(c->rd[x].m, c->rd[x].off, c->rd[x].len, m);
                     for (size_t x = 0; x < c->nr; x++) mu_note(c->r[x].m, c->r[x].off, c->r[x].len, m);
+                    // u1：出どころの分からないアドレスを使うなら、アドレスで使うメモリの全部を帳簿に載せる（d->lock を持っている）
+                    if (whole && c->psb_whole)
+                        for (struct mem *mm = d->mems; mm; mm = mm->next)
+                            if ((mm->aflags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT) && !mm->jpeg && !mm->delta) { mu_note(mm, 0, mm->size, m); mm->wide = 1; }
                 }
         }
         if (n == 0) break;
@@ -8243,6 +8661,7 @@ static VkDeviceAddress VKAPI_CALL get_buffer_address(VkDevice dv, const VkBuffer
     if (rpc_call(VR_GET_BUFFER_ADDRESS, &b, &o) == VK_SUCCESS && o.n >= 8) memcpy(&bf->addr, o.p, 8);
     free(b.p);
     free(o.p);
+    if (bda_on()) vab_add(bf); // CPU から見えるメモリの buffer なら、push constant に入ったアドレスから引けるようにする
     return bf->addr;
 }
 
