@@ -160,7 +160,7 @@ static struct {
     int heat_max;                  // いちばん熱かったときの iPhone の熱の状態
     uint64_t wr_bytes[6], wr_n[6]; // GPU が書くかもしれない CPU から見える範囲（読み戻す元）を理由別に
     double cpu0;                   // 最初の present のときのプロセスの CPU 時間（ms）
-    uint64_t rp_begin, rp_load, rp_store, rp_clear; // render pass を始めた回数と、画面を読み込む・書き戻す・消す attachment の数
+    uint64_t rp_begin, rp_load, rp_store, rp_clear, rp_dload, rp_dstore, rp_same; // render pass を始めた回数と、画面を読み込む・書き戻す・消す attachment の数
     double rp_px;                  // 読み込みと書き戻しの画素の合計（タイルで描く GPU ではここが重い）
 } g_stat;
 // u1（アドレスで読み書きする buffer・結んだあとに書いた descriptor）の数。数えるだけ
@@ -217,8 +217,9 @@ static void print_stats(void) {
     if (g_stat.rp_begin) {
         double per = g_stat.presents ? (double) g_stat.presents : 1;
         fprintf(stderr, "  描く区切り（render pass）%llu 回（1 コマ %.1f 回）・読み込む attachment %llu・書き戻す %llu・消して始める %llu・"
-                        "読み書きした画素 1 コマ %.1f M\n", (unsigned long long) g_stat.rp_begin, g_stat.rp_begin / per,
-                (unsigned long long) g_stat.rp_load, (unsigned long long) g_stat.rp_store, (unsigned long long) g_stat.rp_clear, g_stat.rp_px / per / 1e6);
+                        "（うち深さ 読み込み %llu・書き戻し %llu）・すぐ前と同じ framebuffer に続けて %llu 回・読み書きした画素 1 コマ %.1f M\n", (unsigned long long) g_stat.rp_begin, g_stat.rp_begin / per,
+                (unsigned long long) g_stat.rp_load, (unsigned long long) g_stat.rp_store, (unsigned long long) g_stat.rp_clear,
+                (unsigned long long) g_stat.rp_dload, (unsigned long long) g_stat.rp_dstore, (unsigned long long) g_stat.rp_same, g_stat.rp_px / per / 1e6);
     }
     fprintf(stderr, "  往復せずに済ませた待ち %llu\n", (unsigned long long) g_stat.skipped);
     if (g_stat.presents)
@@ -1422,6 +1423,7 @@ struct cb {
     rng *rd;           // GPU が読むかもしれない範囲（submit の前に、ここだけ送る）
     size_t nrd, caprd;
     struct bctmp *bct; // BC をほどいた中身を入れた一時バッファ（記録し直すときに消す）
+    uint64_t rp_last_fb; // 数える用：この command buffer で前に描いた framebuffer
     const struct gs_pipe *gs; // いまつないでいる、GS を真似た pipeline（無ければ NULL）
     uint32_t app_topo;        // アプリが vkCmdSetPrimitiveTopology で決めた形
     int app_topo_set;
@@ -3657,10 +3659,11 @@ static void put_refs(vr_buf *b, const VkAttachmentReference *r, uint32_t n) {
     }
 }
 // render pass ごとの、読み込む（LOAD）・書き戻す（STORE）・消す（CLEAR）attachment の数。数えるだけ（IPHONE_VK_STATS で出す）
-static struct { uint64_t id; uint8_t nload, nstore, nclear; } g_rpl[2048];
-static void rpl_put(uint64_t id, int nload, int nstore, int nclear) {
+static struct { uint64_t id; uint8_t nload, nstore, nclear, dload, dstore; } g_rpl[2048];
+static void rpl_put(uint64_t id, int nload, int nstore, int nclear, int dload, int dstore) {
     unsigned k = (unsigned) (id * 0x9E3779B97F4A7C15ull >> 40) % 2048;
     g_rpl[k].id = id; g_rpl[k].nload = (uint8_t) nload; g_rpl[k].nstore = (uint8_t) nstore; g_rpl[k].nclear = (uint8_t) nclear;
+    g_rpl[k].dload = (uint8_t) dload; g_rpl[k].dstore = (uint8_t) dstore;
 }
 static void rpl_count(uint64_t id, const VkRect2D *area) {
     unsigned k = (unsigned) (id * 0x9E3779B97F4A7C15ull >> 40) % 2048;
@@ -3669,6 +3672,8 @@ static void rpl_count(uint64_t id, const VkRect2D *area) {
     g_stat.rp_load += g_rpl[k].nload;
     g_stat.rp_store += g_rpl[k].nstore;
     g_stat.rp_clear += g_rpl[k].nclear;
+    g_stat.rp_dload += g_rpl[k].dload;
+    g_stat.rp_dstore += g_rpl[k].dstore;
     g_stat.rp_px += (double) area->extent.width * area->extent.height * (g_rpl[k].nload + g_rpl[k].nstore);
 }
 
@@ -3687,13 +3692,16 @@ static VkResult VKAPI_CALL create_rpass(VkDevice dv, const VkRenderPassCreateInf
         vr_put(&b, &ad, sizeof ad);
     }
     {
-        int nl = 0, ns = 0, nc = 0;
+        int nl = 0, ns = 0, nc = 0, dl = 0, ds = 0;
         for (uint32_t i = 0; i < ci->attachmentCount; i++) {
             nl += ci->pAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
             nc += ci->pAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
             ns += ci->pAttachments[i].storeOp == VK_ATTACHMENT_STORE_OP_STORE;
+            int dep = ci->pAttachments[i].format >= VK_FORMAT_D16_UNORM && ci->pAttachments[i].format <= VK_FORMAT_D32_SFLOAT_S8_UINT;
+            dl += dep && ci->pAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
+            ds += dep && ci->pAttachments[i].storeOp == VK_ATTACHMENT_STORE_OP_STORE;
         }
-        rpl_put(id, nl, ns, nc);
+        rpl_put(id, nl, ns, nc, dl, ds);
     }
     vr_u32(&b, ci->subpassCount);
     for (uint32_t i = 0; i < ci->subpassCount; i++) {
@@ -3751,13 +3759,16 @@ static VkResult VKAPI_CALL create_rpass2(VkDevice dv, const VkRenderPassCreateIn
         vr_u32(&b, fix_layout(ad->finalLayout));
     }
     {
-        int nl = 0, ns = 0, nc = 0;
+        int nl = 0, ns = 0, nc = 0, dl = 0, ds = 0;
         for (uint32_t i = 0; i < ci->attachmentCount; i++) {
             nl += ci->pAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
             nc += ci->pAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
             ns += ci->pAttachments[i].storeOp == VK_ATTACHMENT_STORE_OP_STORE;
+            int dep = ci->pAttachments[i].format >= VK_FORMAT_D16_UNORM && ci->pAttachments[i].format <= VK_FORMAT_D32_SFLOAT_S8_UINT;
+            dl += dep && ci->pAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
+            ds += dep && ci->pAttachments[i].storeOp == VK_ATTACHMENT_STORE_OP_STORE;
         }
-        rpl_put(id, nl, ns, nc);
+        rpl_put(id, nl, ns, nc, dl, ds);
     }
     vr_u32(&b, ci->subpassCount);
     for (uint32_t i = 0; i < ci->subpassCount; i++) {
@@ -4914,6 +4925,9 @@ struct swapchain {
     uint64_t jpeg_bytes; // 受け取った JPEG の合計
     // H.264 で受け取る（受け手が VR_CAP_H264 を名乗ったとき。IPHONE_VK_VIDEO=0 で JPEG に戻す）。use_jpeg も 1 のまま
     int use_video;
+    int upscale;               // 受け手に MetalFX で 1.5 倍に広げてもらう（IPHONE_VK_UPSCALE=1）。広げた絵は別の窓に出す
+    uint32_t vw, vh;           // H.264 で届く絵の大きさ（広げるときは 1.5 倍）
+    HWND vwin;                 // 広げた絵を出す窓（表示の糸が作る）
     uint32_t v_kbps, v_fps, v_gop;
     uint64_t v_stream;         // 流れの番号
     volatile LONG v_need_key;  // 表示の糸がほどけなかった。次に頼むコマをキーフレームにしてもらう
@@ -5130,11 +5144,21 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
     {
         const char *e = getenv("IPHONE_VK_VIDEO");
         sc->use_video = sc->use_jpeg && (g_hw.caps & VR_CAP_H264) && disp_thread_on() && e && *e == '1' && vdec_available();
+        sc->vw = sc->w, sc->vh = sc->h;
+        {
+            const char *u = getenv("IPHONE_VK_UPSCALE");
+            sc->upscale = sc->use_video && u && *u == '1' && (g_hw.caps & VR_CAP_UPSCALE);
+            if (u && *u == '1' && !sc->upscale) say("MetalFX で広げられない（H.264 でない・受け手が名乗らない）");
+            if (sc->upscale) {
+                sc->vw = (sc->w * 3 / 2 + 1) & ~1u, sc->vh = (sc->h * 3 / 2 + 1) & ~1u;
+                say("iPhone の MetalFX で %u x %u を %u x %u に広げ、別の窓に出す", sc->w, sc->h, sc->vw, sc->vh);
+            }
+        }
         if (sc->use_video) {
             const char *k = getenv("IPHONE_VK_VIDEO_KBPS"), *g = getenv("IPHONE_VK_VIDEO_GOP");
             sc->v_fps = sc->gap > 0 ? (uint32_t) (1000.0 / sc->gap + 0.5) : 60;
             if (sc->v_fps < 1) sc->v_fps = 1;
-            double kb = (double) ci->imageExtent.width * ci->imageExtent.height * 0.15 * sc->v_fps / 1000.0;
+            double kb = (double) sc->vw * sc->vh * 0.15 * sc->v_fps / 1000.0;
             sc->v_kbps = k && atoi(k) > 0 ? (uint32_t) atoi(k) : kb < 1000 ? 1000 : kb > 100000 ? 100000 : (uint32_t) kb;
             sc->v_gop = g && atoi(g) > 0 ? (uint32_t) atoi(g) : sc->v_fps * 10;
             sc->v_stream = (uint64_t) InterlockedIncrement64(&g_vstream);
@@ -5458,6 +5482,49 @@ static void disp_give(struct swapchain *sc, vr_buf *out, uint64_t serial) {
 
 // ---- 窓の絵を H.264 で受け取る ----
 // H.264 は前のコマを元にするので、JPEG と違って間のコマを飛ばせない。表示の糸は届いた順に全部ほどき、最後の 1 枚だけを描く
+// 広げた絵を出す窓。表示の糸が作り、その糸で知らせを回す。窓の文は仮（言葉は鶴田さんが決める）
+// 閉じる知らせは、この窓では壊さずにゲームの窓へ回す（ゲームが閉じれば表示の糸が終わって、この窓も壊す）
+static LRESULT CALLBACK up_wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+    if (m == WM_CLOSE) {
+        HWND g = (HWND) GetWindowLongPtrW(w, GWLP_USERDATA);
+        if (g && IsWindow(g)) PostMessageW(g, WM_CLOSE, 0, 0);
+        return 0;
+    }
+    return DefWindowProcW(w, m, wp, lp);
+}
+static HWND up_window(uint32_t w, uint32_t h) {
+    static ATOM cls;
+    if (!cls) {
+        WNDCLASSW wc = { 0 };
+        wc.lpfnWndProc = up_wndproc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.lpszClassName = L"PocketGPUUpscale";
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR) IDC_ARROW);
+        cls = RegisterClassW(&wc);
+    }
+    RECT rc = { 0, 0, (LONG) w, (LONG) h };
+    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+    return CreateWindowExW(0, L"PocketGPUUpscale", L"PocketGPU MetalFX", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+                           rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, GetModuleHandleW(NULL), NULL);
+}
+
+static void draw_bgra_to(HWND hw, const uint8_t *px, uint32_t w, uint32_t h) {
+    BITMAPINFO bmi = { 0 };
+    bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
+    bmi.bmiHeader.biWidth = (LONG) w;
+    bmi.bmiHeader.biHeight = -(LONG) h; // 上から下へ
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    RECT rc;
+    GetClientRect(hw, &rc);
+    HDC dc = GetDC(hw);
+    SetStretchBltMode(dc, COLORONCOLOR);
+    StretchDIBits(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, 0, 0, (int) w, (int) h, px, &bmi, DIB_RGB_COLORS, SRCCOPY);
+    ReleaseDC(hw, dc);
+    GdiFlush();
+}
+
 static void draw_bgra(struct swapchain *sc, const uint8_t *px) {
     BITMAPINFO bmi = { 0 };
     bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
@@ -5487,7 +5554,7 @@ static DWORD WINAPI vdisp_thread(LPVOID arg) {
         say("H.264 を%sでほどく", d.hw ? " GPU（D3D11）" : "ソフト");
         sc->v_hwdec = d.hw;
     }
-    uint8_t *px = malloc((size_t) sc->w * sc->h * 4);
+    uint8_t *px = malloc((size_t) sc->vw * sc->vh * 4);
     vr_buf mine = { 0 };
     int wait_key = 1; // キーフレームが来るまでほどかない（最初・失敗したあと・ためすぎて捨てたあと）
     uint64_t seen = 0; // ほどいたコマの番号（IPHONE_VK_DUMP 用）
@@ -5517,7 +5584,7 @@ static DWORD WINAPI vdisp_thread(LPVOID arg) {
             uint32_t aw, ah, fl;
             memcpy(&st, a, 8), memcpy(&tag, a + 8, 8), memcpy(&aw, a + 16, 4), memcpy(&ah, a + 20, 4), memcpy(&fl, a + 24, 4);
             // 作り直す前の swapchain の絵は出さない。受け手が落としたコマ（中身が空）は飛ばす（次はキーフレームが来る）
-            if (st != sc->v_stream || aw != sc->w || ah != sc->h || n == VR_H264_HEAD) continue;
+            if (st != sc->v_stream || aw != sc->vw || ah != sc->vh || n == VR_H264_HEAD) continue;
             if (wait_key && !(fl & 1)) continue;
             wait_key = 0;
             double t0 = now_ms();
@@ -5532,7 +5599,7 @@ static DWORD WINAPI vdisp_thread(LPVOID arg) {
             if (k > 0) {
                 shown = 1;
                 sc->v_decoded++;
-                if (dump && (uint64_t) atoi(dump) == ++seen) {
+                if (dump && !sc->upscale && (uint64_t) atoi(dump) == ++seen) {
                     const uint8_t *y;
                     uint32_t pitch, rows;
                     if (vdec_map(&d, &y, &pitch, &rows) && rows >= sc->h && pitch >= sc->w) {
@@ -5547,12 +5614,19 @@ static DWORD WINAPI vdisp_thread(LPVOID arg) {
         double t1 = now_ms();
         const uint8_t *y;
         uint32_t pitch, rows;
-        int got = vdec_map(&d, &y, &pitch, &rows) && rows >= sc->h && pitch >= sc->w;
-        if (got) vid_nv12_to_bgra(y, pitch, y + (size_t) pitch * rows, pitch, sc->w, sc->h, px);
+        int got = vdec_map(&d, &y, &pitch, &rows) && rows >= sc->vh && pitch >= sc->vw;
+        if (got) vid_nv12_to_bgra(y, pitch, y + (size_t) pitch * rows, pitch, sc->vw, sc->vh, px);
         vdec_unmap(&d);
         if (!got) continue;
         double t2 = now_ms();
-        draw_bgra(sc, px);
+        if (sc->upscale) {
+            if (!sc->vwin && (sc->vwin = up_window(sc->vw, sc->vh))) SetWindowLongPtrW(sc->vwin, GWLP_USERDATA, (LONG_PTR) sc->hwnd);
+            if (sc->vwin) draw_bgra_to(sc->vwin, px, sc->vw, sc->vh);
+            MSG m;
+            while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
+        } else {
+            draw_bgra(sc, px);
+        }
         sc->v_cvt_ms += t2 - t1;
         sc->v_draw_ms += now_ms() - t2;
         uint64_t serial = d.tag;
@@ -5567,6 +5641,7 @@ static DWORD WINAPI vdisp_thread(LPVOID arg) {
         }
         sc_tick(sc);
     }
+    if (sc->vwin) { DestroyWindow(sc->vwin); sc->vwin = NULL; }
     free(px);
     free(mine.p);
     vdec_close(&d);
@@ -5632,7 +5707,7 @@ static VkResult video_request(struct swapchain *sc, uint32_t j, uint64_t serial,
     vr_u32(&b, sc->h);
     vr_u32(&b, sc->w * 4);
     vr_u32(&b, sc->fmt == VK_FORMAT_B8G8R8A8_UNORM || sc->fmt == VK_FORMAT_B8G8R8A8_SRGB ? 1 : 0);
-    vr_u32(&b, (key ? VR_H264_KEY : 0) | (!now && pipe ? VR_H264_PIPE : 0));
+    vr_u32(&b, (key ? VR_H264_KEY : 0) | (!now && pipe ? VR_H264_PIPE : 0) | (sc->upscale ? VR_H264_UP15 : 0));
     vr_u32(&b, sc->v_kbps);
     vr_u32(&b, sc->v_fps);
     vr_u32(&b, sc->v_gop);
@@ -7726,7 +7801,11 @@ static void VKAPI_CALL cmd_barrier(VkCommandBuffer cbh, VkPipelineStageFlags src
 static void VKAPI_CALL cmd_begin_rp(VkCommandBuffer cbh, const VkRenderPassBeginInfo *bi, VkSubpassContents contents) {
     struct cb *c = (struct cb *) cbh;
     vr_u32(&c->s, VR_CMD_BEGIN_RENDER_PASS);
-    if (g_stats > 0) rpl_count(ID(bi->renderPass), &bi->renderArea);
+    if (g_stats > 0) {
+        rpl_count(ID(bi->renderPass), &bi->renderArea);
+        if (c->rp_last_fb == ID(bi->framebuffer)) g_stat.rp_same++;
+        c->rp_last_fb = ID(bi->framebuffer);
+    }
     vr_u64(&c->s, ID(bi->renderPass));
     vr_u64(&c->s, ID(bi->framebuffer));
     vr_put(&c->s, &bi->renderArea, sizeof bi->renderArea);
