@@ -2521,6 +2521,259 @@ static int vid_encode(void *p, const uint8_t *px, uint32_t w, uint32_t h, uint32
     return 1;
 }
 
+#elif defined(__ANDROID__)
+// ---- Android：MediaCodec（NDK の AMediaCodec）の H.264 エンコーダ ----
+// 機械に GPU・SoC の専用回路があればそれを、なければ Google のソフトの物（c2.android.avc.encoder）を、システムが選ぶ。
+// 入れる絵は NV12（COLOR_FormatYUV420SemiPlanar）。BGRA→NV12 は CPU（video.h）。実機の stride・slice-height は入力の形から読む。
+// 出てきた NAL は Annex B（00 00 00 01）にそろえ、キーフレームには SPS と PPS を付ける（iPhone の vt_done と同じ形）。
+// 1 コマ入れたら 1 コマ出るまで待つ。VKR_VIDEO_CODEC=<名前> で使うエンコーダを決められる（調べ用。adb shell dumpsys media.codec で名前が出る）
+#include <media/NdkMediaCodec.h>
+#include <media/NdkMediaFormat.h>
+typedef struct {
+    AMediaCodec *c;
+    uint32_t ew, eh, fps;
+    uint32_t stride, slice; // 入力バッファの NV12 の行の長さと、Y の面の高さ（機械ごとに 16 などにそろえてある）
+    uint8_t *cfg;
+    size_t cfgn;            // SPS と PPS（エンコーダが出した並びのまま）
+    int force_key, cand;
+    char name[96];
+} mc_enc;
+
+static unsigned g_mc_bad; // 動かなかった候補（vid_open の cand の番号の印）。この先は飛ばす（GPU の物がだめならソフトの物）
+
+// d の NAL の種類を調べる（00 00 01 の次の 1 バイトの下 5 ビット）。7=SPS・8=PPS・5=IDR
+static void mc_scan(const uint8_t *d, size_t n, int *has7, int *has5) {
+    *has7 = *has5 = 0;
+    for (size_t i = 0; i + 3 < n; i++)
+        if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
+            int t = d[i + 3] & 31;
+            if (t == 7) *has7 = 1;
+            if (t == 5) *has5 = 1;
+            i += 2;
+        }
+}
+
+// Annex B（3 バイトか 4 バイトの区切り）を、4 バイトの区切りにそろえて足す。区切りが見つからなければ、全体を 1 つの NAL として足す
+static void mc_put_annexb(vr_buf *o, const uint8_t *d, size_t n) {
+    static const uint8_t sc4[4] = { 0, 0, 0, 1 };
+    size_t start = (size_t) -1;
+    for (size_t i = 0; i + 2 < n; i++) {
+        if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1) {
+            if (start != (size_t) -1) {
+                size_t e = i;
+                while (e > start && d[e - 1] == 0) e--; // 次の区切りの手前の 0（4 バイト区切りの頭）は NAL ではない
+                vr_put(o, sc4, 4);
+                vr_put(o, d + start, e - start);
+            }
+            start = i + 3;
+            i += 2;
+        }
+    }
+    if (start == (size_t) -1) {
+        vr_put(o, sc4, 4);
+        vr_put(o, d, n);
+    } else if (start < n) {
+        vr_put(o, sc4, 4);
+        vr_put(o, d + start, n - start);
+    }
+}
+
+static void mc_set_cfg(mc_enc *e, const uint8_t *d, size_t n) {
+    if (n == 0 || n > (1u << 16)) return;
+    uint8_t *q = realloc(e->cfg, n);
+    if (!q) return;
+    memcpy(q, d, n);
+    e->cfg = q, e->cfgn = n;
+}
+
+// 出力の形（INFO_OUTPUT_FORMAT_CHANGED）の csd-0・csd-1（SPS・PPS）を控える
+static void mc_cfg_from_format(mc_enc *e) {
+    AMediaFormat *f = AMediaCodec_getOutputFormat(e->c);
+    if (!f) return;
+    void *b0 = NULL, *b1 = NULL;
+    size_t n0 = 0, n1 = 0;
+    if (!e->cfgn && AMediaFormat_getBuffer(f, "csd-0", &b0, &n0) && b0) {
+        uint8_t *t = malloc(n0 + (AMediaFormat_getBuffer(f, "csd-1", &b1, &n1) && b1 ? n1 : 0));
+        if (t) {
+            memcpy(t, b0, n0);
+            if (b1 && n1) memcpy(t + n0, b1, n1);
+            mc_set_cfg(e, t, n0 + (b1 ? n1 : 0));
+            free(t);
+        }
+    }
+    AMediaFormat_delete(f);
+}
+
+static void mc_free(mc_enc *e) {
+    if (!e) return;
+    if (e->c) {
+        AMediaCodec_stop(e->c);
+        AMediaCodec_delete(e->c);
+    }
+    free(e->cfg);
+    free(e);
+}
+
+static int mc_try(mc_enc *e, const char *name, int pass, uint32_t kbps, uint32_t fps, uint32_t gop) {
+    e->c = name ? AMediaCodec_createCodecByName(name) : AMediaCodec_createEncoderByType("video/avc");
+    if (!e->c) return 0;
+    AMediaFormat *f = AMediaFormat_new();
+    AMediaFormat_setString(f, AMEDIAFORMAT_KEY_MIME, "video/avc");
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_WIDTH, (int32_t) e->ew);
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_HEIGHT, (int32_t) e->eh);
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_COLOR_FORMAT, 21); // COLOR_FormatYUV420SemiPlanar（NV12）
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_BIT_RATE, (int32_t) (kbps > 2000000 ? 2000000000u : kbps * 1000));
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_FRAME_RATE, (int32_t) fps);
+    AMediaFormat_setFloat(f, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, (float) gop / (float) fps);
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_BITRATE_MODE, 2); // CBR
+    // 遅れを小さくする。知らない鍵は無視される
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_PRIORITY, 0);      // 実時間
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_LATENCY, 1);
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_LOW_LATENCY, 1);
+    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_OPERATING_RATE, (int32_t) fps);
+    AMediaFormat_setInt32(f, "max-bframes", 0);                  // B フレームなし（API 34 の KEY_MAX_B_FRAMES。古い機械では無視）
+    if (pass == 0) AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_PROFILE, 8); // AVCProfileHigh。だめなら 2 回目で外す
+    media_status_t st = AMediaCodec_configure(e->c, f, NULL, NULL, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
+    AMediaFormat_delete(f);
+    if (st == AMEDIA_OK) st = AMediaCodec_start(e->c);
+    if (st != AMEDIA_OK) {
+        AMediaCodec_delete(e->c);
+        e->c = NULL;
+        return 0;
+    }
+    char *nm = NULL;
+    if (AMediaCodec_getName(e->c, &nm) == AMEDIA_OK && nm) {
+        snprintf(e->name, sizeof e->name, "%s", nm);
+        AMediaCodec_releaseName(e->c, nm);
+    }
+    e->stride = e->ew, e->slice = e->eh;
+    AMediaFormat *inf = AMediaCodec_getInputFormat(e->c);
+    if (inf) {
+        int32_t v = 0;
+        if (AMediaFormat_getInt32(inf, AMEDIAFORMAT_KEY_STRIDE, &v) && v >= (int32_t) e->ew && v < 16384) e->stride = (uint32_t) v;
+        if (AMediaFormat_getInt32(inf, AMEDIAFORMAT_KEY_SLICE_HEIGHT, &v) && v >= (int32_t) e->eh && v < 16384) e->slice = (uint32_t) v;
+        AMediaFormat_delete(inf);
+    }
+    return 1;
+}
+
+static void *vid_open(uint32_t ew, uint32_t eh, uint32_t kbps, uint32_t fps, uint32_t gop) {
+    mc_enc *e = calloc(1, sizeof *e);
+    if (!e) return NULL;
+    e->ew = ew, e->eh = eh, e->fps = fps;
+    const char *want = getenv("VKR_VIDEO_CODEC");
+    // 候補：調べ用の名前・システムの選んだ物（GPU や SoC の専用回路が先）・Google のソフトの物
+    const char *cand[] = { want && *want ? want : NULL, NULL, "c2.android.avc.encoder", "OMX.google.h264.encoder" };
+    int ok = 0;
+    for (int i = (want && *want) ? 0 : 1; i < 4 && !ok; i++) {
+        if (g_mc_bad & (1u << i)) continue; // 前に動かなかった候補は飛ばす
+        for (int pass = 0; pass < 2 && !ok; pass++) ok = mc_try(e, cand[i], pass, kbps, fps, gop);
+        if (ok) e->cand = i;
+    }
+    if (!ok) {
+        vlog("H.264 のエンコーダを作れない（MediaCodec）");
+        free(e);
+        return NULL;
+    }
+    vlog("H.264 のエンコーダ：MediaCodec %s・%u x %u（入力の行 %u・面の高さ %u）・%u kbps・%u コマ/秒・キーフレームは %u コマごと", e->name, ew, eh, e->stride, e->slice,
+         kbps, fps, gop);
+    return e;
+}
+
+static void vid_close(void *p) { mc_free((mc_enc *) p); }
+
+static int vid_encode(void *p, const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, int bgra, uint64_t idx, int key, vr_buf *out, int *iskey) {
+    mc_enc *e = (mc_enc *) p;
+    ssize_t ii = AMediaCodec_dequeueInputBuffer(e->c, 500000);
+    if (ii < 0) { vlog("H.264 の入力の席が空かない（%d）", (int) ii); g_mc_bad |= 1u << e->cand; return 0; }
+    size_t cap = 0;
+    uint8_t *ib = AMediaCodec_getInputBuffer(e->c, (size_t) ii, &cap);
+    const size_t ysz = (size_t) e->stride * e->slice, total = ysz + (size_t) e->stride * e->eh / 2;
+    if (!ib || cap < total) {
+        vlog("H.264 の入力バッファが小さい（%zu < %zu）", cap, total);
+        AMediaCodec_queueInputBuffer(e->c, (size_t) ii, 0, 0, 0, 0);
+        return 0;
+    }
+    vid_rgb_to_nv12(px, w, h, stride, bgra, ib, e->stride, ib + ysz, e->stride);
+    if (key || e->force_key) {
+        AMediaFormat *pf = AMediaFormat_new();
+        AMediaFormat_setInt32(pf, "request-sync", 0); // PARAMETER_KEY_REQUEST_SYNC_FRAME
+        AMediaCodec_setParameters(e->c, pf);
+        AMediaFormat_delete(pf);
+    }
+    const int64_t pts = (int64_t) (idx * 1000000ull / e->fps);
+    if (AMediaCodec_queueInputBuffer(e->c, (size_t) ii, 0, total, (uint64_t) pts, 0) != AMEDIA_OK) { g_mc_bad |= 1u << e->cand; return 0; }
+    // 出てくるまで待つ（後ろにためない）。最初のコマはエンコーダの立ち上がりで遅いので長く待つ
+    const double t0 = t_ms(), limit = idx == 0 ? 3000 : 500;
+    int got = 0, iskey_now = 0;
+    while (!got && t_ms() - t0 < limit) {
+        AMediaCodecBufferInfo info;
+        ssize_t oi = AMediaCodec_dequeueOutputBuffer(e->c, &info, 20000);
+        if (oi == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) { mc_cfg_from_format(e); continue; }
+        if (oi < 0) continue; // TRY_AGAIN・BUFFERS_CHANGED
+        size_t osz = 0;
+        uint8_t *ob = AMediaCodec_getOutputBuffer(e->c, (size_t) oi, &osz);
+        if (ob && info.size > 0 && (size_t) info.offset + (size_t) info.size <= osz) {
+            const uint8_t *d = ob + info.offset;
+            const size_t n = (size_t) info.size;
+            if (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) {
+                mc_set_cfg(e, d, n);
+            } else if (info.presentationTimeUs < pts) {
+                e->force_key = 1; // 遅れて出てきた前のコマ。ドライバには渡していないので、つながりが切れた。次をキーフレームにする
+            } else {
+                int has7, has5;
+                mc_scan(d, n, &has7, &has5);
+                iskey_now = has5 || (info.flags & 1);
+                if (iskey_now && !has7 && e->cfgn) mc_put_annexb(out, e->cfg, e->cfgn);
+                static int klog; // 最初の 2 枚のキーフレームだけ、SPS・PPS をどこから付けたかを記録に出す
+                if (iskey_now && klog < 2) {
+                    klog++;
+                    vlog("H.264 のキーフレーム：SPS %s・%zu バイト", has7 ? "はエンコーダ自身が付けた" : e->cfgn ? "を付け足した" : "が無い", n);
+                }
+                mc_put_annexb(out, d, n);
+                got = 1;
+            }
+        }
+        AMediaCodec_releaseOutputBuffer(e->c, (size_t) oi, false);
+    }
+    // 出てこなかったときは落とされたことにして、空のまま返し、次をキーフレームにする（ドライバは空のコマを飛ばす）。
+    // 最初のコマが出ないなら、このエンコーダは動かない。次の候補にする
+    if (!got && idx == 0) { vlog("H.264 の最初のコマが %.0f ms たっても出ない（%s）", t_ms() - t0, e->name); g_mc_bad |= 1u << e->cand; return 0; }
+    e->force_key = !got;
+    *iskey = iskey_now;
+    return 1;
+}
+
+static int vid_probe_once(void) {
+    void *e = vid_open(320, 240, 500, 30, 30);
+    if (!e) return -1;
+    // 開けても動かないエンコーダがある。灰色の 1 コマを実際に縮めてみる
+    uint32_t n = 320 * 240;
+    uint8_t *px = malloc((size_t) n * 4);
+    vr_buf o = { 0 };
+    int key = 0, ok = 0;
+    if (px) {
+        memset(px, 128, (size_t) n * 4);
+        ok = vid_encode(e, px, 320, 240, 320 * 4, 1, 0, 1, &o, &key) && o.n > 0;
+    }
+    vid_close(e);
+    free(px);
+    free(o.p);
+    return ok;
+}
+
+static int vid_probe(void) {
+    if (getenv("VKR_VIDEO_OFF")) return 0;
+    // だめだった候補は g_mc_bad に印がつく。次の候補（ソフトの物）で 3 回まで試す
+    for (int i = 0; i < 3; i++) {
+        int r = vid_probe_once();
+        if (r == 1) return 1;
+        if (r < 0) break;
+    }
+    vlog("H.264：試しの 1 コマが縮められなかった。H.264 は名乗らない");
+    return 0;
+}
+
 #else
 // ほかの機械（Linux での文法の確かめなど）では縮められない。名乗らない
 static int vid_probe(void) { return 0; }
