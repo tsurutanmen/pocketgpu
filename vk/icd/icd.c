@@ -301,12 +301,26 @@ static uint64_t g_submit_msgs;
 // 結果を待ち続けるアプリ（Unreal Engine は 0.5 秒まで回り続ける）の読み直しを、往復せずに答える。
 // 往復のたびに g_lock を持ち続けるので、前は回り続ける糸が g_lock を離さず、
 // 「その query を書く submit」を送る糸が錠を取れずに 0.5 秒待たされていた（1 コマに数回）。IPHONE_VK_QUERY_NR_CACHE=0 で切る
-static struct { uint64_t qp, wmsg, nsub; uint32_t q; } g_qnr[16];
-static unsigned g_qnr_next;
+// 覚える所は (pool, query) の組で 4096 個に散らす。前は 16 個を順に使い回し、Unreal のように多くの query を読み回すアプリでは
+// 覚えがすぐ追い出され、実機で 1 分に 6 万回近く往復していた（1 回約 1 ms）。IPHONE_VK_QUERY_NR_SLOTS=16 で覚えを 16 個に減らせる
+#define QNR_MAX 4096
+static struct { uint64_t qp, wmsg, nsub; uint32_t q; } g_qnr[QNR_MAX];
+static uint64_t g_qnr_miss_none, g_qnr_miss_sub, g_qnr_miss_w; // 往復した理由：覚えが無い・submit が増えた・書き手が変わった
+static unsigned qnr_slots(void) {
+    static unsigned v;
+    if (!v) { const char *e = getenv("IPHONE_VK_QUERY_NR_SLOTS"); v = e && atoi(e) > 0 && atoi(e) <= QNR_MAX ? (unsigned) atoi(e) : QNR_MAX; }
+    return v;
+}
+static unsigned qnr_slot(uint64_t qp, uint32_t q) {
+    uint64_t h = (qp ^ ((uint64_t) q * 0x9E3779B97F4A7C15ull)) * 0xBF58476D1CE4E5B9ull;
+    return (unsigned) ((h >> 32) % qnr_slots());
+}
 static SRWLOCK g_qnr_lock = SRWLOCK_INIT;
 static uint64_t g_qnr_hits; // 往復せずに「まだ」と答えた回数
 static void qnr_print(void) {
     if (g_qnr_hits) fprintf(stderr, "[iphone-vk] query の「まだ」を往復せずに答えた回数 %llu\n", (unsigned long long) g_qnr_hits);
+    fprintf(stderr, "[iphone-vk] query を往復して読んだ理由：覚えが無い %llu・submit が増えた %llu・書き手が変わった %llu\n",
+            (unsigned long long) g_qnr_miss_none, (unsigned long long) g_qnr_miss_sub, (unsigned long long) g_qnr_miss_w);
 }
 static int qnr_on(void) {
     static int v = -1;
@@ -315,9 +329,12 @@ static int qnr_on(void) {
 }
 static int qnr_hit(uint64_t qp, uint32_t q, uint64_t wmsg, uint64_t nsub) {
     int hit = 0;
+    unsigned k = qnr_slot(qp, q);
     AcquireSRWLockShared(&g_qnr_lock);
-    for (int i = 0; i < 16; i++)
-        if (g_qnr[i].qp == qp && g_qnr[i].q == q && g_qnr[i].wmsg == wmsg && g_qnr[i].nsub == nsub) { hit = 1; break; }
+    if (g_qnr[k].qp != qp || g_qnr[k].q != q) g_qnr_miss_none++;
+    else if (g_qnr[k].wmsg != wmsg) g_qnr_miss_w++;
+    else if (g_qnr[k].nsub != nsub) g_qnr_miss_sub++;
+    else hit = 1;
     ReleaseSRWLockShared(&g_qnr_lock);
     return hit;
 }
@@ -328,9 +345,7 @@ static void qnr_put(uint64_t qp, uint32_t q, uint64_t wmsg, uint64_t nsub) {
         if (e && *e && *e != '0') atexit(qnr_print);
     }
     AcquireSRWLockExclusive(&g_qnr_lock);
-    int k = -1;
-    for (int i = 0; i < 16 && k < 0; i++) if (g_qnr[i].qp == qp && g_qnr[i].q == q) k = i;
-    if (k < 0) k = (int) (g_qnr_next++ % 16);
+    unsigned k = qnr_slot(qp, q);
     g_qnr[k].qp = qp;
     g_qnr[k].q = q;
     g_qnr[k].wmsg = wmsg;
@@ -440,20 +455,58 @@ static int recv_head(uint32_t h[2], uint32_t op) {
     return ok;
 }
 
-// g_lock の中で、送り終えたあとに呼ぶ
-static void read_deferred_locked(void) {
-    if (!g_defer.active) return;
-    g_defer.active = 0;
-    g_defer.ready = 1;
-    g_defer.r = VK_ERROR_DEVICE_LOST;
-    g_defer.out.n = 0;
+// まだ読んでいない返事の列（頼んだ順）。窓の絵（PEND_DEFER）と、錠を持たずに待つ進み具合の問い合わせ（PEND_PROGRESS）。
+// 返事は頼んだ順にしか届かないので、ほかの返事を読む所は、先にこの列を全部読む（read_deferred_locked）。
+// 前は進み具合の問い合わせを rpc_call で錠を持ったまま待ち、受け手がそれより前の仕事をこなす間（実機で 1 回 6 ms ほど）、
+// DXVK の submit を送る糸まで止めていた。IPHONE_VK_PROGRESS_ASYNC=0 で前のやり方
+enum { PEND_DEFER = 1, PEND_PROGRESS = 2 };
+static unsigned char g_pend[64];
+static unsigned g_pend_head, g_pend_n;
+static int g_prog_out;                  // 答えを待っている進み具合の問い合わせがある
+static volatile uint64_t g_done_msg;    // 受け手が「終わった」と答えた submit の番号（下の「fence を本当の進み具合で答える」で使う）
+
+static void pend_push_locked(int kind) {
+    if (g_pend_n < sizeof g_pend) g_pend[(g_pend_head + g_pend_n++) % sizeof g_pend] = (unsigned char) kind;
+}
+
+// 列の先頭の返事を 1 つ読む。読めなければ 0（つながりが切れた）
+static int pend_read_one_locked(void) {
+    if (!g_pend_n) return 0;
+    int kind = g_pend[g_pend_head];
+    g_pend_head = (g_pend_head + 1) % sizeof g_pend;
+    g_pend_n--;
     uint32_t h[2];
-    if (!recv_head(h, g_defer.op)) return;
-    vr_reserve(&g_defer.out, h[1]);
-    if (h[1] && !vr_recv_all(g_sock, g_defer.out.p, h[1])) { conn_lost("窓の絵の返事の途中"); return; }
-    g_defer.out.n = h[1];
-    g_defer.r = (VkResult) (int32_t) h[0];
+    if (kind == PEND_DEFER) {
+        g_defer.active = 0;
+        g_defer.ready = 1;
+        g_defer.r = VK_ERROR_DEVICE_LOST;
+        g_defer.out.n = 0;
+        if (!recv_head(h, g_defer.op)) return 0;
+        vr_reserve(&g_defer.out, h[1]);
+        if (h[1] && !vr_recv_all(g_sock, g_defer.out.p, h[1])) { conn_lost("窓の絵の返事の途中"); return 0; }
+        g_defer.out.n = h[1];
+        g_defer.r = (VkResult) (int32_t) h[0];
+        g_stat.bytes_in += 8 + h[1];
+        return 1;
+    }
+    g_prog_out = 0;
+    if (!recv_head(h, VR_GET_PROGRESS)) return 0;
+    uint8_t tmp[64];
+    if (h[1] > sizeof tmp || (h[1] && !vr_recv_all(g_sock, tmp, h[1]))) { conn_lost("進み具合の返事の途中"); return 0; }
     g_stat.bytes_in += 8 + h[1];
+    if ((int32_t) h[0] == VK_SUCCESS && h[1] >= 8) {
+        uint64_t v;
+        memcpy(&v, tmp, 8);
+        if (v > g_done_msg) g_done_msg = v;
+    }
+    return 1;
+}
+
+// g_lock の中で、送り終えたあとに呼ぶ。たまっている返事を頼んだ順に全部読む
+static void read_deferred_locked(void) {
+    while (g_pend_n && !g_dead)
+        if (!pend_read_one_locked()) break;
+    if (g_dead) { g_pend_n = 0; g_prog_out = 0; g_defer.active = 0; }
 }
 
 // 頼んで、返事は待たない。返事は rpc_take_deferred で受け取る（受け取る前に頼めるのは 1 つだけ）
@@ -462,7 +515,7 @@ static void rpc_call_deferred(uint32_t op, vr_buf *b) {
     if (op < VR_OP_COUNT) g_stat.calls[op]++;
     if (g_defer.active) { flush_locked(); read_deferred_locked(); }
     put_msg_locked(op, b);
-    if (flush_locked()) { g_defer.active = 1; g_defer.ready = 0; g_defer.op = op; }
+    if (flush_locked()) { g_defer.active = 1; g_defer.ready = 0; g_defer.op = op; pend_push_locked(PEND_DEFER); }
     ReleaseSRWLockExclusive(&g_lock);
     b->n = 0;
 }
@@ -674,6 +727,8 @@ static vr_sock link_connect(const char *boot, char *host, size_t nhost, char *po
 
 static int connect_locked(void) {
     g_submit_msgs = 0; // 受け手もつながるたびに数え直す
+    g_pend_n = 0;
+    g_prog_out = 0;
     WSADATA w;
     WSAStartup(MAKEWORD(2, 2), &w);
     // IPHONE_VK：「usb」か「usb:番号」なら USB の iPhone に直接。「link」ならインターネット共有の口。それ以外は host:port
@@ -996,7 +1051,23 @@ static int hello(void) {
                 char real[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
                 memcpy(real, g_hw.props.deviceName, sizeof real);
                 real[sizeof real - 1] = 0;
-                snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "%.200s (iPhone-RPC)", real);
+                // 見せる名前は機種名にする（前は「Apple A19 Pro GPU (iPhone-RPC)」）。チップから機種を引き、分からなければチップの名前を添える。
+                // Apple 以外の GPU（3060 の代役）は「iPhone stand-in (…)」。どれも「iPhone」を含むので、DXVK_FILTER_DEVICE_NAME=iPhone で選べる。
+                // IPHONE_VK_NAME で好きな名前に替えられる
+                static const struct { const char *chip, *model; } MODELS[] = {
+                    { "A19 Pro", "iPhone 17 Pro" }, { "A19", "iPhone 17" }, { "A18 Pro", "iPhone 16 Pro" }, { "A18", "iPhone 16" },
+                    { "A17 Pro", "iPhone 15 Pro" }, { "A16", "iPhone 15" }, { "A15", "iPhone 13" },
+                };
+                const char *nm = getenv("IPHONE_VK_NAME"), *model = NULL;
+                if (!strncmp(real, "Apple ", 6))
+                    for (size_t i = 0; i < sizeof MODELS / sizeof *MODELS && !model; i++) {
+                        size_t n = strlen(MODELS[i].chip);
+                        if (!strncmp(real + 6, MODELS[i].chip, n) && real[6 + n] == ' ') model = MODELS[i].model;
+                    }
+                if (nm && *nm) snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "%.200s", nm);
+                else if (model) snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "%s", model);
+                else if (!strncmp(real, "Apple ", 6)) snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "iPhone (%.200s)", real);
+                else snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "iPhone stand-in (%.200s)", real);
                 // 受け手が 1.3 の入口をそろえて名乗ったときだけ 1.3。古い受け手には今まで通り 1.2
                 uint32_t top = vk13() ? VK_API_VERSION_1_3 : VK_API_VERSION_1_2;
                 if (g_hw.props.apiVersion > top)
@@ -2205,7 +2276,7 @@ static int pb_wait(struct dev *d, struct queue *q, uint64_t upto, double ms) {
 }
 
 // ---- fence を本当の進み具合で答える ----
-static volatile uint64_t g_done_msg; // 受け手が「終わった」と答えた submit の番号
+// g_done_msg（受け手が「終わった」と答えた submit の番号）は、返事の列のところで決めている
 static int g_engine_dxvk_any;        // アプリのエンジンが DXVK（版を問わない）
 static volatile LONG g_ndev;         // 生きている装置の数（全部なくなったら submit の番号を数え直す）
 
@@ -2220,8 +2291,50 @@ static int real_fence(void) {
     return on;
 }
 
-// 受け手に終わった submit の番号を聞く（GPU は待たない）
+static int progress_async(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_PROGRESS_ASYNC"); v = !(e && *e == '0'); }
+    return v;
+}
+
+// 進み具合の問い合わせを頼むだけ（答えを待っている物があれば頼まない）。答えは返事の列で g_done_msg に入る
+static void progress_request(void) {
+    AcquireSRWLockExclusive(&g_lock);
+    if (!g_prog_out && !g_dead) {
+        vr_buf b = { 0 };
+        g_stat.calls[VR_GET_PROGRESS]++;
+        put_msg_locked(VR_GET_PROGRESS, &b);
+        free(b.p);
+        if (flush_locked()) { g_prog_out = 1; pend_push_locked(PEND_PROGRESS); }
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+}
+
+// 届いている返事だけを読む（待たない）。進み具合の答えを読めたら 1
+static int progress_take(void) {
+    int got = 0;
+    AcquireSRWLockExclusive(&g_lock);
+    double t0 = now_ms();
+    WSAPOLLFD pf = { .fd = g_sock, .events = POLLRDNORM };
+    while (g_prog_out && g_pend_n && !g_dead && WSAPoll(&pf, 1, 0) > 0) {
+        int kind = g_pend[g_pend_head];
+        if (!pend_read_one_locked()) break;
+        if (kind == PEND_PROGRESS) { got = 1; break; }
+    }
+    if (g_dead) { g_pend_n = 0; g_prog_out = 0; }
+    g_stat.wait_ms[VR_GET_PROGRESS] += now_ms() - t0;
+    ReleaseSRWLockExclusive(&g_lock);
+    return got;
+}
+
+// 受け手に終わった submit の番号を聞く（GPU は待たない）。
+// 錠を持たずに待つやり方では、頼んで、届いていれば読むだけ（届いていなければ前の答えのまま）
 static void progress_poll(void) {
+    if (progress_async()) {
+        progress_request();
+        progress_take();
+        return;
+    }
     vr_buf b = { 0 }, out = { 0 };
     if (rpc_call(VR_GET_PROGRESS, &b, &out) == VK_SUCCESS && out.n >= 8) {
         uint64_t v;
@@ -2232,15 +2345,22 @@ static void progress_poll(void) {
     free(out.p);
 }
 
-// submit の番号 msg まで終わるのを待つ（錠を持たずに聞き直す）。ms 待っても終わらなければ 0
+// submit の番号 msg まで終わるのを待つ。ms 待っても終わらなければ 0。
+// 錠を持たずに待つやり方では、問い合わせを 1 つ出しておき、答えが届くまで錠を放して 1 ms ずつ眠る。
+// 待っている間も、ほかの糸は submit を送れる
 static int progress_wait(uint64_t msg, double ms) {
     if (!msg || g_done_msg >= msg) return 1;
     double t0 = now_ms();
     for (int n = 0;; n++) {
-        progress_poll();
+        if (progress_async()) {
+            progress_request();
+            if (!progress_take()) Sleep(n < 2 ? 0 : 1);
+        } else {
+            progress_poll();
+        }
         if (g_done_msg >= msg || g_dead) return 1;
         if (now_ms() - t0 >= ms) return 0;
-        if (n > 2) Sleep(1);
+        if (!progress_async() && n > 2) Sleep(1);
     }
 }
 
@@ -8714,7 +8834,7 @@ static uint64_t VKAPI_CALL get_memory_capture_address(VkDevice dv, const VkDevic
 // ---- query（GPU に数えさせる：遮蔽・時刻） ----
 // 受け手の VR_CREATE_QUERY_POOL などに送る。結果は受け手が出した仕事を全部待ってから読む
 // query pool ごとの、1 つの query の値の数（結果を取るときに、終わっていない query の欄を書かないために使う）。0 は分からない
-static struct { uint64_t id; int nv; uint32_t count; uint64_t *wmsg; int occ; } g_qpv[256]; // occ：1＝遮蔽・2＝パイプラインの統計 // wmsg：query ごとに書いた submit の番号
+static struct { uint64_t id; int nv; uint32_t count; uint64_t *wmsg; int occ; uint64_t *cw, *cv; } g_qpv[256]; // occ：1＝遮蔽・2＝パイプラインの統計 // wmsg：query ごとに書いた submit の番号
 static SRWLOCK g_qpv_lock = SRWLOCK_INIT;
 
 static void qpv_put(uint64_t id, int nv, uint32_t count, int occ) {
@@ -8728,6 +8848,10 @@ static void qpv_put(uint64_t id, int nv, uint32_t count, int occ) {
     g_qpv[k].occ = occ;
     free(g_qpv[k].wmsg);
     g_qpv[k].wmsg = calloc(count ? count : 1, sizeof *g_qpv[k].wmsg);
+    free(g_qpv[k].cw);
+    free(g_qpv[k].cv);
+    g_qpv[k].cw = calloc(count ? count : 1, sizeof *g_qpv[k].cw);
+    g_qpv[k].cv = calloc((size_t) (count ? count : 1) * (nv > 0 ? nv : 1), sizeof *g_qpv[k].cv);
     ReleaseSRWLockExclusive(&g_qpv_lock);
 }
 
@@ -8763,11 +8887,104 @@ static int qpv_get(uint64_t id, int del) {
     for (int i = 0; i < 256; i++)
         if (g_qpv[i].id == id) {
             nv = g_qpv[i].nv;
-            if (del) { g_qpv[i].id = 0; free(g_qpv[i].wmsg); g_qpv[i].wmsg = NULL; }
+            if (del) {
+                g_qpv[i].id = 0;
+                free(g_qpv[i].wmsg); free(g_qpv[i].cw); free(g_qpv[i].cv);
+                g_qpv[i].wmsg = g_qpv[i].cw = g_qpv[i].cv = NULL;
+            }
             break;
         }
     ReleaseSRWLockExclusive(&g_qpv_lock);
     return nv;
+}
+
+// ---- 終わった query の値を手元に覚える（IPHONE_VK_QUERY_BATCH=0 で切る） ----
+// Unreal Engine は 1 コマに数百の遮蔽の query を 1 個ずつ、終わるまで読み回す。query は毎コマ書き直されるので、
+// 1 個読むたびに往復していた（実機で 1 コマ約 830 回・1 回約 1 ms で、毎秒 1 コマ前後）。
+// 1 個を読む往復で、同じ pool のその先の query もまとめて読み、書いた submit が今回待った番号以下のものだけ覚える
+// （受け手はその番号の submit まで待ってから読むので、その query の値はもう変わらない）。
+// 覚えた値は、その query を書いた submit の番号が同じあいだだけ使う。書き直し・reset で番号が変わるか、CPU からの reset で消す
+#define QRC_SPAN 4096
+static uint64_t g_qrc_hits, g_qrc_trips;
+static void qrc_print(void) {
+    fprintf(stderr, "[iphone-vk] query の値を覚えから答えた回数 %llu・まとめて読んだ往復 %llu\n",
+            (unsigned long long) g_qrc_hits, (unsigned long long) g_qrc_trips);
+}
+static int qrc_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("IPHONE_VK_QUERY_BATCH");
+        v = !(e && *e == '0');
+        const char *st = getenv("IPHONE_VK_STATS");
+        if (v && st && *st && *st != '0') atexit(qrc_print);
+    }
+    return v;
+}
+// 覚えていれば、query 1 個の値をアプリの形（es バイトが nv 個・頼まれれば「終わったか」）で書いて 1
+static int qrc_get(uint64_t id, uint32_t q, size_t es, int want_av, void *data, size_t size) {
+    int hit = 0;
+    AcquireSRWLockShared(&g_qpv_lock);
+    for (int i = 0; i < 256; i++)
+        if (g_qpv[i].id == id) {
+            int nv = g_qpv[i].nv;
+            if (g_qpv[i].cw && q < g_qpv[i].count && g_qpv[i].cw[q] && g_qpv[i].cw[q] == g_qpv[i].wmsg[q]
+                && (size_t) (nv + want_av) * es <= size) {
+                uint8_t *dst = data;
+                for (int k = 0; k < nv; k++) memcpy(dst + (size_t) k * es, &g_qpv[i].cv[(size_t) q * nv + k], es);
+                if (want_av) { uint64_t one = 1; memcpy(dst + (size_t) nv * es, &one, es); }
+                hit = 1;
+            }
+            break;
+        }
+    ReleaseSRWLockShared(&g_qpv_lock);
+    return hit;
+}
+// 受け手から 64 ビット・「終わったか」付きで読んだ first から n 個のうち、書いた submit が upto 以下で終わっているものを覚える
+static void qrc_put(uint64_t id, uint32_t first, uint32_t n, const uint8_t *src, size_t ts, uint64_t upto) {
+    AcquireSRWLockExclusive(&g_qpv_lock);
+    for (int i = 0; i < 256; i++)
+        if (g_qpv[i].id == id) {
+            int nv = g_qpv[i].nv;
+            if (!g_qpv[i].cw) break;
+            for (uint32_t j = 0; j < n && first + j < g_qpv[i].count; j++) {
+                uint32_t q = first + j;
+                uint64_t w = g_qpv[i].wmsg[q], av;
+                memcpy(&av, src + (size_t) j * ts + (size_t) nv * 8, 8);
+                if (!w || w > upto || !av) continue;
+                memcpy(&g_qpv[i].cv[(size_t) q * nv], src + (size_t) j * ts, (size_t) nv * 8);
+                g_qpv[i].cw[q] = w;
+            }
+            break;
+        }
+    ReleaseSRWLockExclusive(&g_qpv_lock);
+}
+static void qrc_drop(uint64_t id, uint32_t first, uint32_t n) {
+    AcquireSRWLockExclusive(&g_qpv_lock);
+    for (int i = 0; i < 256; i++)
+        if (g_qpv[i].id == id) {
+            for (uint32_t q = first; q < first + n && q < g_qpv[i].count && g_qpv[i].cw; q++) g_qpv[i].cw[q] = 0;
+            break;
+        }
+    ReleaseSRWLockExclusive(&g_qpv_lock);
+}
+// 読み直しが要る query（書いた submit が upto 以下で、まだ覚えていない物）の番号の範囲。q は必ず入れる。
+// DXVK は空いた query の番号を飛び飛びに使い回すので、q から先だけでなく pool 全体から選ぶ
+static void qrc_range(uint64_t id, uint32_t q, uint64_t upto, uint32_t *lo, uint32_t *hi) {
+    *lo = *hi = q;
+    AcquireSRWLockShared(&g_qpv_lock);
+    for (int i = 0; i < 256; i++)
+        if (g_qpv[i].id == id) {
+            if (!g_qpv[i].cw) break;
+            for (uint32_t k = 0; k < g_qpv[i].count; k++) {
+                uint64_t w = g_qpv[i].wmsg[k];
+                if (!w || w > upto || g_qpv[i].cw[k] == w) continue;
+                if (k < *lo) *lo = k;
+                if (k > *hi) *hi = k;
+            }
+            break;
+        }
+    ReleaseSRWLockShared(&g_qpv_lock);
+    if (*hi - *lo + 1 > QRC_SPAN) { if (q - *lo < QRC_SPAN) *hi = *lo + QRC_SPAN - 1; else { *lo = q; *hi = q + QRC_SPAN - 1; } }
 }
 
 static VkResult VKAPI_CALL create_qpool(VkDevice dv, const VkQueryPoolCreateInfo *ci, const VkAllocationCallbacks *a, VkQueryPool *out) {
@@ -8864,12 +9081,47 @@ static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32
         // 先に書き手の番号と submit の数を読む（読んだあとに submit が来ても、覚えが古くなる向きにしかならない）
         uint64_t wm = qpv_wmsg(ID(qp), first, n), nsub = g_submit_msgs;
         int nrc = n == 1 && qnr_on();
+        int qb = n == 1 && qrc_on();
+        if (qb && qrc_get(ID(qp), first, es, want_av, data, size)) {
+            g_stat.skipped++;
+            g_qrc_hits++;
+            return VK_SUCCESS;
+        }
         if (nrc && qnr_hit(ID(qp), first, wm, nsub)) {
             // まだ。欄の値は書かず、「終わったか」だけ 0 を書く（受け手に聞いたときと同じ）
             if ((uint64_t) (nv + want_av) * es <= size && want_av) memset((uint8_t *) data + (size_t) nv * es, 0, es);
             g_stat.skipped++;
             g_qnr_hits++;
             free(b.p);
+            return VK_NOT_READY;
+        }
+        if (qb && wm != UINT64_MAX) {
+            // その先の query もまとめて 64 ビットで読み、終わった物を覚えてから、頼まれた 1 個を覚えから答える
+            // IPHONE_VK_QUERY_BATCH=2 なら、それまでに送った submit を全部待ってから読む（往復は減り、1 回の待ちは長くなる）
+            static int qall = -1;
+            if (qall < 0) { const char *e = getenv("IPHONE_VK_QUERY_BATCH"); qall = e && *e == '2'; }
+            if (qall && nsub > wm) wm = nsub;
+            uint32_t lo, hi;
+            qrc_range(ID(qp), first, wm, &lo, &hi);
+            uint32_t span = hi - lo + 1;
+            uint64_t ts8 = (uint64_t) (nv + 1) * 8, tsz8 = (uint64_t) span * ts8;
+            vr_u64(&b, ID(dv));
+            vr_u64(&b, ID(qp));
+            vr_u32(&b, lo);
+            vr_u32(&b, span);
+            vr_u64(&b, tsz8);
+            vr_u64(&b, ts8);
+            vr_u32(&b, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+            vr_u64(&b, wm);
+            VkResult r = rpc_call(VR_GET_QUERY_POOL_RESULTS, &b, &out);
+            free(b.p);
+            g_qrc_trips++;
+            if (r >= 0 && out.p && out.n >= tsz8) qrc_put(ID(qp), lo, span, out.p, (size_t) ts8, wm);
+            free(out.p);
+            if (r < 0) return r;
+            if (qrc_get(ID(qp), first, es, want_av, data, size)) return VK_SUCCESS;
+            if (nrc) qnr_put(ID(qp), first, wm, nsub);
+            if ((uint64_t) (nv + want_av) * es <= size && want_av) memset((uint8_t *) data + (size_t) nv * es, 0, es);
             return VK_NOT_READY;
         }
         vr_u64(&b, ID(dv));
@@ -8918,6 +9170,7 @@ static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32
 
 static void VKAPI_CALL reset_qpool(VkDevice dv, VkQueryPool qp, uint32_t first, uint32_t n) {
     vr_buf b = { 0 };
+    qrc_drop(ID(qp), first, n);
     vr_u64(&b, ID(dv));
     vr_u64(&b, ID(qp));
     vr_u32(&b, first);
