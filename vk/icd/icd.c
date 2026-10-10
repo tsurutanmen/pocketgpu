@@ -1113,7 +1113,10 @@ static int hello(void) {
                 if (nm && *nm) snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "%.200s", nm);
                 else if (model) snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "%s", model);
                 else if (!strncmp(real, "Apple ", 6)) snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "iPhone (%.200s)", real);
-                else snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "iPhone stand-in (%.200s)", real);
+                // PC の GPU（NVIDIA・AMD・Intel）は 3060 などの代役。それ以外（Qualcomm の Adreno・ARM の Mali など）は Android の機種
+                else if (g_hw.props.vendorID == 0x10DE || g_hw.props.vendorID == 0x1002 || g_hw.props.vendorID == 0x8086)
+                    snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "iPhone stand-in (%.200s)", real);
+                else snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "PocketGPU phone (%.200s)", real);
                 // 受け手が 1.3 の入口をそろえて名乗ったときだけ 1.3。古い受け手には今まで通り 1.2
                 uint32_t top = vk13() ? VK_API_VERSION_1_3 : VK_API_VERSION_1_2;
                 if (g_hw.props.apiVersion > top)
