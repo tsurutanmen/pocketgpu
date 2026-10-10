@@ -28,7 +28,8 @@ h1 { font-size: 24px; }
 .node { flex: 1; background: var(--card); border: 1px solid var(--line); border-left: 6px solid var(--line); border-radius: 9px; padding: 10px 12px; font-size: 14px; }
 .node b { display: block; font-size: 15px; margin-bottom: 3px; }
 .node small { display: block; color: var(--sub); font-size: 12px; margin-top: 3px; line-height: 1.5; }
-.node.done { border-left-color: var(--done); }
+.node.done { border-color: var(--done); background: color-mix(in srgb, var(--done) 9%, var(--card)); }
+.node.done b::before { content: "✓ "; color: var(--done); }
 .node.now { border-left-color: var(--main); border-color: var(--main); box-shadow: 0 0 0 2px var(--main) inset; }
 .node.idea { border-left-color: var(--idea); }
 .node.goal { border: 2px solid var(--done); }
