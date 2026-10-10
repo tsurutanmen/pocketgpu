@@ -5783,6 +5783,10 @@ static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi)
         if (direct && sc->use_jpeg) {
             VkResult r = queue_submit(qh, 1, &si, VK_NULL_HANDLE);
             double tb = now_ms();
+            // 測る用：IPHONE_VK_PRESENT_EVERY=N で N コマに 1 回だけ窓の絵を受け取る（GPU は全部描く）。絵を縮めて送る所の重さを切り分ける
+            static int every = -1;
+            if (every < 0) { const char *e = getenv("IPHONE_VK_PRESENT_EVERY"); every = e && atoi(e) > 1 ? atoi(e) : 1; if (every > 1) say("窓の絵は %d コマに 1 回だけ受け取る（測る用）", every); }
+            if (r == VK_SUCCESS && every > 1 && serial % every) { g_stat.blits++; continue; }
             if (r == VK_SUCCESS) r = sc->low && sc->hwnd ? blit_now(sc, idx, serial) : blit(sc, idx, serial);
             g_stat.blit_ms += now_ms() - tb;
             g_stat.blits++;
