@@ -2050,6 +2050,7 @@ static int pb_wait(struct dev *d, struct queue *q, uint64_t upto, double ms) {
 // ---- fence を本当の進み具合で答える ----
 static volatile uint64_t g_done_msg; // 受け手が「終わった」と答えた submit の番号
 static int g_engine_dxvk_any;        // アプリのエンジンが DXVK（版を問わない）
+static volatile LONG g_ndev;         // 生きている装置の数（全部なくなったら submit の番号を数え直す）
 
 static int real_fence(void) {
     static int on = -1;
@@ -2791,6 +2792,7 @@ static VkResult VKAPI_CALL create_device(VkPhysicalDevice pd, const VkDeviceCrea
     free(b.p);
     if (r != VK_SUCCESS) { say("装置を作れない (%d)", r); free(d); return r; }
     say("装置を作った");
+    InterlockedIncrement(&g_ndev);
     *out = (VkDevice) d;
     return VK_SUCCESS;
 }
@@ -2806,6 +2808,14 @@ static void VKAPI_CALL destroy_device(VkDevice dv, const VkAllocationCallbacks *
     rpc_send(VR_DESTROY_DEVICE, &b);
     rpc_flush();
     free(b.p);
+    // 受け手は装置が全部なくなると submit の数を 0 に戻す（cleanup）。こちらも合わせないと、次の装置で
+    // 「終わった submit の番号」が食い違い、fence を本当の進みで待つ所が戻らない（Unreal は試しの装置を壊してから作り直す）
+    if (InterlockedDecrement(&g_ndev) <= 0) {
+        AcquireSRWLockExclusive(&g_lock);
+        g_submit_msgs = 0;
+        g_done_msg = 0;
+        ReleaseSRWLockExclusive(&g_lock);
+    }
     for (int i = 0; i < 16; i++) free(d->queues[i]);
     free(d->pend);
     free(d);
