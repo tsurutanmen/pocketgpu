@@ -599,6 +599,68 @@ int vkr_clients(void) { return g_clients; }
 // 窓に出すコマとして PC に返した数（JPEG・H.264）。アプリが 1 秒ごとに読んで、毎秒のコマ数を出す
 static volatile uint64_t g_frames_total;
 uint64_t vkr_frames_total(void) { return g_frames_total; }
+// アプリの画面に出す絵：PC に返した JPEG のうち最新の 1 枚の写し。アプリが見ている間（vkr_set_preview(1)）だけ写す。
+// 受け手の糸が書き、アプリが 1/30 秒ごとに読むので、ロックで守る。g_pv_serial はコマが変わるたびと消したときに 1 増える
+static volatile int g_pv_on;
+static uint8_t *g_pv_p;
+static size_t g_pv_n, g_pv_cap;
+static uint64_t g_pv_serial;
+#ifdef _WIN32
+static SRWLOCK g_pv_lk = SRWLOCK_INIT;
+static void pv_lock(void) { AcquireSRWLockExclusive(&g_pv_lk); }
+static void pv_unlock(void) { ReleaseSRWLockExclusive(&g_pv_lk); }
+#else
+static pthread_mutex_t g_pv_mx = PTHREAD_MUTEX_INITIALIZER;
+static void pv_lock(void) { pthread_mutex_lock(&g_pv_mx); }
+static void pv_unlock(void) { pthread_mutex_unlock(&g_pv_mx); }
+#endif
+// 返した JPEG を写す。見ていない間は何もしない
+static void pv_store(const uint8_t *p, size_t n) {
+    if (!g_pv_on || !p || !n || n > INT32_MAX) return;
+    pv_lock();
+    if (g_pv_on) {
+        if (g_pv_cap < n) {
+            // コマごとに大きさが少し変わるので、余裕をもって取る
+            size_t c = n + n / 4;
+            free(g_pv_p);
+            g_pv_p = malloc(c);
+            g_pv_cap = g_pv_p ? c : 0;
+        }
+        g_pv_n = g_pv_p ? n : 0;
+        if (g_pv_p) memcpy(g_pv_p, p, n);
+        g_pv_serial++;
+    }
+    pv_unlock();
+}
+// 持っている 1 枚を捨てる（見るのをやめたとき・PC が切れたとき）
+static void pv_clear(void) {
+    pv_lock();
+    if (g_pv_p) {
+        free(g_pv_p);
+        g_pv_p = NULL;
+        g_pv_n = g_pv_cap = 0;
+        g_pv_serial++;
+    }
+    pv_unlock();
+}
+// アプリから呼ぶ：画面に絵を出している間は 1。0 にすると写すのをやめ、持っていた 1 枚も捨てる
+void vkr_set_preview(int on) {
+    g_pv_on = on != 0;
+    if (!on) pv_clear();
+}
+// アプリから呼ぶ：最新の JPEG を buf に写して大きさを返す。まだ無い・cap が足りないときは 0。
+// serial にはいつも今の番号を書く（buf が NULL でもよいので、番号だけ見て変わったときだけ読み直せる）
+int vkr_latest_frame(uint8_t *buf, int cap, uint64_t *serial) {
+    int n = 0;
+    pv_lock();
+    if (serial) *serial = g_pv_serial;
+    if (buf && cap > 0 && g_pv_n && g_pv_n <= (size_t) cap) {
+        memcpy(buf, g_pv_p, g_pv_n);
+        n = (int) g_pv_n;
+    }
+    pv_unlock();
+    return n;
+}
 // アプリから受け手の記録に 1 行書く（熱・電池・低電力の移り変わり）
 void vkr_note(const char *line) { if (line) vlog("%s", line); }
 
@@ -2902,6 +2964,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (!jpeg_encode((const uint8_t *) e->map + off, w, h, stride, (int) bgra, (int) (q ? q : 80), &g_out)) return reply(s, VK_ERROR_UNKNOWN);
         jt_enc += t_ms() - jt1;
         jbytes += g_out.n - before;
+        pv_store(g_out.p + before, g_out.n - before); // アプリの画面に出す最新の 1 枚
         g_frames_total++;
         if (++jn % 100 == 0)
             vlog("JPEG：%llu コマ・GPU を待つ %.1f ms・縮める %.1f ms・平均 %.1f KB（1 コマあたり）・熱 %d", (unsigned long long) jn,
@@ -2934,6 +2997,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             vr_put(&g_out, g_jp.out.p, g_jp.out.n);
             jp_enc += g_jp.ms;
             jpbytes += g_jp.out.n;
+            pv_store(g_jp.out.p, g_jp.out.n); // アプリの画面に出すのも、返事に入れたひとつ前のコマ
         }
         // 今のコマを写して、後ろで縮め始める
         g_jp.w = w, g_jp.h = h, g_jp.stride = stride, g_jp.bgra = (int) bgra, g_jp.q = (int) (q ? q : 80);
@@ -4508,6 +4572,7 @@ static void serve_one(vr_sock c, int remote) {
     serve_client(c);
     g_clients = 0;
     g_cur_remote = 0;
+    pv_clear(); // 次につないだときに、前の接続の絵をアプリの画面に残さない
     if (g_lost) {
 #ifdef _WIN32
         // PC の代役（RTX）は、GPU を失うと同じプロセスでは Vulkan を作り直しても装置を作れない（-3 が続く）。

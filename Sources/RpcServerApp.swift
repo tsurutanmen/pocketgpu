@@ -131,6 +131,9 @@ struct ContentView: View {
     @State private var mcRunning = false
     @State private var linkHost = "" // インターネット共有の口で待っている住所（空なら待っていない）
     @StateObject private var status = DeviceStatus()
+    // PC から来た命令で描いた絵を、この iPhone の画面にも出す。出している間だけ受け手が 1 枚写す
+    @AppStorage("showFrames") private var showFrames = false
+    @StateObject private var preview = FramePreviewModel()
     // 画面の言葉（自動・日本語・English）。ここで読むと、変えたときに画面が描き直される
     @AppStorage("lang") private var lang = AppLang.auto.rawValue
     @Environment(\.scenePhase) private var scenePhase
@@ -155,6 +158,11 @@ struct ContentView: View {
                     LabeledContent(L("電池", "Battery"), value: status.batteryText)
                     if status.lowPower {
                         Text(L("低電力モードがオン。遅くなることがある", "Low Power Mode is on. It may run slower.")).font(.footnote)
+                    }
+                    Toggle(L("iPhone に絵を出す", "Show frames on this iPhone"), isOn: $showFrames)
+                        .onChange(of: showFrames) { _, on in preview.setOn(on) }
+                    if showFrames {
+                        FramePreviewView(model: preview, status: status)
                     }
                     ShareLink(item: diagnosticsText(status: status, log: log)) {
                         Label(L("記録を送る", "Send diagnostics"), systemImage: "square.and.arrow.up")
@@ -225,6 +233,8 @@ struct ContentView: View {
         .onAppear {
             devices = readBridge { rpc_bridge_devices($0, $1) }
             host = addrs.first(where: { $0.ip.hasPrefix("100.") })?.ip ?? addrs.first(where: { $0.name == "en0" })?.ip ?? addrs.first?.ip ?? ""
+            // 前にオンにしたまま閉じたなら、開いたときから出す
+            preview.setOn(showFrames)
         }
         .onChange(of: scenePhase) { _, phase in
             // 後ろに回ると GPU が使えない。前に戻ったら GPU に戻す

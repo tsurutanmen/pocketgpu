@@ -16,6 +16,11 @@ uint64_t vkr_ops_total(void);
 int vkr_clients(void);
 // 窓に出すコマとして PC に返した数（つないでから増え続ける）。1 秒ごとの差で毎秒のコマ数を出す
 uint64_t vkr_frames_total(void);
+// アプリの画面に絵を出すか。1 の間だけ、PC に返した最新の JPEG を 1 枚写しておく。0 にすると写すのをやめ、持っていた 1 枚も捨てる
+void vkr_set_preview(int on);
+// 写しておいた最新の JPEG を buf に写し、大きさを返す。まだ無いときと cap が足りないときは 0。
+// serial はコマが変わるたびに 1 増える（buf が NULL でも書く）。番号が変わったときだけ読み直す
+int vkr_latest_frame(uint8_t * buf, int cap, uint64_t * serial);
 // 受け手の記録に 1 行書く。熱・電池・低電力の移り変わりを残す
 void vkr_note(const char * line);
 // USB の通り道の速さを測る受け口（vk/remote/bw.c）。戻ってこないので別のスレッドで呼ぶ
