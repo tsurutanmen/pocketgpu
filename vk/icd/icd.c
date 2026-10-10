@@ -18,25 +18,43 @@
 //   受け手は、出した仕事が使っているかもしれない物を変える命令の前に、自分の中で仕事の終わりを待つ（drain）。
 //   持ち帰る物があるときは、MEM_READ の返事が終わりの知らせを兼ねる（受け手は読む前に drain する）。
 //   往復は「GPU の答えを持ち帰る」ときだけになる
+//
+// Linux 版は、窓（swapchain）・動画・書き込み監視・読み戻しの遅延を除いた、計算と「描いて読み戻す」所だけ動く（#ifdef _WIN32 で分けている）。
+// 窓の無い Vulkan のアプリが、TCP で受け手（server.c）につないで使う。つなぎ先は IPHONE_VK=host:port
+#ifndef _WIN32
+#define _GNU_SOURCE
+#endif
 #include "../remote/proto.h"
 #include "../remote/wire.h"
+#ifdef _WIN32
 #include <windows.h>
 #define COBJMACROS
 #include <wincodec.h>
+#endif
 #include "../remote/video.h"
+#ifdef _WIN32
 #include <d3d11.h>
 #include <d3d10.h>
 #include <dbghelp.h>
+#endif
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #define VK_NO_PROTOTYPES
+#ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_icd.h>
 
+#ifdef _WIN32
 #define EXPORT __declspec(dllexport)
+#define LINUX_UNUSED
+#define PATH_SEP "\\"
+#else
+#include "plat_posix.h"
+#endif
 #define PAGE 4096u
 // handle → 受け手と取り決めた 64 ビットの番号。32 ビットでは non-dispatchable の handle は uint64_t なので、uintptr_t を通すと上の桁が消える
 #if UINTPTR_MAX == 0xffffffffu
@@ -59,6 +77,7 @@ static void say(const char *fmt, ...) {
 }
 
 // ---- 落ちたときに、どのプログラムのどこで落ちたかを書き出す（IPHONE_VK_LOG=1 のとき） ----
+#ifdef _WIN32
 static void where(const char *tag, void *addr) {
     HMODULE m = NULL;
     char name[MAX_PATH] = "?";
@@ -108,6 +127,38 @@ __attribute__((constructor)) static void install_crash_handler(void) {
     const char *e = getenv("IPHONE_VK_LOG");
     if (e && *e && *e != '0') AddVectoredExceptionHandler(1, crash_handler);
 }
+#else
+// Linux：シグナルの中で呼び出し元を書き出し、元の動作（コアダンプなど）に戻して投げ直す。名前は -g と -rdynamic があれば出る
+static void crash_signal(int sig, siginfo_t *si, void *uc) {
+    (void) uc;
+    (void) si;
+    static const char head[] = "[iphone-vk] 落ちた：シグナル ";
+    char num[16];
+    int n = 0, v = sig;
+    do { num[n++] = (char) ('0' + v % 10); v /= 10; } while (v && n < 15);
+    ssize_t r = write(2, head, sizeof head - 1);
+    for (int i = n - 1; i >= 0; i--) r = write(2, &num[i], 1);
+    r = write(2, "\n", 1);
+    (void) r;
+    void *fr[40];
+    int k = backtrace(fr, 40);
+    backtrace_symbols_fd(fr, k, 2);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+__attribute__((constructor)) static void install_crash_handler(void) {
+    const char *e = getenv("IPHONE_VK_LOG");
+    if (!(e && *e && *e != '0')) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = crash_signal;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    static const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE };
+    for (unsigned i = 0; i < sizeof sigs / sizeof *sigs; i++) sigaction(sigs[i], &sa, NULL);
+}
+#endif
 
 // ---- 数える（IPHONE_VK_STATS=1） ----
 static const char *const OP_NAME[VR_OP_COUNT] = {
@@ -175,12 +226,20 @@ __attribute__((used))
 #endif
 static const volatile char g_kit_mark[] = "PGKIT-MARK:################################";
 
+#ifdef _WIN32
 static double now_ms(void) {
     LARGE_INTEGER f, c;
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&c);
     return (double) c.QuadPart * 1000.0 / (double) f.QuadPart;
 }
+#else
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double) ts.tv_sec * 1000.0 + (double) ts.tv_nsec / 1e6;
+}
+#endif
 
 static double proc_cpu_ms(void);
 
@@ -263,6 +322,9 @@ static volatile LONG64 g_next_id;
 static uint64_t new_id(void) { return (1ull << 62) | (uint64_t) InterlockedIncrement64(&g_next_id); }
 
 // 命令の並びを縮める LZ4（BSD-2）。この 1 つのファイルの中に取り込む
+#ifndef _WIN32
+#define LZ4LIB_VISIBILITY // LZ4_* を .so の外に出さない（アプリが読んでいる別の liblz4 と取り違えない）
+#endif
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
@@ -409,6 +471,10 @@ static void conn_lost(const char *what) {
 static HWND g_stall_hwnd; // 帯を出す窓（いちばん新しい swapchain の窓）
 static int g_stalled;
 
+#ifndef _WIN32
+// 窓の無い Linux 版は、帯を出す窓が無い（記録だけ）
+static void banner(const wchar_t *t) { (void) t; }
+#else
 static void banner(const wchar_t *t) {
     HWND w = g_stall_hwnd;
     if (!w || !IsWindow(w)) return;
@@ -427,6 +493,8 @@ static void banner(const wchar_t *t) {
     SelectObject(dc, old);
     ReleaseDC(w, dc);
 }
+
+#endif
 
 // 帯の文は仮。画面の文章は CEO が書く
 static void stall_banner(double sec) {
@@ -462,7 +530,9 @@ static int recv_head(uint32_t h[2], uint32_t op) {
     if (g_stalled) {
         g_stalled = 0;
         fprintf(stderr, "[iphone-vk] 受け手の返事が戻った（%.1f 秒止まっていた）\n", (now_ms() - t0) / 1000);
+#ifdef _WIN32
         if (g_stall_hwnd) InvalidateRect(g_stall_hwnd, NULL, FALSE);
+#endif
     }
     if (!ok) conn_lost("返事を待っている所");
     // 返事の長さは受け手の言うまま確保するので、ありえない大きさなら切る（読み出しは 64 MB ずつ・窓の絵は数 MB）
@@ -529,7 +599,7 @@ static void read_deferred_locked(void) {
 }
 
 // 頼んで、返事は待たない。返事は rpc_take_deferred で受け取る（受け取る前に頼めるのは 1 つだけ）
-static void rpc_call_deferred(uint32_t op, vr_buf *b) {
+LINUX_UNUSED static void rpc_call_deferred(uint32_t op, vr_buf *b) {
     AcquireSRWLockExclusive(&g_lock);
     if (op < VR_OP_COUNT) g_stat.calls[op]++;
     if (g_defer.active) { flush_locked(); read_deferred_locked(); }
@@ -548,7 +618,7 @@ static int defer_unlocked(void) {
     return v;
 }
 
-static VkResult rpc_take_deferred(vr_buf *out) {
+LINUX_UNUSED static VkResult rpc_take_deferred(vr_buf *out) {
     double t0 = now_ms();
     if (defer_unlocked()) {
         // 返事が届いた分だけ錠の中で読み、まだなら錠の外で 1 ms ずつ待つ。待つ間にほかの糸が先に読んでもよい（g_defer.ready に入る）
@@ -611,6 +681,28 @@ static VkResult rpc_call(uint32_t op, vr_buf *b, vr_buf *out) {
     return res;
 }
 
+// 受信を待つ長さ（ミリ秒・0 は無限）を決める。Winsock は DWORD のミリ秒、POSIX は struct timeval
+static void sock_rcvtimeo(vr_sock s, unsigned ms) {
+#ifdef _WIN32
+    DWORD to = ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *) &to, sizeof to);
+#else
+    struct timeval to = { (time_t) (ms / 1000), (suseconds_t) (ms % 1000) * 1000 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof to);
+#endif
+}
+
+// 待たない（non-blocking）にする・戻す
+static void sock_nonblock(vr_sock s, int on) {
+#ifdef _WIN32
+    u_long nb = on ? 1 : 0;
+    ioctlsocket(s, FIONBIO, &nb);
+#else
+    int fl = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK));
+#endif
+}
+
 // host:port に TCP でつなぐ。1.5 秒でつながらなければ諦める（iPhone がいないときにアプリを待たせない）
 static vr_sock tcp_connect(const char *host, const char *port) {
     struct addrinfo hints = { 0 }, *ai = NULL;
@@ -618,8 +710,8 @@ static vr_sock tcp_connect(const char *host, const char *port) {
     hints.ai_socktype = SOCK_STREAM;
     if (getaddrinfo(host, port, &hints, &ai) != 0 || !ai) return INVALID_SOCKET;
     vr_sock s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    u_long nb = 1;
-    ioctlsocket(s, FIONBIO, &nb);
+    if (s == INVALID_SOCKET) { freeaddrinfo(ai); return INVALID_SOCKET; }
+    sock_nonblock(s, 1);
     connect(s, ai->ai_addr, (int) ai->ai_addrlen);
     freeaddrinfo(ai);
     fd_set wf, ef;
@@ -628,12 +720,20 @@ static vr_sock tcp_connect(const char *host, const char *port) {
     FD_ZERO(&ef);
     FD_SET(s, &ef);
     struct timeval tv = { 1, 500000 };
+#ifdef _WIN32
     int ok = select(0, NULL, &wf, &ef, &tv) == 1 && FD_ISSET(s, &wf);
-    nb = 0;
-    ioctlsocket(s, FIONBIO, &nb);
+#else
+    // POSIX の select は「つながった」ときも「失敗した」ときも書ける印を返すので、SO_ERROR で成功を確かめる
+    int ok = select(s + 1, NULL, &wf, &ef, &tv) > 0 && FD_ISSET(s, &wf);
+    if (ok) {
+        int err = 0;
+        socklen_t el = sizeof err;
+        ok = getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0;
+    }
+#endif
+    sock_nonblock(s, 0);
     if (!ok) { closesocket(s); return INVALID_SOCKET; }
-    DWORD to = 5000; // 最初のあいさつまでは 5 秒で諦める
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *) &to, sizeof to);
+    sock_rcvtimeo(s, 5000); // 最初のあいさつまでは 5 秒で諦める
     return s;
 }
 
@@ -641,6 +741,8 @@ static vr_sock tcp_connect(const char *host, const char *port) {
 // iTunes と一緒に入る Apple Mobile Device Service が 127.0.0.1:27015 で待っている（usbmuxd）。
 // 「この iPhone のこの番号につないで」と頼むと、その接続がそのまま USB の通り道になる。
 // Python の中継（usb_forward.py）を通さないので、1 段ぶん速い
+// Linux：話し方（plist）は同じだが、usbmuxd の口は Unix socket（/var/run/usbmuxd）で、ここは 127.0.0.1 の TCP しか知らない。
+// 今は socat などで TCP に橋渡しして IPHONE_VK_MUX=番号 で向ける（Unix socket を直に開く道は未実装）
 static char *mux_call(vr_sock s, const char *type, const char *extra) {
     char body[1024];
     int n = snprintf(body, sizeof body,
@@ -692,7 +794,7 @@ static vr_sock usb_connect(int port) {
     if (s == INVALID_SOCKET) return s;
     char extra[160];
     snprintf(extra, sizeof extra, "<key>DeviceID</key><integer>%lld</integer><key>PortNumber</key><integer>%u</integer>",
-             dev, (unsigned) htons((u_short) port));
+             dev, (unsigned) htons((uint16_t) port));
     char *res = mux_call(s, "Connect", extra);
     long long num = res ? plist_int_after(res, "Number", NULL) : -1;
     free(res);
@@ -772,8 +874,10 @@ static int connect_locked(void) {
     g_submit_msgs = 0; // 受け手もつながるたびに数え直す
     g_pend_n = 0;
     g_prog_out = 0;
+#ifdef _WIN32
     WSADATA w;
     WSAStartup(MAKEWORD(2, 2), &w);
+#endif
     // IPHONE_VK：「usb」か「usb:番号」なら USB の iPhone に直接。「link」ならインターネット共有の口。それ以外は host:port
     const char *e = getenv("IPHONE_VK");
     char host[128] = "127.0.0.1", port[16] = "50061";
@@ -805,14 +909,19 @@ static int connect_locked(void) {
     int big = 4 << 20;
     setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *) &big, sizeof big);
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *) &big, sizeof big);
-    DWORD to = 5000; // 最初のあいさつだけは 5 秒で諦める
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *) &to, sizeof to);
+    sock_rcvtimeo(s, 5000); // 最初のあいさつだけは 5 秒で諦める
     g_sock = s;
     say("%s:%s につないだ", host, port);
     // つないだら、このドライバの DLL をプロセスが終わるまで外させない。最後の instance を壊すとローダーが DLL を外して読み直すが、
     // 外れるときにつながりを閉じないので古いつながりが残り、受け手（一度に 1 人の相手）が 2 本目のあいさつに答えず固まった（CTS で見つかった）
+#ifdef _WIN32
     HMODULE self;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR) (void *) &connect_locked, &self);
+#else
+    // Linux のローダーも、最後の instance を壊すとこの .so を外す。RTLD_NODELETE で開き直して外れないようにする
+    Dl_info di;
+    if (dladdr((void *) &connect_locked, &di) && di.dli_fname) dlopen(di.dli_fname, RTLD_NOW | RTLD_NODELETE);
+#endif
     return 1;
 }
 
@@ -1254,7 +1363,9 @@ static int hello(void) {
                     say("load_store_op_none：受け手%sので、NONE を LOAD・STORE に直して送る", g_srv_lso ? "は持つが試す" : "が持たない");
                 }
             }
+#ifdef _WIN32
             if (g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_swapchain", 70 };
+#endif
             // ドライバの中だけで済む拡張（受け手には送らない）
             if ((g_hw.caps & VR_CAP_NEW_MASK) && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_copy_commands2", 1 };
             // ひな形での descriptor の書き込みは、ドライバがふつうの書き込みに直す（zink が名前で確かめる）
@@ -1339,8 +1450,7 @@ static int hello(void) {
                 g_hw.ok = 1;
                 say("受け手の GPU：%s", g_hw.props.deviceName);
                 // あいさつが済んだら、計算を待つ間は切らない
-                DWORD to = 0;
-                setsockopt(g_sock, SOL_SOCKET, SO_RCVTIMEO, (const char *) &to, sizeof to);
+                sock_rcvtimeo(g_sock, 0);
             }
         } else {
             say("あいさつに返事がない (%d)", r);
@@ -1747,6 +1857,17 @@ static void rng_merge(rng *a, size_t *n) {
 
 // ---- メモリの写し ----
 // ページ p0〜p1 の書き込み監視を見て、書かれたページに印を付ける（監視の印は消える）
+#ifndef _WIN32
+// Linux 版には書き込み監視がまだ無い。範囲の全ページを「書いたかもしれない」とする。
+// 受け手の中身の写し（m->sent）がある写しは、そのうち違う所だけを送るので、余計に送るのは写しを初めて送るときだけ。
+// （次の一歩：/proc/self/clear_refs と pagemap の soft-dirty、または userfaultfd の write-protect）
+static void collect_dirty(struct mem *m, size_t p0, size_t p1) {
+    if (p1 > m->npages) p1 = m->npages;
+    if (p0 >= p1) return;
+    g_stat.ww_calls++;
+    memset(m->dirty + p0, 1, p1 - p0);
+}
+#else
 static void collect_dirty(struct mem *m, size_t p0, size_t p1) {
     if (p1 > m->npages) p1 = m->npages;
     if (p0 >= p1) return;
@@ -1760,7 +1881,9 @@ static void collect_dirty(struct mem *m, size_t p0, size_t p1) {
     g_stat.ww_pages += count;
     for (ULONG_PTR i = 0; i < count; i++) m->dirty[(size_t) ((uint8_t *) m->addrs[i] - m->shadow) / PAGE] = 1;
 }
+#endif
 
+#ifdef _WIN32
 // ---- GPU が書いた所の読み戻しを、CPU が触るまで遅らせる（IPHONE_VK_LAZY_RB） ----
 // 待ったときにすぐ読み戻さず「古い」と印を付け、そのページを PAGE_NOACCESS にする。CPU（アプリでもドライバでも）が触ると例外になるので、
 // ベクトル化例外処理で受け手から読み、ページを開けてから続けさせる。Godot の粒のように、GPU が毎コマ書くが CPU は読まない
@@ -2294,6 +2417,26 @@ static void lz_print(void) {
             (unsigned long long) g_lzs.maps);
 }
 
+#else
+// ---- 読み戻しの遅延（Linux 版には無い） ----
+// 遅らせる仕組みは、ページを PAGE_NOACCESS にして例外（VEH）で読み戻すので、Linux では使わない。
+// lz_mode が 0 のままなので、GPU が書いた所は待ったときにすぐ全部読み戻す（IPHONE_VK_LAZY_RB=0 と同じ）
+enum { LZ_FAULT, LZ_SEND, LZ_BACK, LZ_OTHER };
+LINUX_UNUSED static int lz_mode(void) { return 0; }
+static int lz_why_ok(int w) { (void) w; return 0; }
+static void lz_settle(struct mem *m, uint64_t off, uint64_t len, int why) { (void) m; (void) off; (void) len; (void) why; }
+static void lz_settle_dirty(struct mem *m, size_t p0, size_t p1) { (void) m; (void) p0; (void) p1; }
+static int lz_hold(rng *r, size_t n) { (void) r; (void) n; return 0; }
+static void lz_hold_end(int held) { (void) held; }
+static rng *lz_split(rng **take, size_t *nt, size_t *ct, size_t *nlz) { (void) take; (void) nt; (void) ct; *nlz = 0; return NULL; }
+static void lz_mark(rng *r, size_t n) { (void) n; free(r); }
+static void lz_forget(struct mem *m) { (void) m; }
+static void lz_buffer_gone(struct dev *d, struct buf *bf) { (void) d; (void) bf; }
+static void lz_on_map(struct mem *m) { (void) m; }
+static void lz_print(void) {}
+static VkResult VKAPI_CALL invalidate_ranges(VkDevice dv, uint32_t n, const VkMappedMemoryRange *r) { (void) dv; (void) n; (void) r; return VK_SUCCESS; }
+#endif
+
 // 書いたページの中で、受け手の中身と違う所だけを送るか（IPHONE_VK_WDIFF=0 で、今までどおりページを丸ごと送る）
 static int wdiff_on(void) {
     static int v = -1;
@@ -2482,7 +2625,11 @@ static void read_back_many(rng *r, size_t n) {
     for (size_t i = 0; i < n; i++) {
         if (!r[i].len) continue;
         uint64_t p0 = r[i].off / PAGE * PAGE, p1 = (r[i].off + r[i].len + PAGE - 1) / PAGE * PAGE;
+#ifdef _WIN32
         ResetWriteWatch(r[i].m->shadow + p0, (SIZE_T) (p1 - p0));
+#else
+        (void) p0; (void) p1; // 書き込み監視が無い
+#endif
     }
     lz_hold_end(lzh);
 }
@@ -2674,7 +2821,11 @@ static void VKAPI_CALL destroy_instance(VkInstance i, const VkAllocationCallback
 static VkResult VKAPI_CALL enum_instance_ext(const char *layer, uint32_t *n, VkExtensionProperties *p) {
     (void) layer;
     static const VkExtensionProperties ext[] = {
-        { "VK_KHR_get_physical_device_properties2", 2 }, { "VK_KHR_surface", 25 }, { "VK_KHR_win32_surface", 6 } };
+        { "VK_KHR_get_physical_device_properties2", 2 },
+#ifdef _WIN32
+        { "VK_KHR_surface", 25 }, { "VK_KHR_win32_surface", 6 }
+#endif
+    };
     const uint32_t all = sizeof ext / sizeof *ext;
     if (!p) { *n = all; return VK_SUCCESS; }
     uint32_t k = *n < all ? *n : all;
@@ -3448,6 +3599,20 @@ static void VKAPI_CALL get_queue2(VkDevice dv, const VkDeviceQueueInfo2 *i, VkQu
 }
 
 // ---- メモリ ----
+// 写しを OS に返す（Windows は VirtualFree・Linux は munmap）。ADDRS_OK：書き込み監視の受け皿が取れたか（Linux は受け皿が無い）
+#ifdef _WIN32
+#define ADDRS_OK(m) ((m)->addrs != NULL)
+#else
+#define ADDRS_OK(m) 1
+#endif
+static void shadow_free(struct mem *m) {
+#ifdef _WIN32
+    VirtualFree(m->shadow, 0, MEM_RELEASE);
+#else
+    munmap(m->shadow, m->npages * PAGE);
+#endif
+}
+
 static VkResult VKAPI_CALL alloc_memory(VkDevice dv, const VkMemoryAllocateInfo *ai, const VkAllocationCallbacks *a, VkDeviceMemory *out) {
     (void) a;
     struct dev *d = (struct dev *) dv;
@@ -3459,11 +3624,17 @@ static VkResult VKAPI_CALL alloc_memory(VkDevice dv, const VkMemoryAllocateInfo 
               (g_hw.mem.memoryTypes[ai->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
     if (m->host) {
         m->npages = (size_t) ((m->size + PAGE - 1) / PAGE);
+#ifdef _WIN32
         m->shadow = VirtualAlloc(NULL, m->npages * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
         m->addrs = malloc(m->npages * sizeof *m->addrs);
+#else
+        m->shadow = mmap(NULL, m->npages * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); // 0 で埋まって、ページに揃う
+        if (m->shadow == (uint8_t *) MAP_FAILED) m->shadow = NULL;
+        m->addrs = NULL; // 書き込み監視が無いので受け皿は要らない
+#endif
         m->dirty = calloc(m->npages, 1);
-        if (!m->shadow || !m->addrs || !m->dirty) {
-            if (m->shadow) VirtualFree(m->shadow, 0, MEM_RELEASE);
+        if (!m->shadow || !ADDRS_OK(m) || !m->dirty) {
+            if (m->shadow) shadow_free(m);
             free(m->addrs);
             free(m->dirty);
             free(m);
@@ -3486,7 +3657,7 @@ static VkResult VKAPI_CALL alloc_memory(VkDevice dv, const VkMemoryAllocateInfo 
     VkResult r = rpc_call(VR_ALLOC_MEMORY, &b, NULL);
     free(b.p);
     if (r != VK_SUCCESS) {
-        if (m->shadow) VirtualFree(m->shadow, 0, MEM_RELEASE);
+        if (m->shadow) shadow_free(m);
         free(m->addrs);
         free(m->dirty);
         free(m);
@@ -3532,7 +3703,7 @@ static void VKAPI_CALL free_memory(VkDevice dv, VkDeviceMemory mm, const VkAlloc
     m->use = NULL;
     m->nuse = m->cuse = 0;
     ReleaseSRWLockExclusive(&g_muse_lock);
-    if (m->shadow) VirtualFree(m->shadow, 0, MEM_RELEASE);
+    if (m->shadow) shadow_free(m);
     free(m->addrs);
     free(m->dirty);
     free(m->sent);
@@ -4868,6 +5039,8 @@ static VkResult VKAPI_CALL create_sampler(VkDevice dv, const VkSamplerCreateInfo
 
 static void VKAPI_CALL destroy_sampler(VkDevice dv, VkSampler h, const VkAllocationCallbacks *a) { (void) a; if (h) send_destroy(VR_DESTROY_SAMPLER, dv, ID(h)); }
 
+// Linux 版には窓（surface・swapchain）が無い。VK_KHR_surface も名乗らないので、窓を出すアプリは別の装置を選ぶ
+#ifdef _WIN32
 // ---- 窓（surface） ----
 // 新しいローダーは、窓の口をドライバ自身に作らせる（作る入口が無いドライバには、窓の問い合わせを回さない）。
 // ここでは VkIcdSurfaceWin32 の形で作って、窓のハンドルを覚えておくだけ
@@ -4952,6 +5125,9 @@ static VkResult VKAPI_CALL surface_modes(VkPhysicalDevice pd, VkSurfaceKHR s, ui
     return k < all ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+#endif
+
+#ifdef _WIN32
 // ---- 窓の絵を H.264 でほどく（Media Foundation の Microsoft H.264 デコーダ・遅れの少ない設定） ----
 // 受け手が 1 コマずつ縮めた物（VR_READ_H264）を、表示の糸で順にほどく。絵は NV12 で出てくるので、BGRA に直して描く。
 // GPU でほどけるとき（D3D11 の DXVA）は GPU で。だめならソフトで
@@ -5360,6 +5536,8 @@ static void sc_tick(struct swapchain *sc) {
     }
 }
 
+#endif
+
 static uint32_t pick_mem(uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t t = 0; t < g_hw.mem.memoryTypeCount; t++)
         if ((bits & (1u << t)) && (g_hw.mem.memoryTypes[t].propertyFlags & want) == want) return t;
@@ -5384,6 +5562,7 @@ static void VKAPI_CALL cmd_barrier(VkCommandBuffer cbh, VkPipelineStageFlags src
 static void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cbh, VkImage im, VkImageLayout l, VkBuffer bb, uint32_t n, const VkBufferImageCopy *rg);
 static void VKAPI_CALL get_queue(VkDevice dv, uint32_t fam, uint32_t idx, VkQueue *out);
 
+#ifdef _WIN32
 static void disp_stop(struct swapchain *sc);
 static int disp_thread_on(void);
 
@@ -6314,6 +6493,15 @@ static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi)
     return worst;
 }
 
+#else
+// CPU を使った時間（ms）
+static double proc_cpu_ms(void) {
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru)) return 0;
+    return (double) (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000.0 + (double) (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000.0;
+}
+#endif
+
 // ---- shader・パイプライン ----
 // ---- シェーダーが書く場所 ----
 // GPU が書くかもしれない CPU から見えるメモリは、終わったあと PC に読み戻す。これまでは storage buffer につないだ物を
@@ -6979,8 +7167,8 @@ static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreate
     // 調べ用：IPHONE_VK_SPV_DUMP=フォルダ で、受け手に送るシェーダーを番号ごとに書き出す
     const char *dump = getenv("IPHONE_VK_SPV_DUMP");
     if (dump && *dump) {
-        char p[MAX_PATH];
-        snprintf(p, sizeof p, "%s\\%llu%s.spv", dump, (unsigned long long) id, fix ? "_fix" : "");
+        char p[1024];
+        snprintf(p, sizeof p, "%s" PATH_SEP "%llu%s.spv", dump, (unsigned long long) id, fix ? "_fix" : "");
         FILE *f = fopen(p, "wb");
         if (f) { fwrite(code, 1, size, f); fclose(f); }
     }
@@ -10278,12 +10466,14 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkDestroySemaphore", destroy_semaphore);
     F("vkCreateSampler", create_sampler);
     F("vkDestroySampler", destroy_sampler);
+#ifdef _WIN32
     F("vkCreateSwapchainKHR", create_swapchain);
     F("vkDestroySwapchainKHR", destroy_swapchain);
     F("vkGetSwapchainImagesKHR", swapchain_images);
     F("vkAcquireNextImageKHR", acquire_image);
     F("vkAcquireNextImage2KHR", acquire_image2);
     F("vkQueuePresentKHR", queue_present);
+#endif
     F("vkCreateImage", create_image);
     F("vkDestroyImage", destroy_image);
     F("vkGetImageMemoryRequirements", image_reqs);
@@ -10509,11 +10699,13 @@ static PFN_vkVoidFunction lookup_phys(const char *pName) {
     F("vkEnumerateDeviceExtensionProperties", enum_device_ext);
     F("vkEnumerateDeviceLayerProperties", enum_device_layers);
     F("vkCreateDevice", create_device);
+#ifdef _WIN32
     F("vkGetPhysicalDeviceSurfaceSupportKHR", surface_support);
     F("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", surface_caps);
     F("vkGetPhysicalDeviceSurfaceFormatsKHR", surface_formats);
     F("vkGetPhysicalDeviceSurfacePresentModesKHR", surface_modes);
     F("vkGetPhysicalDeviceWin32PresentationSupportKHR", win32_presentation_support);
+#endif
     return NULL;
 }
 
@@ -10523,8 +10715,10 @@ static PFN_vkVoidFunction lookup(const char *pName) {
     F("vkEnumerateInstanceExtensionProperties", enum_instance_ext);
     F("vkEnumerateInstanceVersion", enum_instance_version);
     F("vkEnumeratePhysicalDevices", enum_phys);
+#ifdef _WIN32
     F("vkCreateWin32SurfaceKHR", create_win32_surface);
     F("vkDestroySurfaceKHR", destroy_surface);
+#endif
     PFN_vkVoidFunction f = lookup_phys(pName);
     return f ? f : lookup_device(pName);
 }

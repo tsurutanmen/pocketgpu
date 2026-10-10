@@ -52,10 +52,24 @@ static inline const void *vr_rbytes(vr_rd *r, uint32_t *n) { *n = vr_ru32(r); re
 static inline void vr_rcopy(vr_rd *r, void *dst, size_t n) { const void *q = vr_take(r, n); if (q) memcpy(dst, q, n); else memset(dst, 0, n); }
 
 // ---- つなぐ ----
+// POSIX：相手が閉じた socket に書くと SIGPIPE でアプリごと落ちるので、MSG_NOSIGNAL で止める（無い OS は 0）。
+// シグナルで割り込まれた（EINTR）ときは、つながりが切れたことにせず読み書きを続ける
+#if defined(MSG_NOSIGNAL) && !defined(_WIN32)
+#define VR_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define VR_SEND_FLAGS 0
+#endif
+#ifdef _WIN32
+#define VR_INTERRUPTED() 0
+#else
+#include <errno.h>
+#define VR_INTERRUPTED() (errno == EINTR)
+#endif
 static inline int vr_send_all(vr_sock s, const void *d, size_t n) {
     const char *p = (const char *) d;
     while (n) {
-        int k = send(s, p, n > (1u << 30) ? (1 << 30) : (int) n, 0);
+        int k = (int) send(s, p, n > (1u << 30) ? (1 << 30) : (int) n, VR_SEND_FLAGS);
+        if (k < 0 && VR_INTERRUPTED()) continue;
         if (k <= 0) return 0;
         p += k; n -= (size_t) k;
     }
@@ -64,7 +78,8 @@ static inline int vr_send_all(vr_sock s, const void *d, size_t n) {
 static inline int vr_recv_all(vr_sock s, void *d, size_t n) {
     char *p = (char *) d;
     while (n) {
-        int k = recv(s, p, n > (1u << 30) ? (1 << 30) : (int) n, 0);
+        int k = (int) recv(s, p, n > (1u << 30) ? (1 << 30) : (int) n, 0);
+        if (k < 0 && VR_INTERRUPTED()) continue;
         if (k <= 0) return 0;
         p += k; n -= (size_t) k;
     }
