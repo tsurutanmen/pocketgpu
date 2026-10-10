@@ -149,6 +149,14 @@ static void like_ios_mask(VkPhysicalDeviceFeatures *f) {
 // DirectX 12（vkd3d-proton）が見る物：同時につなぐ set の数・update after bind の数・texel buffer の揃え
 #define IOS_MIN(x, v) do { if ((x) > (v)) (x) = (v); } while (0)
 #define IOS_MAX(x, v) do { if ((x) < (v)) (x) = (v); } while (0)
+// 調べ用：VKR_LIKE_IOS_VENDOR=1 で、代役が GPU の会社の番号を Apple（0x106B）と答える。
+// ドライバ（iPhone 用の直しは会社の番号で決める）と、DXVK・vkd3d-proton（Apple なら root の CBV を住所で渡す、など）が本物の iPhone と同じ道を通る
+static void like_ios_vendor(VkPhysicalDeviceProperties *p) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VKR_LIKE_IOS_VENDOR"); v = e && *e == '1'; }
+    if (v) p->vendorID = 0x106b;
+}
+
 static void like_ios_limits(VkPhysicalDeviceLimits *l) {
     if (!like_ios()) return;
     IOS_MIN(l->maxBoundDescriptorSets, 8);
@@ -2638,6 +2646,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         vkGetPhysicalDeviceFeatures(g_pd, &f);
         like_ios_mask(&f);
         like_ios_limits(&p.limits);
+        like_ios_vendor(&p);
         vkGetPhysicalDeviceMemoryProperties(g_pd, &m);
 #if defined(__APPLE__) && TARGET_OS_IPHONE
         // iPhone では、iOS がこのアプリに許すメモリのほうが、MoltenVK の答える量よりずっと小さい（超えるとアプリが止められる）。
@@ -2687,6 +2696,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             VkPhysicalDeviceProperties2 p2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = chain };
             vkGetPhysicalDeviceProperties2(g_pd, &p2);
             like_ios_limits(&p2.properties.limits);
+            like_ios_vendor(&p2.properties);
             for (uint32_t i = 0; i < n; i++) like_ios_props2(blocks[i]);
             vr_put(&g_out, &p2.properties, sizeof p2.properties);
         }
