@@ -1026,6 +1026,156 @@ static void mask_features(VkPhysicalDeviceFeatures *f) {
     if (!(g_hw.caps & VR_CAP_QUERY)) f->occlusionQueryPrecise = VK_FALSE;
 }
 
+// ---- sparse（tiled resources）の「名乗りだけ」の真似（kit_extra/research/sparse_emulation.md の S1） ----
+// 機能・性質・sparse binding のキューを名乗る。sparse の buffer と image は、受け手にはふつうの物として作り（SPARSE の印を外す）、
+// ドライバが仮の大きさ全部ぶんの隠しメモリを、作ったときに結ぶ。vkQueueBindSparse は中身を動かさず、待つ・知らせる合図だけを空の submit で送る。
+// シェーダーの residency の問い合わせ（OpImageSparse*）は、ふつうの読みと「いつもある」に直す（spv_sparse）。
+// 守らない約束：結んでいない所を読んでも 0 にならない・書いても捨てられない・タイルを結び直しても中身はついて来ない・
+// 同じヒープのタイルを 2 か所に結んでも中身は共有されない・CheckAccessFullyMapped はいつも真
+// IPHONE_VK_SPARSE=0 で名乗らない（前と同じ）・1 でどのアプリにも名乗る・無ければ vkd3d-proton のときだけ
+static int sparse_mode(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_SPARSE"); v = e && *e ? (*e == '1' ? 2 : *e == '0' ? 0 : 1) : 1; }
+    return v;
+}
+static int sparse_on(void) { int m = sparse_mode(); return m == 2 || (m == 1 && vkd3d()); }
+// 結んでいない所の読みが 0 だと名乗るか（residencyNonResidentStrict）。S1 は 0 にしないので、標準は名乗らない。
+// vkd3d-proton はこれが無いと TiledResourcesTier を 1 にするが、VKD3D_FEATURE_LEVEL=12_0（IPHONE_VK_FL12）があれば 2 に上げる。
+// IPHONE_VK_SPARSE_STRICT=1 で名乗る（嘘になる）
+static int sparse_strict(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_SPARSE_STRICT"); v = e && *e == '1'; }
+    return v;
+}
+// 隠しメモリの合計の上限（IPHONE_VK_SPARSE_MAX_MB・標準 1024 MiB）。iPhone のアプリが使えるのは全部で約 5.8 GB で、
+// 仮想テクスチャ用の大きな tiled resource を丸ごと持つと、それだけで iPhone のアプリが落とされる。超える物は作らずに断る
+static uint64_t sparse_cap(void) {
+    static uint64_t v;
+    if (!v) {
+        const char *e = getenv("IPHONE_VK_SPARSE_MAX_MB");
+        uint64_t mb = e && *e ? strtoull(e, NULL, 0) : 1024;
+        v = (mb ? mb : 1) << 20;
+    }
+    return v;
+}
+static volatile LONG64 g_sparse_bytes; // いま持っている隠しメモリの合計
+enum { SPARSE_BLOCK = 65536 };
+#define SPARSE_BUF_FLAGS (VK_BUFFER_CREATE_SPARSE_BINDING_BIT | VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT | VK_BUFFER_CREATE_SPARSE_ALIASED_BIT)
+#define SPARSE_IMG_FLAGS (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_SPARSE_ALIASED_BIT)
+
+// 隠しメモリを size バイト取ってよいか。上限を超えるなら断って、記録に出す（IPHONE_VK_LOG が無くても出す）
+static int sparse_take(uint64_t size, const char *what, uint64_t app_size) {
+    uint64_t cap = sparse_cap();
+    LONG64 now = InterlockedAdd64(&g_sparse_bytes, (LONG64) size);
+    if ((uint64_t) now > cap) {
+        InterlockedAdd64(&g_sparse_bytes, -(LONG64) size);
+        static volatile LONG k;
+        LONG c = InterlockedIncrement(&k);
+        if (c <= 8 || (c & (c - 1)) == 0)
+            fprintf(stderr, "[iphone-vk] sparse の %s（仮の大きさ %.1f MiB）を作らずに断った：ふつうのメモリで丸ごと持つと合計 %.1f MiB になり、"
+                            "上限 %.0f MiB を超える（IPHONE_VK_SPARSE_MAX_MB で変えられる・%ld 回目）\n",
+                    what, app_size / 1048576.0, (double) (now) / 1048576.0, cap / 1048576.0, c);
+        return 0;
+    }
+    say("sparse の %s（仮の大きさ %.1f MiB）を、ふつうのメモリ %.1f MiB で丸ごと持つ（合計 %.1f MiB／上限 %.0f MiB）", what, app_size / 1048576.0,
+        size / 1048576.0, (double) now / 1048576.0, cap / 1048576.0);
+    return 1;
+}
+static void sparse_give(uint64_t size) { InterlockedAdd64(&g_sparse_bytes, -(LONG64) size); }
+
+// 色の形式の、塊 1 つのバイト数と塊の大きさ（圧縮でなければ 1x1）。知らない形式・深度とステンシルは 0
+static int fmt_block(VkFormat f, uint32_t *bytes, uint32_t *bw, uint32_t *bh) {
+    uint32_t b = 0, w = 1, h = 1;
+    if (f == VK_FORMAT_R4G4_UNORM_PACK8 || (f >= VK_FORMAT_R8_UNORM && f <= VK_FORMAT_R8_SRGB)) b = 1;
+    else if ((f >= VK_FORMAT_R4G4B4A4_UNORM_PACK16 && f <= VK_FORMAT_A1R5G5B5_UNORM_PACK16) || (f >= VK_FORMAT_R8G8_UNORM && f <= VK_FORMAT_R8G8_SRGB) ||
+             (f >= VK_FORMAT_R16_UNORM && f <= VK_FORMAT_R16_SFLOAT))
+        b = 2;
+    else if ((f >= VK_FORMAT_R8G8B8A8_UNORM && f <= VK_FORMAT_A2B10G10R10_SINT_PACK32) || (f >= VK_FORMAT_R16G16_UNORM && f <= VK_FORMAT_R16G16_SFLOAT) ||
+             (f >= VK_FORMAT_R32_UINT && f <= VK_FORMAT_R32_SFLOAT) || f == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || f == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)
+        b = 4;
+    else if ((f >= VK_FORMAT_R16G16B16A16_UNORM && f <= VK_FORMAT_R16G16B16A16_SFLOAT) || (f >= VK_FORMAT_R32G32_UINT && f <= VK_FORMAT_R32G32_SFLOAT) ||
+             (f >= VK_FORMAT_R64_UINT && f <= VK_FORMAT_R64_SFLOAT))
+        b = 8;
+    else if ((f >= VK_FORMAT_R32G32B32A32_UINT && f <= VK_FORMAT_R32G32B32A32_SFLOAT) || (f >= VK_FORMAT_R64G64_UINT && f <= VK_FORMAT_R64G64_SFLOAT))
+        b = 16;
+    else if ((f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC1_RGBA_SRGB_BLOCK) || f == VK_FORMAT_BC4_UNORM_BLOCK || f == VK_FORMAT_BC4_SNORM_BLOCK ||
+             (f >= VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK && f <= VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK) || f == VK_FORMAT_EAC_R11_UNORM_BLOCK || f == VK_FORMAT_EAC_R11_SNORM_BLOCK)
+        b = 8, w = h = 4;
+    else if ((f >= VK_FORMAT_BC2_UNORM_BLOCK && f <= VK_FORMAT_BC3_SRGB_BLOCK) || (f >= VK_FORMAT_BC5_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK) ||
+             f == VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK || f == VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK || f == VK_FORMAT_EAC_R11G11_UNORM_BLOCK ||
+             f == VK_FORMAT_EAC_R11G11_SNORM_BLOCK || f == VK_FORMAT_ASTC_4x4_UNORM_BLOCK || f == VK_FORMAT_ASTC_4x4_SRGB_BLOCK)
+        b = 16, w = h = 4;
+    *bytes = b; *bw = w; *bh = h;
+    return b != 0;
+}
+
+// 2D・1 サンプルの標準のブロックの形（Vulkan の Standard Sparse Image Block Shapes。64 KB）。画素で返す。無い形式は 0
+static int sparse_shape(VkFormat f, uint32_t *gw, uint32_t *gh, uint32_t *bytes, uint32_t *bw, uint32_t *bh) {
+    if (!fmt_block(f, bytes, bw, bh)) return 0;
+    uint32_t w, h;
+    switch (*bytes) {
+    case 1: w = 256; h = 256; break;
+    case 2: w = 256; h = 128; break;
+    case 4: w = 128; h = 128; break;
+    case 8: w = 128; h = 64; break;
+    case 16: w = 64; h = 64; break;
+    default: return 0;
+    }
+    *gw = w * *bw;
+    *gh = h * *bh;
+    return 1;
+}
+
+// sparse の image を作ったときの形（必要なメモリと、タイルの並びの答えに使う）
+struct spimg { int on, residency; VkImageType type; VkFormat fmt; uint32_t w, h, d, mips, layers; VkSampleCountFlagBits samples; VkImageTiling tiling; };
+
+static uint32_t div_up(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
+static uint64_t up64k(uint64_t a) { return (a + SPARSE_BLOCK - 1) / SPARSE_BLOCK * SPARSE_BLOCK; }
+
+// residency の image のタイルの並び。ふつうの段のタイルを層ごとに並べ、その後ろに層ごとの mip tail（小さい段をまとめた所）を置く。
+// 結び付けは中身を動かさないので、この並びはアプリに答える数のためだけの物。*size は仮の大きさ（アプリに答えるメモリの量）
+static int sparse_img_layout(const struct spimg *s, VkSparseImageMemoryRequirements *r, VkDeviceSize *size) {
+    uint32_t gw, gh, bytes, bw, bh;
+    if (!s->on || !s->residency || s->type != VK_IMAGE_TYPE_2D || s->samples != VK_SAMPLE_COUNT_1_BIT || s->tiling != VK_IMAGE_TILING_OPTIMAL ||
+        !sparse_shape(s->fmt, &gw, &gh, &bytes, &bw, &bh))
+        return 0;
+    uint32_t mips = s->mips ? s->mips : 1, layers = s->layers ? s->layers : 1, first_tail = mips;
+    uint64_t tiles = 0, tail = 0;
+    for (uint32_t l = 0; l < mips; l++) {
+        uint32_t wl = s->w >> l ? s->w >> l : 1, hl = s->h >> l ? s->h >> l : 1;
+        if (first_tail == mips && (wl < gw || hl < gh)) first_tail = l; // ブロックより小さい段から後ろは mip tail
+        if (l < first_tail) tiles += (uint64_t) div_up(wl, gw) * div_up(hl, gh);
+        else tail += (uint64_t) div_up(wl, bw) * div_up(hl, bh) * bytes;
+    }
+    tail = up64k(tail);
+    memset(r, 0, sizeof *r);
+    r->formatProperties.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    r->formatProperties.imageGranularity = (VkExtent3D) { gw, gh, 1 };
+    r->formatProperties.flags = 0; // 層ごとに mip tail・揃えなし・標準の形
+    r->imageMipTailFirstLod = first_tail;
+    r->imageMipTailSize = tail;
+    r->imageMipTailOffset = tiles * SPARSE_BLOCK * layers;
+    r->imageMipTailStride = tail;
+    *size = tiles * SPARSE_BLOCK * layers + tail * layers;
+    if (!*size) *size = SPARSE_BLOCK;
+    return 1;
+}
+
+// 隠しメモリの種類：GPU だけのメモリ（CPU から見えない・lazily でない）を優先する
+static uint32_t sparse_mem_type(uint32_t bits) {
+    int best = -1;
+    for (uint32_t i = 0; i < g_hw.mem.memoryTypeCount; i++) {
+        if (!(bits & (1u << i))) continue;
+        VkMemoryPropertyFlags f = g_hw.mem.memoryTypes[i].propertyFlags;
+        if (f & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT | VK_MEMORY_PROPERTY_PROTECTED_BIT)) continue;
+        if (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) return i;
+        if (best < 0) best = (int) i;
+    }
+    if (best >= 0) return (uint32_t) best;
+    for (uint32_t i = 0; i < 32; i++) if (bits & (1u << i)) return i;
+    return 0;
+}
+
 static int hello(void) {
     AcquireSRWLockExclusive(&g_hw_lock);
     if (g_hw.tried) { ReleaseSRWLockExclusive(&g_hw_lock); return g_hw.ok; }
@@ -1287,7 +1437,8 @@ static uint64_t memw_upto(struct mem *m, uint64_t off, uint64_t len) {
     return m->wide ? u | MEMW_WIDE : u;
 }
 
-struct buf { uint64_t size; VkMemoryRequirements req; struct mem *m; uint64_t memoff; uint64_t addr; }; // addr：受け手の GPU の中のアドレス
+struct buf { uint64_t size; VkMemoryRequirements req; struct mem *m; uint64_t memoff; uint64_t addr; // addr：受け手の GPU の中のアドレス
+             struct mem *hidden; uint64_t hidden_size; }; // hidden：sparse（S1）の隠しメモリ。作ったときに結び、消すときに放す
 
 // ---- アドレスで読み書きされる buffer の見張り（u1。kit_extra/research/uab_tracking.md の筋書き 3） ----
 // vkd3d-proton は root の SRV・UAV（Apple なら CBV も）を、set に載せずにアドレス（buffer device address）で渡す。
@@ -2500,11 +2651,11 @@ static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *ci, const
         if (!strcmp(ai->pEngineName, "vkd3d")) g_engine_vkd3d = 1;
         // DirectX 12 の feature level 12_0 を名乗らせる。vkd3d-proton は tiled resources（sparse）が無いと 11_x までにするが、
         // 起動時に 12_0 が作れるかだけを見るゲームがある。VKD3D_FEATURE_LEVEL は装置を作るときに読まれる。
-        // 名乗るだけで sparse の中身は無い。利用者が自分で値を入れていれば触らない。IPHONE_VK_FL12=0 で立てない
+        // sparse はふつうのメモリで持つ形で名乗る（IPHONE_VK_SPARSE）。利用者が自分で値を入れていれば触らない。IPHONE_VK_FL12=0 で立てない
         const char *fl = getenv("IPHONE_VK_FL12");
         if (g_engine_vkd3d && !(fl && *fl == '0') && !GetEnvironmentVariableA("VKD3D_FEATURE_LEVEL", NULL, 0)) {
             SetEnvironmentVariableA("VKD3D_FEATURE_LEVEL", "12_0");
-            say("DirectX 12 の feature level 12_0 を名乗らせる（VKD3D_FEATURE_LEVEL=12_0・sparse の中身は無い）");
+            say("DirectX 12 の feature level 12_0 を名乗らせる（VKD3D_FEATURE_LEVEL=12_0）");
         }
     }
     struct inst *i = calloc(1, sizeof *i);
@@ -2558,12 +2709,25 @@ static void VKAPI_CALL get_props(VkPhysicalDevice pd, VkPhysicalDeviceProperties
     // 同時につなげる set が 8 個の GPU（iPhone）では root signature を作れないので、揃えを 64 と名乗って 8 個に収める
     // （raw buffer は texel buffer で読む。揃えを大きく名乗るのは、アプリに厳しくするだけなので安全）
     if (sets8()) p->limits.minStorageBufferOffsetAlignment = 64;
+    // sparse の名乗り（S1）。2D・1 サンプルの標準の形だけ。3D と MSAA は名乗らない
+    if (sparse_on()) {
+        p->limits.sparseAddressSpaceSize = sparse_cap();
+        memset(&p->sparseProperties, 0, sizeof p->sparseProperties);
+        p->sparseProperties.residencyStandard2DBlockShape = VK_TRUE;
+        p->sparseProperties.residencyNonResidentStrict = sparse_strict() ? VK_TRUE : VK_FALSE;
+    }
 }
 
 static void VKAPI_CALL get_features(VkPhysicalDevice pd, VkPhysicalDeviceFeatures *f) {
     say("機能の一覧");
     (void) pd;
     *f = g_hw.feats;
+    // sparse の名乗り（S1）。aliased は名乗るが守らない（同じメモリを 2 か所に結んでも中身は共有されない）。
+    // shaderResourceResidency はシェーダーを直して「いつもある」と答える（spv_sparse）
+    if (sparse_on()) {
+        f->sparseBinding = f->sparseResidencyBuffer = f->sparseResidencyImage2D = f->sparseResidencyAliased = VK_TRUE;
+        f->shaderResourceResidency = VK_TRUE;
+    }
 }
 
 typedef struct { VkStructureType st; uint32_t size; } stinfo;
@@ -2899,19 +3063,25 @@ static void VKAPI_CALL get_features2(VkPhysicalDevice pd, VkPhysicalDeviceFeatur
         }
 }
 
+// sparse（S1）を名乗るときは、描く・計算するキューに sparse binding の印を足す（vkQueueBindSparse は合図だけの submit にする）
+static VkQueueFamilyProperties qf_fix(VkQueueFamilyProperties q) {
+    if (sparse_on() && (q.queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))) q.queueFlags |= VK_QUEUE_SPARSE_BINDING_BIT;
+    return q;
+}
+
 static void VKAPI_CALL get_queue_families(VkPhysicalDevice pd, uint32_t *n, VkQueueFamilyProperties *q) {
     say("キューの一覧");
     (void) pd;
     if (!q) { *n = g_hw.nq; return; }
     uint32_t k = *n < g_hw.nq ? *n : g_hw.nq;
-    memcpy(q, g_hw.q, k * sizeof *q);
+    for (uint32_t i = 0; i < k; i++) q[i] = qf_fix(g_hw.q[i]);
     *n = k;
 }
 
 static void VKAPI_CALL get_queue_families2(VkPhysicalDevice pd, uint32_t *n, VkQueueFamilyProperties2 *q) {
     if (!q) { get_queue_families(pd, n, NULL); return; }
     uint32_t k = *n < g_hw.nq ? *n : g_hw.nq;
-    for (uint32_t i = 0; i < k; i++) q[i].queueFamilyProperties = g_hw.q[i];
+    for (uint32_t i = 0; i < k; i++) q[i].queueFamilyProperties = qf_fix(g_hw.q[i]);
     *n = k;
 }
 
@@ -3055,6 +3225,17 @@ static VkResult VKAPI_CALL enum_device_layers(VkPhysicalDevice pd, uint32_t *n, 
 
 static VkResult VKAPI_CALL get_image_format(VkPhysicalDevice pd, VkFormat f, VkImageType t, VkImageTiling ti, VkImageUsageFlags u, VkImageCreateFlags fl, VkImageFormatProperties *p) {
     (void) pd;
+    // sparse（S1）：受け手にはふつうの image として作るので、印を外して聞く。residency は 2D・optimal・標準の形のある色の形式・1 サンプルだけ
+    if (sparse_on() && (fl & SPARSE_IMG_FLAGS)) {
+        uint32_t gw, gh, by, bw, bh;
+        if ((fl & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) && (t != VK_IMAGE_TYPE_2D || ti != VK_IMAGE_TILING_OPTIMAL || !sparse_shape(f, &gw, &gh, &by, &bw, &bh))) {
+            memset(p, 0, sizeof *p);
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        }
+        VkResult r = get_image_format(pd, f, t, ti, u, fl & ~(VkImageCreateFlags) SPARSE_IMG_FLAGS, p);
+        if (r == VK_SUCCESS && (fl & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT)) p->sampleCounts &= VK_SAMPLE_COUNT_1_BIT;
+        return r;
+    }
     if (g_bc && bc_sub(f)) {
         memset(p, 0, sizeof *p);
         const VkImageUsageFlags ok = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -3090,14 +3271,32 @@ static VkResult VKAPI_CALL get_image_format2(VkPhysicalDevice pd, const VkPhysic
     return get_image_format(pd, i->format, i->type, i->tiling, i->usage, i->flags, &p->imageFormatProperties);
 }
 
+// sparse の image の形式の性質（S1）。2D・1 サンプル・optimal で、標準の形のある色の形式だけ 1 つ答える（ほかは 0 個）
+static int sparse_fmt_props(VkPhysicalDevice pd, VkFormat f, VkImageType t, VkSampleCountFlagBits s, VkImageUsageFlags u, VkImageTiling ti,
+                            VkSparseImageFormatProperties *q) {
+    uint32_t gw, gh, by, bw, bh;
+    if (!sparse_on() || t != VK_IMAGE_TYPE_2D || s != VK_SAMPLE_COUNT_1_BIT || ti != VK_IMAGE_TILING_OPTIMAL || !sparse_shape(f, &gw, &gh, &by, &bw, &bh))
+        return 0;
+    VkImageFormatProperties ip;
+    if (get_image_format(pd, f, t, ti, u, VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT, &ip) != VK_SUCCESS) return 0;
+    q->aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    q->imageGranularity = (VkExtent3D) { gw, gh, 1 };
+    q->flags = 0;
+    return 1;
+}
+
 static void VKAPI_CALL get_sparse_format(VkPhysicalDevice pd, VkFormat f, VkImageType t, VkSampleCountFlagBits s, VkImageUsageFlags u, VkImageTiling ti, uint32_t *n, VkSparseImageFormatProperties *p) {
-    (void) pd; (void) f; (void) t; (void) s; (void) u; (void) ti; (void) p;
-    *n = 0;
+    VkSparseImageFormatProperties q;
+    uint32_t k = (uint32_t) sparse_fmt_props(pd, f, t, s, u, ti, &q);
+    if (!p) { *n = k; return; }
+    if (*n && k) { p[0] = q; *n = 1; } else *n = 0;
 }
 
 static void VKAPI_CALL get_sparse_format2(VkPhysicalDevice pd, const VkPhysicalDeviceSparseImageFormatInfo2 *i, uint32_t *n, VkSparseImageFormatProperties2 *p) {
-    (void) pd; (void) i; (void) p;
-    *n = 0;
+    VkSparseImageFormatProperties q;
+    uint32_t k = (uint32_t) sparse_fmt_props(pd, i->format, i->type, i->samples, i->usage, i->tiling, &q);
+    if (!p) { *n = k; return; }
+    if (*n && k) { p[0].properties = q; *n = 1; } else *n = 0;
 }
 
 static void VKAPI_CALL get_ext_buffer(VkPhysicalDevice pd, const VkPhysicalDeviceExternalBufferInfo *i, VkExternalBufferProperties *p) {
@@ -3155,6 +3354,11 @@ static VkResult VKAPI_CALL create_device(VkPhysicalDevice pd, const VkDeviceCrea
         VkBool32 *e = (VkBool32 *) &en;
         const VkBool32 *rf = (const VkBool32 *) &g_hw.real;
         for (size_t k = 0; k < sizeof en / sizeof(VkBool32); k++) e[k] = e[k] && rf[k];
+        // sparse は受け手では使わない（ドライバが真似る。iPhone の MoltenVK は持たない）。代役の GPU が持っていても有効にしない
+        en.sparseBinding = en.sparseResidencyBuffer = en.sparseResidencyImage2D = en.sparseResidencyImage3D = VK_FALSE;
+        en.sparseResidency2Samples = en.sparseResidency4Samples = en.sparseResidency8Samples = en.sparseResidency16Samples = VK_FALSE;
+        en.sparseResidencyAliased = VK_FALSE;
+        if (sparse_on()) en.shaderResourceResidency = VK_FALSE; // シェーダーの residency の問い合わせはドライバが直す（spv_sparse）
         vr_put(&b, &en, sizeof en);
     }
     vr_u32(&b, nc);
@@ -3406,15 +3610,41 @@ static void brq_learn(uint32_t flags, uint32_t usage, VkDeviceSize size, const V
 }
 
 static uint32_t gs_buffer_usage(uint32_t usage);
-static VkResult VKAPI_CALL create_buffer(VkDevice dv, const VkBufferCreateInfo *ci, const VkAllocationCallbacks *a, VkBuffer *out) {
-    (void) a;
+static VkResult VKAPI_CALL bind_buffer(VkDevice dv, VkBuffer bb, VkDeviceMemory mm, VkDeviceSize off);
+static void VKAPI_CALL destroy_buffer(VkDevice dv, VkBuffer bb, const VkAllocationCallbacks *a);
+
+// sparse の buffer（S1）：アプリに答えるメモリの量は 64 KB の倍数、並びは 64 KB。
+// 本当の必要量（受け手の答え）ぶんの隠しメモリを取って結ぶ。probe（作る前に必要量を聞くだけ）なら取らない
+static VkResult sparse_hide_buffer(VkDevice dv, struct buf *bf, uint32_t usage, int probe) {
+    VkMemoryRequirements real = bf->req;
+    bf->req.size = up64k(bf->size);
+    bf->req.alignment = SPARSE_BLOCK;
+    if (probe) return VK_SUCCESS;
+    if (!sparse_take(real.size, "buffer", bf->size)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    VkMemoryAllocateFlagsInfo fi = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+                                     .flags = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) ? VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT : 0 };
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = fi.flags ? &fi : NULL,
+                                .allocationSize = real.size, .memoryTypeIndex = sparse_mem_type(real.memoryTypeBits) };
+    VkDeviceMemory m = VK_NULL_HANDLE;
+    VkResult r = alloc_memory(dv, &ai, NULL, &m);
+    if (r != VK_SUCCESS) { sparse_give(real.size); return r; }
+    bind_buffer(dv, (VkBuffer) bf, m, 0);
+    bf->hidden = (struct mem *) m;
+    bf->hidden_size = real.size;
+    return VK_SUCCESS;
+}
+
+static VkResult create_buffer_ex(VkDevice dv, const VkBufferCreateInfo *ci, VkBuffer *out, int probe) {
     struct buf *bf = calloc(1, sizeof *bf);
     if (!bf) return VK_ERROR_OUT_OF_HOST_MEMORY;
     bf->size = ci->size;
+    // sparse（S1）：受け手にはふつうの buffer として作る
+    int sp = (ci->flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) && sparse_on();
+    uint32_t flags = sp ? ci->flags & ~(uint32_t) SPARSE_BUF_FLAGS : ci->flags;
     vr_buf b = { 0 }, o = { 0 };
     vr_u64(&b, ID(dv));
     vr_u64(&b, ID(bf));
-    vr_u32(&b, ci->flags);
+    vr_u32(&b, flags);
     vr_u64(&b, ci->size);
     // maintenance5 では、使い道を pNext の 64 ビットの形で渡せる。今の受け手は 32 ビットまでしか使わない
     uint32_t usage = ci->usage;
@@ -3422,22 +3652,30 @@ static VkResult VKAPI_CALL create_buffer(VkDevice dv, const VkBufferCreateInfo *
         if (x->sType == VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO) usage = (uint32_t) ((const VkBufferUsageFlags2CreateInfo *) x)->usage;
     usage = gs_buffer_usage(usage); // GS を真似る VS が storage buffer として読む
     vr_u32(&b, usage);
-    if ((g_hw.caps & VR_CAP_ASYNC_CREATE) && brq_find(ci->flags, usage, ci->size, &bf->req)) {
+    if ((g_hw.caps & VR_CAP_ASYNC_CREATE) && brq_find(flags, usage, ci->size, &bf->req)) {
         rpc_send(VR_CREATE_BUFFER_NR, &b);
         free(b.p);
-        *out = (VkBuffer) bf;
-        return VK_SUCCESS;
+    } else {
+        VkResult r = rpc_call(VR_CREATE_BUFFER, &b, &o);
+        if (r == VK_SUCCESS && o.n >= sizeof bf->req) {
+            memcpy(&bf->req, o.p, sizeof bf->req);
+            brq_learn(flags, usage, ci->size, &bf->req);
+        }
+        free(b.p);
+        free(o.p);
+        if (r != VK_SUCCESS) { free(bf); return r; }
     }
-    VkResult r = rpc_call(VR_CREATE_BUFFER, &b, &o);
-    if (r == VK_SUCCESS && o.n >= sizeof bf->req) {
-        memcpy(&bf->req, o.p, sizeof bf->req);
-        brq_learn(ci->flags, usage, ci->size, &bf->req);
+    if (sp) {
+        VkResult r = sparse_hide_buffer(dv, bf, usage, probe);
+        if (r != VK_SUCCESS) { destroy_buffer(dv, (VkBuffer) bf, NULL); return r; }
     }
-    free(b.p);
-    free(o.p);
-    if (r != VK_SUCCESS) { free(bf); return r; }
     *out = (VkBuffer) bf;
     return VK_SUCCESS;
+}
+
+static VkResult VKAPI_CALL create_buffer(VkDevice dv, const VkBufferCreateInfo *ci, const VkAllocationCallbacks *a, VkBuffer *out) {
+    (void) a;
+    return create_buffer_ex(dv, ci, out, 0);
 }
 
 static void forget_buffer_in_sets(struct buf *bf);
@@ -3453,7 +3691,12 @@ static void VKAPI_CALL destroy_buffer(VkDevice dv, VkBuffer bb, const VkAllocati
     vr_u64(&b, ID(bb));
     rpc_send(VR_DESTROY_BUFFER, &b);
     free(b.p);
-    free((struct buf *) bb);
+    struct buf *bf = (struct buf *) bb;
+    if (bf->hidden) { // sparse（S1）の隠しメモリは、buffer を消したあとで放す
+        free_memory(dv, (VkDeviceMemory) bf->hidden, NULL);
+        sparse_give(bf->hidden_size);
+    }
+    free(bf);
 }
 
 static void VKAPI_CALL buffer_reqs(VkDevice dv, VkBuffer bb, VkMemoryRequirements *r) { (void) dv; *r = ((struct buf *) bb)->req; }
@@ -3488,7 +3731,8 @@ static VkResult VKAPI_CALL bind_buffer2(VkDevice dv, uint32_t n, const VkBindBuf
 
 // ---- 画像 ----
 struct img { VkMemoryRequirements req; struct mem *m; uint64_t memoff; VkFormat bc; // bc：ほどいて持つ BC の形式
-    uint32_t ls_fmt, ls_w, ls_h, ls_mips, ls_layers, ls_usage, ls_samples; }; // LOAD・STORE を調べる・減らすために覚える（ls.inc）
+    uint32_t ls_fmt, ls_w, ls_h, ls_mips, ls_layers, ls_usage, ls_samples; // LOAD・STORE を調べる・減らすために覚える（ls.inc）
+    struct spimg sp; struct mem *hidden; uint64_t hidden_size; }; // sparse（S1）の形と隠しメモリ
 static void ls_note_rp1(uint64_t id, const VkRenderPassCreateInfo *ci, const vr_buf *pay);
 static void ls_note_rp2(uint64_t id, const VkRenderPassCreateInfo2 *ci, const vr_buf *pay);
 static void ls_note_fb(uint64_t id, const VkFramebufferCreateInfo *ci);
@@ -3501,12 +3745,49 @@ static VkImageLayout fix_layout(VkImageLayout l) {
     return l == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR || l == VK_IMAGE_LAYOUT_SHARED_PRESENT_KHR ? VK_IMAGE_LAYOUT_GENERAL : l;
 }
 
-static VkResult VKAPI_CALL create_image(VkDevice dv, const VkImageCreateInfo *ci, const VkAllocationCallbacks *a, VkImage *out) {
-    (void) a;
+static VkResult VKAPI_CALL bind_image(VkDevice dv, VkImage h, VkDeviceMemory mm, VkDeviceSize off);
+static void VKAPI_CALL destroy_image(VkDevice dv, VkImage h, const VkAllocationCallbacks *a);
+
+static struct spimg spimg_of(const VkImageCreateInfo *ci) {
+    struct spimg s = { 1, (ci->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) != 0, ci->imageType, ci->format, ci->extent.width, ci->extent.height,
+                       ci->extent.depth, ci->mipLevels, ci->arrayLayers, ci->samples, ci->tiling };
+    return s;
+}
+
+// sparse の image（S1）：アプリに答えるメモリの量は、タイルの並び（sparse_img_layout）の仮の大きさ、並びは 64 KB。
+// 本当の必要量（受け手の答え）ぶんの隠しメモリを取って結ぶ。probe なら取らない
+static VkResult sparse_hide_image(VkDevice dv, struct img *im, int probe) {
+    VkMemoryRequirements real = im->req;
+    VkSparseImageMemoryRequirements sr;
+    VkDeviceSize vsize = 0;
+    im->req.size = sparse_img_layout(&im->sp, &sr, &vsize) ? vsize : up64k(real.size);
+    im->req.alignment = SPARSE_BLOCK;
+    if (probe) return VK_SUCCESS;
+    if (!sparse_take(real.size, im->sp.residency ? "image" : "image（residency なし）", im->req.size)) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = real.size, .memoryTypeIndex = sparse_mem_type(real.memoryTypeBits) };
+    VkDeviceMemory m = VK_NULL_HANDLE;
+    VkResult r = alloc_memory(dv, &ai, NULL, &m);
+    if (r != VK_SUCCESS) { sparse_give(real.size); return r; }
+    bind_image(dv, (VkImage) im, m, 0);
+    im->hidden = (struct mem *) m;
+    im->hidden_size = real.size;
+    return VK_SUCCESS;
+}
+
+static VkResult create_image_ex(VkDevice dv, const VkImageCreateInfo *ci, VkImage *out, int probe) {
     struct img *im = calloc(1, sizeof *im);
     if (!im) return VK_ERROR_OUT_OF_HOST_MEMORY;
     im->ls_fmt = ci->format; im->ls_w = ci->extent.width; im->ls_h = ci->extent.height; im->ls_mips = ci->mipLevels; im->ls_layers = ci->arrayLayers;
     im->ls_usage = ci->usage; im->ls_samples = ci->samples;
+    // sparse（S1）：形を覚えて、受け手にはふつうの image として作る（BC をほどく前の、アプリの形式で覚える）
+    VkImageCreateInfo sci;
+    int sp = (ci->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) && sparse_on();
+    if (sp) {
+        im->sp = spimg_of(ci);
+        sci = *ci;
+        sci.flags &= ~(VkImageCreateFlags) SPARSE_IMG_FLAGS;
+        ci = &sci;
+    }
     VkImageCreateInfo bci;
     if (g_bc && bc_sub(ci->format)) {
         bci = *ci;
@@ -3559,19 +3840,27 @@ static VkResult VKAPI_CALL create_image(VkDevice dv, const VkImageCreateInfo *ci
         rpc_send(VR_CREATE_IMAGE_NR, &b);
         free(b.p);
         free(o.p);
-        *out = (VkImage) im;
-        return VK_SUCCESS;
+    } else {
+        VkResult r = rpc_call(VR_CREATE_IMAGE, &b, &o);
+        if (r == VK_SUCCESS && o.n >= sizeof im->req) {
+            memcpy(&im->req, o.p, sizeof im->req);
+            qc_put(key, r, o.p, (uint32_t) sizeof im->req);
+        }
+        free(b.p);
+        free(o.p);
+        if (r != VK_SUCCESS) { free(im); return r; }
     }
-    VkResult r = rpc_call(VR_CREATE_IMAGE, &b, &o);
-    if (r == VK_SUCCESS && o.n >= sizeof im->req) {
-        memcpy(&im->req, o.p, sizeof im->req);
-        qc_put(key, r, o.p, (uint32_t) sizeof im->req);
+    if (sp) {
+        VkResult r = sparse_hide_image(dv, im, probe);
+        if (r != VK_SUCCESS) { destroy_image(dv, (VkImage) im, NULL); return r; }
     }
-    free(b.p);
-    free(o.p);
-    if (r != VK_SUCCESS) { free(im); return r; }
     *out = (VkImage) im;
     return VK_SUCCESS;
+}
+
+static VkResult VKAPI_CALL create_image(VkDevice dv, const VkImageCreateInfo *ci, const VkAllocationCallbacks *a, VkImage *out) {
+    (void) a;
+    return create_image_ex(dv, ci, out, 0);
 }
 
 static void send_destroy(uint32_t op, VkDevice dv, uint64_t id) {
@@ -3586,10 +3875,36 @@ static void VKAPI_CALL destroy_image(VkDevice dv, VkImage h, const VkAllocationC
     (void) a;
     if (!h) return;
     send_destroy(VR_DESTROY_IMAGE, dv, ID(h));
-    free((struct img *) h);
+    struct img *im = (struct img *) h;
+    if (im->hidden) { // sparse（S1）の隠しメモリは、image を消したあとで放す
+        free_memory(dv, (VkDeviceMemory) im->hidden, NULL);
+        sparse_give(im->hidden_size);
+    }
+    free(im);
 }
 
 static void VKAPI_CALL image_reqs(VkDevice dv, VkImage h, VkMemoryRequirements *r) { (void) dv; *r = ((struct img *) h)->req; }
+
+// sparse の image のタイルの並び（S1）。residency の image だけ 1 つ答える（ほかは 0 個）
+static void sparse_reqs_out(const struct spimg *s, uint32_t *n, VkSparseImageMemoryRequirements *r, VkSparseImageMemoryRequirements2 *r2) {
+    VkSparseImageMemoryRequirements q;
+    VkDeviceSize sz;
+    uint32_t k = s && s->on && sparse_img_layout(s, &q, &sz) ? 1 : 0;
+    if (!r && !r2) { *n = k; return; }
+    if (*n && k) {
+        if (r) r[0] = q;
+        else r2[0].memoryRequirements = q;
+        *n = 1;
+    } else *n = 0;
+}
+static void VKAPI_CALL image_sparse_reqs(VkDevice dv, VkImage h, uint32_t *n, VkSparseImageMemoryRequirements *r) {
+    (void) dv;
+    sparse_reqs_out(h ? &((struct img *) h)->sp : NULL, n, r, NULL);
+}
+static void VKAPI_CALL image_sparse_reqs2(VkDevice dv, const VkImageSparseMemoryRequirementsInfo2 *i, uint32_t *n, VkSparseImageMemoryRequirements2 *r) {
+    (void) dv;
+    sparse_reqs_out(i->image ? &((struct img *) i->image)->sp : NULL, n, NULL, r);
+}
 
 static void VKAPI_CALL image_reqs2(VkDevice dv, const VkImageMemoryRequirementsInfo2 *i, VkMemoryRequirements2 *r) {
     image_reqs(dv, i->image, &r->memoryRequirements);
@@ -6532,6 +6847,107 @@ done:
     return o;
 }
 
+// sparse（S1）：シェーダーの residency の問い合わせを、ふつうの読みと「いつもある」に直す。iPhone の GPU（MoltenVK）は
+// SparseResidency の capability を持たないので、残すとシェーダーが組めない。
+//   %r = OpImageSparseXxx %S args…  →  %t = OpImageXxx %T args…  ;  %r = OpCompositeConstruct %S %0 %t
+//   （%S は { int 状態, %T 値 } の struct。状態は 0）
+//   %b = OpImageSparseTexelsResident %bool %code  →  %b = OpCopyObject %bool %true
+// OpCapability SparseResidency は外す。直したら新しく確保した並びを返す（*n に語の数）。直す所が無ければ NULL
+static uint32_t sparse_plain_op(uint32_t op) {
+    // OpImageSparseSampleImplicitLod（305）〜 OpImageSparseDrefGather（315）は、OpImageSampleImplicitLod（87）〜 OpImageDrefGather（97）と同じ並び
+    if (op >= 305 && op <= 315) return op - 305 + 87;
+    if (op == 320) return 98; // OpImageSparseRead → OpImageRead
+    return 0;
+}
+static uint32_t *spv_sparse(const uint32_t *w, size_t nw, size_t *n) {
+    if (!sparse_on() || nw < 5 || w[0] != 0x07230203) return NULL;
+    uint32_t bound = w[3];
+    if (bound > (1u << 22)) return NULL;
+    uint32_t *tdef = calloc(bound, sizeof *tdef), *zero = calloc(bound, sizeof *zero), *tru = calloc(bound, sizeof *tru);
+    uint8_t *newc = calloc(bound, 1); // その型の 0・true の定数を新しく足す
+    uint32_t *o = NULL;
+    size_t nsp = 0, ncap = 0, nres = 0, first_func = 0;
+    if (!tdef || !zero || !tru || !newc) goto done;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > nw) goto done; // 壊れている：触らない
+        const uint32_t *x = &w[i];
+        if (op == 17 && wc == 2 && x[1] == 41) ncap++; // OpCapability SparseResidency
+        else if (op >= 19 && op <= 39 && wc >= 2 && x[1] < bound) tdef[x[1]] = (uint32_t) i;
+        else if (op == 43 && wc == 4 && x[1] < bound && x[2] < bound && x[3] == 0 && tdef[x[1]] && (w[tdef[x[1]]] & 0xffff) == 21 && !zero[x[1]])
+            zero[x[1]] = x[2]; // 32 ビットの整数の 0
+        else if (op == 41 && wc == 3 && x[1] < bound && x[2] < bound && !tru[x[1]]) tru[x[1]] = x[2]; // OpConstantTrue
+        else if (sparse_plain_op(op)) {
+            // 結果の型は 2 つのメンバーの struct で、1 つ目は 32 ビットの整数
+            if (wc < 5 || x[1] >= bound || !tdef[x[1]]) goto done;
+            const uint32_t *st = &w[tdef[x[1]]];
+            if ((st[0] & 0xffff) != 30 || (st[0] >> 16) != 4 || st[2] >= bound || !tdef[st[2]] || (w[tdef[st[2]]] & 0xffff) != 21 || w[tdef[st[2]] + 2] != 32) goto done;
+            nsp++;
+        } else if (op == 316) { // OpImageSparseTexelsResident
+            if (wc != 4 || x[1] >= bound) goto done;
+            nres++;
+        }
+        if (op == 54 && !first_func) first_func = i;
+        i += wc;
+    }
+    if (!nsp && !nres && !ncap) goto done;
+    if ((nsp || nres) && !first_func) goto done;
+    // 足す定数と、読みの値を受ける番号
+    uint32_t nb = bound;
+    size_t nconst_words = 0;
+    for (size_t i = 5; i < nw; i += w[i] >> 16) {
+        uint32_t op = w[i] & 0xffff;
+        const uint32_t *x = &w[i];
+        if (sparse_plain_op(op)) {
+            uint32_t it = w[tdef[x[1]] + 2];
+            if (!zero[it]) { zero[it] = nb++; newc[it] |= 1; nconst_words += 4; }
+        } else if (op == 316 && !tru[x[1]]) { tru[x[1]] = nb++; newc[x[1]] |= 2; nconst_words += 3; }
+    }
+    o = malloc((nw + nconst_words + nsp * 5) * sizeof *o);
+    if (!o) goto done;
+    memcpy(o, w, 5 * sizeof *o);
+    size_t k = 5;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        const uint32_t *x = &w[i];
+        if (i == first_func) // 型と定数は関数の前に
+            for (uint32_t t = 0; t < bound; t++) {
+                if (newc[t] & 1) { o[k++] = (4u << 16) | 43; o[k++] = t; o[k++] = zero[t]; o[k++] = 0; }
+                if (newc[t] & 2) { o[k++] = (3u << 16) | 41; o[k++] = t; o[k++] = tru[t]; }
+            }
+        if (op == 17 && wc == 2 && x[1] == 41) { i += wc; continue; }
+        uint32_t plain = sparse_plain_op(op);
+        if (plain) {
+            const uint32_t *st = &w[tdef[x[1]]];
+            uint32_t tmp = nb++;
+            memcpy(o + k, x, wc * sizeof *o);
+            o[k] = (wc << 16) | plain;
+            o[k + 1] = st[3]; // 値の型
+            o[k + 2] = tmp;
+            k += wc;
+            o[k++] = (5u << 16) | 80; o[k++] = x[1]; o[k++] = x[2]; o[k++] = zero[st[2]]; o[k++] = tmp; // OpCompositeConstruct
+        } else if (op == 316) {
+            o[k++] = (4u << 16) | 83; o[k++] = x[1]; o[k++] = x[2]; o[k++] = tru[x[1]]; // OpCopyObject %bool %r %true
+        } else {
+            memcpy(o + k, x, wc * sizeof *o);
+            k += wc;
+        }
+        i += wc;
+    }
+    o[3] = nb;
+    *n = k;
+    {
+        static volatile LONG cnt;
+        LONG c = InterlockedIncrement(&cnt);
+        if (c <= 3 || (c & (c - 1)) == 0)
+            say("シェーダーの sparse の読み %zu か所・residency の問い合わせ %zu か所を、ふつうの読みと「いつもある」に直した（%ld 本目）", nsp, nres, c);
+    }
+done:
+    free(tdef); free(zero); free(tru); free(newc);
+    if (o && !*n) { free(o); o = NULL; }
+    return o;
+}
+
 static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out) {
     (void) a;
     size_t nfix = 0;
@@ -6540,6 +6956,11 @@ static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreate
         size_t n2 = 0;
         uint32_t *fix2 = spv_vecatomic(fix ? fix : ci->pCode, fix ? nfix : ci->codeSize / 4, &n2);
         if (fix2) { free(fix); fix = fix2; nfix = n2; }
+    }
+    {
+        size_t n3 = 0;
+        uint32_t *fix3 = spv_sparse(fix ? fix : ci->pCode, fix ? nfix : ci->codeSize / 4, &n3);
+        if (fix3) { free(fix); fix = fix3; nfix = n3; }
     }
     const uint32_t *code = fix ? fix : ci->pCode;
     size_t size = fix ? nfix * 4 : ci->codeSize;
@@ -9010,6 +9431,46 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
     return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
 }
 
+// ---- vkQueueBindSparse（S1） ----
+// 結び付けは中身を動かさない（sparse の物は作ったときに隠しメモリへ丸ごと結んである）。
+// 待つ・知らせる semaphore（timeline の値も）と fence だけを、command buffer の無い submit として同じキューに送る
+static VkResult VKAPI_CALL queue_bind_sparse(VkQueue qh, uint32_t n, const VkBindSparseInfo *bi, VkFence f) {
+    uint32_t nw = 0, nb = 0, no = 0, ni = 0;
+    for (uint32_t i = 0; i < n; i++) nw += bi[i].waitSemaphoreCount;
+    VkSubmitInfo *si = n ? calloc(n, sizeof *si) : NULL;
+    VkTimelineSemaphoreSubmitInfo *tl = n ? calloc(n, sizeof *tl) : NULL;
+    VkPipelineStageFlags *st = nw ? malloc(nw * sizeof *st) : NULL;
+    if ((n && (!si || !tl)) || (nw && !st)) { free(si); free(tl); free(st); return VK_ERROR_OUT_OF_HOST_MEMORY; }
+    for (uint32_t k = 0; k < nw; k++) st[k] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    for (uint32_t i = 0, at = 0; i < n; i++) {
+        si[i].sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si[i].waitSemaphoreCount = bi[i].waitSemaphoreCount;
+        si[i].pWaitSemaphores = bi[i].pWaitSemaphores;
+        si[i].pWaitDstStageMask = st + at;
+        at += bi[i].waitSemaphoreCount;
+        si[i].signalSemaphoreCount = bi[i].signalSemaphoreCount;
+        si[i].pSignalSemaphores = bi[i].pSignalSemaphores;
+        for (const VkBaseInStructure *x = bi[i].pNext; x; x = x->pNext)
+            if (x->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) {
+                tl[i] = *(const VkTimelineSemaphoreSubmitInfo *) x;
+                tl[i].pNext = NULL;
+                si[i].pNext = &tl[i];
+            }
+        nb += bi[i].bufferBindCount;
+        no += bi[i].imageOpaqueBindCount;
+        ni += bi[i].imageBindCount;
+    }
+    static volatile LONG calls;
+    LONG c = InterlockedIncrement(&calls);
+    if (c <= 3 || (c & (c - 1)) == 0)
+        say("vkQueueBindSparse %ld 回目：buffer %u・image（opaque）%u・image %u の結び付け。中身は動かさず、合図だけ送る", c, nb, no, ni);
+    VkResult r = queue_submit(qh, n, si, f);
+    free(si);
+    free(tl);
+    free(st);
+    return r;
+}
+
 static VkResult VKAPI_CALL queue_wait_idle(VkQueue qh) {
     struct queue *q = (struct queue *) qh;
     if (real_fence()) progress_wait(q->last_msg, 1e300);
@@ -9660,7 +10121,7 @@ static void VKAPI_CALL cmd_wait_events2(VkCommandBuffer cbh, uint32_t n, const V
 static void VKAPI_CALL dev_buffer_reqs(VkDevice dv, const VkDeviceBufferMemoryRequirements *i, VkMemoryRequirements2 *r) {
     VkBuffer b = VK_NULL_HANDLE;
     memset(&r->memoryRequirements, 0, sizeof r->memoryRequirements);
-    if (create_buffer(dv, i->pCreateInfo, NULL, &b) == VK_SUCCESS) {
+    if (create_buffer_ex(dv, i->pCreateInfo, &b, 1) == VK_SUCCESS) { // sparse でも隠しメモリは取らない
         buffer_reqs(dv, b, &r->memoryRequirements);
         destroy_buffer(dv, b, NULL);
     }
@@ -9668,14 +10129,16 @@ static void VKAPI_CALL dev_buffer_reqs(VkDevice dv, const VkDeviceBufferMemoryRe
 static void VKAPI_CALL dev_image_reqs(VkDevice dv, const VkDeviceImageMemoryRequirements *i, VkMemoryRequirements2 *r) {
     VkImage im = VK_NULL_HANDLE;
     memset(&r->memoryRequirements, 0, sizeof r->memoryRequirements);
-    if (create_image(dv, i->pCreateInfo, NULL, &im) == VK_SUCCESS) {
+    if (create_image_ex(dv, i->pCreateInfo, &im, 1) == VK_SUCCESS) {
         image_reqs(dv, im, &r->memoryRequirements);
         destroy_image(dv, im, NULL);
     }
 }
 static void VKAPI_CALL dev_image_sparse_reqs(VkDevice dv, const VkDeviceImageMemoryRequirements *i, uint32_t *n, VkSparseImageMemoryRequirements2 *r) {
-    (void) dv; (void) i; (void) r;
-    *n = 0;
+    (void) dv;
+    struct spimg s = { 0 };
+    if (sparse_on() && (i->pCreateInfo->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)) s = spimg_of(i->pCreateInfo);
+    sparse_reqs_out(&s, n, NULL, r);
 }
 
 // private data：アプリが物に付ける小さな値。ドライバの中だけで持つ
@@ -9941,6 +10404,12 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkGetDeviceImageMemoryRequirementsKHR", dev_image_reqs);
     F("vkGetDeviceImageSparseMemoryRequirements", dev_image_sparse_reqs);
     F("vkGetDeviceImageSparseMemoryRequirementsKHR", dev_image_sparse_reqs);
+    if (sparse_on()) { // sparse（S1）。名乗らないときは前と同じ「まだ中継していない入口」のまま
+        F("vkGetImageSparseMemoryRequirements", image_sparse_reqs);
+        F("vkGetImageSparseMemoryRequirements2", image_sparse_reqs2);
+        F("vkGetImageSparseMemoryRequirements2KHR", image_sparse_reqs2);
+        F("vkQueueBindSparse", queue_bind_sparse);
+    }
     F("vkCreateQueryPool", create_qpool);
     F("vkDestroyQueryPool", destroy_qpool);
     F("vkGetQueryPoolResults", get_qpool_results);
