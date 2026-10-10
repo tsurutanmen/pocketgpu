@@ -14,6 +14,10 @@ void vkr_set_thermal(int state);
 // 受け手が処理した命令の数（つないでから増え続ける）と、いま PC がつながっているか。画面のファンを回すのに使う
 uint64_t vkr_ops_total(void);
 int vkr_clients(void);
+// 窓に出すコマとして PC に返した数（つないでから増え続ける）。1 秒ごとの差で毎秒のコマ数を出す
+uint64_t vkr_frames_total(void);
+// 受け手の記録に 1 行書く。熱・電池・低電力の移り変わりを残す
+void vkr_note(const char * line);
 // USB の通り道の速さを測る受け口（vk/remote/bw.c）。戻ってこないので別のスレッドで呼ぶ
 int vkr_bw_serve(const char * host, int port);
 // インターネット共有の口（USB を有線のネットワークとして使う道）。合言葉は 16 進 32 文字で、起動のたびに作る。

@@ -596,6 +596,11 @@ static volatile uint64_t g_ops_total;
 static volatile int g_clients;
 uint64_t vkr_ops_total(void) { return g_ops_total; }
 int vkr_clients(void) { return g_clients; }
+// 窓に出すコマとして PC に返した数（JPEG・H.264）。アプリが 1 秒ごとに読んで、毎秒のコマ数を出す
+static volatile uint64_t g_frames_total;
+uint64_t vkr_frames_total(void) { return g_frames_total; }
+// アプリから受け手の記録に 1 行書く（熱・電池・低電力の移り変わり）
+void vkr_note(const char *line) { if (line) vlog("%s", line); }
 
 // command buffer ごとに、どの command pool の物か・記録した中でどの descriptor set を使うか
 typedef struct { uint64_t cb, pool; uint64_t *sets; uint32_t n, cap; idlist *mems; } cbinfo;
@@ -2897,9 +2902,10 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (!jpeg_encode((const uint8_t *) e->map + off, w, h, stride, (int) bgra, (int) (q ? q : 80), &g_out)) return reply(s, VK_ERROR_UNKNOWN);
         jt_enc += t_ms() - jt1;
         jbytes += g_out.n - before;
+        g_frames_total++;
         if (++jn % 100 == 0)
-            vlog("JPEG：%llu コマ・GPU を待つ %.1f ms・縮める %.1f ms・平均 %.1f KB（1 コマあたり）", (unsigned long long) jn,
-                 jt_wait / 100, jt_enc / 100, jbytes / 1024.0 / 100), jt_wait = jt_enc = 0, jbytes = 0;
+            vlog("JPEG：%llu コマ・GPU を待つ %.1f ms・縮める %.1f ms・平均 %.1f KB（1 コマあたり）・熱 %d", (unsigned long long) jn,
+                 jt_wait / 100, jt_enc / 100, jbytes / 1024.0 / 100, g_thermal), jt_wait = jt_enc = 0, jbytes = 0;
         return reply(s, 0);
 #else
         (void) bgra; (void) q;
@@ -2932,9 +2938,10 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         // 今のコマを写して、後ろで縮め始める
         g_jp.w = w, g_jp.h = h, g_jp.stride = stride, g_jp.bgra = (int) bgra, g_jp.q = (int) (q ? q : 80);
         if (!jp_start((const uint8_t *) e->map + off)) return reply(s, VK_ERROR_OUT_OF_HOST_MEMORY);
+        g_frames_total++;
         if (++jpn % 100 == 0)
-            vlog("JPEG（先送り）：%llu コマ・GPU を待つ %.1f ms・前のコマを待つ %.1f ms・縮める %.1f ms（後ろで）・平均 %.1f KB（1 コマあたり）",
-                 (unsigned long long) jpn, jp_wait / 100, jp_join_ms / 100, jp_enc / 100, jpbytes / 1024.0 / 100),
+            vlog("JPEG（先送り）：%llu コマ・GPU を待つ %.1f ms・前のコマを待つ %.1f ms・縮める %.1f ms（後ろで）・平均 %.1f KB（1 コマあたり）・熱 %d",
+                 (unsigned long long) jpn, jp_wait / 100, jp_join_ms / 100, jp_enc / 100, jpbytes / 1024.0 / 100, g_thermal),
                 jp_wait = jp_join_ms = jp_enc = 0, jpbytes = 0;
         return reply(s, 0);
 #else
@@ -2994,6 +3001,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             memcpy(&f, g_out.p + before + 24, 4);
             vbytes += g_out.n - before - VR_H264_HEAD;
             vkeys += f & 1;
+            g_frames_total++;
             if (++vn % 100 == 0)
                 vlog("H.264：%llu コマ・GPU を待つ %.1f ms・前のコマを待つ %.1f ms・縮める %.1f ms・平均 %.1f KB・キーフレーム %llu 枚（100 コマあたり）",
                      (unsigned long long) vn, vt_wait / 100, vt_join_ms / 100, vt_enc / 100, vbytes / 1024.0 / 100, (unsigned long long) vkeys),

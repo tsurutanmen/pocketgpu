@@ -130,6 +130,9 @@ struct ContentView: View {
     @State private var vkFailed = false
     @State private var mcRunning = false
     @State private var linkHost = "" // インターネット共有の口で待っている住所（空なら待っていない）
+    @StateObject private var status = DeviceStatus()
+    // 画面の言葉（自動・日本語・English）。ここで読むと、変えたときに画面が描き直される
+    @AppStorage("lang") private var lang = AppLang.auto.rawValue
     @Environment(\.scenePhase) private var scenePhase
     private let usbHost = "127.0.0.1"
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -140,43 +143,63 @@ struct ContentView: View {
             Form {
                 // GPU のカード：ファンの数は機種で、回る速さは PC から来る仕事の量で変わる
                 Section { GPUCardView() }
-                Section("この iPhone") {
-                    Text(devices.isEmpty ? "読み込み中" : devices).font(.footnote.monospaced())
-                    Text("アプリが使えるメモリの残り：\(availMB) MB").font(.footnote)
-                    Text(onCPU ? "いまの計算：CPU" : "いまの計算：GPU").font(.footnote)
-                }
-                Section {
-                    Picker("待ち受ける住所", selection: $host) {
-                        ForEach(addrs, id: \.ip) { a in
-                            Text("\(a.ip)（\(a.name.hasPrefix("utun") ? "Tailscale" : a.name == "en0" ? "Wi-Fi" : a.name)）").tag(a.ip)
+                Section(L("状態", "Status")) {
+                    LabeledContent(L("PC", "PC"), value: status.connected ? L("つながっている", "Connected") : L("待っている", "Waiting"))
+                    LabeledContent(L("毎秒のコマ数", "Frames per second"), value: String(format: "%.1f", status.fps))
+                    LabeledContent(L("熱", "Temperature")) {
+                        HStack(spacing: 6) {
+                            Circle().fill(status.thermalColor).frame(width: 8, height: 8)
+                            Text(status.thermalText)
                         }
                     }
-                    TextField("番号", text: $port).keyboardType(.numberPad)
-                    Toggle("GPU（Metal）で計算する", isOn: $useGPU)
-                    Toggle("USB でも待ち受ける", isOn: $usb)
-                    Toggle("後ろに回っても続ける", isOn: $keepAlive)
-                        .onChange(of: keepAlive) { _, on in if running { on ? Keeper.shared.start() : Keeper.shared.stop() } }
-                    Toggle("開いたら自動で始める", isOn: $autoStart)
-                    Toggle("Metal 4 の tensor を使う・開き直すと効く", isOn: $metalTensor)
-                } header: { Text("待ち受け") }
+                    LabeledContent(L("電池", "Battery"), value: status.batteryText)
+                    if status.lowPower {
+                        Text(L("低電力モードがオン。遅くなることがある", "Low Power Mode is on. It may run slower.")).font(.footnote)
+                    }
+                    ShareLink(item: diagnosticsText(status: status, log: log)) {
+                        Label(L("記録を送る", "Send diagnostics"), systemImage: "square.and.arrow.up")
+                    }
+                }
+                Section(L("この iPhone", "This iPhone")) {
+                    Text(devices.isEmpty ? L("読み込み中", "Loading") : devices).font(.footnote.monospaced())
+                    Text(L("アプリが使えるメモリの残り：\(availMB) MB", "Memory available to the app: \(availMB) MB")).font(.footnote)
+                    Text(onCPU ? L("いまの計算：CPU", "Computing on: CPU") : L("いまの計算：GPU", "Computing on: GPU")).font(.footnote)
+                }
                 Section {
-                    Button(running ? "動いている（止めるときはアプリを閉じる）" : "受け手を始める") {
+                    Picker(L("待ち受ける住所", "Listen address"), selection: $host) {
+                        ForEach(addrs, id: \.ip) { a in
+                            Text("\(a.ip) (\(a.name.hasPrefix("utun") ? "Tailscale" : a.name == "en0" ? "Wi-Fi" : a.name))").tag(a.ip)
+                        }
+                    }
+                    TextField(L("番号", "Port"), text: $port).keyboardType(.numberPad)
+                    Toggle(L("GPU（Metal）で計算する", "Compute on the GPU (Metal)"), isOn: $useGPU)
+                    Toggle(L("USB でも待ち受ける", "Also listen over USB"), isOn: $usb)
+                    Toggle(L("後ろに回っても続ける", "Keep running in the background"), isOn: $keepAlive)
+                        .onChange(of: keepAlive) { _, on in if running { on ? Keeper.shared.start() : Keeper.shared.stop() } }
+                    Toggle(L("開いたら自動で始める", "Start automatically on launch"), isOn: $autoStart)
+                    Toggle(L("Metal 4 の tensor を使う・開き直すと効く", "Use Metal 4 tensors (applies after relaunch)"), isOn: $metalTensor)
+                    Picker(L("言語", "Language"), selection: $lang) {
+                        ForEach(AppLang.allCases) { l in Text(l.label).tag(l.rawValue) }
+                    }
+                } header: { Text(L("待ち受け", "Listening")) }
+                Section {
+                    Button(running ? L("動いている（止めるときはアプリを閉じる）", "Running (close the app to stop)") : L("受け手を始める", "Start receiver")) {
                         if !host.isEmpty { start(host) }
                         if usb { start(usbHost) }
                     }
                     .disabled(running || (host.isEmpty && !usb))
                     if started.contains(host) {
-                        Text("PC で：llama-cli … --rpc \(host):\(port)").font(.footnote.monospaced()).textSelection(.enabled)
+                        Text(L("PC で：", "On the PC: ") + "llama-cli … --rpc \(host):\(port)").font(.footnote.monospaced()).textSelection(.enabled)
                     }
                     if started.contains(usbHost) {
-                        Text("USB：usb_forward.py のあと --rpc 127.0.0.1:50053").font(.footnote.monospaced()).textSelection(.enabled)
+                        Text(L("USB：usb_forward.py のあと", "USB: after usb_forward.py,") + " --rpc 127.0.0.1:50053").font(.footnote.monospaced()).textSelection(.enabled)
                     }
                     if vkFailed {
-                        Text("Vulkan：起動に失敗（下の記録の vk: を見る）").font(.footnote)
+                        Text(L("Vulkan：起動に失敗（下の記録の vk: を見る）", "Vulkan: failed to start (see the vk: lines in the log below)")).font(.footnote)
                     } else if vkStarted {
-                        Text("Vulkan：USB の 50060 番で待ち受け中").font(.footnote.monospaced()).textSelection(.enabled)
+                        Text(L("Vulkan：USB の 50060 番で待ち受け中", "Vulkan: listening on USB port 50060")).font(.footnote.monospaced()).textSelection(.enabled)
                         if !linkHost.isEmpty {
-                            Text("Vulkan：インターネット共有の口 \(linkHost):50060 でも待ち受け中").font(.footnote.monospaced()).textSelection(.enabled)
+                            Text(L("Vulkan：インターネット共有の口 \(linkHost):50060 でも待ち受け中", "Vulkan: also listening on the tethering link \(linkHost):50060")).font(.footnote.monospaced()).textSelection(.enabled)
                         }
                     }
                 }
@@ -193,11 +216,11 @@ struct ContentView: View {
                     Text("中身は Pumpkin（GPL-3.0）。世界は書類の minecraft/ に置く").font(.footnote)
                 } header: { Text("マイクラのサーバー") }
                 #endif
-                Section("記録") {
+                Section(L("記録", "Log")) {
                     Text(log).font(.caption2.monospaced()).textSelection(.enabled)
                 }
             }
-            .navigationTitle("計算の受け手")
+            .navigationTitle(L("計算の受け手", "GPU Receiver"))
         }
         .onAppear {
             devices = readBridge { rpc_bridge_devices($0, $1) }
@@ -211,6 +234,7 @@ struct ContentView: View {
         }
         .onReceive(tick) { _ in
             vkr_set_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
+            status.tick()
             // インターネット共有の口が出たら、そこでも待つ（消えたら閉じる）
             if vkStarted {
                 let h = hotspotAddress() ?? ""
