@@ -706,6 +706,13 @@ static int dxvk3(void) {
     return v;
 }
 static int vkd3d(void) { return g_engine_vkd3d && dxvk3(); }
+// transform feedback を名乗る相手。vkd3d-proton は持たないと装置を作らない。zink は持たないと OpenGL を 2.1 で止める
+// （stream output の数を 0 にするため）。IPHONE_VK_ZINK_XFB=0 で zink には名乗らない
+static int xfb_named(void) {
+    static int z = -1;
+    if (z < 0) { const char *e = getenv("IPHONE_VK_ZINK_XFB"); z = !(e && *e == '0'); }
+    return vkd3d() || (g_engine_zink && z);
+}
 
 // 中継するだけで済む（新しい入口が要らない）拡張だけを見せる
 static const char *const ALLOWED_EXT[] = {
@@ -934,7 +941,8 @@ static int hello(void) {
                 g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_vertex_attribute_divisor", 1 };
             // vkd3d-proton が必須にする物で、ドライバの中で済ませる物（受け手には送らない）。
             // transform feedback は名乗りだけ（記録の命令は飛ばす。stream output を使う pipeline が作れるかは受け手の GPU しだい）
-            if (vkd3d() && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_transform_feedback", 1 };
+            if (xfb_named() && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_transform_feedback", 1 };
+            if (xfb_named() && !has_ext("VK_EXT_transform_feedback")) say("拡張の一覧がいっぱい（%u 個）で、transform feedback を名乗れない", g_hw.ne);
             if (!rd.bad) {
                 char real[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
                 memcpy(real, g_hw.props.deviceName, sizeof real);
@@ -2449,6 +2457,8 @@ static void vkd3d_props(VkBaseOutStructure *x) {
         p->maxTransformFeedbackBufferDataStride = 2048;
         p->transformFeedbackQueries = VK_TRUE;
         p->transformFeedbackStreamsLinesTriangles = VK_TRUE;
+        // zink には GS の stream を名乗らない（geometryStreams が無い）ので、決まりどおり stream は 1 本
+        if (!vkd3d()) { p->maxTransformFeedbackStreams = 1; p->transformFeedbackStreamsLinesTriangles = VK_FALSE; }
         p->transformFeedbackRasterizationStreamSelect = VK_FALSE;
         p->transformFeedbackDraw = VK_TRUE;
     }
@@ -2469,7 +2479,7 @@ static void VKAPI_CALL get_props2(VkPhysicalDevice pd, VkPhysicalDevicePropertie
             k->maxVertexAttribDivisor = e.maxVertexAttribDivisor;
             k->supportsNonZeroFirstInstance = VK_FALSE;
         }
-        else if (vkd3d()) vkd3d_props(x);
+        else if (vkd3d() || (xfb_named() && x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT)) vkd3d_props(x);
 }
 
 static void VKAPI_CALL get_features2(VkPhysicalDevice pd, VkPhysicalDeviceFeatures2 *f) {
@@ -2489,7 +2499,9 @@ static void VKAPI_CALL get_features2(VkPhysicalDevice pd, VkPhysicalDeviceFeatur
         } else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT) {
             // 名乗りだけ（vkd3d-proton は持たないと装置を作らない）。stream output の命令は飛ばす
             VkPhysicalDeviceTransformFeedbackFeaturesEXT *t = (void *) x;
-            t->transformFeedback = t->geometryStreams = vkd3d() ? VK_TRUE : VK_FALSE;
+            t->transformFeedback = xfb_named() ? VK_TRUE : VK_FALSE;
+            // zink は geometryStreams があると GS の stream を使う道を開けるが、GS は zink に名乗っていないので要らない
+            t->geometryStreams = vkd3d() ? VK_TRUE : VK_FALSE;
         } else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT && !(vkd3d() && g_srv_unused_att)) {
             // 受け手の答えのまま。vkd3d-proton のとき以外と、受け手の GPU が持たないときは「無い」
             ((VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT *) x)->dynamicRenderingUnusedAttachments = VK_FALSE;
