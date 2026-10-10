@@ -160,6 +160,8 @@ static struct {
     int heat_max;                  // いちばん熱かったときの iPhone の熱の状態
     uint64_t wr_bytes[6], wr_n[6]; // GPU が書くかもしれない CPU から見える範囲（読み戻す元）を理由別に
     double cpu0;                   // 最初の present のときのプロセスの CPU 時間（ms）
+    uint64_t rp_begin, rp_load, rp_store, rp_clear; // render pass を始めた回数と、画面を読み込む・書き戻す・消す attachment の数
+    double rp_px;                  // 読み込みと書き戻しの画素の合計（タイルで描く GPU ではここが重い）
 } g_stat;
 // u1（アドレスで読み書きする buffer・結んだあとに書いた descriptor）の数。数えるだけ
 static struct { volatile LONG64 pv, rd_n, wr_n, whole, ub_sets, ub_ents; } g_u1;
@@ -212,6 +214,12 @@ static void print_stats(void) {
                         "結んだあとに書かれた set %lld 回（descriptor %lld 個）\n",
                 (long long) g_u1.pv, (long long) g_u1.rd_n, (long long) g_u1.wr_n, (long long) g_u1.whole, (long long) g_u1.ub_sets, (long long) g_u1.ub_ents);
     lz_print();
+    if (g_stat.rp_begin) {
+        double per = g_stat.presents ? (double) g_stat.presents : 1;
+        fprintf(stderr, "  描く区切り（render pass）%llu 回（1 コマ %.1f 回）・読み込む attachment %llu・書き戻す %llu・消して始める %llu・"
+                        "読み書きした画素 1 コマ %.1f M\n", (unsigned long long) g_stat.rp_begin, g_stat.rp_begin / per,
+                (unsigned long long) g_stat.rp_load, (unsigned long long) g_stat.rp_store, (unsigned long long) g_stat.rp_clear, g_stat.rp_px / per / 1e6);
+    }
     fprintf(stderr, "  往復せずに済ませた待ち %llu\n", (unsigned long long) g_stat.skipped);
     if (g_stat.presents)
         fprintf(stderr, "  present %llu 回 %.1f ms（うち窓に描く %llu 回 %.1f ms）\n", (unsigned long long) g_stat.presents, g_stat.present_ms,
@@ -3648,6 +3656,22 @@ static void put_refs(vr_buf *b, const VkAttachmentReference *r, uint32_t n) {
         vr_put(b, &x, sizeof x);
     }
 }
+// render pass ごとの、読み込む（LOAD）・書き戻す（STORE）・消す（CLEAR）attachment の数。数えるだけ（IPHONE_VK_STATS で出す）
+static struct { uint64_t id; uint8_t nload, nstore, nclear; } g_rpl[2048];
+static void rpl_put(uint64_t id, int nload, int nstore, int nclear) {
+    unsigned k = (unsigned) (id * 0x9E3779B97F4A7C15ull >> 40) % 2048;
+    g_rpl[k].id = id; g_rpl[k].nload = (uint8_t) nload; g_rpl[k].nstore = (uint8_t) nstore; g_rpl[k].nclear = (uint8_t) nclear;
+}
+static void rpl_count(uint64_t id, const VkRect2D *area) {
+    unsigned k = (unsigned) (id * 0x9E3779B97F4A7C15ull >> 40) % 2048;
+    g_stat.rp_begin++;
+    if (g_rpl[k].id != id) return;
+    g_stat.rp_load += g_rpl[k].nload;
+    g_stat.rp_store += g_rpl[k].nstore;
+    g_stat.rp_clear += g_rpl[k].nclear;
+    g_stat.rp_px += (double) area->extent.width * area->extent.height * (g_rpl[k].nload + g_rpl[k].nstore);
+}
+
 static VkResult VKAPI_CALL create_rpass(VkDevice dv, const VkRenderPassCreateInfo *ci, const VkAllocationCallbacks *a, VkRenderPass *out) {
     (void) a;
     uint64_t id = new_id();
@@ -3661,6 +3685,15 @@ static VkResult VKAPI_CALL create_rpass(VkDevice dv, const VkRenderPassCreateInf
         ad.initialLayout = fix_layout(ad.initialLayout);
         ad.finalLayout = fix_layout(ad.finalLayout);
         vr_put(&b, &ad, sizeof ad);
+    }
+    {
+        int nl = 0, ns = 0, nc = 0;
+        for (uint32_t i = 0; i < ci->attachmentCount; i++) {
+            nl += ci->pAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
+            nc += ci->pAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+            ns += ci->pAttachments[i].storeOp == VK_ATTACHMENT_STORE_OP_STORE;
+        }
+        rpl_put(id, nl, ns, nc);
     }
     vr_u32(&b, ci->subpassCount);
     for (uint32_t i = 0; i < ci->subpassCount; i++) {
@@ -3716,6 +3749,15 @@ static VkResult VKAPI_CALL create_rpass2(VkDevice dv, const VkRenderPassCreateIn
         vr_u32(&b, ad->stencilStoreOp);
         vr_u32(&b, fix_layout(ad->initialLayout));
         vr_u32(&b, fix_layout(ad->finalLayout));
+    }
+    {
+        int nl = 0, ns = 0, nc = 0;
+        for (uint32_t i = 0; i < ci->attachmentCount; i++) {
+            nl += ci->pAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
+            nc += ci->pAttachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+            ns += ci->pAttachments[i].storeOp == VK_ATTACHMENT_STORE_OP_STORE;
+        }
+        rpl_put(id, nl, ns, nc);
     }
     vr_u32(&b, ci->subpassCount);
     for (uint32_t i = 0; i < ci->subpassCount; i++) {
@@ -7684,6 +7726,7 @@ static void VKAPI_CALL cmd_barrier(VkCommandBuffer cbh, VkPipelineStageFlags src
 static void VKAPI_CALL cmd_begin_rp(VkCommandBuffer cbh, const VkRenderPassBeginInfo *bi, VkSubpassContents contents) {
     struct cb *c = (struct cb *) cbh;
     vr_u32(&c->s, VR_CMD_BEGIN_RENDER_PASS);
+    if (g_stats > 0) rpl_count(ID(bi->renderPass), &bi->renderArea);
     vr_u64(&c->s, ID(bi->renderPass));
     vr_u64(&c->s, ID(bi->framebuffer));
     vr_put(&c->s, &bi->renderArea, sizeof bi->renderArea);
@@ -8159,6 +8202,25 @@ static void VKAPI_CALL cmd_begin_rendering(VkCommandBuffer cbh, const VkRenderin
     if (!need_cap(VR_CAP_DYNAMIC_RENDERING, "dynamic rendering")) return;
     struct cb *c = (struct cb *) cbh;
     vr_u32(&c->s, VR_CMD_BEGIN_RENDERING);
+    if (g_stats > 0) {
+        int nl = 0, ns = 0, nc = 0;
+        const VkRenderingAttachmentInfo *at[10];
+        uint32_t na = 0;
+        for (uint32_t i = 0; i < ri->colorAttachmentCount && na < 8; i++) at[na++] = &ri->pColorAttachments[i];
+        if (ri->pDepthAttachment) at[na++] = ri->pDepthAttachment;
+        if (ri->pStencilAttachment) at[na++] = ri->pStencilAttachment;
+        for (uint32_t i = 0; i < na; i++) {
+            if (!at[i]->imageView) continue;
+            nl += at[i]->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD;
+            nc += at[i]->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+            ns += at[i]->storeOp == VK_ATTACHMENT_STORE_OP_STORE;
+        }
+        g_stat.rp_begin++;
+        g_stat.rp_load += nl;
+        g_stat.rp_store += ns;
+        g_stat.rp_clear += nc;
+        g_stat.rp_px += (double) ri->renderArea.extent.width * ri->renderArea.extent.height * (nl + ns);
+    }
     // 2 次の command buffer の中身はここに写して送るので、受け手では「2 次から描く」の印を外す
     vr_u32(&c->s, ri->flags & ~(uint32_t) VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT);
     vr_put(&c->s, &ri->renderArea, sizeof ri->renderArea);
