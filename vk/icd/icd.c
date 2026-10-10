@@ -162,6 +162,12 @@ static struct {
     double cpu0;                   // 最初の present のときのプロセスの CPU 時間（ms）
 } g_stat;
 static int g_stats = -1;
+// 試す人に配るまとめの印。pc/make_kit.py が「#」の 32 文字を人ごとの番号に書き換える（長さは変えない）。
+// 配った物が外に出たとき、誰に渡した分かを見分ける。ふだん組んだ物は「#」のまま
+#ifdef __GNUC__
+__attribute__((used))
+#endif
+static const volatile char g_kit_mark[] = "PGKIT-MARK:################################";
 
 static double now_ms(void) {
     LARGE_INTEGER f, c;
@@ -205,6 +211,7 @@ static void print_stats(void) {
         fprintf(stderr, "  present %llu 回 %.1f ms（うち窓に描く %llu 回 %.1f ms）\n", (unsigned long long) g_stat.presents, g_stat.present_ms,
                 (unsigned long long) g_stat.blits, g_stat.blit_ms);
     if (g_stat.heat_max) fprintf(stderr, "  iPhone の熱：いちばん熱かったのは %d（0 ふつう〜3 とても熱い）\n", g_stat.heat_max);
+    if (g_kit_mark[11] != '#') fprintf(stderr, "  配った印：%.32s\n", (const char *) g_kit_mark + 11);
     if (g_stat.presents > 1)
         fprintf(stderr, "  最初の present からのプロセスの CPU %.0f ms（present 1 回 %.2f ms）\n", proc_cpu_ms() - g_stat.cpu0,
                 (proc_cpu_ms() - g_stat.cpu0) / (double) (g_stat.presents - 1));
