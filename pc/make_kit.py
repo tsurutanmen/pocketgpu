@@ -38,6 +38,15 @@ echo If you see "Apple ... GPU (... USB)" above, it works.
 pause
 '''
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# PC の様子を 1 つのテキストにまとめる（kit/report.ps1・ユーザー名・PC 名・IP は入れない）
+REPORT = r'''@echo off
+rem PocketGPU: write pocketgpu-report.txt about this PC (no user name, PC name or IP).
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0report.ps1"
+pause
+'''
+
 # 手順だけの下書き。言い回しは鶴田さんが直す
 README = '''PocketGPU tester kit (draft)
 ============================
@@ -62,6 +71,7 @@ Steps
 
 Reporting
 - In the iPhone app, tap "Send diagnostics" and send the text to us on Discord or by email.
+- On the PC, double-click report.cmd. It writes pocketgpu-report.txt (no user name, PC name or IP). Send that too.
 - Please also tell us the PC, the app or game, the resolution, and what happened.
 
 If the connection keeps dropping
@@ -92,6 +102,7 @@ PocketGPU 試験用のまとめ（下書き）
 
 報告
 - iPhone のアプリの「記録を送る」を押して、その文を Discord かメールで送ってください
+- PC で report.cmd をダブルクリックすると pocketgpu-report.txt ができます。ユーザー名・PC 名・IP は入りません。これも送ってください
 - PC、アプリやゲームの名前、画面の大きさ、何が起きたかも書いてください
 
 つながりが何度も切れるとき
@@ -125,11 +136,18 @@ def newest_ipa():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('who', help='渡す人の名前（Reddit の名前など・英数字）')
+    ap.add_argument('--discord-id', default='', help='Discord の bot から作るときの、その人の番号。同じ番号には 2 つめを作らない')
     a = ap.parse_args()
+    ledger = os.path.join(OUT, 'ledger.csv')
+    if a.discord_id and os.path.exists(ledger):
+        with open(ledger, encoding='utf-8') as f:
+            if any(row and row[-1] == a.discord_id for row in csv.reader(f)):
+                print('ALREADY')
+                raise SystemExit(3)
     who = re.sub(r'[^A-Za-z0-9_-]', '_', a.who)[:15]
     mark = (who.ljust(15, '_') + '-' + secrets.token_hex(8)).encode()
     assert len(mark) == 32
-    kit = os.path.join(OUT, f'PocketGPU-{who}')
+    kit = os.path.join(OUT, f'PocketGPU-{who}' + (f'-{a.discord_id[-6:]}' if a.discord_id else ''))
     if os.path.exists(kit):
         raise SystemExit(f'{kit} はもうある。同じ人に作り直すなら、先にそのフォルダと zip を片づける')
 
@@ -143,8 +161,9 @@ def main():
         for n in ('d3d11.dll', 'dxgi.dll', 'd3d10core.dll'):
             shutil.copy2(os.path.join(DXVK, arch, n), os.path.join(kit, 'dxvk', arch, n))
     shutil.copy2(DXVK_LICENSE, os.path.join(kit, 'dxvk', 'LICENSE'))
-    for name, text in (('pocketgpu.cmd', LAUNCH), ('check.cmd', CHECK)):
+    for name, text in (('pocketgpu.cmd', LAUNCH), ('check.cmd', CHECK), ('report.cmd', REPORT)):
         open(os.path.join(kit, name), 'w', encoding='ascii', newline='\r\n').write(text)
+    shutil.copy2(os.path.join(HERE, 'kit', 'report.ps1'), os.path.join(kit, 'report.ps1'))
     open(os.path.join(kit, 'README.txt'), 'w', encoding='utf-8-sig', newline='\r\n').write(README)
 
     # iPhone のアプリ：Payload/RpcServer.app/ に印のファイルを足した IPA
@@ -167,16 +186,17 @@ def main():
                 p = os.path.join(root, n)
                 z.write(p, os.path.join(os.path.basename(kit), os.path.relpath(p, kit)))
 
-    ledger = os.path.join(OUT, 'ledger.csv')
     new = not os.path.exists(ledger)
     with open(ledger, 'a', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         if new:
-            w.writerow(['日時', '渡す人', '印', 'iphone_icd.dll（64）', 'iphone_icd.dll（32）', 'IPA', 'IPA の元', 'zip'])
+            w.writerow(['日時', '渡す人', '印', 'iphone_icd.dll（64）', 'iphone_icd.dll（32）', 'IPA', 'IPA の元', 'zip', 'Discord の番号'])
         w.writerow([datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), a.who, mark.decode(),
                     sha256(os.path.join(kit, 'iphone_icd.dll')), sha256(os.path.join(kit, 'x86', 'iphone_icd.dll')),
-                    sha256(dst_ipa), os.path.basename(src_ipa), sha256(zpath)])
-    print(f'{zpath}\n印：{mark.decode()}')
+                    sha256(dst_ipa), os.path.basename(src_ipa), sha256(zpath), a.discord_id])
+    shutil.rmtree(kit)  # 配るのは zip。中身のフォルダは残さない
+    print(f'ZIP={zpath}')
+    print(f'MARK={mark.decode()}')
 
 
 if __name__ == '__main__':
