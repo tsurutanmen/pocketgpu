@@ -863,6 +863,15 @@ static int allowed_ext(const char *name) {
     return 0;
 }
 
+// VK_EXT_provoking_vertex を名乗るか（IPHONE_VK_PROVOKING=0 で名乗らない・1 で zink にも名乗る）。
+// 拡張の一覧はあいさつのときに一度だけ作る。Chrome は ANGLE より前に自分の Vulkan と Dawn の instance を作るので、エンジンの名前では分けず、
+// zink（名乗ると GS の真似を使わない道に変わる）のほかは名乗る
+static int provoking_named(void) {
+    const char *e = getenv("IPHONE_VK_PROVOKING");
+    if (e && *e) return *e == '1';
+    return !g_engine_zink;
+}
+
 static int has_ext(const char *name) {
     for (uint32_t i = 0; i < g_hw.ne; i++)
         if (!strcmp(g_hw.ext[i].extensionName, name)) return 1;
@@ -1047,6 +1056,10 @@ static int hello(void) {
             // transform feedback は名乗りだけ（記録の命令は飛ばす。stream output を使う pipeline が作れるかは受け手の GPU しだい）
             if (xfb_named() && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_transform_feedback", 1 };
             if (xfb_named() && !has_ext("VK_EXT_transform_feedback")) say("拡張の一覧がいっぱい（%u 個）で、transform feedback を名乗れない", g_hw.ne);
+            // GL の頂点の順（flat の値を最後の頂点から取る）は名乗りだけ。ANGLE は無いと OpenGL ES 2.0 までしか作らず、Chrome の WebGL 2 が作れない。
+            // pipeline の鎖の VkPipelineRasterizationProvokingVertexStateCreateInfoEXT は受け手に送らない（flat の値は最初の頂点の物になる）
+            if (provoking_named() && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_provoking_vertex", 1 };
+            if (provoking_named() && !has_ext("VK_EXT_provoking_vertex")) say("拡張の一覧がいっぱい（%u 個）で、provoking vertex を名乗れない（ANGLE の WebGL 2 が作れない）", g_hw.ne);
             if (!rd.bad) {
                 char real[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
                 memcpy(real, g_hw.props.deviceName, sizeof real);
@@ -1082,6 +1095,17 @@ static int hello(void) {
                 // 共有メモリの GPU（integrated）と名乗ると、llama.cpp などはデータを CPU から直接書ける所に置こうとして、
                 // 写しの送り返しが毎回モデル全部になってしまう
                 g_hw.props.deviceType = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+                // 調べ用：IPHONE_VK_AS_SWIFTSHADER=1 で、Google の SwiftShader（会社 0x1AE0・型 0xC0DE・CPU）と名乗る。
+                // Windows の Chrome は WebGPU に D3D12 しか使わず、Vulkan のアダプタは SwiftShader のときだけ受ける
+                // （Dawn の Vulkan は Windows で外部メモリを持たないので、SwiftShader 以外は CanUseAdapter で落ちる）。
+                // --use-webgpu-adapter=swiftshader と ANGLE の D3D11 で、WebGPU だけをこのドライバに通すための物
+                const char *sws = getenv("IPHONE_VK_AS_SWIFTSHADER");
+                if (sws && *sws == '1') {
+                    g_hw.props.vendorID = 0x1AE0;
+                    g_hw.props.deviceID = 0xC0DE;
+                    g_hw.props.deviceType = VK_PHYSICAL_DEVICE_TYPE_CPU;
+                    say("SwiftShader と名乗る（IPHONE_VK_AS_SWIFTSHADER）");
+                }
                 for (uint32_t i = 0; i < g_hw.mem.memoryTypeCount; i++)
                     if (g_hw.mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
                         g_hw.mem.memoryTypes[i].propertyFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -2757,6 +2781,11 @@ static void VKAPI_CALL get_props2(VkPhysicalDevice pd, VkPhysicalDevicePropertie
             k->maxVertexAttribDivisor = e.maxVertexAttribDivisor;
             k->supportsNonZeroFirstInstance = VK_FALSE;
         }
+        else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_PROPERTIES_EXT) {
+            VkPhysicalDeviceProvokingVertexPropertiesEXT *pv = (void *) x;
+            pv->provokingVertexModePerPipeline = provoking_named() ? VK_TRUE : VK_FALSE;
+            pv->transformFeedbackPreservesTriangleFanProvokingVertex = VK_FALSE;
+        }
         else if (vkd3d() || (xfb_named() && x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT)) vkd3d_props(x);
 }
 
@@ -2780,6 +2809,10 @@ static void VKAPI_CALL get_features2(VkPhysicalDevice pd, VkPhysicalDeviceFeatur
             t->transformFeedback = xfb_named() ? VK_TRUE : VK_FALSE;
             // zink は geometryStreams があると GS の stream を使う道を開けるが、GS は zink に名乗っていないので要らない
             t->geometryStreams = vkd3d() ? VK_TRUE : VK_FALSE;
+        } else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT) {
+            VkPhysicalDeviceProvokingVertexFeaturesEXT *pv = (void *) x;
+            pv->provokingVertexLast = provoking_named() ? VK_TRUE : VK_FALSE;
+            pv->transformFeedbackPreservesProvokingVertex = VK_FALSE;
         } else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT && !(vkd3d() && g_srv_unused_att)) {
             // 受け手の答えのまま。vkd3d-proton のとき以外と、受け手の GPU が持たないときは「無い」
             ((VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT *) x)->dynamicRenderingUnusedAttachments = VK_FALSE;
