@@ -1114,7 +1114,8 @@ static int hello(void) {
                 else if (model) snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "%s", model);
                 else if (!strncmp(real, "Apple ", 6)) snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "iPhone (%.200s)", real);
                 // PC の GPU（NVIDIA・AMD・Intel）は 3060 などの代役。それ以外（Qualcomm の Adreno・ARM の Mali など）は Android の機種
-                else if (g_hw.props.vendorID == 0x10DE || g_hw.props.vendorID == 0x1002 || g_hw.props.vendorID == 0x8086)
+                // 会社を Apple と名乗らせた代役（VKR_LIKE_IOS_VENDOR）は、名前が Apple で始まらないので代役と分かる
+                else if (g_hw.props.vendorID == 0x10DE || g_hw.props.vendorID == 0x1002 || g_hw.props.vendorID == 0x8086 || g_hw.props.vendorID == 0x106b)
                     snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "iPhone stand-in (%.200s)", real);
                 else snprintf(g_hw.props.deviceName, sizeof g_hw.props.deviceName, "PocketGPU phone (%.200s)", real);
                 // 受け手が 1.3 の入口をそろえて名乗ったときだけ 1.3。古い受け手には今まで通り 1.2
