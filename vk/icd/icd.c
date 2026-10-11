@@ -6352,7 +6352,8 @@ static LRESULT CALLBACK up_wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
     }
     return DefWindowProcW(w, m, wp, lp);
 }
-static HWND up_window(uint32_t w, uint32_t h) {
+// 窓はゲームの窓と同じモニターに、見せる前に置く（主のモニターに一瞬も出さない）。IPHONE_VK_MONITOR があればそのモニターへ
+static HWND up_window(uint32_t w, uint32_t h, HWND game) {
     static ATOM cls;
     if (!cls) {
         WNDCLASSW wc = { 0 };
@@ -6364,8 +6365,17 @@ static HWND up_window(uint32_t w, uint32_t h) {
     }
     RECT rc = { 0, 0, (LONG) w, (LONG) h };
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    return CreateWindowExW(0, L"PocketGPUUpscale", L"PocketGPU MetalFX", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
-                           rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    int x = CW_USEDEFAULT, y = CW_USEDEFAULT;
+    HMONITOR mon = game ? MonitorFromWindow(game, MONITOR_DEFAULTTONULL) : NULL;
+    MONITORINFO mi = { .cbSize = sizeof mi };
+    if (mon && GetMonitorInfoA(mon, &mi)) { x = mi.rcWork.left + 40; y = mi.rcWork.top + 40; }
+    HWND wnd = CreateWindowExW(0, L"PocketGPUUpscale", L"PocketGPU MetalFX", WS_OVERLAPPEDWINDOW, x, y,
+                               rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    if (wnd) {
+        move_to_monitor(wnd);
+        ShowWindow(wnd, SW_SHOWNOACTIVATE);
+    }
+    return wnd;
 }
 
 static void draw_bgra_to(HWND hw, const uint8_t *px, uint32_t w, uint32_t h) {
@@ -6480,7 +6490,7 @@ static DWORD WINAPI vdisp_thread(LPVOID arg) {
         if (!got) continue;
         double t2 = now_ms();
         if (sc->upscale) {
-            if (!sc->vwin && (sc->vwin = up_window(sc->vw, sc->vh))) SetWindowLongPtrW(sc->vwin, GWLP_USERDATA, (LONG_PTR) sc->hwnd);
+            if (!sc->vwin && (sc->vwin = up_window(sc->vw, sc->vh, sc->hwnd))) SetWindowLongPtrW(sc->vwin, GWLP_USERDATA, (LONG_PTR) sc->hwnd);
             if (sc->vwin) draw_bgra_to(sc->vwin, px, sc->vw, sc->vh);
             MSG m;
             while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
