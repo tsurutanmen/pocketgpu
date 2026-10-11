@@ -363,6 +363,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_READ_H264] = "READ_H264", [VR_GET_PROGRESS] = "GET_PROGRESS",
     [VR_RECORD_CTL] = "RECORD_CTL", [VR_RECORD_FRAME] = "RECORD_FRAME", [VR_RECORD_FETCH] = "RECORD_FETCH",
     [VR_MEM_WRITE_CODED] = "MEM_WRITE_CODED",
+    [VR_CREATE_ACCEL] = "CREATE_ACCEL", [VR_DESTROY_ACCEL] = "DESTROY_ACCEL", [VR_GET_ACCEL_SIZES] = "GET_ACCEL_SIZES",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -1286,10 +1287,18 @@ static struct {
     uint32_t nq;
     VkQueueFamilyProperties q[16];
     uint32_t ne;
-    VkExtensionProperties ext[64];
+    VkExtensionProperties ext[80]; // レイトレーシングの名前（4 つ）を足すので 64 から広げた
     uint32_t caps; // 受け手ができること（VR_CAP_*）
 } g_hw;
 static SRWLOCK g_hw_lock = SRWLOCK_INIT;
+
+// レイトレーシングの土台（acceleration structure と ray query）を名乗るか。受け手が VR_CAP_RT と VR_CAP_BDA を名乗ったとき。
+// IPHONE_VK_RT=0 で名乗らない
+static int rt_on(void) {
+    static int off = -1;
+    if (off < 0) { const char *e = getenv("IPHONE_VK_RT"); off = e && *e == '0'; }
+    return !off && (g_hw.caps & VR_CAP_RT) && (g_hw.caps & VR_CAP_BDA);
+}
 
 // 新しい DXVK（2 以上）が必須にする物のうち、ドライバがまだ全部は運べない物も名乗る
 // （descriptor indexing の 5 つ・inline uniform block・maintenance5 と 6）。確かめ終わったら外す。
@@ -1361,6 +1370,11 @@ static int allowed_ext(const char *name) {
     if (!strcmp(name, "VK_KHR_vertex_attribute_divisor")) return (g_hw.caps & VR_CAP_DIVISOR) != 0;
     if (dxvk3() && (!strcmp(name, "VK_KHR_maintenance5") || !strcmp(name, "VK_KHR_maintenance6"))) return 1;
     if (!strcmp(name, "VK_EXT_dynamic_rendering_unused_attachments")) return g_srv_unused_att && vkd3d();
+    // レイトレーシングの土台。deferred host operations はドライバの中で済ませる（CPU で作る道は名乗らない）が、受け手の装置でも有効にする
+    // （acceleration structure の拡張がこれを前提にするため）。ray tracing pipeline はまだ運ばないので名乗らない
+    if (!strcmp(name, "VK_KHR_acceleration_structure") || !strcmp(name, "VK_KHR_ray_query") ||
+        !strcmp(name, "VK_KHR_deferred_host_operations") || !strcmp(name, "VK_KHR_buffer_device_address"))
+        return rt_on();
     for (size_t i = 0; i < sizeof ALLOWED_EXT / sizeof *ALLOWED_EXT; i++)
         if (!strcmp(name, ALLOWED_EXT[i])) return 1;
     for (size_t i = 0; i < sizeof CAP_EXT / sizeof *CAP_EXT; i++)
@@ -1700,7 +1714,7 @@ static int hello(void) {
                 vr_rcopy(&rd, &x, sizeof x);
                 if (!strcmp(x.extensionName, "VK_EXT_dynamic_rendering_unused_attachments")) g_srv_unused_att = 1;
                 if (!strcmp(x.extensionName, "VK_KHR_load_store_op_none") || !strcmp(x.extensionName, "VK_EXT_load_store_op_none")) g_srv_lso = 1;
-                if (allowed_ext(x.extensionName) && g_hw.ne < 62) g_hw.ext[g_hw.ne++] = x;
+                if (allowed_ext(x.extensionName) && g_hw.ne < 78) g_hw.ext[g_hw.ne++] = x;
                 if (!strcmp(x.extensionName, "VK_KHR_vertex_attribute_divisor")) g_khr_div_native = 1;
             }
             {   // load_store_op_none：受け手が持たない（か、IPHONE_VK_LSO=1 で試す）ときは、値を直して送る
@@ -1712,32 +1726,32 @@ static int hello(void) {
                         has_khr |= !strcmp(g_hw.ext[z].extensionName, "VK_KHR_load_store_op_none");
                         has_ext |= !strcmp(g_hw.ext[z].extensionName, "VK_EXT_load_store_op_none");
                     }
-                    if (!has_khr && g_hw.ne < 63) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_load_store_op_none", 1 };
-                    if (!has_ext && g_hw.ne < 63) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_load_store_op_none", 1 };
+                    if (!has_khr && g_hw.ne < 79) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_load_store_op_none", 1 };
+                    if (!has_ext && g_hw.ne < 79) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_load_store_op_none", 1 };
                     say("load_store_op_none：受け手%sので、NONE を LOAD・STORE に直して送る", g_srv_lso ? "は持つが試す" : "が持たない");
                 }
             }
-            if (g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_swapchain", 70 };
+            if (g_hw.ne < 80) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_swapchain", 70 };
             // ドライバの中だけで済む拡張（受け手には送らない）
-            if ((g_hw.caps & VR_CAP_NEW_MASK) && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_copy_commands2", 1 };
+            if ((g_hw.caps & VR_CAP_NEW_MASK) && g_hw.ne < 80) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_copy_commands2", 1 };
             // ひな形での descriptor の書き込みは、ドライバがふつうの書き込みに直す（zink が名前で確かめる）
-            if (g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_descriptor_update_template", 1 };
+            if (g_hw.ne < 80) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_descriptor_update_template", 1 };
             // push descriptor は、ドライバがふつうの set に直す
-            if (g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_push_descriptor", 2 };
+            if (g_hw.ne < 80) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_push_descriptor", 2 };
             // depth clip は pipeline を作るときに depth clamp に置き換える（DXVK 2 が拡張の無い GPU でしていたのと同じ）
-            if (dxvk3() && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_depth_clip_enable", 1 };
+            if (dxvk3() && g_hw.ne < 80) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_depth_clip_enable", 1 };
             // 空の descriptor は受け手が受ける（GPU が持たなければ代わりの物で）
-            if (dxvk3() && (g_hw.caps & VR_CAP_NULL_DESC) && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_robustness2", 1 };
+            if (dxvk3() && (g_hw.caps & VR_CAP_NULL_DESC) && g_hw.ne < 80) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_robustness2", 1 };
             // 頂点の step rate：DXVK 3 は KHR の名前で探す。中身は EXT と同じなので、受け手には EXT として渡す
-            if ((g_hw.caps & VR_CAP_DIVISOR) && !has_ext("VK_KHR_vertex_attribute_divisor") && has_ext("VK_EXT_vertex_attribute_divisor") && g_hw.ne < 64)
+            if ((g_hw.caps & VR_CAP_DIVISOR) && !has_ext("VK_KHR_vertex_attribute_divisor") && has_ext("VK_EXT_vertex_attribute_divisor") && g_hw.ne < 80)
                 g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_vertex_attribute_divisor", 1 };
             // vkd3d-proton が必須にする物で、ドライバの中で済ませる物（受け手には送らない）。
             // transform feedback は名乗りだけ（記録の命令は飛ばす。stream output を使う pipeline が作れるかは受け手の GPU しだい）
-            if (xfb_named() && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_transform_feedback", 1 };
+            if (xfb_named() && g_hw.ne < 80) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_transform_feedback", 1 };
             if (xfb_named() && !has_ext("VK_EXT_transform_feedback")) say("拡張の一覧がいっぱい（%u 個）で、transform feedback を名乗れない", g_hw.ne);
             // GL の頂点の順（flat の値を最後の頂点から取る）は名乗りだけ。ANGLE は無いと OpenGL ES 2.0 までしか作らず、Chrome の WebGL 2 が作れない。
             // pipeline の鎖の VkPipelineRasterizationProvokingVertexStateCreateInfoEXT は受け手に送らない（flat の値は最初の頂点の物になる）
-            if (provoking_named() && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_provoking_vertex", 1 };
+            if (provoking_named() && g_hw.ne < 80) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_EXT_provoking_vertex", 1 };
             if (provoking_named() && !has_ext("VK_EXT_provoking_vertex")) say("拡張の一覧がいっぱい（%u 個）で、provoking vertex を名乗れない（ANGLE の WebGL 2 が作れない）", g_hw.ne);
             if (!rd.bad) {
                 char real[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
@@ -1770,6 +1784,7 @@ static int hello(void) {
                     g_hw.props.apiVersion = VK_MAKE_API_VERSION(0, 1, VK_API_VERSION_MINOR(top), VK_API_VERSION_PATCH(g_hw.props.apiVersion));
                 if (g_hw.caps & ~VR_CAP_DELTA) say("受け手ができること（caps）0x%x", g_hw.caps);
                 if (g_can_code) say("動画のコマのような平面は、縮めて送る（VR_MEM_WRITE_CODED）");
+                if (rt_on()) say("レイトレーシングの土台（acceleration structure・ray query）を名乗る");
                 // GPU が BC を読めなければ、ドライバがほどく（IPHONE_VK_BC=1 で、読める GPU でもほどく・0 でほどかない）
                 const char *bce = getenv("IPHONE_VK_BC");
                 g_bc = bce && *bce ? *bce == '1' : !g_hw.feats.textureCompressionBC;
@@ -3593,11 +3608,17 @@ static const stinfo FEAT_ST[] = {
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES, sizeof(VkPhysicalDeviceMaintenance6Features) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT, sizeof(VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT, sizeof(VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT) },
+    // レイトレーシングの土台（rt_on() のときだけ中身を残す）
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR, sizeof(VkPhysicalDeviceAccelerationStructureFeaturesKHR) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR, sizeof(VkPhysicalDeviceRayQueryFeaturesKHR) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES, sizeof(VkPhysicalDeviceBufferDeviceAddressFeatures) },
 };
 
 // 1.3 に向けて足した機能の構造体。装置を作るときは、中継できない機能を 0 にしてから送る
 static int new_feature_st(VkStructureType st) {
     return st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES || st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES ||
+           st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR || st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR ||
+           st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES ||
            st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES ||
            st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT ||
            st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT || st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES ||
@@ -3623,6 +3644,7 @@ static const stinfo PROP_ST[] = {
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT, sizeof(VkPhysicalDeviceRobustness2PropertiesEXT) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT, sizeof(VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT) },
     { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES, sizeof(VkPhysicalDeviceTexelBufferAlignmentProperties) },
+    { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR, sizeof(VkPhysicalDeviceAccelerationStructurePropertiesKHR) },
 };
 
 static uint32_t st_size(const stinfo *t, size_t n, VkStructureType st) {
@@ -3669,6 +3691,8 @@ static void mask_ext_features(VkBaseOutStructure *s) {
             // アドレスは受け手の本物を返す。shader がアドレスでたどって書いた中身は、ドライバの写しの見張りに入らない
             if (g_hw.caps & VR_CAP_BDA) f->bufferDeviceAddress = k.bufferDeviceAddress;
         }
+        // acceleration structure は buffer device address を前提にする（build の入力はどれもアドレスで渡る）
+        if (rt_on()) f->bufferDeviceAddress = k.bufferDeviceAddress;
         if (vkd3d()) {
             // vkd3d-proton は descriptor heap を、種類ごとの大きな set（update after bind・数は確保のときに決める）で作る。
             // シェーダーの印は受け手の GPU の答えのまま。binding の flags と確保の数は受け手に運ぶ（VR_CAP_DESC_FLAGS）
@@ -3738,6 +3762,18 @@ static void mask_ext_features(VkBaseOutStructure *s) {
     } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES) {
         VkPhysicalDeviceHostQueryResetFeatures *f = (void *) s;
         if (!(g_hw.caps & VR_CAP_QUERY)) f->hostQueryReset = VK_FALSE;
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR) {
+        // GPU の上で作る・作り直す・写すだけ。CPU で作る（host commands）・間接の build・作り直しの記録（capture replay）は運ばない
+        VkPhysicalDeviceAccelerationStructureFeaturesKHR *f = (void *) s;
+        if (!rt_on()) f->accelerationStructure = f->descriptorBindingAccelerationStructureUpdateAfterBind = VK_FALSE;
+        f->accelerationStructureCaptureReplay = f->accelerationStructureIndirectBuild = f->accelerationStructureHostCommands = VK_FALSE;
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR) {
+        if (!rt_on()) ((VkPhysicalDeviceRayQueryFeaturesKHR *) s)->rayQuery = VK_FALSE;
+    } else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES) {
+        // 1.2 の構造体の bufferDeviceAddress と同じ決め方（DXVK 3 の仲間か、レイトレーシングのとき）
+        VkPhysicalDeviceBufferDeviceAddressFeatures *f = (void *) s;
+        if (!((g_hw.caps & VR_CAP_BDA) && (dxvk3() || rt_on()))) f->bufferDeviceAddress = VK_FALSE;
+        f->bufferDeviceAddressCaptureReplay = f->bufferDeviceAddressMultiDevice = VK_FALSE;
     }
 }
 
@@ -8413,7 +8449,9 @@ static void copy_dsets(VkDevice dv, uint32_t nc, const VkCopyDescriptorSet *c) {
     VkDescriptorImageInfo *ii = calloc(total, sizeof *ii);
     VkDescriptorBufferInfo *bi = calloc(total, sizeof *bi);
     VkBufferView *tv = calloc(total, sizeof *tv);
-    if (!w || !ii || !bi || !tv) { free(w); free(ii); free(bi); free(tv); return; }
+    VkAccelerationStructureKHR *ash = calloc(total, sizeof *ash);
+    VkWriteDescriptorSetAccelerationStructureKHR *asw = calloc(total, sizeof *asw);
+    if (!w || !ii || !bi || !tv || !ash || !asw) { free(w); free(ii); free(bi); free(tv); free(ash); free(asw); return; }
     uint32_t n = 0, missing = 0;
     for (uint32_t i = 0; i < nc; i++) {
         const struct dset *src = (const struct dset *) c[i].srcSet;
@@ -8432,6 +8470,11 @@ static void copy_dsets(VkDevice dv, uint32_t nc, const VkCopyDescriptorSet *c) {
                 if (!e->b) { missing++; continue; } // 消えたバッファ
                 bi[n] = (VkDescriptorBufferInfo) { (VkBuffer) e->b, e->off, e->range };
                 w[n].pBufferInfo = &bi[n];
+            } else if (e->type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+                ash[n] = (VkAccelerationStructureKHR) (uintptr_t) e->h0;
+                asw[n] = (VkWriteDescriptorSetAccelerationStructureKHR) { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
+                                                                          .accelerationStructureCount = 1, .pAccelerationStructures = &ash[n] };
+                w[n].pNext = &asw[n];
             } else {
                 missing++;
                 continue;
@@ -8441,7 +8484,7 @@ static void copy_dsets(VkDevice dv, uint32_t nc, const VkCopyDescriptorSet *c) {
     }
     if (missing) say("descriptor の写し：中身が分からない %u 個を飛ばした", missing);
     if (n) update_dsets(dv, n, w, 0, NULL);
-    free(w); free(ii); free(bi); free(tv);
+    free(w); free(ii); free(bi); free(tv); free(ash); free(asw);
 }
 
 // 空の descriptor を書いたら、種類ごとに 1 回だけ記録に出す（iPhone の GPU は空の descriptor を持たないので、受け手が代わりの物を入れる）
@@ -8456,7 +8499,8 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
     uint32_t real = 0;
-#define KNOWN_DESC(t) (is_buffer_desc(t) || is_image_desc(t) || (is_texel_desc(t) && (g_hw.caps & VR_CAP_D3D)))
+#define KNOWN_DESC(t) (is_buffer_desc(t) || is_image_desc(t) || (is_texel_desc(t) && (g_hw.caps & VR_CAP_D3D)) || \
+                       ((t) == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR && rt_on()))
     for (uint32_t i = 0; i < nw; i++) if (KNOWN_DESC(w[i].descriptorType)) real++;
     vr_u32(&b, real);
     for (uint32_t i = 0; i < nw; i++) {
@@ -8467,6 +8511,19 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
         vr_u32(&b, w[i].dstArrayElement);
         vr_u32(&b, w[i].descriptorType);
         vr_u32(&b, w[i].descriptorCount);
+        if (w[i].descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+            // 中身は鎖の VkWriteDescriptorSetAccelerationStructureKHR にある。1 つにつき acceleration structure の番号を送る
+            const VkWriteDescriptorSetAccelerationStructureKHR *as = NULL;
+            for (const VkBaseInStructure *x = w[i].pNext; x; x = x->pNext)
+                if (x->sType == VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR) as = (const void *) x;
+            for (uint32_t k = 0; k < w[i].descriptorCount; k++) {
+                uint64_t h = as && k < as->accelerationStructureCount ? ID(as->pAccelerationStructures[k]) : 0;
+                if (!h) note_null_desc(w[i].descriptorType);
+                vr_u64(&b, h);
+                dset_put_full(s, (struct dent) { w[i].dstBinding, w[i].dstArrayElement + k, w[i].descriptorType, NULL, 0, 0, h, 0, 0, 0 });
+            }
+            continue;
+        }
         if (is_image_desc(w[i].descriptorType)) {
             for (uint32_t k = 0; k < w[i].descriptorCount; k++) {
                 const VkDescriptorImageInfo *ii = &w[i].pImageInfo[k];
@@ -8725,6 +8782,15 @@ static void VKAPI_CALL update_dset_tmpl(VkDevice dv, VkDescriptorSet set, VkDesc
             for (uint32_t k = 0; k < cnt; k++) memcpy(&tv[k], p + k * e->stride, sizeof *tv);
             w[i].pTexelBufferView = tv;
             keep[i] = tv;
+        } else if (e->descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+            // 中身は VkAccelerationStructureKHR の並び。書き込みの鎖（VkWriteDescriptorSetAccelerationStructureKHR）に直す
+            struct { VkWriteDescriptorSetAccelerationStructureKHR w; VkAccelerationStructureKHR h[]; } *as =
+                calloc(1, sizeof *as + (cnt ? cnt : 1) * sizeof(VkAccelerationStructureKHR));
+            for (uint32_t k = 0; k < cnt; k++) memcpy(&as->h[k], p + k * e->stride, sizeof as->h[k]);
+            as->w = (VkWriteDescriptorSetAccelerationStructureKHR) { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
+                                                                     .accelerationStructureCount = cnt, .pAccelerationStructures = as->h };
+            w[i].pNext = &as->w;
+            keep[i] = as;
         }
     }
     update_dsets(dv, t->n, w, 0, NULL);
@@ -10715,6 +10781,7 @@ static VkResult VKAPI_CALL create_qpool(VkDevice dv, const VkQueryPoolCreateInfo
     int nv = 0;
     if (ci->queryType == VK_QUERY_TYPE_OCCLUSION || ci->queryType == VK_QUERY_TYPE_TIMESTAMP) nv = 1;
     else if (ci->queryType == VK_QUERY_TYPE_PIPELINE_STATISTICS) nv = __builtin_popcount(ci->pipelineStatistics);
+    else if (ci->queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR || ci->queryType == VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR) nv = 1;
     if (nv > 0) qpv_put(id, nv, ci->queryCount, ci->queryType == VK_QUERY_TYPE_OCCLUSION ? 1 : ci->queryType == VK_QUERY_TYPE_PIPELINE_STATISTICS ? 2 : ci->queryType == VK_QUERY_TYPE_TIMESTAMP ? 3 : 0);
     if (getenv("IPHONE_VK_QUERY_LOG")) say("query pool %llu：種類 %d・%u 個・統計 0x%x", (unsigned long long) id, ci->queryType, ci->queryCount, ci->pipelineStatistics);
     vr_buf b = { 0 };
@@ -11141,6 +11208,278 @@ static void VKAPI_CALL get_pdata(VkDevice dv, VkObjectType t, uint64_t obj, VkPr
     ReleaseSRWLockShared(&g_pdata_lock);
 }
 
+// ---- レイトレーシングの土台（VK_KHR_acceleration_structure・VK_KHR_ray_query。VR_CAP_RT） ----
+// acceleration structure は受け手の GPU の上だけで作る（CPU で作る道は名乗らない）。中身は受け手の物で、ドライバは番号とアドレスだけを覚える。
+// build の入力（頂点・番号・行列・instance）はアドレスで渡るので、受け手の帳簿に載らない。CPU から見えるメモリの物は、
+// アドレスの表（vab）から引いて「GPU が読む範囲」に足し、そのメモリに wide の印を付ける（送る・待つは今までの道で済む）
+struct accel { uint64_t addr; struct buf *b; uint64_t off, size; uint32_t type; }; // addr：受け手の GPU の中のアドレス
+
+static VkResult VKAPI_CALL create_accel(VkDevice dv, const VkAccelerationStructureCreateInfoKHR *ci, const VkAllocationCallbacks *a, VkAccelerationStructureKHR *out) {
+    (void) a;
+    if (!rt_on()) { say("acceleration structure：受け手が持たない"); return VK_ERROR_OUT_OF_HOST_MEMORY; }
+    if (ci->deviceAddress) say("acceleration structure：capture replay のアドレスは使えない（無視する）");
+    struct accel *x = calloc(1, sizeof *x);
+    if (!x) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    x->b = (struct buf *) (uintptr_t) ci->buffer;
+    x->off = ci->offset;
+    x->size = ci->size;
+    x->type = ci->type;
+    vr_buf b = { 0 }, o = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, ID(x));
+    vr_u64(&b, ID(ci->buffer));
+    vr_u64(&b, ci->offset);
+    vr_u64(&b, ci->size);
+    vr_u32(&b, ci->type);
+    vr_u32(&b, ci->createFlags);
+    VkResult r = rpc_call(VR_CREATE_ACCEL, &b, &o);
+    if (r == VK_SUCCESS && o.n >= 8) memcpy(&x->addr, o.p, 8);
+    free(b.p);
+    free(o.p);
+    if (r != VK_SUCCESS) { say("acceleration structure を作れない (%d)", r); free(x); return r; }
+    *out = (VkAccelerationStructureKHR) (uintptr_t) x;
+    return VK_SUCCESS;
+}
+
+static void VKAPI_CALL destroy_accel(VkDevice dv, VkAccelerationStructureKHR h, const VkAllocationCallbacks *a) {
+    (void) a;
+    if (!h) return;
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u64(&b, ID(h));
+    rpc_send(VR_DESTROY_ACCEL, &b);
+    free(b.p);
+    free((struct accel *) (uintptr_t) h);
+}
+
+static VkDeviceAddress VKAPI_CALL accel_address(VkDevice dv, const VkAccelerationStructureDeviceAddressInfoKHR *i) {
+    (void) dv;
+    struct accel *x = (struct accel *) (uintptr_t) i->accelerationStructure;
+    return x ? x->addr : 0;
+}
+
+// アドレス a から始まる build の入力を、CPU から見えるメモリなら「GPU が読む範囲」に足す（buffer の終わりまで。大きさは分からない）
+static void rt_note_addr(struct cb *c, VkDeviceAddress a) {
+    if (!c || !a || !bda_on() || !g_nvab) return;
+    struct mem *m;
+    uint64_t off, end;
+    if (!vab_find(a, &m, &off, &end)) return; // GPU だけのメモリ（受け手が持つ）か、アドレスを尋ねられていない buffer
+    rng_add(&c->rd, &c->nrd, &c->caprd, m, off, end - off, 0);
+    m->wide = 1; // 受け手の帳簿に載らない使い方：MEM_WRITE はドライバの番号まで待たせる
+}
+
+// geometry の並び（vr_accel_geoms）を積む。c が NULL なら大きさを尋ねる形（アドレスは送らない。行列は「あるか」だけ 1 で送る）。
+// c があれば、CPU から見えるメモリの入力を「GPU が読む範囲」に足す
+static void put_geoms(vr_buf *b, const VkAccelerationStructureBuildGeometryInfoKHR *bi, struct cb *c, const VkAccelerationStructureBuildRangeInfoKHR *rg) {
+    vr_u32(b, bi->geometryCount);
+    for (uint32_t g = 0; g < bi->geometryCount; g++) {
+        const VkAccelerationStructureGeometryKHR *ge = bi->pGeometries ? &bi->pGeometries[g] : bi->ppGeometries[g];
+        uint32_t po = rg ? rg[g].primitiveOffset : 0;
+        vr_u32(b, ge->geometryType);
+        vr_u32(b, ge->flags);
+        if (ge->geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+            const VkAccelerationStructureGeometryTrianglesDataKHR *t = &ge->geometry.triangles;
+            vr_u32(b, t->vertexFormat);
+            vr_u64(b, c ? t->vertexData.deviceAddress : 0);
+            vr_u64(b, t->vertexStride);
+            vr_u32(b, t->maxVertex);
+            vr_u32(b, t->indexType);
+            vr_u64(b, c ? t->indexData.deviceAddress : 0);
+            vr_u64(b, c ? t->transformData.deviceAddress : (t->transformData.hostAddress != NULL));
+            if (c) {
+                rt_note_addr(c, t->vertexData.deviceAddress);
+                if (t->indexType != VK_INDEX_TYPE_NONE_KHR && t->indexData.deviceAddress) rt_note_addr(c, t->indexData.deviceAddress + po);
+                if (t->transformData.deviceAddress) rt_note_addr(c, t->transformData.deviceAddress + (rg ? rg[g].transformOffset : 0));
+            }
+        } else if (ge->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
+            const VkAccelerationStructureGeometryAabbsDataKHR *x = &ge->geometry.aabbs;
+            vr_u64(b, c ? x->data.deviceAddress : 0);
+            vr_u64(b, x->stride);
+            if (c) rt_note_addr(c, x->data.deviceAddress + po);
+        } else if (ge->geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR) {
+            const VkAccelerationStructureGeometryInstancesDataKHR *x = &ge->geometry.instances;
+            vr_u32(b, x->arrayOfPointers);
+            vr_u64(b, c ? x->data.deviceAddress : 0);
+            if (c && x->data.deviceAddress) {
+                rt_note_addr(c, x->data.deviceAddress + po);
+                // ポインタの並び：CPU が書いた並びなら、写しから指す先を読んで、それも送る
+                struct mem *m;
+                uint64_t off, end;
+                if (x->arrayOfPointers && rg && vab_find(x->data.deviceAddress + po, &m, &off, &end) && m->shadow)
+                    for (uint32_t k = 0; k < rg[g].primitiveCount && off + 8ull * (k + 1) <= end; k++) {
+                        uint64_t p;
+                        memcpy(&p, m->shadow + off + 8ull * k, 8);
+                        rt_note_addr(c, p);
+                    }
+            }
+        } else {
+            say("acceleration structure：知らない geometry の種類 %d", ge->geometryType);
+        }
+    }
+}
+
+// 大きさの問い合わせは同じ形で何度も来る（DirectX 12 の prebuild info）。答えを覚えて往復を省く
+struct accsz { uint64_t h; uint32_t n; uint8_t *k; uint64_t v[3]; };
+static struct accsz g_accsz[64];
+static unsigned g_accsz_next;
+static SRWLOCK g_accsz_lock = SRWLOCK_INIT;
+
+static void VKAPI_CALL accel_sizes(VkDevice dv, VkAccelerationStructureBuildTypeKHR bt, const VkAccelerationStructureBuildGeometryInfoKHR *bi,
+                                   const uint32_t *maxp, VkAccelerationStructureBuildSizesInfoKHR *out) {
+    out->accelerationStructureSize = out->updateScratchSize = out->buildScratchSize = 0;
+    if (!rt_on()) return;
+    vr_buf b = { 0 }, o = { 0 };
+    vr_u64(&b, ID(dv));
+    vr_u32(&b, bt);
+    vr_u32(&b, bi->type);
+    vr_u32(&b, bi->flags);
+    vr_u32(&b, bi->mode);
+    put_geoms(&b, bi, NULL, NULL);
+    for (uint32_t g = 0; g < bi->geometryCount; g++) vr_u32(&b, maxp ? maxp[g] : 0);
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < b.n; i++) h = (h ^ ((const uint8_t *) b.p)[i]) * 1099511628211ull;
+    AcquireSRWLockShared(&g_accsz_lock);
+    for (int i = 0; i < 64; i++)
+        if (g_accsz[i].k && g_accsz[i].h == h && g_accsz[i].n == b.n && !memcmp(g_accsz[i].k, b.p, b.n)) {
+            out->accelerationStructureSize = g_accsz[i].v[0];
+            out->updateScratchSize = g_accsz[i].v[1];
+            out->buildScratchSize = g_accsz[i].v[2];
+            ReleaseSRWLockShared(&g_accsz_lock);
+            free(b.p);
+            return;
+        }
+    ReleaseSRWLockShared(&g_accsz_lock);
+    if (rpc_call(VR_GET_ACCEL_SIZES, &b, &o) == VK_SUCCESS && o.n >= 24) {
+        uint64_t v[3];
+        memcpy(v, o.p, 24);
+        out->accelerationStructureSize = v[0];
+        out->updateScratchSize = v[1];
+        out->buildScratchSize = v[2];
+        AcquireSRWLockExclusive(&g_accsz_lock);
+        struct accsz *e = &g_accsz[g_accsz_next++ % 64];
+        free(e->k);
+        e->k = malloc(b.n);
+        if (e->k) { memcpy(e->k, b.p, b.n); e->h = h; e->n = (uint32_t) b.n; memcpy(e->v, v, sizeof v); }
+        ReleaseSRWLockExclusive(&g_accsz_lock);
+    }
+    free(b.p);
+    free(o.p);
+}
+
+static void VKAPI_CALL cmd_build_accel(VkCommandBuffer cbh, uint32_t n, const VkAccelerationStructureBuildGeometryInfoKHR *bi,
+                                       const VkAccelerationStructureBuildRangeInfoKHR *const *rg) {
+    struct cb *c = (struct cb *) cbh;
+    if (!rt_on()) { say("acceleration structure の build：受け手が持たないので飛ばした"); return; }
+    vr_u32(&c->s, VR_CMD_BUILD_ACCEL);
+    vr_u32(&c->s, n);
+    for (uint32_t i = 0; i < n; i++) {
+        vr_u32(&c->s, bi[i].type);
+        vr_u32(&c->s, bi[i].flags);
+        vr_u32(&c->s, bi[i].mode);
+        vr_u64(&c->s, ID(bi[i].srcAccelerationStructure));
+        vr_u64(&c->s, ID(bi[i].dstAccelerationStructure));
+        vr_u64(&c->s, bi[i].scratchData.deviceAddress);
+        put_geoms(&c->s, &bi[i], c, rg[i]);
+        for (uint32_t g = 0; g < bi[i].geometryCount; g++) {
+            vr_u32(&c->s, rg[i][g].primitiveCount);
+            vr_u32(&c->s, rg[i][g].primitiveOffset);
+            vr_u32(&c->s, rg[i][g].firstVertex);
+            vr_u32(&c->s, rg[i][g].transformOffset);
+        }
+    }
+}
+
+static void VKAPI_CALL cmd_build_accel_indirect(VkCommandBuffer cbh, uint32_t n, const VkAccelerationStructureBuildGeometryInfoKHR *bi,
+                                                const VkDeviceAddress *addr, const uint32_t *stride, const uint32_t *const *maxp) {
+    (void) cbh; (void) n; (void) bi; (void) addr; (void) stride; (void) maxp;
+    say("acceleration structure の間接の build はまだ運ばない（名乗っていない）。飛ばした");
+}
+
+static void VKAPI_CALL cmd_copy_accel(VkCommandBuffer cbh, const VkCopyAccelerationStructureInfoKHR *i) {
+    struct cb *c = (struct cb *) cbh;
+    if (!rt_on()) return;
+    if (i->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR && i->mode != VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR) {
+        say("acceleration structure の写し：mode %d はまだ運ばない", i->mode);
+        return;
+    }
+    vr_u32(&c->s, VR_CMD_COPY_ACCEL);
+    vr_u64(&c->s, ID(i->src));
+    vr_u64(&c->s, ID(i->dst));
+    vr_u32(&c->s, i->mode);
+}
+
+static void VKAPI_CALL cmd_copy_accel_to_mem(VkCommandBuffer cbh, const VkCopyAccelerationStructureToMemoryInfoKHR *i) {
+    (void) cbh; (void) i;
+    say("acceleration structure をメモリに書き出す（serialize）はまだ運ばない。飛ばした");
+}
+
+static void VKAPI_CALL cmd_copy_mem_to_accel(VkCommandBuffer cbh, const VkCopyMemoryToAccelerationStructureInfoKHR *i) {
+    (void) cbh; (void) i;
+    say("メモリから acceleration structure を読む（deserialize）はまだ運ばない。飛ばした");
+}
+
+static void VKAPI_CALL cmd_write_accel_props(VkCommandBuffer cbh, uint32_t n, const VkAccelerationStructureKHR *as, VkQueryType qt, VkQueryPool qp, uint32_t first) {
+    struct cb *c = (struct cb *) cbh;
+    if (!rt_on()) return;
+    vr_u32(&c->s, VR_CMD_WRITE_ACCEL_PROPS);
+    vr_u32(&c->s, n);
+    for (uint32_t i = 0; i < n; i++) vr_u64(&c->s, ID(as[i]));
+    vr_u32(&c->s, qt);
+    vr_u64(&c->s, ID(qp));
+    vr_u32(&c->s, first);
+    cb_note_q(c, ID(qp), first, n);
+}
+
+static void VKAPI_CALL accel_compat(VkDevice dv, const VkAccelerationStructureVersionInfoKHR *v, VkAccelerationStructureCompatibilityKHR *out) {
+    (void) dv; (void) v;
+    *out = VK_ACCELERATION_STRUCTURE_COMPATIBILITY_INCOMPATIBLE_KHR; // 書き出した物を読み込む道は運ばない
+}
+
+// CPU で作る・写す（accelerationStructureHostCommands）は名乗っていない。呼ばれたら記録に出して断る
+static VkResult VKAPI_CALL host_build_accel(VkDevice dv, VkDeferredOperationKHR op, uint32_t n, const VkAccelerationStructureBuildGeometryInfoKHR *bi,
+                                            const VkAccelerationStructureBuildRangeInfoKHR *const *rg) {
+    (void) dv; (void) op; (void) n; (void) bi; (void) rg;
+    say("acceleration structure を CPU で作る道は運ばない（名乗っていない）");
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+static VkResult VKAPI_CALL host_copy_accel(VkDevice dv, VkDeferredOperationKHR op, const VkCopyAccelerationStructureInfoKHR *i) {
+    (void) dv; (void) op; (void) i;
+    say("acceleration structure を CPU で写す道は運ばない（名乗っていない）");
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+static VkResult VKAPI_CALL host_copy_accel_to_mem(VkDevice dv, VkDeferredOperationKHR op, const VkCopyAccelerationStructureToMemoryInfoKHR *i) {
+    (void) dv; (void) op; (void) i;
+    say("acceleration structure を CPU で書き出す道は運ばない（名乗っていない）");
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+static VkResult VKAPI_CALL host_copy_mem_to_accel(VkDevice dv, VkDeferredOperationKHR op, const VkCopyMemoryToAccelerationStructureInfoKHR *i) {
+    (void) dv; (void) op; (void) i;
+    say("acceleration structure を CPU で読み込む道は運ばない（名乗っていない）");
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+static VkResult VKAPI_CALL host_write_accel_props(VkDevice dv, uint32_t n, const VkAccelerationStructureKHR *as, VkQueryType qt, size_t sz, void *data, size_t stride) {
+    (void) dv; (void) n; (void) as; (void) qt; (void) sz; (void) data; (void) stride;
+    say("acceleration structure の大きさを CPU で読む道は運ばない（名乗っていない）");
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+
+// ---- VK_KHR_deferred_host_operations：ドライバの中だけで済ませる ----
+// CPU で作る道は上で断るので、後回しになる仕事は無い。仕事の札だけを作り、いつ聞かれても「済んだ」と答える
+static VkResult VKAPI_CALL create_defer(VkDevice dv, const VkAllocationCallbacks *a, VkDeferredOperationKHR *out) {
+    (void) dv; (void) a;
+    void *p = calloc(1, 8);
+    if (!p) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    *out = (VkDeferredOperationKHR) (uintptr_t) p;
+    return VK_SUCCESS;
+}
+static void VKAPI_CALL destroy_defer(VkDevice dv, VkDeferredOperationKHR op, const VkAllocationCallbacks *a) {
+    (void) dv; (void) a;
+    free((void *) (uintptr_t) op);
+}
+static uint32_t VKAPI_CALL defer_concurrency(VkDevice dv, VkDeferredOperationKHR op) { (void) dv; (void) op; return 1; }
+static VkResult VKAPI_CALL defer_result(VkDevice dv, VkDeferredOperationKHR op) { (void) dv; (void) op; return VK_SUCCESS; }
+static VkResult VKAPI_CALL defer_join(VkDevice dv, VkDeferredOperationKHR op) { (void) dv; (void) op; return VK_SUCCESS; }
+
 // まだ中継していない入口。呼ばれたら名前を出す（入口ごとに別の関数）
 #define NOT_YET(X) \
     X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements) X(vkGetImageSparseMemoryRequirements2) \
@@ -11435,6 +11774,28 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkCmdBeginQueryIndexedEXT", cmd_begin_query_indexed);
     F("vkCmdEndQueryIndexedEXT", cmd_end_query_indexed);
     F("vkCmdDrawIndirectByteCountEXT", cmd_draw_xfb_count);
+    // レイトレーシングの土台（VR_CAP_RT）
+    F("vkCreateAccelerationStructureKHR", create_accel);
+    F("vkDestroyAccelerationStructureKHR", destroy_accel);
+    F("vkGetAccelerationStructureDeviceAddressKHR", accel_address);
+    F("vkGetAccelerationStructureBuildSizesKHR", accel_sizes);
+    F("vkCmdBuildAccelerationStructuresKHR", cmd_build_accel);
+    F("vkCmdBuildAccelerationStructuresIndirectKHR", cmd_build_accel_indirect);
+    F("vkCmdCopyAccelerationStructureKHR", cmd_copy_accel);
+    F("vkCmdCopyAccelerationStructureToMemoryKHR", cmd_copy_accel_to_mem);
+    F("vkCmdCopyMemoryToAccelerationStructureKHR", cmd_copy_mem_to_accel);
+    F("vkCmdWriteAccelerationStructuresPropertiesKHR", cmd_write_accel_props);
+    F("vkGetDeviceAccelerationStructureCompatibilityKHR", accel_compat);
+    F("vkBuildAccelerationStructuresKHR", host_build_accel);
+    F("vkCopyAccelerationStructureKHR", host_copy_accel);
+    F("vkCopyAccelerationStructureToMemoryKHR", host_copy_accel_to_mem);
+    F("vkCopyMemoryToAccelerationStructureKHR", host_copy_mem_to_accel);
+    F("vkWriteAccelerationStructuresPropertiesKHR", host_write_accel_props);
+    F("vkCreateDeferredOperationKHR", create_defer);
+    F("vkDestroyDeferredOperationKHR", destroy_defer);
+    F("vkGetDeferredOperationMaxConcurrencyKHR", defer_concurrency);
+    F("vkGetDeferredOperationResultKHR", defer_result);
+    F("vkDeferredOperationJoinKHR", defer_join);
 #define NY_F(n) F(#n, ny_##n);
     NOT_YET(NY_F)
 #undef NY_F

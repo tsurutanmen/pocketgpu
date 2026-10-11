@@ -138,9 +138,16 @@ static int g_portability; // MoltenVK のときは portability_subset を有効�
     X(vkCmdSetDepthBoundsTestEnable) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) X(vkCmdSetRasterizerDiscardEnable) \
     X(vkCmdSetDepthBiasEnable) X(vkCmdSetPrimitiveRestartEnable) X(vkGetBufferDeviceAddress)
 
+// レイトレーシングの土台（VR_CAP_RT）。GPU が acceleration structure と ray query を持てば detect_caps で読む
+#define VKFUNCS_RT(X) \
+    X(vkCreateAccelerationStructureKHR) X(vkDestroyAccelerationStructureKHR) X(vkGetAccelerationStructureBuildSizesKHR) \
+    X(vkGetAccelerationStructureDeviceAddressKHR) X(vkCmdBuildAccelerationStructuresKHR) X(vkCmdCopyAccelerationStructureKHR) \
+    X(vkCmdWriteAccelerationStructuresPropertiesKHR)
+
 #define DECL(n) static PFN_##n n;
 VKFUNCS(DECL)
 VKFUNCS_OPT(DECL)
+VKFUNCS_RT(DECL)
 #undef DECL
 
 static uint32_t g_caps = VR_CAP_DELTA; // 受け手ができること（あいさつで名乗る）
@@ -227,6 +234,15 @@ static void like_ios_vendor(VkPhysicalDeviceProperties *p) {
     if (v) p->vendorID = 0x106b;
 }
 
+// 調べ用：VKR_LIKE_IOS_RT=1 で、iPhone のふりの代役でもレイトレーシングの土台（acceleration structure・ray query）だけは名乗る。
+// 名乗る範囲は、iPhone で予定している物だけ（GPU の上で作る・作り直す・写す・大きさを数える・ray query）。
+// CPU で作る・間接の build・capture replay・ray tracing pipeline は名乗らない（work/rt/DESIGN.md）
+static int like_ios_rt(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VKR_LIKE_IOS_RT"); v = e && *e == '1'; }
+    return v;
+}
+
 static void like_ios_limits(VkPhysicalDeviceLimits *l) {
     if (!like_ios()) return;
     IOS_MIN(l->maxBoundDescriptorSets, 8);
@@ -260,6 +276,33 @@ static void like_ios_props2(VkBaseOutStructure *x) {
         IOS_MAX(p->storageTexelBufferOffsetAlignmentBytes, 64);
         IOS_MAX(p->uniformTexelBufferOffsetAlignmentBytes, 64);
         p->storageTexelBufferOffsetSingleTexelAlignment = p->uniformTexelBufferOffsetSingleTexelAlignment = VK_FALSE;
+    } else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR) {
+        // iPhone で予定する上限（仮）。Metal の instance の番号は 24 ビット・1 つの set の数は argument buffer に収める分
+        VkPhysicalDeviceAccelerationStructurePropertiesKHR *p = (void *) x;
+        IOS_MIN(p->maxGeometryCount, 16777215ull);
+        IOS_MIN(p->maxInstanceCount, 16777215ull);
+        IOS_MIN(p->maxPrimitiveCount, 536870911ull);
+        IOS_MIN(p->maxPerStageDescriptorAccelerationStructures, 64);
+        IOS_MIN(p->maxPerStageDescriptorUpdateAfterBindAccelerationStructures, 64);
+        IOS_MIN(p->maxDescriptorSetAccelerationStructures, 64);
+        IOS_MIN(p->maxDescriptorSetUpdateAfterBindAccelerationStructures, 64);
+        IOS_MAX(p->minAccelerationStructureScratchOffsetAlignment, 256);
+    }
+}
+
+// iPhone のふりで、レイトレーシングの機能のうち iPhone で予定していない物を隠す
+static void like_ios_rt_feats(VkBaseOutStructure *x) {
+    if (!like_ios()) return;
+    if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR) {
+        VkPhysicalDeviceAccelerationStructureFeaturesKHR *f = (void *) x;
+        if (!like_ios_rt()) f->accelerationStructure = f->descriptorBindingAccelerationStructureUpdateAfterBind = VK_FALSE;
+        f->accelerationStructureCaptureReplay = f->accelerationStructureIndirectBuild = f->accelerationStructureHostCommands = VK_FALSE;
+    } else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR) {
+        if (!like_ios_rt()) ((VkPhysicalDeviceRayQueryFeaturesKHR *) x)->rayQuery = VK_FALSE;
+    } else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR) {
+        VkPhysicalDeviceRayTracingPipelineFeaturesKHR *f = (void *) x;
+        f->rayTracingPipeline = f->rayTracingPipelineShaderGroupHandleCaptureReplay = f->rayTracingPipelineShaderGroupHandleCaptureReplayMixed = VK_FALSE;
+        f->rayTracingPipelineTraceRaysIndirect = f->rayTraversalPrimitiveCulling = VK_FALSE;
     }
 }
 static VkBuffer g_dummy_vb;
@@ -297,7 +340,7 @@ static ent *g_tab;
 static size_t g_cap, g_cnt;
 
 enum { K_DEVICE = 1, K_QUEUE, K_BUFFER, K_MEMORY, K_SHADER, K_DSL, K_PLAYOUT, K_PIPELINE, K_DPOOL, K_DSET, K_CPOOL, K_CB, K_FENCE, K_SEM,
-       K_IMAGE, K_VIEW, K_RPASS, K_FB, K_SAMPLER, K_QPOOL, K_BVIEW };
+       K_IMAGE, K_VIEW, K_RPASS, K_FB, K_SAMPLER, K_QPOOL, K_BVIEW, K_ACCEL }; // K_ACCEL：acceleration structure（aux は buffer の番号）
 
 static size_t slot(uint64_t id) { return (size_t) ((id * 0x9E3779B97F4A7C15ull) >> 20) & (g_cap - 1); }
 
@@ -367,7 +410,7 @@ static void del(uint64_t id) {
 #define KIND_OF(T) _Generic((T) 0, VkBuffer: K_BUFFER, VkBufferView: K_BVIEW, VkCommandPool: K_CPOOL, VkDescriptorPool: K_DPOOL, \
     VkDescriptorSet: K_DSET, VkDescriptorSetLayout: K_DSL, VkDeviceMemory: K_MEMORY, VkFence: K_FENCE, VkFramebuffer: K_FB, \
     VkImage: K_IMAGE, VkImageView: K_VIEW, VkPipeline: K_PIPELINE, VkPipelineLayout: K_PLAYOUT, VkQueryPool: K_QPOOL, \
-    VkRenderPass: K_RPASS, VkSampler: K_SAMPLER, VkSemaphore: K_SEM, VkShaderModule: K_SHADER, default: 0)
+    VkRenderPass: K_RPASS, VkSampler: K_SAMPLER, VkSemaphore: K_SEM, VkShaderModule: K_SHADER, VkAccelerationStructureKHR: K_ACCEL, default: 0)
 static uint64_t HK(uint64_t id, uint32_t kind) {
     ent *e = find(id);
     if (e && kind == K_DEVICE && e->kind == K_DEVICE) g_last_dev = e->h;
@@ -560,6 +603,29 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
         vkGetBufferDeviceAddress = (PFN_vkGetBufferDeviceAddress) load_opt(v12, "vkGetBufferDeviceAddress", e_bda ? "KHR" : NULL);
         if (vkGetBufferDeviceAddress) caps |= VR_CAP_BDA;
     }
+    // レイトレーシングの土台：GPU が acceleration structure・ray query・deferred host operations を持ち、機能もあれば名乗る。
+    // iPhone のふり（VKR_LIKE_IOS）のときは VKR_LIKE_IOS_RT=1 のときだけ。iPhone の MoltenVK は 1.4.2 では持たない
+    // （PR #2771 を入れて組んだ MoltenVK なら、同じ道で名乗る。work/rt/DESIGN.md）
+#define CLEAR_RT(n) n = NULL;
+    VKFUNCS_RT(CLEAR_RT)
+#undef CLEAR_RT
+    if ((caps & VR_CAP_BDA) && has_ext(ep, ne, "VK_KHR_acceleration_structure") && has_ext(ep, ne, "VK_KHR_ray_query") &&
+        has_ext(ep, ne, "VK_KHR_deferred_host_operations") && (!like_ios() || like_ios_rt()) && vkGetPhysicalDeviceFeatures2) {
+        VkPhysicalDeviceAccelerationStructureFeaturesKHR fas = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
+        VkPhysicalDeviceRayQueryFeaturesKHR frq = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR, .pNext = &fas };
+        VkPhysicalDeviceFeatures2 rf2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &frq };
+        vkGetPhysicalDeviceFeatures2(g_pd, &rf2);
+        vlog("レイトレーシングの機能：accelerationStructure %u・rayQuery %u", (unsigned) fas.accelerationStructure, (unsigned) frq.rayQuery);
+        if (fas.accelerationStructure && frq.rayQuery) {
+#define LOAD_RT(n) n = (PFN_##n) gipa(g_inst, #n);
+            VKFUNCS_RT(LOAD_RT)
+#undef LOAD_RT
+            if (vkCreateAccelerationStructureKHR && vkDestroyAccelerationStructureKHR && vkGetAccelerationStructureBuildSizesKHR &&
+                vkGetAccelerationStructureDeviceAddressKHR && vkCmdBuildAccelerationStructuresKHR && vkCmdCopyAccelerationStructureKHR &&
+                vkCmdWriteAccelerationStructuresPropertiesKHR)
+                caps |= VR_CAP_RT;
+        }
+    }
     // 空の descriptor
     g_nulldesc_gpu = 0;
     if (has_ext(ep, ne, "VK_EXT_robustness2") && vkGetPhysicalDeviceFeatures2) {
@@ -578,6 +644,17 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     vlog("できること（caps）0x%x：1.3 %s・dynamic rendering %s・sync2 %s・render pass 2 %s・extended dynamic state %s・query %s",
          caps, caps & VR_CAP_VK13 ? "○" : "×", caps & VR_CAP_DYNAMIC_RENDERING ? "○" : "×", caps & VR_CAP_SYNC2 ? "○" : "×",
          caps & VR_CAP_RENDER_PASS2 ? "○" : "×", caps & VR_CAP_EXT_DYNAMIC_STATE ? "○" : "×", caps & VR_CAP_QUERY ? "○" : "×");
+    // 名乗れないときに原因を追えるように、GPU の拡張のあり無しも出す。iPhone の MoltenVK は、PR #2771 で組んだ物で
+    // MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=1 のときだけ持つ（アプリの設定「レイトレーシングを試す」）
+    {
+        const char *mrt = getenv("MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING");
+        vlog("レイトレーシングの拡張：acceleration_structure %s・ray_query %s・deferred_host_operations %s・ray_tracing_pipeline %s・MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=%s",
+             has_ext(ep, ne, "VK_KHR_acceleration_structure") ? "○" : "×", has_ext(ep, ne, "VK_KHR_ray_query") ? "○" : "×",
+             has_ext(ep, ne, "VK_KHR_deferred_host_operations") ? "○" : "×", has_ext(ep, ne, "VK_KHR_ray_tracing_pipeline") ? "○" : "×",
+             mrt && *mrt ? mrt : "なし");
+    }
+    vlog("レイトレーシングの土台（acceleration structure・ray query）%s%s", caps & VR_CAP_RT ? "○" : "×",
+         like_ios() ? (like_ios_rt() ? "（iPhone のふり・VKR_LIKE_IOS_RT で名乗る）" : "（iPhone のふり：名乗らない）") : "");
 }
 
 // ---- 起動 ----
@@ -1167,7 +1244,7 @@ static void dev_free(VkDevice dev, int last) {
     grave_sweep(dev);
     uint64_t me = (uint64_t) (uintptr_t) dev;
     static const int order[] = { K_PIPELINE, K_FB, K_RPASS, K_PLAYOUT, K_SHADER, K_DPOOL, K_DSL, K_SAMPLER, K_CPOOL, K_FENCE, K_SEM,
-                                 K_QPOOL, K_VIEW, K_BVIEW, K_IMAGE, K_BUFFER, K_MEMORY };
+                                 K_QPOOL, K_VIEW, K_BVIEW, K_ACCEL, K_IMAGE, K_BUFFER, K_MEMORY };
     for (size_t o = 0; o < sizeof order / sizeof *order; o++)
         for (size_t i = 0; i < g_cap; i++) {
             ent *e = &g_tab[i];
@@ -1190,6 +1267,7 @@ static void dev_free(VkDevice dev, int last) {
             case K_SAMPLER: vkDestroySampler(dev, (VkSampler) e->h, NULL); break;
             case K_QPOOL: vkDestroyQueryPool(dev, (VkQueryPool) e->h, NULL); break;
             case K_BVIEW: vkDestroyBufferView(dev, (VkBufferView) e->h, NULL); break;
+            case K_ACCEL: if (vkDestroyAccelerationStructureKHR) vkDestroyAccelerationStructureKHR(dev, (VkAccelerationStructureKHR) e->h, NULL); break;
             }
             e->h = 0; // 消した印（表から外すのは最後にまとめて）
         }
@@ -1418,6 +1496,53 @@ static uint32_t set_range_mask(uint32_t first, uint32_t n) {
     return m;
 }
 static uint64_t g_missing_set_binds; // 受け手に無い set をつなごうとした回数（記録に出す数を絞る）
+
+// ---- レイトレーシングの土台（VR_CAP_RT） ----
+// vr_accel_geoms（proto.h）を読む。返した並びは呼んだ側が free する
+static VkAccelerationStructureGeometryKHR *rd_geoms(vr_rd *r, uint32_t *count) {
+    uint32_t n = vr_ru32(r);
+    *count = 0;
+    if (r->bad || n > (r->n - r->at) / 8) { r->bad = 1; return NULL; } // 1 つ 8 バイトより短いことはない
+    VkAccelerationStructureGeometryKHR *g = calloc(n ? n : 1, sizeof *g);
+    if (!g) { r->bad = 1; return NULL; }
+    for (uint32_t i = 0; i < n && !r->bad; i++) {
+        g[i].sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        g[i].geometryType = (VkGeometryTypeKHR) vr_ru32(r);
+        g[i].flags = vr_ru32(r);
+        if (g[i].geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+            VkAccelerationStructureGeometryTrianglesDataKHR *t = &g[i].geometry.triangles;
+            t->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+            t->vertexFormat = (VkFormat) vr_ru32(r);
+            t->vertexData.deviceAddress = vr_ru64(r);
+            t->vertexStride = vr_ru64(r);
+            t->maxVertex = vr_ru32(r);
+            t->indexType = (VkIndexType) vr_ru32(r);
+            t->indexData.deviceAddress = vr_ru64(r);
+            t->transformData.deviceAddress = vr_ru64(r);
+        } else if (g[i].geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
+            VkAccelerationStructureGeometryAabbsDataKHR *x = &g[i].geometry.aabbs;
+            x->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR;
+            x->data.deviceAddress = vr_ru64(r);
+            x->stride = vr_ru64(r);
+        } else if (g[i].geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR) {
+            VkAccelerationStructureGeometryInstancesDataKHR *x = &g[i].geometry.instances;
+            x->sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+            x->arrayOfPointers = vr_ru32(r);
+            x->data.deviceAddress = vr_ru64(r);
+        } else {
+            vlog("acceleration structure：知らない geometry の種類 %u", (unsigned) g[i].geometryType);
+            r->bad = 1;
+        }
+    }
+    *count = n;
+    return g;
+}
+
+// acceleration structure の番号 → その置き場の buffer のメモリを、記録の「使うメモリ」に足す
+static void use_accel(cbinfo *ci, uint64_t id) {
+    ent *e = find(id);
+    if (e && e->kind == K_ACCEL) use_buffer(ci, e->aux);
+}
 
 // ---- command buffer に積まれた命令を実行する ----
 static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
@@ -1916,6 +2041,74 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             uint32_t flags = vr_ru32(r);
             use_buffer(ci, bid);
             if (!r->bad && qp) vkCmdCopyQueryPoolResults(cb, qp, first, n, OBJ(VkBuffer, bid), off, stride, flags);
+        } break;
+        case VR_CMD_BUILD_ACCEL: {
+            uint32_t n = vr_ru32(r);
+            if (n > 65536 || n > r->n - r->at) { r->bad = 1; break; }
+            VkAccelerationStructureBuildGeometryInfoKHR *bi = calloc(n ? n : 1, sizeof *bi);
+            VkAccelerationStructureBuildRangeInfoKHR **rg = calloc(n ? n : 1, sizeof *rg);
+            if (!bi || !rg) { free(bi); free(rg); r->bad = 1; break; }
+            int ok = 1; // 欠けた物があっても、並びがずれないように最後まで読む
+            for (uint32_t i = 0; i < n && !r->bad; i++) {
+                bi[i].sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+                bi[i].type = (VkAccelerationStructureTypeKHR) vr_ru32(r);
+                bi[i].flags = vr_ru32(r);
+                bi[i].mode = (VkBuildAccelerationStructureModeKHR) vr_ru32(r);
+                uint64_t sid = vr_ru64(r), did = vr_ru64(r);
+                bi[i].srcAccelerationStructure = OBJ(VkAccelerationStructureKHR, sid);
+                bi[i].dstAccelerationStructure = OBJ(VkAccelerationStructureKHR, did);
+                bi[i].scratchData.deviceAddress = vr_ru64(r);
+                uint32_t ng = 0;
+                bi[i].pGeometries = rd_geoms(r, &ng);
+                bi[i].geometryCount = ng;
+                rg[i] = calloc(ng ? ng : 1, sizeof **rg);
+                if (!rg[i]) { r->bad = 1; break; }
+                for (uint32_t k = 0; k < ng && !r->bad; k++) {
+                    rg[i][k].primitiveCount = vr_ru32(r);
+                    rg[i][k].primitiveOffset = vr_ru32(r);
+                    rg[i][k].firstVertex = vr_ru32(r);
+                    rg[i][k].transformOffset = vr_ru32(r);
+                }
+                if (!bi[i].dstAccelerationStructure || (bi[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR && !bi[i].srcAccelerationStructure)) ok = 0;
+                use_accel(ci, sid);
+                use_accel(ci, did);
+            }
+            tracef(ci, "  acceleration structure を作る %u 個", n);
+            if (ok && !r->bad && n) vkCmdBuildAccelerationStructuresKHR(cb, n, bi, (const VkAccelerationStructureBuildRangeInfoKHR *const *) rg);
+            else if (!r->bad) vlog("acceleration structure の build：作る先（作り直すなら元も）が無いので飛ばした");
+            for (uint32_t i = 0; i < n; i++) { free((void *) bi[i].pGeometries); free(rg[i]); }
+            free(bi);
+            free(rg);
+        } break;
+        case VR_CMD_COPY_ACCEL: {
+            uint64_t sid = vr_ru64(r), did = vr_ru64(r);
+            VkCopyAccelerationStructureInfoKHR cp = { .sType = VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR };
+            cp.src = OBJ(VkAccelerationStructureKHR, sid);
+            cp.dst = OBJ(VkAccelerationStructureKHR, did);
+            cp.mode = (VkCopyAccelerationStructureModeKHR) vr_ru32(r);
+            use_accel(ci, sid);
+            use_accel(ci, did);
+            if (!r->bad && cp.src && cp.dst) vkCmdCopyAccelerationStructureKHR(cb, &cp);
+            else if (!r->bad) vlog("acceleration structure の写し：元か先が無いので飛ばした");
+        } break;
+        case VR_CMD_WRITE_ACCEL_PROPS: {
+            uint32_t n = vr_ru32(r);
+            if (n > (r->n - r->at) / 8) { r->bad = 1; break; }
+            VkAccelerationStructureKHR *as = calloc(n ? n : 1, sizeof *as);
+            if (!as) { r->bad = 1; break; }
+            int ok = 1;
+            for (uint32_t i = 0; i < n; i++) {
+                uint64_t aid = vr_ru64(r);
+                as[i] = OBJ(VkAccelerationStructureKHR, aid);
+                if (!as[i]) ok = 0;
+                use_accel(ci, aid);
+            }
+            VkQueryType qt = (VkQueryType) vr_ru32(r);
+            VkQueryPool qp = OBJ(VkQueryPool, vr_ru64(r));
+            uint32_t first = vr_ru32(r);
+            if (ok && qp && !r->bad && n) vkCmdWriteAccelerationStructuresPropertiesKHR(cb, n, as, qt, qp, first);
+            else if (!r->bad) vlog("acceleration structure の大きさの query：acceleration structure か pool が無いので飛ばした");
+            free(as);
         } break;
         default:
             vlog("知らない記録の命令 %u", op);
@@ -3098,6 +3291,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     // query の結果は、出した仕事が全部終わってから読む（ドライバは fence を待たずに「終わった」と答えているので）
     // （VR_GET_QUERY_POOL_RESULTS は、その query を書いた submit までだけ待つ。中で待つ）
     case VR_DESTROY_QUERY_POOL: case VR_RESET_QUERY_POOL:
+    case VR_DESTROY_ACCEL:
         drain();
         break;
     default:
@@ -3180,6 +3374,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = chain };
             vkGetPhysicalDeviceFeatures2(g_pd, &f2);
             like_ios_mask(&f2.features);
+            for (uint32_t i = 0; i < n; i++) like_ios_rt_feats(blocks[i]);
             if (fake_divisor())
                 for (uint32_t i = 0; i < n; i++) {
                     VkBaseOutStructure *b = blocks[i];
@@ -3982,6 +4177,23 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 }
                 w.pTexelBufferView = tv;
                 if (!r->bad && w.dstSet) uds_add(&g_uds, d, &w, tv); else free(tv);
+                continue;
+            }
+            if (w.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+                // 1 つにつき acceleration structure の番号（VR_CAP_RT）。書き込みの鎖と並びを 1 つの塊にして、まとめ書きのあとに放す
+                struct aswrite { VkWriteDescriptorSetAccelerationStructureKHR w; VkAccelerationStructureKHR h[]; } *as =
+                    calloc(1, sizeof *as + (w.descriptorCount ? w.descriptorCount : 1) * sizeof(VkAccelerationStructureKHR));
+                for (uint32_t k = 0; k < w.descriptorCount; k++) {
+                    uint64_t aid = vr_ru64(r);
+                    if (as) as->h[k] = OBJ(VkAccelerationStructureKHR, aid);
+                    ent *ae = find(aid);
+                    if (se && ae && ae->kind == K_ACCEL && ae->aux) idlist_add(&se->list, ae->aux); // 置き場の buffer を使う物として覚える
+                }
+                if (!as) continue;
+                as->w = (VkWriteDescriptorSetAccelerationStructureKHR) { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
+                                                                         .accelerationStructureCount = w.descriptorCount, .pAccelerationStructures = as->h };
+                w.pNext = &as->w;
+                if (!r->bad && w.dstSet && (g_caps & VR_CAP_RT)) uds_add(&g_uds, d, &w, as); else free(as);
                 continue;
             }
             if (image) {
@@ -5064,6 +5276,64 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t a = b && vkGetBufferDeviceAddress && !r->bad ? vkGetBufferDeviceAddress(d, &bi) : 0;
         vr_u64(&g_out, a);
         return reply(s, 0);
+    }
+    // ---- レイトレーシングの土台（VR_CAP_RT） ----
+    case VR_CREATE_ACCEL: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r), bid = vr_ru64(r);
+        VkAccelerationStructureCreateInfoKHR ci = { .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR };
+        ci.buffer = OBJ(VkBuffer, bid);
+        ci.offset = vr_ru64(r);
+        ci.size = vr_ru64(r);
+        ci.type = (VkAccelerationStructureTypeKHR) vr_ru32(r);
+        ci.createFlags = vr_ru32(r) & ~(uint32_t) VK_ACCELERATION_STRUCTURE_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT_KHR; // 名乗っていない
+        if (!d || !ci.buffer || r->bad || !(g_caps & VR_CAP_RT)) {
+            vlog("acceleration structure：装置・buffer のどれかが無いか、レイトレーシングを名乗っていない。作らない");
+            vr_u64(&g_out, 0);
+            return reply(s, VK_ERROR_INITIALIZATION_FAILED);
+        }
+        VkAccelerationStructureKHR as;
+        VkResult res = vkCreateAccelerationStructureKHR(d, &ci, NULL, &as);
+        uint64_t addr = 0;
+        if (res == VK_SUCCESS) {
+            put(id, (uint64_t) as, K_ACCEL);
+            find(id)->aux = bid; // 置き場の buffer（使うメモリの帳簿に使う）
+            VkAccelerationStructureDeviceAddressInfoKHR ai = { .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR, .accelerationStructure = as };
+            addr = vkGetAccelerationStructureDeviceAddressKHR(d, &ai);
+        } else vlog("acceleration structure を作れない (%d)", res);
+        vr_u64(&g_out, addr);
+        return reply(s, res);
+    }
+    case VR_DESTROY_ACCEL: {
+        VkDevice d = DEV(vr_ru64(r));
+        uint64_t id = vr_ru64(r);
+        VkAccelerationStructureKHR as = OBJ(VkAccelerationStructureKHR, id);
+        if (d && as && vkDestroyAccelerationStructureKHR) vkDestroyAccelerationStructureKHR(d, as, NULL);
+        del(id);
+        return 1;
+    }
+    case VR_GET_ACCEL_SIZES: {
+        VkDevice d = DEV(vr_ru64(r));
+        VkAccelerationStructureBuildTypeKHR bt = (VkAccelerationStructureBuildTypeKHR) vr_ru32(r);
+        VkAccelerationStructureBuildGeometryInfoKHR bi = { .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR };
+        bi.type = (VkAccelerationStructureTypeKHR) vr_ru32(r);
+        bi.flags = vr_ru32(r);
+        bi.mode = (VkBuildAccelerationStructureModeKHR) vr_ru32(r);
+        uint32_t ng = 0;
+        VkAccelerationStructureGeometryKHR *g = rd_geoms(r, &ng);
+        uint32_t *mx = calloc(ng ? ng : 1, sizeof *mx);
+        for (uint32_t i = 0; i < ng && mx && !r->bad; i++) mx[i] = vr_ru32(r);
+        bi.geometryCount = ng;
+        bi.pGeometries = g;
+        VkAccelerationStructureBuildSizesInfoKHR sz = { .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR };
+        int ok = d && g && mx && !r->bad && (g_caps & VR_CAP_RT);
+        if (ok) vkGetAccelerationStructureBuildSizesKHR(d, bt, &bi, mx, &sz);
+        free(g);
+        free(mx);
+        vr_u64(&g_out, sz.accelerationStructureSize);
+        vr_u64(&g_out, sz.updateScratchSize);
+        vr_u64(&g_out, sz.buildScratchSize);
+        return reply(s, ok ? VK_SUCCESS : VK_ERROR_INITIALIZATION_FAILED);
     }
     case VR_CREATE_BUFFER_VIEW: {
         VkDevice d = DEV(vr_ru64(r));

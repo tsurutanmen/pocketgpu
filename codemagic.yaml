@@ -4,17 +4,22 @@ workflows:
   ios-app:
     name: iPhone アプリ（署名なしの IPA）
     instance_type: mac_mini_m2
-    max_build_duration: 45
+    # MVK_RT=true で vendor/moltenvk-rt が無いと、MoltenVK もここで組むので 60 分にしてある
+    max_build_duration: 60
     environment:
       xcode: 26.3
       vars:
         # true ならマイクラのサーバー Pumpkin も入れる。vendor/pumpkin-lib に組んだ物があればそれを使う（無ければ組む・15 分ほど）
         MINECRAFT: "true"
+        # true ならレイトレーシングの入った作りかけの MoltenVK（PR #2771）で組む試す用の IPA。始めるときに変数を上書きする。
+        # vendor/moltenvk-rt/MoltenVK-ios-rt.tar.xz があればそれを使う（無ければ組む・10〜20 分）
+        MVK_RT: "false"
     cache:
       cache_paths:
         - $HOME/.cargo/registry
         - $HOME/.cargo/git
         - $CM_BUILD_DIR/pumpkin/target
+        - $CM_BUILD_DIR/mvk-rt/src/External/build
     scripts:
       - name: 組む
         script: bash ci/build_ios.sh
@@ -22,3 +27,25 @@ workflows:
       - RpcServer.ipa
       # 組んだときの記録の全部（ci/build_ios.sh が書く）
       - build.log
+      - mvk-rt/*.log
+  # レイトレーシングの入った作りかけの MoltenVK（KhronosGroup/MoltenVK の PR #2771）だけを iOS 用に組む。
+  # 出来た MoltenVK-ios-rt.tar.xz と MOLTENVK_RT_COMMIT.txt を vendor/moltenvk-rt/ に置くと、ios-app の MVK_RT=true は組まずにそれを使う
+  moltenvk-rt:
+    name: MoltenVK（レイトレーシングの作りかけ PR #2771）を iOS 用に組む
+    instance_type: mac_mini_m2
+    max_build_duration: 45
+    environment:
+      xcode: 26.3
+      vars:
+        # PR #2771 の commit を 40 文字で。替えたら vendor/moltenvk-rt も置き直す
+        MVK_COMMIT: "176926b4eb7b6bd70f46a59f277b4417dd235f67"
+    cache:
+      cache_paths:
+        - $CM_BUILD_DIR/mvk-rt/src/External/build
+    scripts:
+      - name: 組む
+        script: bash ci/build_moltenvk_rt.sh $CM_BUILD_DIR/mvk-rt
+    artifacts:
+      - mvk-rt/MoltenVK-ios-rt.tar.xz
+      - mvk-rt/MOLTENVK_RT_COMMIT.txt
+      - mvk-rt/*.log

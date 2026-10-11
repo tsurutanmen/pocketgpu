@@ -10,6 +10,14 @@ struct RpcServerApp: App {
         if UserDefaults.standard.object(forKey: "metalTensor") as? Bool == false {
             setenv("GGML_METAL_TENSOR_DISABLE", "1", 1)
         }
+        #if MVK_RT
+        // 試す用の IPA（レイトレーシングの入った作りかけの MoltenVK・PR #2771）だけ。MoltenVK は設定を最初の Vulkan の呼び出しで
+        // 環境変数から読むので、受け手を始める前に立てる。切り替えはアプリを開き直すと効く。
+        // 受け手は MoltenVK が拡張を名乗ったときだけ、PC にレイトレーシングを名乗る（記録の「レイトレーシングの土台」の行）
+        if UserDefaults.standard.bool(forKey: "rtExperimental") {
+            setenv("MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING", "1", 1)
+        }
+        #endif
         rpc_bridge_init()
         // 窓に出す絵を MetalFX で広げる関数を、受け手に先に渡しておく（PC が頼んだときだけ使う）
         FXUpscaler.register()
@@ -129,6 +137,8 @@ struct ContentView: View {
     // 後ろに回っても続ける（その間は CPU で計算する）
     @AppStorage("keepAlive") private var keepAlive = true
     @AppStorage("metalTensor") private var metalTensor = true
+    // 試す用の IPA だけ：MoltenVK のレイトレーシング（作りかけ）を有効にする。初めは切り。読むのは RpcServerApp.init
+    @AppStorage("rtExperimental") private var rtExperimental = false
     // インターネット共有を USB でつないだ有線の網でも Vulkan と速さを測る口を待つ。初めは切り。合言葉は USB の口で PC に渡す
     @AppStorage("hotspotListen") private var hotspotListen = false
     @State private var onCPU = false
@@ -235,6 +245,12 @@ struct ContentView: View {
                         .onChange(of: keepAlive) { _, on in if running { on ? Keeper.shared.start() : Keeper.shared.stop() } }
                     Toggle(L("起動時に自動で開始", "Start automatically on launch"), isOn: $autoStart)
                     Toggle(L("Metal 4 の tensor を使用する。アプリの再起動後に有効になります", "Use Metal 4 tensors (applies after relaunch)"), isOn: $metalTensor)
+                    #if MVK_RT
+                    Toggle(L("試験中のレイトレーシングを使用する。アプリの再起動後に有効になります", "Use experimental ray tracing (applies after relaunch)"), isOn: $rtExperimental)
+                    if rtExperimental {
+                        Text(L("試験用のビルドです。使用できるかどうかはログの vk: の行で確認できます", "Test build. Check the vk: lines in the log to see whether it is available.")).font(.footnote)
+                    }
+                    #endif
                     Picker(L("言語", "Language"), selection: $lang) {
                         ForEach(AppLang.allCases) { l in Text(l.label).tag(l.rawValue) }
                     }

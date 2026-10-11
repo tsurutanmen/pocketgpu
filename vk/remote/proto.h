@@ -34,6 +34,11 @@
 #define VR_CAP_PROGRESS 1048576u    // VR_GET_PROGRESS：GPU を待たずに、終わった submit の番号を返す（ドライバが fence を本当の進み具合で答える）
 #define VR_CAP_UPSCALE 2097152u     // VR_READ_H264 の印 VR_H264_UP15 を受ける：縮める前に MetalFX で 1.5 倍に広げる（iPhone だけ）
 #define VR_CAP_H264 262144u          // VR_READ_H264：窓に出すコマを受け手が H.264 に縮めて、1 コマずつ返す（iPhone は VideoToolbox、PC の代役は Media Foundation）
+// レイトレーシングの土台（VK_KHR_acceleration_structure を GPU の上で作るだけ・VK_KHR_ray_query）。VR_CAP_BDA も要る。
+// VR_CREATE_ACCEL・VR_DESTROY_ACCEL・VR_GET_ACCEL_SIZES・VR_CMD_BUILD_ACCEL・VR_CMD_COPY_ACCEL・VR_CMD_WRITE_ACCEL_PROPS と、
+// descriptor の種類 VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR（1 つにつき acceleration structure の番号 u64）。
+// ray tracing pipeline（SBT）はまだ入らない。番号はほかの係（1<<22・1<<23 往復を減らす・1<<25 平面・1<<26 録画）と重ならないよう 1<<28
+#define VR_CAP_RT 268435456u
 // VR_READ_H264 の印
 #define VR_H264_KEY 1u               // このコマをキーフレーム（IDR）にする。ドライバがほどき直すとき
 #define VR_H264_PIPE 2u
@@ -160,6 +165,11 @@ enum vr_op {
     // ---- 縮めた平面の書き込み（VR_CAP_PLANE_CODE）。ほかの係が足す命令と番号が重ならないよう 104 から（録画は 96〜、レイトレは 112〜） ----
     VR_MEM_WRITE_CODED = 104,    // memory・offset・番号（u64。VR_MEM_WRITE の末尾と同じ意味で、いつも付ける）・縮めた中身（plane_codec.h。
                                  // ほどくと offset から「幅 × 行の数」バイトの隙間の無い並び）。返事なし。受け手は VR_MEM_WRITE と同じく待ってから書く
+    // ---- レイトレーシング（VR_CAP_RT）。ほかの係が足す命令と番号が重ならないよう 112 から（録画は 96〜、平面は 104〜、往復を減らす係は 120） ----
+    VR_CREATE_ACCEL = 112,       // [同期] device・id・buffer・offset（u64）・大きさ（u64）・種類（u32）・create の flags（u32）→ 結果・GPU の中のアドレス（u64）
+    VR_DESTROY_ACCEL,            // device・id
+    VR_GET_ACCEL_SIZES,          // [同期] device・build の種類（u32）・build の形（種類・flags・mode の u32 ×3 と vr_accel_geoms。アドレスは 0）・
+                                 // primitive の最大数の並び（u32）→ accelerationStructureSize・updateScratchSize・buildScratchSize（u64 ×3）
     VR_OP_COUNT
 };
 
@@ -207,7 +217,17 @@ enum vr_cmd {
     VR_CMD_END_QUERY,             // pool・番号
     VR_CMD_WRITE_TIMESTAMP,       // stage（1.0 の形）・pool・番号
     VR_CMD_COPY_QUERY_RESULTS,    // pool・最初・数・buffer・offset・間隔・flags
+    // ---- レイトレーシング（VR_CAP_RT）。ほかの係が足す記録の命令と番号が重ならないよう 64 から ----
+    VR_CMD_BUILD_ACCEL = 64,      // 数（u32）・数だけ [種類・flags・mode（u32）・元 id・先 id（u64）・scratch のアドレス（u64）・vr_accel_geoms・
+                                  //                    geometry ごとの範囲（primitiveCount・primitiveOffset・firstVertex・transformOffset の u32 ×4）]
+    VR_CMD_COPY_ACCEL,            // 元 id・先 id（u64）・mode（u32）
+    VR_CMD_WRITE_ACCEL_PROPS,     // 数（u32）・id の並び（u64）・query の種類（u32）・pool（u64）・最初の query（u32）
 };
+
+// vr_accel_geoms：geometry の数（u32）・数だけ [種類（u32）・flags（u32）・種類ごとの中身]。アドレスは受け手の GPU の本物（VR_GET_BUFFER_ADDRESS で渡した物）
+//   三角形：頂点の形式（u32）・頂点のアドレス（u64）・頂点の間隔（u64）・最大の頂点番号（u32）・番号の型（u32）・番号のアドレス（u64）・行列のアドレス（u64）
+//   AABB：アドレス（u64）・間隔（u64）
+//   instance：ポインタの並びか（u32）・アドレス（u64）
 
 // graphics pipeline（VR_CREATE_GRAPHICS_PIPELINE）の末尾に付けてよい物。[u32 sType][中身の bytes] を並べる。
 // 古い受け手は末尾を読まないので、付けても壊れない

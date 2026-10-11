@@ -32,9 +32,27 @@ find build-ios -name "*.a" -path "*Release-iphoneos*" -exec cp {} libs/ \;
 ls -la libs
 
 # Vulkan の受け手は MoltenVK（Vulkan を Metal の上で動かす部品）を使う。iOS 用の静的ライブラリとヘッダー
-if [ ! -d MoltenVK ]; then
-    curl -sSL -o mvk.tar https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar
-    tar xf mvk.tar
+# MVK_RT=true なら、レイトレーシングの入った作りかけの MoltenVK（PR #2771・ci/build_moltenvk_rt.sh）を使う。
+# vendor/moltenvk-rt/MoltenVK-ios-rt.tar.xz（moltenvk-rt の workflow で組んで置いた物）があればそれ、無ければここで組む（10〜20 分）。
+# この IPA は試す用。ふだん使いの IPA は MVK_RT=false のまま組む
+if [ "${MVK_RT:-false}" = "true" ]; then
+    rm -rf MoltenVK
+    if [ -f vendor/moltenvk-rt/MoltenVK-ios-rt.tar.xz ]; then
+        xz -dc vendor/moltenvk-rt/MoltenVK-ios-rt.tar.xz | tar xf -
+        echo "レイトレーシングの入った MoltenVK（置いてあった物）：$(cat vendor/moltenvk-rt/MOLTENVK_RT_COMMIT.txt 2>/dev/null)"
+    else
+        bash ci/build_moltenvk_rt.sh "$PWD/mvk-rt"
+        xz -dc mvk-rt/MoltenVK-ios-rt.tar.xz | tar xf -
+        echo "レイトレーシングの入った MoltenVK（ここで組んだ物）：$(cat mvk-rt/MOLTENVK_RT_COMMIT.txt)"
+    fi
+    [ -f MoltenVK/MoltenVK/RT_BUILD ] || { echo "レイトレーシングの入った MoltenVK になっていない"; exit 1; }
+else
+    # 前に試す用を組んだ所で公開版に戻すときは、ほどき直す
+    if [ -f MoltenVK/MoltenVK/RT_BUILD ]; then rm -rf MoltenVK; fi
+    if [ ! -d MoltenVK ]; then
+        curl -sSL -o mvk.tar https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar
+        tar xf mvk.tar
+    fi
 fi
 ls -la MoltenVK/MoltenVK/static/MoltenVK.xcframework/ios-arm64
 
@@ -49,6 +67,10 @@ if [ "${MINECRAFT:-false}" = "true" ]; then
         cp pumpkin/target/aarch64-apple-ios/release/libpumpkin_ios.a libs/
     fi
     EXTRA=("PUMPKIN_LDFLAGS=-lpumpkin_ios -framework Security -framework SystemConfiguration" "PUMPKIN_SWIFT_FLAG=PUMPKIN")
+fi
+# 試す用の IPA だけ、設定に「レイトレーシングを試す」を出す（Swift の #if MVK_RT）
+if [ "${MVK_RT:-false}" = "true" ]; then
+    EXTRA+=("MVK_RT_SWIFT_FLAG=MVK_RT")
 fi
 
 command -v xcodegen > /dev/null || brew install xcodegen

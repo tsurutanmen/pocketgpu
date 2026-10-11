@@ -51,7 +51,9 @@ targets:
         # マイクラのサーバー（Pumpkin・GPL-3.0）を入れるときだけ、自動ビルドが PUMPKIN_LDFLAGS と PUMPKIN_SWIFT_FLAG を渡す
         PUMPKIN_LDFLAGS: ""
         PUMPKIN_SWIFT_FLAG: ""
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) $(PUMPKIN_SWIFT_FLAG)"
+        # レイトレーシングの入った MoltenVK で組む試す用の IPA だけ、自動ビルドが MVK_RT_SWIFT_FLAG=MVK_RT を渡す（設定に切り替えが出る）
+        MVK_RT_SWIFT_FLAG: ""
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) $(PUMPKIN_SWIFT_FLAG) $(MVK_RT_SWIFT_FLAG)"
         CLANG_CXX_LANGUAGE_STANDARD: c++17
         GCC_PREPROCESSOR_DEFINITIONS: $(inherited) GGML_MAX_NAME=160
         TARGETED_DEVICE_FAMILY: "1,2"
