@@ -230,7 +230,7 @@ struct ScreenMirrorStatusRow: View {
     }
 
     private var text: String {
-        guard model.connected else { return L("待っている", "Waiting") }
+        guard model.connected else { return L("接続待ち", "Waiting") }
         let f = String(format: "%.1f", model.fps)
         var s = L("毎秒 \(f) コマ", "\(f) fps")
         if let img = model.image {
@@ -248,14 +248,14 @@ struct ScreenMirrorImageView: View {
 
     var body: some View {
         if !model.connected {
-            Text(L("PC を待っています", "Waiting for the PC")).font(.footnote).foregroundStyle(textColor)
+            Text(L("PC の接続を待っています", "Waiting for the PC to connect")).font(.footnote).foregroundStyle(textColor)
         } else if let img = model.image {
             // 行の高さは決まっていないので、高さの上限は幅を縦横比で抑えて守る
             let aspect = max(img.size.width, 1) / max(img.size.height, 1)
             Image(uiImage: img).resizable().scaledToFit()
                 .frame(maxWidth: maxHeight * aspect)
         } else {
-            Text(L("絵が届くのを待っています", "Waiting for a frame")).font(.footnote).foregroundStyle(textColor)
+            Text(L("映像を待っています", "Waiting for video")).font(.footnote).foregroundStyle(textColor)
         }
     }
 }

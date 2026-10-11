@@ -66,10 +66,10 @@ final class DeviceStatus: ObservableObject {
 
     var thermalText: String {
         switch thermal {
-        case .nominal: return L("ふつう", "Normal")
-        case .fair: return L("やや熱い", "Warm")
-        case .serious: return L("熱い", "Hot")
-        case .critical: return L("とても熱い", "Very hot")
+        case .nominal: return L("正常", "Normal")
+        case .fair: return L("やや高い", "Warm")
+        case .serious: return L("高い", "Hot")
+        case .critical: return L("非常に高い", "Very hot")
         @unknown default: return "?"
         }
     }

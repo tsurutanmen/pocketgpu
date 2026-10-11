@@ -155,9 +155,9 @@ struct ContentView: View {
                 // GPU のカード：ファンの数は機種で、回る速さは PC から来る仕事の量で変わる
                 Section { GPUCardView() }
                 Section(L("状態", "Status")) {
-                    LabeledContent(L("PC", "PC"), value: status.connected ? L("つながっている", "Connected") : L("待っている", "Waiting"))
+                    LabeledContent(L("PC", "PC"), value: status.connected ? L("接続中", "Connected") : L("接続待ち", "Waiting"))
                     LabeledContent(L("毎秒のコマ数", "Frames per second"), value: String(format: "%.1f", status.fps))
-                    LabeledContent(L("熱", "Temperature")) {
+                    LabeledContent(L("温度", "Temperature")) {
                         HStack(spacing: 6) {
                             Circle().fill(status.thermalColor).frame(width: 8, height: 8)
                             Text(status.thermalText)
@@ -167,13 +167,13 @@ struct ContentView: View {
                     if status.lowPower {
                         Text(L("低電力モードがオン。遅くなることがある", "Low Power Mode is on. It may run slower.")).font(.footnote)
                     }
-                    Toggle(L("iPhone に絵を出す", "Show frames on this iPhone"), isOn: $showFrames)
+                    Toggle(L("iPhone に出力", "Output to this iPhone"), isOn: $showFrames)
                         .onChange(of: showFrames) { _, on in preview.setOn(on) }
                     if showFrames {
                         Toggle(L("全画面は横向きで固定", "Full screen: lock to landscape"), isOn: $fullLandscape)
                         FramePreviewView(model: preview, status: status)
                     }
-                    Toggle(L("PC の画面を映す", "Mirror the PC screen"), isOn: $mirrorOn)
+                    Toggle(L("PC の画面をミラー", "Mirror the PC screen"), isOn: $mirrorOn)
                         .onChange(of: mirrorOn) { _, on in setMirror(on) }
                     if mirrorOn {
                         if !showFrames {
@@ -183,7 +183,7 @@ struct ContentView: View {
                         ScreenMirrorView(model: mirror)
                     }
                     ShareLink(item: diagnosticsText(status: status, log: log)) {
-                        Label(L("記録を送る", "Send diagnostics"), systemImage: "square.and.arrow.up")
+                        Label(L("ログを送信", "Send logs"), systemImage: "square.and.arrow.up")
                     }
                 }
                 Section(L("この iPhone", "This iPhone")) {
@@ -192,24 +192,24 @@ struct ContentView: View {
                     Text(onCPU ? L("いまの計算：CPU", "Computing on: CPU") : L("いまの計算：GPU", "Computing on: GPU")).font(.footnote)
                 }
                 Section {
-                    Picker(L("待ち受ける住所", "Listen address"), selection: $host) {
+                    Picker(L("アドレス", "Address"), selection: $host) {
                         ForEach(addrs, id: \.ip) { a in
                             Text("\(a.ip) (\(a.name.hasPrefix("utun") ? "Tailscale" : a.name == "en0" ? "Wi-Fi" : a.name))").tag(a.ip)
                         }
                     }
-                    TextField(L("番号", "Port"), text: $port).keyboardType(.numberPad)
+                    TextField(L("ポート", "Port"), text: $port).keyboardType(.numberPad)
                     Toggle(L("GPU（Metal）で計算する", "Compute on the GPU (Metal)"), isOn: $useGPU)
                     Toggle(L("USB でも待ち受ける", "Also listen over USB"), isOn: $usb)
-                    Toggle(L("後ろに回っても続ける", "Keep running in the background"), isOn: $keepAlive)
+                    Toggle(L("バックグラウンドでも動かす", "Keep running in the background"), isOn: $keepAlive)
                         .onChange(of: keepAlive) { _, on in if running { on ? Keeper.shared.start() : Keeper.shared.stop() } }
-                    Toggle(L("開いたら自動で始める", "Start automatically on launch"), isOn: $autoStart)
+                    Toggle(L("起動時に自動で開始", "Start automatically on launch"), isOn: $autoStart)
                     Toggle(L("Metal 4 の tensor を使う・開き直すと効く", "Use Metal 4 tensors (applies after relaunch)"), isOn: $metalTensor)
                     Picker(L("言語", "Language"), selection: $lang) {
                         ForEach(AppLang.allCases) { l in Text(l.label).tag(l.rawValue) }
                     }
                 } header: { Text(L("待ち受け", "Listening")) }
                 Section {
-                    Button(running ? L("動いている（止めるときはアプリを閉じる）", "Running (close the app to stop)") : L("受け手を始める", "Start receiver")) {
+                    Button(running ? L("実行中・停止はアプリを終了", "Running. Quit the app to stop") : L("開始", "Start")) {
                         if !host.isEmpty { start(host) }
                         if usb { start(usbHost) }
                     }
@@ -221,7 +221,7 @@ struct ContentView: View {
                         Text(L("USB：usb_forward.py のあと", "USB: after usb_forward.py,") + " --rpc 127.0.0.1:50053").font(.footnote.monospaced()).textSelection(.enabled)
                     }
                     if vkFailed {
-                        Text(L("Vulkan：起動に失敗（下の記録の vk: を見る）", "Vulkan: failed to start (see the vk: lines in the log below)")).font(.footnote)
+                        Text(L("Vulkan：起動に失敗（下のログの vk: を見る）", "Vulkan: failed to start (see the vk: lines in the log below)")).font(.footnote)
                     } else if vkStarted {
                         Text(L("Vulkan：USB の 50060 番で待ち受け中", "Vulkan: listening on USB port 50060")).font(.footnote.monospaced()).textSelection(.enabled)
                         if !linkHost.isEmpty {
@@ -231,7 +231,7 @@ struct ContentView: View {
                 }
                 #if PUMPKIN
                 Section {
-                    Button(mcRunning ? "動いている（止めるときはアプリを閉じる）" : "マイクラのサーバーを始める") {
+                    Button(mcRunning ? "実行中・停止はアプリを終了" : "マイクラのサーバーを始める") {
                         MinecraftServer.shared.start()
                         mcRunning = true
                     }
@@ -242,11 +242,11 @@ struct ContentView: View {
                     Text("中身は Pumpkin（GPL-3.0）。世界は書類の minecraft/ に置く").font(.footnote)
                 } header: { Text("マイクラのサーバー") }
                 #endif
-                Section(L("記録", "Log")) {
+                Section(L("ログ", "Log")) {
                     Text(log).font(.caption2.monospaced()).textSelection(.enabled)
                 }
             }
-            .navigationTitle(L("計算の受け手", "GPU Receiver"))
+            .navigationTitle(L("GPU", "GPU"))
         }
         .onAppear {
             devices = readBridge { rpc_bridge_devices($0, $1) }
