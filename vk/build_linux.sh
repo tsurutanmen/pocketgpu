@@ -1,10 +1,12 @@
 #!/bin/bash
-# Linux 用（WSL・Steam Deck を含む）を gcc で組む。窓（swapchain）・動画・書き込み監視は無く、計算と「描いて読み戻す」所だけ動く版。
+# Linux 用（WSL・Steam Deck を含む）を gcc で組む。窓は X11（xcb・Xlib）に JPEG の絵で出す。動画（H.264）と読み戻しの遅延は無い版。
+# X・libturbojpeg は動くときに dlopen するので、組むときに要るのは gcc と Vulkan のヘッダだけ。
 #   vk/build_linux.sh [出す所]                  既定は vk/build_linux
 #   vk/build_linux.sh [出す所] icd tests        icd・tests・server から選ぶ（server は Linux で受け手を組む。lavapipe などが受け手になる）
 # Vulkan のヘッダ：VK_HEADERS=フォルダ があればそれ、無ければ third_party/Vulkan-Headers/include、それも無ければシステムの物
 # 使い方（組んだあと）：
 #   VK_ICD_FILENAMES=出す所/iphone_icd_linux.json IPHONE_VK=受け手の住所:50061 出す所/vecadd iPhone
+#   VK_ICD_FILENAMES=出す所/iphone_icd_linux.json IPHONE_VK=usb 出す所/wsitri iPhone 60      （USB の iPhone・窓に三角形）
 set -e
 cd "$(dirname "$0")"
 OUT=${1:-$PWD/build_linux}
@@ -28,7 +30,10 @@ for w in $WHAT; do
         for t in vecadd tri tri13 copyimg pushdesc copydesc extlist; do
             $CC $VKH -Itests/linux_shim tests/$t.c -o "$OUT/$t" -ldl -l:libvulkan.so.1
         done
-        echo "試験：$OUT/{vecadd,tri,tri13,copyimg,pushdesc,copydesc,extlist}"
+        # 窓（X11）の試験と、書き込み監視の速さの試験。X と Vulkan のローダーは dlopen で読む
+        $CC $VKH -Itests tests/wsitri.c -o "$OUT/wsitri" -ldl
+        $CC $VKH -Itests/linux_shim tests/wwbench.c -o "$OUT/wwbench" -ldl -l:libvulkan.so.1
+        echo "試験：$OUT/{vecadd,tri,tri13,copyimg,pushdesc,copydesc,extlist,wsitri,wwbench}"
         ;;
     server)
         $CC -w $VKH -DVR_SERVER_MAIN remote/server.c -o "$OUT/vk_server_linux" -lpthread -ldl -lm -l:libvulkan.so.1

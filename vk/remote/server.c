@@ -52,7 +52,10 @@ static void qos_hi(void) {
 }
 #ifdef __ANDROID__
 #include <android/log.h>
-// Android には ImageIO も WIC も無いので、JPEG は stb_image_write（public domain / MIT・https://github.com/nothings/stb）の小さな書き手で縮める
+#endif
+#ifdef __linux__
+// Android と Linux（lavapipe などを受け手にする試験）には ImageIO も WIC も無いので、
+// JPEG は stb_image_write（public domain / MIT・https://github.com/nothings/stb）の小さな書き手で縮める
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STBIW_ASSERT(x) ((void) 0)
 #pragma GCC diagnostic push
@@ -61,8 +64,8 @@ static void qos_hi(void) {
 #include "../third_party/stb/stb_image_write.h"
 #pragma GCC diagnostic pop
 #endif
-// 窓に出すコマを JPEG に縮められる機械（iPhone は ImageIO、PC の代役は WIC、Android は stb）
-#if defined(__APPLE__) || defined(_WIN32) || defined(__ANDROID__)
+// 窓に出すコマを JPEG に縮められる機械（iPhone は ImageIO、PC の代役は WIC、Android と Linux は stb）
+#if defined(__APPLE__) || defined(_WIN32) || defined(__linux__)
 #define VR_HAVE_JPEG 1
 #endif
 
@@ -191,6 +194,32 @@ static void like_ios_mask(VkPhysicalDeviceFeatures *f) {
 #define IOS_MAX(x, v) do { if ((x) < (v)) (x) = (v); } while (0)
 // 調べ用：VKR_LIKE_IOS_VENDOR=1 で、代役が GPU の会社の番号を Apple（0x106B）と答える。
 // ドライバ（iPhone 用の直しは会社の番号で決める）と、DXVK・vkd3d-proton（Apple なら root の CBV を住所で渡す、など）が本物の iPhone と同じ道を通る
+// 調べ用：VKR_ADD_LOCAL_MEM=1 で、「GPU の手元だけ」のメモリの種類が無い GPU（lavapipe は CPU から見える種類 1 つだけ）に、
+// 手元だけの種類を 1 つ足して見せる。中身は CPU から見える種類と同じ物を使う。
+// ドライバは CPU から見える種類の DEVICE_LOCAL を外す（iPhone は手元だけの種類を別に持つ）ので、lavapipe だと手元の種類が無くなり、
+// vkcube などが深さの画像を置けずに止まる
+static int g_alias_mem = -1; // 足した種類の番号（足していなければ -1）
+static uint32_t g_alias_of;  // その中身の種類
+static void alias_mem_props(VkPhysicalDeviceMemoryProperties *m) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VKR_ADD_LOCAL_MEM"); v = e && *e == '1'; }
+    g_alias_mem = -1;
+    if (!v || m->memoryTypeCount >= VK_MAX_MEMORY_TYPES) return;
+    for (uint32_t i = 0; i < m->memoryTypeCount; i++)
+        if ((m->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(m->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) return;
+    for (uint32_t i = 0; i < m->memoryTypeCount; i++)
+        if (m->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+            g_alias_of = i;
+            g_alias_mem = (int) m->memoryTypeCount;
+            m->memoryTypes[m->memoryTypeCount].heapIndex = m->memoryTypes[i].heapIndex;
+            m->memoryTypes[m->memoryTypeCount++].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            vlog("試験用：メモリの種類 %u（GPU の手元だけ・中身は %u 番）を足した（VKR_ADD_LOCAL_MEM）", (unsigned) g_alias_mem, (unsigned) i);
+            return;
+        }
+}
+static uint32_t alias_bits(uint32_t bits) { return g_alias_mem >= 0 && (bits & (1u << g_alias_of)) ? bits | (1u << g_alias_mem) : bits; }
+static uint32_t alias_type(uint32_t t) { return g_alias_mem >= 0 && t == (uint32_t) g_alias_mem ? g_alias_of : t; }
+
 static void like_ios_vendor(VkPhysicalDeviceProperties *p) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("VKR_LIKE_IOS_VENDOR"); v = e && *e == '1'; }
@@ -1984,8 +2013,8 @@ done:
     free(rgb);
     return ok;
 }
-#elif defined(__ANDROID__)
-// Android：stb_image_write の JPEG 書き手。BGRA/RGBA を RGB に並べ直してから渡す（stb は 3 バイトの RGB を受け取る）。
+#elif defined(__linux__)
+// Android と Linux：stb_image_write の JPEG 書き手。BGRA/RGBA を RGB に並べ直してから渡す（stb は 3 バイトの RGB を受け取る）。
 // 色は 4:2:0 に間引く（stb は質 90 以下で自動）。縮めるのは CPU 1 本
 static void stb_to_vr(void *ctx, void *data, int size) { vr_put((vr_buf *) ctx, data, (size_t) size); }
 static int jpeg_encode(const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, int bgra, int q, vr_buf *out) {
@@ -3106,6 +3135,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             vlog("使ってよいメモリ %llu MB（iOS がいま許す %llu MB から余裕を引いた）", (unsigned long long) (ok >> 20), (unsigned long long) (avail >> 20));
         }
 #endif
+        alias_mem_props(&m);
         vr_put(&g_out, &p, sizeof p);
         vr_put(&g_out, &f, sizeof f);
         vr_put(&g_out, &m, sizeof m);
@@ -3367,6 +3397,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (res == VK_SUCCESS) {
             put(id, (uint64_t) b, K_BUFFER);
             vkGetBufferMemoryRequirements(d, b, &req);
+            req.memoryTypeBits = alias_bits(req.memoryTypeBits);
         }
         if (op == VR_CREATE_BUFFER_NR) {
             if (res != VK_SUCCESS) vlog("buffer を作れない (%d)", res);
@@ -3387,7 +3418,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t id = vr_ru64(r);
         VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
         mai.allocationSize = vr_ru64(r);
-        mai.memoryTypeIndex = vr_ru32(r);
+        mai.memoryTypeIndex = alias_type(vr_ru32(r));
         // 末尾の flags（VkMemoryAllocateFlagsInfo）。古いドライバは付けない
         VkMemoryAllocateFlagsInfo mfi = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
         if (!r->bad && r->at + 4 <= r->n) {
@@ -4429,6 +4460,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (res == VK_SUCCESS) {
             put(id, (uint64_t) im, K_IMAGE);
             vkGetImageMemoryRequirements(d, im, &req);
+            req.memoryTypeBits = alias_bits(req.memoryTypeBits);
         }
         if (op == VR_CREATE_IMAGE_NR) {
             if (res != VK_SUCCESS) vlog("image を作れない (%d)", res);

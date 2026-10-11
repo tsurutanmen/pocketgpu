@@ -3,7 +3,10 @@
 ListDevices には USB の機器を 1 台あると答え、Connect を頼まれたら、その番号を代役の番地に読み替えてつなぐ。
   python fake_usbmuxd.py --listen 27115 --map 50060=127.0.0.1:50070
   IPHONE_VK=usb IPHONE_VK_MUX=27115 でドライバを向ける
+Linux の usbmuxd と同じく Unix socket で待つときは --unix パス（ドライバは IPHONE_VK_MUX=パス か USBMUXD_SOCKET_ADDRESS=UNIX:パス）
+  python3 fake_usbmuxd.py --unix /tmp/usbmuxd --map 50060=127.0.0.1:50330
 """
+import os
 import argparse
 import plistlib
 import socket
@@ -83,6 +86,7 @@ def handle(c, mapping):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--listen", type=int, default=27115)
+    ap.add_argument("--unix", help="この Unix socket で待つ（Linux の /var/run/usbmuxd の代わり）")
     ap.add_argument("--map", action="append", default=[], help="iPhone の番号=host:port")
     a = ap.parse_args()
     mapping = {}
@@ -90,11 +94,19 @@ def main():
         k, v = m.split("=")
         h, p = v.rsplit(":", 1)
         mapping[int(k)] = (h, int(p))
-    srv = socket.socket()
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", a.listen))
+    if a.unix:
+        if os.path.exists(a.unix):
+            os.unlink(a.unix)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(a.unix)
+        where = a.unix
+    else:
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", a.listen))
+        where = f"127.0.0.1:{a.listen}"
     srv.listen(16)
-    print(f"偽の usbmuxd：127.0.0.1:{a.listen}", mapping, flush=True)
+    print(f"偽の usbmuxd：{where}", mapping, flush=True)
     while True:
         c, _ = srv.accept()
         threading.Thread(target=handle, args=(c, mapping), daemon=True).start()

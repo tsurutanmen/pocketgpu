@@ -19,10 +19,17 @@
 //   持ち帰る物があるときは、MEM_READ の返事が終わりの知らせを兼ねる（受け手は読む前に drain する）。
 //   往復は「GPU の答えを持ち帰る」ときだけになる
 //
-// Linux 版は、窓（swapchain）・動画・書き込み監視・読み戻しの遅延を除いた、計算と「描いて読み戻す」所だけ動く（#ifdef _WIN32 で分けている）。
-// 窓の無い Vulkan のアプリが、TCP で受け手（server.c）につないで使う。つなぎ先は IPHONE_VK=host:port
+// Linux 版（#ifdef _WIN32 で分けている）は、窓を X11（VK_KHR_xcb_surface・VK_KHR_xlib_surface）に出す。窓の絵は JPEG だけ（H.264 は Windows だけ）。
+// 書き込み監視は userfaultfd の非同期の書き込み禁止と PAGEMAP_SCAN（核 6.7 以降）。読み戻しの遅延は無い。
+// つなぎ先は IPHONE_VK=host:port か usb（usbmuxd の Unix socket）
 #ifndef _WIN32
 #define _GNU_SOURCE
+// strtol などを glibc 2.38 からの新しい名前（__isoc23_strtol）につながない。少し古い glibc（Steam Deck など）でも読めるように
+#include <features.h>
+#undef __GLIBC_USE_C2X_STRTOL
+#define __GLIBC_USE_C2X_STRTOL 0
+#undef __GLIBC_USE_C23_STRTOL
+#define __GLIBC_USE_C23_STRTOL 0
 #endif
 #include "../remote/proto.h"
 #include "../remote/wire.h"
@@ -45,8 +52,23 @@
 #define VK_NO_PROTOTYPES
 #ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
+#else
+// X の型だけを先に決めて、Vulkan の X11 の窓の口（vulkan_xcb.h・vulkan_xlib.h）を読む。X の開発用ヘッダは要らない
+// （X の関数は、窓に描くときに libxcb.so.1 を dlopen して引く。wsi_x11.inc）
+typedef struct xcb_connection_t xcb_connection_t;
+typedef uint32_t xcb_window_t;
+typedef uint32_t xcb_visualid_t;
+typedef struct _XDisplay Display;
+typedef unsigned long Window;
+typedef unsigned long VisualID;
 #endif
 #include <vulkan/vulkan.h>
+#ifndef _WIN32
+#include <vulkan/vulkan_xcb.h>
+#include <vulkan/vulkan_xlib.h>
+#define VK_USE_PLATFORM_XCB_KHR
+#define VK_USE_PLATFORM_XLIB_KHR
+#endif
 #include <vulkan/vk_icd.h>
 
 #ifdef _WIN32
@@ -840,7 +862,7 @@ static void read_deferred_locked(void) {
 }
 
 // 頼んで、返事は待たない。返事は rpc_take_deferred で受け取る（受け取る前に頼めるのは 1 つだけ）
-LINUX_UNUSED static void rpc_call_deferred(uint32_t op, vr_buf *b) {
+static void rpc_call_deferred(uint32_t op, vr_buf *b) {
     AcquireSRWLockExclusive(&g_lock);
     if (op < VR_OP_COUNT) g_stat.calls[op]++;
     if (g_defer.active) { flush_locked(); read_deferred_locked(); }
@@ -859,7 +881,7 @@ static int defer_unlocked(void) {
     return v;
 }
 
-LINUX_UNUSED static VkResult rpc_take_deferred(vr_buf *out) {
+static VkResult rpc_take_deferred(vr_buf *out) {
     double t0 = now_ms();
     if (defer_unlocked()) {
         // 返事が届いた分だけ錠の中で読み、まだなら錠の外で 1 ms ずつ待つ。待つ間にほかの糸が先に読んでもよい（g_defer.ready に入る）
@@ -982,8 +1004,8 @@ static vr_sock tcp_connect(const char *host, const char *port) {
 // iTunes と一緒に入る Apple Mobile Device Service が 127.0.0.1:27015 で待っている（usbmuxd）。
 // 「この iPhone のこの番号につないで」と頼むと、その接続がそのまま USB の通り道になる。
 // Python の中継（usb_forward.py）を通さないので、1 段ぶん速い
-// Linux：話し方（plist）は同じだが、usbmuxd の口は Unix socket（/var/run/usbmuxd）で、ここは 127.0.0.1 の TCP しか知らない。
-// 今は socat などで TCP に橋渡しして IPHONE_VK_MUX=番号 で向ける（Unix socket を直に開く道は未実装）
+// Linux（Steam Deck を含む）：話し方（plist）は同じで、usbmuxd（libimobiledevice の物）の口は Unix socket の /var/run/usbmuxd。
+// 口は mux_open で決める（IPHONE_VK_MUX・USBMUXD_SOCKET_ADDRESS・既定の順）
 static char *mux_call(vr_sock s, const char *type, const char *extra) {
     char body[1024];
     int n = snprintf(body, sizeof body,
@@ -1012,13 +1034,61 @@ static long long plist_int_after(const char *at, const char *key, const char *li
     return q ? atoll(q + 9) : -1;
 }
 
-static vr_sock usb_connect(int port) {
-    // 試験では IPHONE_VK_MUX=番号 で偽物の usbmuxd に向けられる
+#ifndef _WIN32
+// Unix socket につなぐ（usbmuxd は同じ機械の中なので、すぐにつながるか断られる）
+static vr_sock unix_connect(const char *path) {
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    if (strlen(path) >= sizeof a.sun_path) return INVALID_SOCKET;
+    memcpy(a.sun_path, path, strlen(path));
+    vr_sock s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s == INVALID_SOCKET) return s;
+    if (connect(s, (struct sockaddr *) &a, sizeof a) != 0) { closesocket(s); return INVALID_SOCKET; }
+    sock_rcvtimeo(s, 5000);
+    return s;
+}
+#endif
+
+// usbmuxd の口を開く。どこにつないだかを where に書く
+//   IPHONE_VK_MUX=番号               127.0.0.1 のその番号（TCP。試験の偽物の usbmuxd や、socat などの橋渡し）
+//   IPHONE_VK_MUX=/パス か unix:パス  その Unix socket（Linux。Steam Deck で usbmuxd を入れ物の中で動かして、口をホームに置くときなど）
+//   IPHONE_VK_MUX が無ければ USBMUXD_SOCKET_ADDRESS（libusbmuxd と同じ書き方：UNIX:パス か 住所:番号）
+//   それも無ければ Windows は 127.0.0.1:27015（Apple Mobile Device Service）、Linux は /var/run/usbmuxd
+static vr_sock mux_open(char *where, size_t nw) {
     const char *mp = getenv("IPHONE_VK_MUX");
-    char mport[16];
-    snprintf(mport, sizeof mport, "%s", mp && *mp ? mp : "27015");
-    vr_sock s = tcp_connect("127.0.0.1", mport);
-    if (s == INVALID_SOCKET) { say("Apple Mobile Device Service（127.0.0.1:27015）につながらない"); return s; }
+    const char *env = mp && *mp ? mp : getenv("USBMUXD_SOCKET_ADDRESS");
+    char a[300] = "";
+    if (env && *env) snprintf(a, sizeof a, "%s", env);
+#ifndef _WIN32
+    if (!a[0]) snprintf(a, sizeof a, "/var/run/usbmuxd");
+    const char *path = !strncmp(a, "UNIX:", 5) || !strncmp(a, "unix:", 5) ? a + 5 : a[0] == '/' ? a : NULL;
+    if (path) {
+        snprintf(where, nw, "usbmuxd の口 %s", path);
+        return unix_connect(path);
+    }
+#else
+    if (!a[0]) snprintf(a, sizeof a, "27015");
+#endif
+    // 「住所:番号」か「番号」だけ（住所は 127.0.0.1）
+    char host[256] = "127.0.0.1", port[16];
+    const char *c = strrchr(a, ':');
+    if (c) {
+        size_t n = (size_t) (c - a) < sizeof host - 1 ? (size_t) (c - a) : sizeof host - 1;
+        memcpy(host, a, n);
+        host[n] = 0;
+        snprintf(port, sizeof port, "%s", c + 1);
+    } else {
+        snprintf(port, sizeof port, "%s", a);
+    }
+    snprintf(where, nw, "usbmuxd の口 %s:%s", host, port);
+    return tcp_connect(host, port);
+}
+
+static vr_sock usb_connect(int port) {
+    char where[320];
+    vr_sock s = mux_open(where, sizeof where);
+    if (s == INVALID_SOCKET) { say("%s につながらない（usbmuxd が動いていない）", where); return s; }
     char *list = mux_call(s, "ListDevices", "");
     closesocket(s);
     if (!list) { say("usbmuxd が機器の一覧を返さない"); return INVALID_SOCKET; }
@@ -1031,7 +1101,7 @@ static vr_sock usb_connect(int port) {
     }
     free(list);
     if (dev < 0) { say("USB でつながった iPhone が見えない"); return INVALID_SOCKET; }
-    s = tcp_connect("127.0.0.1", mport);
+    s = mux_open(where, sizeof where);
     if (s == INVALID_SOCKET) return s;
     char extra[160];
     snprintf(extra, sizeof extra, "<key>DeviceID</key><integer>%lld</integer><key>PortNumber</key><integer>%u</integer>",
@@ -1606,9 +1676,7 @@ static int hello(void) {
                     say("load_store_op_none：受け手%sので、NONE を LOAD・STORE に直して送る", g_srv_lso ? "は持つが試す" : "が持たない");
                 }
             }
-#ifdef _WIN32
             if (g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_swapchain", 70 };
-#endif
             // ドライバの中だけで済む拡張（受け手には送らない）
             if ((g_hw.caps & VR_CAP_NEW_MASK) && g_hw.ne < 64) g_hw.ext[g_hw.ne++] = (VkExtensionProperties) { "VK_KHR_copy_commands2", 1 };
             // ひな形での descriptor の書き込みは、ドライバがふつうの書き込みに直す（zink が名前で確かめる）
@@ -1726,6 +1794,7 @@ struct mem {
     uint32_t nuse, cuse;
     struct mem *prev, *next;
     uint32_t aflags;   // VkMemoryAllocateFlagsInfo の flags（DEVICE_ADDRESS なら、シェーダーがアドレスで読み書きしうる）
+    int ww;            // Linux：写しを書き込み監視している（userfaultfd）。0 なら全ページを「書いたかもしれない」とする
     volatile LONG wide; // 受け手の帳簿に載らない使い方（アドレスで読み書き・結んだあとに書いた descriptor）をされた。
                         // MEM_WRITE・MEM_READ に「受け手の判定より短くせず、ドライバの番号までは必ず待つ」の印を付ける
 };
@@ -2101,14 +2170,155 @@ static void rng_merge(rng *a, size_t *n) {
 // ---- メモリの写し ----
 // ページ p0〜p1 の書き込み監視を見て、書かれたページに印を付ける（監視の印は消える）
 #ifndef _WIN32
-// Linux 版には書き込み監視がまだ無い。範囲の全ページを「書いたかもしれない」とする。
-// 受け手の中身の写し（m->sent）がある写しは、そのうち違う所だけを送るので、余計に送るのは写しを初めて送るときだけ。
-// （次の一歩：/proc/self/clear_refs と pagemap の soft-dirty、または userfaultfd の write-protect）
+// Linux の書き込み監視：写しを userfaultfd の非同期の書き込み禁止（UFFD_FEATURE_WP_ASYNC・核 6.7 から）にしておき、
+// PAGEMAP_SCAN で「書き込み禁止が外れたページ」＝書かれたページを読み、読んだページは書き込み禁止に戻す
+// （GetWriteWatch の WRITE_WATCH_FLAG_RESET と同じ。範囲ごとに読んで戻せる）。
+//   書き込みで起きる例外は核の中で片づく。シグナルを使わないので、Wine・Proton やゲームの SIGSEGV の処理とぶつからない。
+//   read() などで核が写しに書いても数えられる（受け手からの読み戻しも。読み戻したあとは ww_reset で戻す）。
+//   2 MB の大きなページ（THP）にすると 1 ページで 2 MB を送ることになるので、写しは 4 KB のページのままにする（MADV_NOHUGEPAGE）
+// 使えない核（6.7 より前・userfaultfd が禁じられている）では、全ページを「書いたかもしれない」とし、
+// 受け手の中身の写し（m->sent）と比べて違う所だけを送る（前のやり方。比べる分の CPU を使う）。IPHONE_VK_WW=0 で必ず前のやり方
+#include <linux/userfaultfd.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#ifndef UFFD_USER_MODE_ONLY
+#define UFFD_USER_MODE_ONLY 1
+#endif
+#ifndef UFFD_FEATURE_WP_UNPOPULATED
+#define UFFD_FEATURE_WP_UNPOPULATED (1 << 13)
+#endif
+#ifndef UFFD_FEATURE_WP_ASYNC
+#define UFFD_FEATURE_WP_ASYNC (1 << 15)
+#endif
+// PAGEMAP_SCAN（linux/fs.h の pm_scan_arg・page_region と同じ形。古いヘッダでも組めるように自分で書く）
+struct ww_region { uint64_t start, end, categories; };
+struct ww_scan {
+    uint64_t size, flags, start, end, walk_end, vec, vec_len, max_pages;
+    uint64_t category_inverted, category_mask, category_anyof_mask, return_mask;
+};
+#define WW_PAGEMAP_SCAN _IOWR('f', 16, struct ww_scan)
+#define WW_SCAN_WP_MATCHING 1ull    // 見つけたページを書き込み禁止に戻す
+#define WW_SCAN_CHECK_WPASYNC 2ull  // 監視していないページがあれば失敗にする
+#define WW_PAGE_IS_WRITTEN 2ull
+static int g_ww = -1;               // 1 監視できる・0 できない（全ページ）
+static int g_uffd = -1, g_pagemap = -1;
+static SRWLOCK g_ww_lock = SRWLOCK_INIT;
+
+// 写しの範囲を書き込み禁止にする（読んだ印を消す）
+static int ww_protect(void *p, size_t len) {
+    struct uffdio_writeprotect wp = { .range = { (uint64_t) (uintptr_t) p, len }, .mode = UFFDIO_WRITEPROTECT_MODE_WP };
+    return ioctl(g_uffd, UFFDIO_WRITEPROTECT, &wp) == 0;
+}
+
+// 写しを監視に入れる。だめなら 0（その写しは全ページのやり方）
+static int ww_register(void *p, size_t len) {
+    madvise(p, len, MADV_NOHUGEPAGE);
+    struct uffdio_register rg = { .range = { (uint64_t) (uintptr_t) p, len }, .mode = UFFDIO_REGISTER_MODE_WP };
+    if (ioctl(g_uffd, UFFDIO_REGISTER, &rg) != 0) return 0;
+    if (!ww_protect(p, len)) {
+        struct uffdio_range ur = { (uint64_t) (uintptr_t) p, len };
+        ioctl(g_uffd, UFFDIO_UNREGISTER, &ur);
+        return 0;
+    }
+    return 1;
+}
+
+// ページ p0〜p1 のうち書かれたページに dirty の印を付け（数を found に足し）、そのページを書き込み禁止に戻す。失敗なら 0
+static int ww_scan(uint8_t *base, size_t p0, size_t p1, uint8_t *dirty, uint64_t *found) {
+    uint64_t start = (uint64_t) (uintptr_t) (base + p0 * PAGE), end = (uint64_t) (uintptr_t) (base + p1 * PAGE);
+    struct ww_region reg[128];
+    while (start < end) {
+        struct ww_scan a = { .size = sizeof a, .flags = WW_SCAN_WP_MATCHING | WW_SCAN_CHECK_WPASYNC, .start = start, .end = end,
+                             .vec = (uint64_t) (uintptr_t) reg, .vec_len = 128, .category_mask = WW_PAGE_IS_WRITTEN, .return_mask = WW_PAGE_IS_WRITTEN };
+        long n = ioctl(g_pagemap, WW_PAGEMAP_SCAN, &a);
+        if (n < 0) return 0;
+        for (long i = 0; i < n; i++) {
+            size_t a0 = (size_t) ((reg[i].start - (uint64_t) (uintptr_t) base) / PAGE), a1 = (size_t) ((reg[i].end - (uint64_t) (uintptr_t) base) / PAGE);
+            if (dirty) memset(dirty + a0, 1, a1 - a0);
+            if (found) *found += a1 - a0;
+        }
+        if (a.walk_end <= start || a.walk_end > end) break;
+        start = a.walk_end;
+    }
+    return 1;
+}
+
+// 監視を使えるか。最初に 1 回だけ、userfaultfd を開き、小さな写しで「書いたページだけが見つかる」ことを確かめる
+static int ww_init(void) {
+    if (g_ww >= 0) return g_ww;
+    AcquireSRWLockExclusive(&g_ww_lock);
+    if (g_ww < 0) {
+        const char *e = getenv("IPHONE_VK_WW");
+        const char *why = NULL;
+        int ok = 0;
+        if (e && *e == '0') why = "IPHONE_VK_WW=0";
+        if (!why) {
+            g_uffd = (int) syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+            if (g_uffd < 0 && errno == EINVAL) g_uffd = (int) syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+            if (g_uffd < 0) why = errno == EPERM ? "userfaultfd が禁じられている" : "userfaultfd が無い";
+        }
+        if (!why) {
+            struct uffdio_api api = { .api = UFFD_API, .features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED };
+            if (ioctl(g_uffd, UFFDIO_API, &api) != 0 || !(api.features & UFFD_FEATURE_WP_ASYNC)) why = "非同期の書き込み禁止（核 6.7 から）が無い";
+        }
+        if (!why && (g_pagemap = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC)) < 0) why = "/proc/self/pagemap を開けない";
+        if (!why) {
+            // 4 ページの写しで試す：2 番目だけ書いて、見つかるのがそのページだけか
+            uint8_t *t = mmap(NULL, 4 * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            uint8_t d[4] = { 0 };
+            uint64_t n = 0;
+            if (t == (uint8_t *) MAP_FAILED) why = "試しの写しを取れない";
+            else {
+                if (!ww_register(t, 4 * PAGE)) why = "写しを監視に入れられない";
+                else {
+                    t[PAGE + 5] = 1;
+                    if (!ww_scan(t, 0, 4, d, &n)) why = "PAGEMAP_SCAN（核 6.7 から）が無い";
+                    else if (n != 1 || !d[1]) why = "書いたページを正しく見つけられない";
+                    else {
+                        n = 0;
+                        ww_scan(t, 0, 4, NULL, &n); // 読んだあとは消えている
+                        if (n) why = "読んだ印が消えない";
+                    }
+                }
+                munmap(t, 4 * PAGE);
+            }
+        }
+        ok = !why;
+        if (!ok) {
+            if (g_uffd >= 0) close(g_uffd);
+            if (g_pagemap >= 0) close(g_pagemap);
+            g_uffd = g_pagemap = -1;
+        }
+        say(ok ? "書き込み監視：userfaultfd の非同期の書き込み禁止と PAGEMAP_SCAN" : "書き込み監視が使えない（%s）。全ページを受け手の中身と比べる", why);
+        g_ww = ok;
+    }
+    ReleaseSRWLockExclusive(&g_ww_lock);
+    return g_ww;
+}
+
 static void collect_dirty(struct mem *m, size_t p0, size_t p1) {
     if (p1 > m->npages) p1 = m->npages;
     if (p0 >= p1) return;
     g_stat.ww_calls++;
-    memset(m->dirty + p0, 1, p1 - p0);
+    if (!m->ww) {
+        memset(m->dirty + p0, 1, p1 - p0);
+        return;
+    }
+    double t0 = now_ms();
+    uint64_t n = 0;
+    if (!ww_scan(m->shadow, p0, p1, m->dirty, &n)) {
+        // 読めなかった：この範囲は全部書いたかもしれないとし、この写しの監視はやめる
+        say("書き込み監視を読めない（%d）。この写しは全ページを比べる", errno);
+        memset(m->dirty + p0, 1, p1 - p0);
+        m->ww = 0;
+    }
+    g_stat.ww_pages += n;
+    g_stat.ww_ms += now_ms() - t0;
+}
+
+// 自分で写しに書いた所（受け手からの読み戻し）の印を消す（ResetWriteWatch）
+static void ww_reset(struct mem *m, uint64_t a, uint64_t b) {
+    if (m->ww && b > a) ww_protect(m->shadow + a, (size_t) (b - a));
 }
 #else
 static void collect_dirty(struct mem *m, size_t p0, size_t p1) {
@@ -2889,7 +3099,7 @@ static void read_back_many(rng *r, size_t n) {
 #ifdef _WIN32
         ResetWriteWatch(r[i].m->shadow + p0, (SIZE_T) (p1 - p0));
 #else
-        (void) p0; (void) p1; // 書き込み監視が無い
+        ww_reset(r[i].m, p0, p1);
 #endif
     }
     lz_hold_end(lzh);
@@ -3087,6 +3297,8 @@ static VkResult VKAPI_CALL enum_instance_ext(const char *layer, uint32_t *n, VkE
         { "VK_KHR_get_physical_device_properties2", 2 },
 #ifdef _WIN32
         { "VK_KHR_surface", 25 }, { "VK_KHR_win32_surface", 6 }
+#else
+        { "VK_KHR_surface", 25 }, { "VK_KHR_xcb_surface", 6 }, { "VK_KHR_xlib_surface", 6 }
 #endif
     };
     const uint32_t all = sizeof ext / sizeof *ext;
@@ -3938,7 +4150,8 @@ static VkResult VKAPI_CALL alloc_memory(VkDevice dv, const VkMemoryAllocateInfo 
 #else
         m->shadow = mmap(NULL, m->npages * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); // 0 で埋まって、ページに揃う
         if (m->shadow == (uint8_t *) MAP_FAILED) m->shadow = NULL;
-        m->addrs = NULL; // 書き込み監視が無いので受け皿は要らない
+        m->addrs = NULL; // 監視の受け皿は要らない（PAGEMAP_SCAN は呼ぶ側の小さな受け皿に返す）
+        if (m->shadow && ww_init()) m->ww = ww_register(m->shadow, m->npages * PAGE);
 #endif
         m->dirty = calloc(m->npages, 1);
         if (!m->shadow || !ADDRS_OK(m) || !m->dirty) {
@@ -5347,11 +5560,14 @@ static VkResult VKAPI_CALL create_sampler(VkDevice dv, const VkSamplerCreateInfo
 
 static void VKAPI_CALL destroy_sampler(VkDevice dv, VkSampler h, const VkAllocationCallbacks *a) { (void) a; if (h) send_destroy(VR_DESTROY_SAMPLER, dv, ID(h)); }
 
-// Linux 版には窓（surface・swapchain）が無い。VK_KHR_surface も名乗らないので、窓を出すアプリは別の装置を選ぶ
-#ifdef _WIN32
 // ---- 窓（surface） ----
 // 新しいローダーは、窓の口をドライバ自身に作らせる（作る入口が無いドライバには、窓の問い合わせを回さない）。
-// ここでは VkIcdSurfaceWin32 の形で作って、窓のハンドルを覚えておくだけ
+// 窓に依る所は、次の細い関数に分ける（swapchain の仕組みは Windows と Linux で同じ）
+//   surface_hwnd（surface → 描く窓）・win_size（窓の中の大きさ）・win_draw（B・G・R・A の絵を窓いっぱいに描く）・
+//   jdec_open・jdec_decode・jdec_close（JPEG をほどく）・monitor_hz（書き換えの速さ）・move_to_monitor（窓をモニターへ動かす）
+// Windows は Win32（GDI・WIC）。Linux は X11（wsi_x11.inc：xcb を dlopen・JPEG は libturbojpeg か stb_image）
+#ifdef _WIN32
+// Windows：VkIcdSurfaceWin32 の形で作って、窓のハンドルを覚えておくだけ
 static VkResult VKAPI_CALL create_win32_surface(VkInstance inst, const VkWin32SurfaceCreateInfoKHR *ci, const VkAllocationCallbacks *a, VkSurfaceKHR *out) {
     (void) inst; (void) a;
     VkIcdSurfaceWin32 *s = calloc(1, sizeof *s);
@@ -5374,6 +5590,41 @@ static HWND surface_hwnd(VkSurfaceKHR s) {
     return ((VkIcdSurfaceWin32 *) b)->hwnd;
 }
 
+static VkBool32 VKAPI_CALL win32_presentation_support(VkPhysicalDevice pd, uint32_t qf) {
+    (void) pd;
+    return qf < g_hw.nq && (g_hw.q[qf].queueFlags & VK_QUEUE_GRAPHICS_BIT);
+}
+
+// 窓の中の大きさ。分からなければ 0
+static int win_size(HWND w, uint32_t *cw, uint32_t *ch) {
+    RECT rc = { 0, 0, 0, 0 };
+    if (!w || !GetClientRect(w, &rc)) return 0;
+    *cw = rc.right - rc.left > 0 ? (uint32_t) (rc.right - rc.left) : 0;
+    *ch = rc.bottom - rc.top > 0 ? (uint32_t) (rc.bottom - rc.top) : 0;
+    return 1;
+}
+
+// w x h の B・G・R・A の絵（上から下へ）を、窓いっぱいに伸ばして描く
+static void win_draw(HWND hw, const uint8_t *px, uint32_t w, uint32_t h) {
+    BITMAPINFO bmi = { 0 };
+    bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
+    bmi.bmiHeader.biWidth = (LONG) w;
+    bmi.bmiHeader.biHeight = -(LONG) h; // 上から下へ
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    RECT rc;
+    GetClientRect(hw, &rc);
+    HDC dc = GetDC(hw);
+    SetStretchBltMode(dc, COLORONCOLOR);
+    StretchDIBits(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, 0, 0, (int) w, (int) h, px, &bmi, DIB_RGB_COLORS, SRCCOPY);
+    ReleaseDC(hw, dc);
+    GdiFlush();
+}
+#else
+#include "wsi_x11.inc"
+#endif
+
 static VkResult VKAPI_CALL surface_support(VkPhysicalDevice pd, uint32_t qf, VkSurfaceKHR s, VkBool32 *ok) {
     say("窓に出せるか（surface support）");
     (void) pd;
@@ -5381,22 +5632,17 @@ static VkResult VKAPI_CALL surface_support(VkPhysicalDevice pd, uint32_t qf, VkS
     return VK_SUCCESS;
 }
 
-static VkBool32 VKAPI_CALL win32_presentation_support(VkPhysicalDevice pd, uint32_t qf) {
-    (void) pd;
-    return qf < g_hw.nq && (g_hw.q[qf].queueFlags & VK_QUEUE_GRAPHICS_BIT);
-}
-
 static VkResult VKAPI_CALL surface_caps(VkPhysicalDevice pd, VkSurfaceKHR s, VkSurfaceCapabilitiesKHR *c) {
     say("窓の性質（surface caps）");
     (void) pd;
     memset(c, 0, sizeof *c);
-    RECT rc = { 0, 0, 1, 1 };
+    uint32_t cw = 1, ch = 1;
     HWND w = surface_hwnd(s);
-    if (w) GetClientRect(w, &rc);
+    if (w) win_size(w, &cw, &ch);
     c->minImageCount = 2;
     c->maxImageCount = 8;
-    c->currentExtent.width = rc.right - rc.left > 0 ? (uint32_t) (rc.right - rc.left) : 1;
-    c->currentExtent.height = rc.bottom - rc.top > 0 ? (uint32_t) (rc.bottom - rc.top) : 1;
+    c->currentExtent.width = cw > 0 ? cw : 1;
+    c->currentExtent.height = ch > 0 ? ch : 1;
     // 本物の Windows のドライバと同じく、作れる大きさは窓の今の大きさだけにする。
     // 幅を持たせると、DXVK は描く大きさで作り、窓と違うので毎コマ作り直しになっていた
     c->minImageExtent = c->maxImageExtent = c->currentExtent;
@@ -5411,7 +5657,7 @@ static VkResult VKAPI_CALL surface_caps(VkPhysicalDevice pd, VkSurfaceKHR s, VkS
 static VkResult VKAPI_CALL surface_formats(VkPhysicalDevice pd, VkSurfaceKHR s, uint32_t *n, VkSurfaceFormatKHR *f) {
     say("窓の形式（surface formats）");
     (void) pd; (void) s;
-    // Windows の窓（GDI）にそのまま描き写せる並び（B G R A）
+    // 窓（Windows の GDI・X11 の 24 ビットの窓）にそのまま描き写せる並び（B G R A）
     static const VkSurfaceFormatKHR fm[] = { { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR }, { VK_FORMAT_B8G8R8A8_SRGB, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR } };
     const uint32_t all = 2;
     if (!f) { *n = all; return VK_SUCCESS; }
@@ -5432,8 +5678,6 @@ static VkResult VKAPI_CALL surface_modes(VkPhysicalDevice pd, VkSurfaceKHR s, ui
     *n = k;
     return k < all ? VK_INCOMPLETE : VK_SUCCESS;
 }
-
-#endif
 
 #ifdef _WIN32
 // ---- 窓の絵を H.264 でほどく（Media Foundation の Microsoft H.264 デコーダ・遅れの少ない設定） ----
@@ -5764,6 +6008,10 @@ static int vdec_available(void) {
     }
     return v > 0;
 }
+#else
+// Linux は窓の絵を JPEG で受け取る（H.264 をほどく道はまだ無い）
+static int vdec_available(void) { return 0; }
+#endif
 
 static volatile LONG64 g_vstream; // 流れの番号（swapchain ごとに新しくする）
 
@@ -5844,8 +6092,6 @@ static void sc_tick(struct swapchain *sc) {
     }
 }
 
-#endif
-
 static uint32_t pick_mem(uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t t = 0; t < g_hw.mem.memoryTypeCount; t++)
         if ((bits & (1u << t)) && (g_hw.mem.memoryTypes[t].propertyFlags & want) == want) return t;
@@ -5870,19 +6116,33 @@ static void VKAPI_CALL cmd_barrier(VkCommandBuffer cbh, VkPipelineStageFlags src
 static void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cbh, VkImage im, VkImageLayout l, VkBuffer bb, uint32_t n, const VkBufferImageCopy *rg);
 static void VKAPI_CALL get_queue(VkDevice dv, uint32_t fam, uint32_t idx, VkQueue *out);
 
-#ifdef _WIN32
-// 録画（VR_CAP_RECORD・OBS の録画を iPhone で）。窓に出すコマの印を送る（Windows の窓の道だけ）
+// 録画（VR_CAP_RECORD・OBS の録画を iPhone で）。窓に出すコマの印を送る
 #include "record_icd.inc"
 
 static void disp_stop(struct swapchain *sc);
 static int disp_thread_on(void);
 
+#ifdef _WIN32
 // CPU を使った時間（ms）。FILETIME は 100 ns 単位
 static double ft_ms(const FILETIME *f) { return (double) (((uint64_t) f->dwHighDateTime << 32) | f->dwLowDateTime) / 1e4; }
 static double proc_cpu_ms(void) {
     FILETIME c, e, k, u;
     return GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u) ? ft_ms(&k) + ft_ms(&u) : 0;
 }
+
+// 終わった糸が使った CPU 時間（ms）
+static double thread_cpu_ms(HANDLE t) {
+    FILETIME c, e, k, u;
+    return GetThreadTimes(t, &c, &e, &k, &u) ? ft_ms(&k) + ft_ms(&u) : 0;
+}
+#else
+// CPU を使った時間（ms）。糸の CPU 時間（thread_cpu_ms）は plat_posix.h
+static double proc_cpu_ms(void) {
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru)) return 0;
+    return (double) (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000.0 + (double) (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000.0;
+}
+#endif
 
 static void VKAPI_CALL destroy_swapchain(VkDevice dv, VkSwapchainKHR h, const VkAllocationCallbacks *a) {
     (void) a;
@@ -5918,6 +6178,7 @@ static void VKAPI_CALL destroy_swapchain(VkDevice dv, VkSwapchainKHR h, const Vk
     free(sc);
 }
 
+#ifdef _WIN32
 // IPHONE_VK_MONITOR=sub（主でないモニター）か番号（1 から）なら、アプリの窓をそのモニターの左上へ動かす。大きさは変えない。
 // 同じ窓は 1 回だけ動かす（作り直しのたびに動かすと、手で動かした場所が戻ってしまう）
 static BOOL CALLBACK collect_monitor(HMONITOR m, HDC dc, LPRECT rc, LPARAM lp) {
@@ -5964,6 +6225,7 @@ static double monitor_hz(HWND w) {
         return dm.dmDisplayFrequency;
     return 60;
 }
+#endif
 
 static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreateInfoKHR *ci, const VkAllocationCallbacks *a, VkSwapchainKHR *out) {
     (void) a;
@@ -5974,10 +6236,10 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
     move_to_monitor(sc->hwnd);
     g_stall_hwnd = sc->hwnd;
     {
-        RECT rc0 = { 0 };
-        if (sc->hwnd) GetClientRect(sc->hwnd, &rc0);
-        sc->asked_w = (uint32_t) (rc0.right - rc0.left);
-        sc->asked_h = (uint32_t) (rc0.bottom - rc0.top);
+        uint32_t cw = 0, ch = 0;
+        if (sc->hwnd) win_size(sc->hwnd, &cw, &ch);
+        sc->asked_w = cw;
+        sc->asked_h = ch;
     }
     sc->w = ci->imageExtent.width;
     sc->h = ci->imageExtent.height;
@@ -6124,6 +6386,7 @@ static VkResult VKAPI_CALL acquire_image2(VkDevice dv, const VkAcquireNextImageI
     return acquire_image(dv, ai->swapchain, ai->timeout, ai->semaphore, ai->fence, idx);
 }
 
+#ifdef _WIN32
 // 持ち帰った画像 j を窓に描き写す
 // 受け手に JPEG にしてもらったコマを、WIC でほどいて写し（BGRA）に書く。失敗したら 0
 // JPEG をほどいて、w×h の B・G・R・A の並びにする。1 ほどけた・-1 大きさが違う（窓の大きさが変わる前の絵）・0 失敗
@@ -6153,6 +6416,21 @@ done:
     if (st) IWICStream_Release(st);
     return ok;
 }
+
+// JPEG をほどく道具。使う糸ごとに 1 つ（COM は呼ぶ側の糸で始めておく）
+struct jdec { IWICImagingFactory *fac; };
+static int jdec_open(struct jdec *j) {
+    j->fac = NULL;
+    return SUCCEEDED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **) &j->fac));
+}
+static void jdec_close(struct jdec *j) {
+    if (j->fac) IWICImagingFactory_Release(j->fac);
+    j->fac = NULL;
+}
+static int jdec_decode(struct jdec *j, const uint8_t *data, size_t n, uint32_t w, uint32_t h, uint8_t *px) {
+    return jpeg_decode(j->fac, data, n, w, h, px);
+}
+#endif
 
 // 受け手に縮めてもらった JPEG を取ってくる。1 取れた・-1 まだ出す物が無い（先送りの最初）・0 失敗
 // 今の設定で、返ってきた JPEG が何回前に頼んだ物か（先送りで 1・返事を次のコマで受け取るので 1）
@@ -6211,14 +6489,17 @@ static uint64_t jpeg_serial(struct swapchain *sc, uint64_t now) {
 }
 
 static int jpeg_fetch(struct swapchain *sc, uint32_t j) {
-    static IWICImagingFactory *fac;
-    if (!fac) {
+    static struct jdec jd;
+    static int jok;
+    if (!jok) {
+#ifdef _WIN32
         CoInitializeEx(NULL, COINIT_MULTITHREADED);
-        if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **) &fac))) return 0;
+#endif
+        if (!(jok = jdec_open(&jd))) return 0;
     }
     vr_buf out = { 0 };
     int k = jpeg_request(sc, j, &out);
-    if (k == 1) k = jpeg_decode(fac, out.p, out.n, sc->w, sc->h, sc->px[j]);
+    if (k == 1) k = jdec_decode(&jd, out.p, out.n, sc->w, sc->h, sc->px[j]);
     free(out.p);
     return k;
 }
@@ -6228,18 +6509,13 @@ static void dump_frame(struct swapchain *sc, const uint8_t *px);
 // 窓に描く糸：渡された最新の JPEG をほどいて描く
 static DWORD WINAPI disp_thread(LPVOID arg) {
     struct swapchain *sc = (struct swapchain *) arg;
+#ifdef _WIN32
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    IWICImagingFactory *fac = NULL;
-    CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **) &fac);
+#endif
+    struct jdec jd;
+    int jok = jdec_open(&jd);
     uint8_t *px = malloc((size_t) sc->w * sc->h * 4);
     vr_buf mine = { 0 };
-    BITMAPINFO bmi = { 0 };
-    bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
-    bmi.bmiHeader.biWidth = (LONG) sc->w;
-    bmi.bmiHeader.biHeight = -(LONG) sc->h; // 上から下へ
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
     for (;;) {
         AcquireSRWLockExclusive(&sc->disp.lk);
         while (!sc->disp.has && !sc->disp.quit) SleepConditionVariableSRW(&sc->disp.cv, &sc->disp.lk, INFINITE, 0);
@@ -6250,14 +6526,8 @@ static DWORD WINAPI disp_thread(LPVOID arg) {
         sc->disp.has = 0;
         uint64_t serial = sc->disp.serial;
         ReleaseSRWLockExclusive(&sc->disp.lk);
-        if (!fac || !px || jpeg_decode(fac, mine.p, mine.n, sc->w, sc->h, px) != 1) continue;
-        RECT rc;
-        GetClientRect(sc->hwnd, &rc);
-        HDC dc = GetDC(sc->hwnd);
-        SetStretchBltMode(dc, COLORONCOLOR);
-        StretchDIBits(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, 0, 0, (int) sc->w, (int) sc->h, px, &bmi, DIB_RGB_COLORS, SRCCOPY);
-        ReleaseDC(sc->hwnd, dc);
-        GdiFlush();
+        if (!jok || !px || jdec_decode(&jd, mine.p, mine.n, sc->w, sc->h, px) != 1) continue;
+        win_draw(sc->hwnd, px, sc->w, sc->h);
         if (serial && sc->npres - serial < 64) {
             double lat = now_ms() - sc->pres_t[serial % 64];
             sc->lat_sum += lat;
@@ -6272,8 +6542,10 @@ static DWORD WINAPI disp_thread(LPVOID arg) {
     }
     free(px);
     free(mine.p);
-    if (fac) IWICImagingFactory_Release(fac);
+    jdec_close(&jd);
+#ifdef _WIN32
     CoUninitialize();
+#endif
     return 0;
 }
 
@@ -6291,8 +6563,7 @@ static void disp_stop(struct swapchain *sc) {
     WakeConditionVariable(&sc->disp.cv);
     ReleaseSRWLockExclusive(&sc->disp.lk);
     WaitForSingleObject(sc->disp.thr, 5000);
-    FILETIME c, e, k, u;
-    if (GetThreadTimes(sc->disp.thr, &c, &e, &k, &u)) sc->disp_cpu += ft_ms(&k) + ft_ms(&u);
+    sc->disp_cpu += thread_cpu_ms(sc->disp.thr);
     CloseHandle(sc->disp.thr);
     sc->disp.thr = NULL;
     free(sc->disp.jpg.p);
@@ -6320,8 +6591,9 @@ static void dump_frame_at(struct swapchain *sc, const uint8_t *px, uint64_t fram
 
 // 窓の大きさが swapchain と違い、しかもその窓の大きさでまだ頼んでいなければ、作り直しを 1 回だけ頼む。
 // DXVK-macOS は窓でなく描く大きさで作るので、毎コマ頼むと作り直しが止まらない（違う大きさのままでも、窓に合わせて伸ばして描く）
-static int ask_resize(struct swapchain *sc, const RECT *rc) {
-    uint32_t w = (uint32_t) (rc->right - rc->left), h = (uint32_t) (rc->bottom - rc->top);
+static int ask_resize(struct swapchain *sc) {
+    uint32_t w = 0, h = 0;
+    if (!win_size(sc->hwnd, &w, &h)) return 0;
     if (!w || !h || (w == sc->w && h == sc->h) || (w == sc->asked_w && h == sc->asked_h)) return 0;
     sc->asked_w = w;
     sc->asked_h = h;
@@ -6346,6 +6618,7 @@ static void disp_give(struct swapchain *sc, vr_buf *out, uint64_t serial) {
     ReleaseSRWLockExclusive(&sc->disp.lk);
 }
 
+#ifdef _WIN32
 // ---- 窓の絵を H.264 で受け取る ----
 // H.264 は前のコマを元にするので、JPEG と違って間のコマを飛ばせない。表示の糸は届いた順に全部ほどき、最後の 1 枚だけを描く
 // 広げた絵を出す窓。表示の糸が作り、その糸で知らせを回す。窓の文は仮（言葉は鶴田さんが決める）
@@ -6382,40 +6655,6 @@ static HWND up_window(uint32_t w, uint32_t h, HWND game) {
         ShowWindow(wnd, SW_SHOWNOACTIVATE);
     }
     return wnd;
-}
-
-static void draw_bgra_to(HWND hw, const uint8_t *px, uint32_t w, uint32_t h) {
-    BITMAPINFO bmi = { 0 };
-    bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
-    bmi.bmiHeader.biWidth = (LONG) w;
-    bmi.bmiHeader.biHeight = -(LONG) h; // 上から下へ
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    RECT rc;
-    GetClientRect(hw, &rc);
-    HDC dc = GetDC(hw);
-    SetStretchBltMode(dc, COLORONCOLOR);
-    StretchDIBits(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, 0, 0, (int) w, (int) h, px, &bmi, DIB_RGB_COLORS, SRCCOPY);
-    ReleaseDC(hw, dc);
-    GdiFlush();
-}
-
-static void draw_bgra(struct swapchain *sc, const uint8_t *px) {
-    BITMAPINFO bmi = { 0 };
-    bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
-    bmi.bmiHeader.biWidth = (LONG) sc->w;
-    bmi.bmiHeader.biHeight = -(LONG) sc->h; // 上から下へ
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-    RECT rc;
-    GetClientRect(sc->hwnd, &rc);
-    HDC dc = GetDC(sc->hwnd);
-    SetStretchBltMode(dc, COLORONCOLOR);
-    StretchDIBits(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, 0, 0, (int) sc->w, (int) sc->h, px, &bmi, DIB_RGB_COLORS, SRCCOPY);
-    ReleaseDC(sc->hwnd, dc);
-    GdiFlush();
 }
 
 // 窓に描く糸（H.264）：渡されたコマを順にほどいて、最後の 1 枚を描く
@@ -6497,11 +6736,11 @@ static DWORD WINAPI vdisp_thread(LPVOID arg) {
         double t2 = now_ms();
         if (sc->upscale) {
             if (!sc->vwin && (sc->vwin = up_window(sc->vw, sc->vh, sc->hwnd))) SetWindowLongPtrW(sc->vwin, GWLP_USERDATA, (LONG_PTR) sc->hwnd);
-            if (sc->vwin) draw_bgra_to(sc->vwin, px, sc->vw, sc->vh);
+            if (sc->vwin) win_draw(sc->vwin, px, sc->vw, sc->vh);
             MSG m;
             while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
         } else {
-            draw_bgra(sc, px);
+            win_draw(sc->hwnd, px, sc->w, sc->h);
         }
         sc->v_cvt_ms += t2 - t1;
         sc->v_draw_ms += now_ms() - t2;
@@ -6614,6 +6853,13 @@ static int video_blit(struct swapchain *sc, uint32_t j, uint64_t serial, int now
     video_fallback(sc);
     return 0;
 }
+#else
+// Linux は窓の絵を JPEG だけで受け取る（use_video はいつも 0）
+static int video_blit(struct swapchain *sc, uint32_t j, uint64_t serial, int now, VkResult *r) {
+    (void) sc; (void) j; (void) serial; (void) now; (void) r;
+    return 0;
+}
+#endif
 
 // 今のコマの JPEG をその場で受け取って、表示の糸に渡す（区切りの待ちがあるときの、遅れの少ないやり方）
 static VkResult blit_now(struct swapchain *sc, uint32_t j, uint64_t serial) {
@@ -6621,11 +6867,7 @@ static VkResult blit_now(struct swapchain *sc, uint32_t j, uint64_t serial) {
     VkResult vr = VK_SUCCESS;
     int vk = video_blit(sc, j, serial, 1, &vr);
     if (vk < 0) return vr;
-    if (vk > 0) {
-        RECT rc;
-        GetClientRect(sc->hwnd, &rc);
-        return ask_resize(sc, &rc) ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
-    }
+    if (vk > 0) return ask_resize(sc) ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
     static int q = -1;
     if (q < 0) { const char *e = getenv("IPHONE_VK_JPEG_Q"); q = e && atoi(e) > 0 ? atoi(e) : 80; }
     vr_buf b = { 0 }, out = { 0 };
@@ -6644,9 +6886,7 @@ static VkResult blit_now(struct swapchain *sc, uint32_t j, uint64_t serial) {
     }
     free(out.p);
     if (r != VK_SUCCESS) return r;
-    RECT rc;
-    GetClientRect(sc->hwnd, &rc);
-    if (ask_resize(sc, &rc)) return VK_SUBOPTIMAL_KHR;
+    if (ask_resize(sc)) return VK_SUBOPTIMAL_KHR;
     return VK_SUCCESS;
 }
 
@@ -6659,9 +6899,7 @@ static VkResult blit(struct swapchain *sc, uint32_t j, uint64_t serial) {
         VkResult vr = VK_SUCCESS;
         int vk = video_blit(sc, j, serial, 0, &vr);
         if (vk != 0) {
-            RECT rc;
-            GetClientRect(sc->hwnd, &rc);
-            if (vk > 0 && ask_resize(sc, &rc)) return VK_SUBOPTIMAL_KHR;
+            if (vk > 0 && ask_resize(sc)) return VK_SUBOPTIMAL_KHR;
             return VK_SUCCESS;
         }
         // JPEG を取ってきて表示の糸に渡し、ほどいて描くのを待たずに戻る
@@ -6670,9 +6908,7 @@ static VkResult blit(struct swapchain *sc, uint32_t j, uint64_t serial) {
         uint64_t got = jpeg_serial(sc, serial);
         if (k == 1) disp_give(sc, &out, got);
         free(out.p);
-        RECT rc;
-        GetClientRect(sc->hwnd, &rc);
-        if (ask_resize(sc, &rc)) return VK_SUBOPTIMAL_KHR;
+        if (ask_resize(sc)) return VK_SUBOPTIMAL_KHR;
         return VK_SUCCESS;
     }
     // JPEG で受け取ったときは、もう B・G・R・A の並びになっている
@@ -6682,25 +6918,13 @@ static VkResult blit(struct swapchain *sc, uint32_t j, uint64_t serial) {
         if (k < 0) return VK_SUCCESS; // 出す物がまだ無い
         is_bgra = k;
     }
-    BITMAPINFO bmi = { 0 };
-    bmi.bmiHeader.biSize = sizeof bmi.bmiHeader;
-    bmi.bmiHeader.biWidth = (LONG) sc->w;
-    bmi.bmiHeader.biHeight = -(LONG) sc->h; // 上から下へ
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
     if (!is_bgra && (sc->fmt == VK_FORMAT_R8G8B8A8_UNORM || sc->fmt == VK_FORMAT_R8G8B8A8_SRGB))
         for (size_t p = 0; p < (size_t) sc->w * sc->h; p++) { uint8_t t = px[p * 4]; px[p * 4] = px[p * 4 + 2]; px[p * 4 + 2] = t; }
-    RECT rc;
-    GetClientRect(sc->hwnd, &rc);
-    HDC dc = GetDC(sc->hwnd);
-    SetStretchBltMode(dc, COLORONCOLOR);
-    StretchDIBits(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, 0, 0, (int) sc->w, (int) sc->h, px, &bmi, DIB_RGB_COLORS, SRCCOPY);
-    ReleaseDC(sc->hwnd, dc);
+    win_draw(sc->hwnd, px, sc->w, sc->h);
     sc_tick(sc);
     dump_frame(sc, px);
     // 窓の大きさが変わったら、作り直してもらう
-    if (ask_resize(sc, &rc)) return VK_SUBOPTIMAL_KHR;
+    if (ask_resize(sc)) return VK_SUBOPTIMAL_KHR;
     return VK_SUCCESS;
 }
 
@@ -6818,15 +7042,6 @@ static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi)
     if (sc0) sc0->last_end = now_ms();
     return worst;
 }
-
-#else
-// CPU を使った時間（ms）
-static double proc_cpu_ms(void) {
-    struct rusage ru;
-    if (getrusage(RUSAGE_SELF, &ru)) return 0;
-    return (double) (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000.0 + (double) (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000.0;
-}
-#endif
 
 // ---- shader・パイプライン ----
 // ---- シェーダーが書く場所 ----
@@ -10815,14 +11030,12 @@ static PFN_vkVoidFunction lookup_device(const char *pName) {
     F("vkDestroySemaphore", destroy_semaphore);
     F("vkCreateSampler", create_sampler);
     F("vkDestroySampler", destroy_sampler);
-#ifdef _WIN32
     F("vkCreateSwapchainKHR", create_swapchain);
     F("vkDestroySwapchainKHR", destroy_swapchain);
     F("vkGetSwapchainImagesKHR", swapchain_images);
     F("vkAcquireNextImageKHR", acquire_image);
     F("vkAcquireNextImage2KHR", acquire_image2);
     F("vkQueuePresentKHR", queue_present);
-#endif
     F("vkCreateImage", create_image);
     F("vkDestroyImage", destroy_image);
     F("vkGetImageMemoryRequirements", image_reqs);
@@ -11048,12 +11261,15 @@ static PFN_vkVoidFunction lookup_phys(const char *pName) {
     F("vkEnumerateDeviceExtensionProperties", enum_device_ext);
     F("vkEnumerateDeviceLayerProperties", enum_device_layers);
     F("vkCreateDevice", create_device);
-#ifdef _WIN32
     F("vkGetPhysicalDeviceSurfaceSupportKHR", surface_support);
     F("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", surface_caps);
     F("vkGetPhysicalDeviceSurfaceFormatsKHR", surface_formats);
     F("vkGetPhysicalDeviceSurfacePresentModesKHR", surface_modes);
+#ifdef _WIN32
     F("vkGetPhysicalDeviceWin32PresentationSupportKHR", win32_presentation_support);
+#else
+    F("vkGetPhysicalDeviceXcbPresentationSupportKHR", xcb_presentation_support);
+    F("vkGetPhysicalDeviceXlibPresentationSupportKHR", xlib_presentation_support);
 #endif
     return NULL;
 }
@@ -11066,8 +11282,11 @@ static PFN_vkVoidFunction lookup(const char *pName) {
     F("vkEnumeratePhysicalDevices", enum_phys);
 #ifdef _WIN32
     F("vkCreateWin32SurfaceKHR", create_win32_surface);
-    F("vkDestroySurfaceKHR", destroy_surface);
+#else
+    F("vkCreateXcbSurfaceKHR", create_xcb_surface);
+    F("vkCreateXlibSurfaceKHR", create_xlib_surface);
 #endif
+    F("vkDestroySurfaceKHR", destroy_surface);
     PFN_vkVoidFunction f = lookup_phys(pName);
     return f ? f : lookup_device(pName);
 }

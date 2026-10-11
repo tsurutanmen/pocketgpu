@@ -110,7 +110,7 @@ static void rc_fetch(const char *rpath) {
     if (!base || (b2 && b2 > base)) base = b2;
     base = base ? base + 1 : rpath;
     char dst[MAX_PATH * 2];
-    snprintf(dst, sizeof dst, "%s\\%s", g_rc.fetch, base);
+    snprintf(dst, sizeof dst, "%s" PATH_SEP "%s", g_rc.fetch, base);
     FILE *f = fopen(dst, "wb");
     if (!f) { say("録画：%s に書けない", dst); return; }
     uint64_t at = 0, total = 1;
