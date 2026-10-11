@@ -1,0 +1,2 @@
+# シェルの台本は Windows の作業コピーでも LF のまま（WSL や Linux でそのまま動かすため）
+*.sh text eol=lf
