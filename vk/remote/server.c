@@ -1349,6 +1349,30 @@ static void set_dynamic(VkCommandBuffer cb, uint32_t st, uint32_t n, const uint3
     vlog("知らない値の変え方 %u（値 %u 個）", st, n);
 }
 
+// pipeline layout と pipeline が持つ set の数を覚える（ent の size に「数＋1」。0 は分からない。layout と pipeline では size を使っていない）。
+// replay が、受け手に無い set の番号を使う pipeline の draw・dispatch を見分けるのに使う
+static void note_layout_sets(uint64_t id, uint32_t ns) {
+    ent *e = find(id);
+    if (e && e->kind == K_PLAYOUT) e->size = (uint64_t) ns + 1;
+}
+static void note_pipe_sets(uint64_t pid, uint64_t lid) {
+    ent *l = find(lid), *p = find(pid);
+    if (p && p->kind == K_PIPELINE) p->size = l && l->kind == K_PLAYOUT ? l->size : 0;
+}
+// その pipeline が使うかもしれない set の番号の印（分からなければ全部）
+static uint32_t pipe_set_mask(uint64_t pid) {
+    ent *p = find(pid);
+    if (!p || p->kind != K_PIPELINE || !p->size) return ~0u;
+    uint64_t ns = p->size - 1;
+    return ns >= 32 ? ~0u : (uint32_t) ((1ull << ns) - 1);
+}
+static uint32_t set_range_mask(uint32_t first, uint32_t n) {
+    uint32_t m = 0;
+    for (uint32_t i = first; i < first + n && i < 32; i++) m |= 1u << i;
+    return m;
+}
+static uint64_t g_missing_set_binds; // 受け手に無い set をつなごうとした回数（記録に出す数を絞る）
+
 // ---- command buffer に積まれた命令を実行する ----
 static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
     // 有効な描き方・計算の仕方がつながっていない draw と dispatch は飛ばす
@@ -1356,6 +1380,12 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
     int gfx = 0, cmp = 0;
     int rp_off = 0; // 始められなかった render pass の中（次の subpass・終わり・draw を飛ばす）
     uint32_t skipped = 0;
+    // 受け手に無い set（取れなかった・消えた番号）は MoltenVK に渡さない。MoltenVK は set を submit のときに読むので、
+    // 空の set をつなぐと submit の中で落ちる（10/10 iPhone の bindDescriptorSets の 0x3c）。つながなかった番号を miss に覚え、
+    // その番号を使うかもしれない pipeline の draw・dispatch も飛ばす（描くときにも set を読んで落ちるので）。[0] 描く・[1] 計算
+    int gfx_pl = 0, cmp_pl = 0;
+    uint32_t miss[2] = { 0, 0 }, uses[2] = { ~0u, ~0u };
+#define SET_GATE() (gfx = gfx_pl && !(miss[0] & uses[0]), cmp = cmp_pl && !(miss[1] & uses[1]))
     while (r->at < r->n && !r->bad) {
         uint32_t op = vr_ru32(r);
         switch (op) {
@@ -1365,17 +1395,21 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             VkPipeline pl = OBJ(VkPipeline, pid);
             tracef(ci, "  pipeline %llu%s", (unsigned long long) pid, pl ? "" : "（無い）");
             if (pl) vkCmdBindPipeline(cb, (VkPipelineBindPoint) bp, pl);
-            if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) gfx = pl != VK_NULL_HANDLE;
-            else if (bp == VK_PIPELINE_BIND_POINT_COMPUTE) cmp = pl != VK_NULL_HANDLE;
+            if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) { gfx_pl = pl != VK_NULL_HANDLE; uses[0] = pipe_set_mask(pid); }
+            else if (bp == VK_PIPELINE_BIND_POINT_COMPUTE) { cmp_pl = pl != VK_NULL_HANDLE; uses[1] = pipe_set_mask(pid); }
+            SET_GATE();
         } break;
         case VR_CMD_BIND_DESCRIPTOR_SETS: {
             uint32_t bp = vr_ru32(r);
             VkPipelineLayout pl = OBJ(VkPipelineLayout, vr_ru64(r));
             uint32_t first = vr_ru32(r), n = vr_ru32(r);
             VkDescriptorSet sets[32];
+            uint32_t nmiss = 0;
+            uint64_t miss_id = 0;
             for (uint32_t i = 0; i < n && i < 32; i++) {
                 uint64_t sid = vr_ru64(r);
                 sets[i] = OBJ(VkDescriptorSet, sid);
+                if (!sets[i] && !nmiss++) miss_id = sid;
                 if (dbg_on() && ci) {
                     vr_buf *d = dset_of(sid);
                     tracef(ci, "  set %llu%s：%.*s", (unsigned long long) sid, sets[i] ? "" : "（無い）", (int) d->n, d->p ? (const char *) d->p : "");
@@ -1391,8 +1425,20 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             uint32_t dyn[64];
             for (uint32_t i = 0; i < nd && i < 64; i++) dyn[i] = vr_ru32(r);
             for (uint32_t i = 64; i < nd && !r->bad; i++) (void) vr_ru32(r);
-            if (pl) vkCmdBindDescriptorSets(cb, (VkPipelineBindPoint) bp, pl, first, n < 32 ? n : 32, sets, nd < 64 ? nd : 64, dyn);
-            else vlog("descriptor set をつなぐ layout が無いので飛ばした");
+            int k = bp == VK_PIPELINE_BIND_POINT_GRAPHICS ? 0 : bp == VK_PIPELINE_BIND_POINT_COMPUTE ? 1 : -1;
+            uint32_t range = set_range_mask(first, n < 32 ? n : 32);
+            if (pl && !nmiss) {
+                vkCmdBindDescriptorSets(cb, (VkPipelineBindPoint) bp, pl, first, n < 32 ? n : 32, sets, nd < 64 ? nd : 64, dyn);
+                if (k >= 0) miss[k] &= ~range;
+            } else {
+                // つながなかった番号には前の set が残るか、何もつながっていない。どちらもその番号を使う draw は描けない
+                if (k >= 0) miss[k] |= range;
+                if (!pl) vlog("descriptor set をつなぐ layout が無いので飛ばした");
+                else if (++g_missing_set_binds <= 20 || g_missing_set_binds % 1000 == 0)
+                    vlog("受け手に無い descriptor set（%llu）をつなごうとした（%u 番から %u 個のうち %u 個が無い・command buffer %llu・%llu 回目）。つながずに、その番号を使う draw・dispatch を飛ばす",
+                         (unsigned long long) miss_id, first, n, nmiss, (unsigned long long) (ci ? ci->cb : 0), (unsigned long long) g_missing_set_binds);
+            }
+            SET_GATE();
         } break;
         case VR_CMD_PUSH_CONSTANTS: {
             VkPipelineLayout pl = OBJ(VkPipelineLayout, vr_ru64(r));
@@ -1831,6 +1877,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
         }
     }
     if (skipped) vlog("描き方か計算の仕方がつながっていないので、draw・dispatch を %u 回飛ばした", skipped);
+#undef SET_GATE
 }
 
 // ---- 窓に出すコマを JPEG に縮める（VR_READ_JPEG） ----
@@ -3670,7 +3717,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         }
         VkPipelineLayoutCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = ns, .pSetLayouts = sl, .pushConstantRangeCount = np, .pPushConstantRanges = pr };
         VkPipelineLayout l;
-        if (vkCreatePipelineLayout(d, &ci, NULL, &l) == VK_SUCCESS) put(id, (uint64_t) l, K_PLAYOUT);
+        if (vkCreatePipelineLayout(d, &ci, NULL, &l) == VK_SUCCESS) { put(id, (uint64_t) l, K_PLAYOUT); note_layout_sets(id, ns); }
         if (empty) vkDestroyDescriptorSetLayout(d, empty, NULL); // layout を作ったあとは消してよい
         return 1;
     }
@@ -3687,7 +3734,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t id = vr_ru64(r);
         VkComputePipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         ci.flags = vr_ru32(r);
-        ci.layout = OBJ(VkPipelineLayout, vr_ru64(r));
+        uint64_t lid = vr_ru64(r);
+        ci.layout = OBJ(VkPipelineLayout, lid);
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
         ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         ci.stage.flags = vr_ru32(r);
@@ -3709,7 +3757,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         }
         VkPipeline p;
         VkResult res = vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &ci, NULL, &p);
-        if (res == VK_SUCCESS) put(id, (uint64_t) p, K_PIPELINE);
+        if (res == VK_SUCCESS) { put(id, (uint64_t) p, K_PIPELINE); note_pipe_sets(id, lid); }
         else vlog("compute pipeline を作れない (%d)", res);
         return reply(s, res);
     }
@@ -4540,7 +4588,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t id = vr_ru64(r);
         VkGraphicsPipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
         ci.flags = vr_ru32(r);
-        ci.layout = OBJ(VkPipelineLayout, vr_ru64(r));
+        uint64_t lid = vr_ru64(r);
+        ci.layout = OBJ(VkPipelineLayout, lid);
         ci.renderPass = OBJ(VkRenderPass, vr_ru64(r));
         ci.subpass = vr_ru32(r);
         // シェーダーの段
@@ -4728,7 +4777,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 }
         VkPipeline pp;
         VkResult res = r->bad ? VK_ERROR_INITIALIZATION_FAILED : vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &ci, NULL, &pp);
-        if (res == VK_SUCCESS) put(id, (uint64_t) pp, K_PIPELINE);
+        if (res == VK_SUCCESS) { put(id, (uint64_t) pp, K_PIPELINE); note_pipe_sets(id, lid); }
         else vlog("graphics pipeline を作れない (%d)", res);
         return reply(s, res);
     }

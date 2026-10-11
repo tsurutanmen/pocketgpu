@@ -36,6 +36,7 @@
 #include <d3d11.h>
 #include <d3d10.h>
 #include <dbghelp.h>
+#include <tlhelp32.h>
 #endif
 #include <stdarg.h>
 #include <stdio.h>
@@ -102,6 +103,131 @@ static void where(const char *tag, void *addr) {
 }
 
 static void print_stats_fwd(void);
+// 外された DLL の記録（ntdll が最後の 64 個ほどを覚えている）。番地が外された DLL の中なら、その名前と DLL の中の位置を書く
+typedef struct { PVOID base; SIZE_T size; ULONG seq, stamp, sum; WCHAR name[32]; ULONG ver[2]; } unload_ev;
+static int unloaded_at(void *addr, char *out, size_t n) {
+    typedef VOID (NTAPI *PFN_TRACE)(PULONG *, PULONG *, PVOID *);
+    PFN_TRACE f = (PFN_TRACE) (void *) GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlGetUnloadEventTraceEx");
+    PULONG esz = NULL, ecnt = NULL;
+    PVOID tr = NULL;
+    if (!f) return 0;
+    f(&esz, &ecnt, &tr);
+    // 3 つ目に返るのは「配列を指す変数」の番地なので、もう 1 段たどる
+    if (!esz || !ecnt || !tr || !*esz || !(tr = *(PVOID *) tr)) return 0;
+    const unload_ev *best = NULL;
+    for (ULONG i = 0; i < *ecnt; i++) {
+        const unload_ev *e = (const unload_ev *) ((const char *) tr + (size_t) i * *esz);
+        if (!e->base) continue;
+        if ((uintptr_t) addr >= (uintptr_t) e->base && (uintptr_t) addr < (uintptr_t) e->base + e->size && (!best || e->seq > best->seq)) best = e;
+    }
+    if (!best) return 0;
+    snprintf(out, n, "外された %ls+0x%llx（%p〜%p・外した順番 %lu）", best->name, (unsigned long long) ((uintptr_t) addr - (uintptr_t) best->base),
+             best->base, (void *) ((uintptr_t) best->base + best->size), best->seq);
+    return 1;
+}
+
+// 番地 → 「DLL+位置」。読み込まれていれば DLL の名前、外された DLL の中ならその名前（dbghelp は使わない。ほかの糸を止めている間にも呼ぶので）
+static void addr_name(void *addr, char *out, size_t n) {
+    HMODULE m = NULL;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR) addr, &m)) {
+        GetModuleFileNameA(m, name, sizeof name);
+        const char *b = strrchr(name, '\\');
+        snprintf(out, n, "%s+0x%llx", b ? b + 1 : name, (unsigned long long) ((uintptr_t) addr - (uintptr_t) m));
+    } else if (!unloaded_at(addr, out, n)) {
+        snprintf(out, n, "%p（どの DLL にも無い）", addr);
+    }
+}
+
+// 糸が始まった関数の番地（NtQueryInformationThread の ThreadQuerySetWin32StartAddress）
+static void *thread_start(HANDLE t) {
+    typedef LONG (NTAPI *PFN_QIT)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static PFN_QIT q;
+    if (!q) q = (PFN_QIT) (void *) GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+    void *a = NULL;
+    if (!q || q(t, 9, &a, sizeof a, NULL) < 0) return NULL;
+    return a;
+}
+
+// 落ちた番地が DLL の外（外された DLL に戻ったなど）のときに、何が起きたかを追うための記録。
+// 落ちた糸のスタックに残っている戻り先・全部の糸の始まりの関数と今いる所・読み込まれている DLL の範囲を書く
+static void crash_details(EXCEPTION_POINTERS *ep) {
+    char a[320], b[320];
+    CONTEXT *cx = ep->ContextRecord;
+#ifdef _WIN64
+    uintptr_t sp = (uintptr_t) cx->Rsp;
+#else
+    uintptr_t sp = (uintptr_t) cx->Esp;
+#endif
+    addr_name(thread_start(GetCurrentThread()), a, sizeof a);
+    fprintf(stderr, "[iphone-vk] 落ちた糸 %lu：始まり %s\n", GetCurrentThreadId(), a);
+    // スタックに残っている、DLL の中（外された DLL も）を指す値。いちばん上は今戻った先のことが多い
+    NT_TIB *tib = (NT_TIB *) NtCurrentTeb();
+    uintptr_t top = (uintptr_t) tib->StackBase;
+    int hits = 0;
+    for (uintptr_t p = sp - sizeof(void *); p + sizeof(void *) <= top && p < sp + 16384 && hits < 24; p += sizeof(void *)) {
+        void *v = *(void **) p;
+        HMODULE m = NULL;
+        int in = GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR) v, &m);
+        if (!in && !unloaded_at(v, a, sizeof a)) continue;
+        if (in) addr_name(v, a, sizeof a);
+        fprintf(stderr, "[iphone-vk]   スタック sp%+d：%s\n", (int) ((intptr_t) p - (intptr_t) sp), a);
+        hits++;
+    }
+    // ほかの糸：始まりの関数と今いる所（止めて読む。止めている間は印字も dbghelp もしない）
+    struct { DWORD id; void *start, *pc; } th[256];
+    int nth = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te = { .dwSize = sizeof te };
+        for (BOOL ok = Thread32First(snap, &te); ok && nth < 256; ok = Thread32Next(snap, &te)) {
+            if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
+            HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+            if (!t) continue;
+            th[nth].id = te.th32ThreadID;
+            th[nth].start = thread_start(t);
+            th[nth].pc = NULL;
+            if (SuspendThread(t) != (DWORD) -1) {
+                CONTEXT c = { .ContextFlags = CONTEXT_CONTROL };
+#ifdef _WIN64
+                if (GetThreadContext(t, &c)) th[nth].pc = (void *) c.Rip;
+#else
+                if (GetThreadContext(t, &c)) th[nth].pc = (void *) c.Eip;
+#endif
+                ResumeThread(t);
+            }
+            CloseHandle(t);
+            nth++;
+        }
+        CloseHandle(snap);
+    }
+    for (int i = 0; i < nth; i++) {
+        addr_name(th[i].start, a, sizeof a);
+        addr_name(th[i].pc, b, sizeof b);
+        fprintf(stderr, "[iphone-vk]   糸 %lu：始まり %s・今 %s\n", th[i].id, a, b);
+    }
+    // 読み込まれている DLL の範囲（K32EnumProcessModules は loader の錠を取らない）
+    typedef BOOL (WINAPI *PFN_ENUM)(HANDLE, HMODULE *, DWORD, LPDWORD);
+    typedef BOOL (WINAPI *PFN_INFO)(HANDLE, HMODULE, void *, DWORD);
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    PFN_ENUM en = (PFN_ENUM) (void *) GetProcAddress(k32, "K32EnumProcessModules");
+    PFN_INFO inf = (PFN_INFO) (void *) GetProcAddress(k32, "K32GetModuleInformation");
+    HMODULE mods[512];
+    DWORD need = 0;
+    if (en && inf && en(GetCurrentProcess(), mods, sizeof mods, &need)) {
+        fprintf(stderr, "[iphone-vk] 読み込まれている DLL：");
+        for (DWORD i = 0; i < need / sizeof *mods && i < 512; i++) {
+            struct { LPVOID base; DWORD size; LPVOID entry; } mi;
+            char nm[MAX_PATH] = "?";
+            if (!inf(GetCurrentProcess(), mods[i], &mi, sizeof mi)) continue;
+            GetModuleFileNameA(mods[i], nm, sizeof nm);
+            const char *s = strrchr(nm, '\\');
+            fprintf(stderr, "%s%s %p〜%p", i ? "・" : "", s ? s + 1 : nm, mi.base, (void *) ((uintptr_t) mi.base + mi.size));
+        }
+        fputc('\n', stderr);
+    }
+}
+
 static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
@@ -115,11 +241,22 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
                 (void *) ep->ExceptionRecord->ExceptionInformation[1]);
     fputc('\n', stderr);
     where("場所", ep->ExceptionRecord->ExceptionAddress);
+    HMODULE in = NULL;
+    // 番地がどの DLL の中でもないとき（外された DLL に戻ったなど）は、下の呼び出し元（記録係そのもの）は役に立たないので、くわしく書く
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR) ep->ExceptionRecord->ExceptionAddress, &in)) {
+        char a[320];
+        addr_name(ep->ExceptionRecord->ExceptionAddress, a, sizeof a);
+        fprintf(stderr, "[iphone-vk] 落ちた番地：%s\n", a);
+        fflush(stderr);
+        crash_details(ep);
+        fflush(stderr);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     void *fr[40];
     USHORT n = RtlCaptureStackBackTrace(0, 40, fr, NULL);
     for (USHORT i = 0; i < n; i++) where("  呼び出し元", fr[i]);
     fflush(stderr);
-    { if (getenv("IPHONE_VK_STATS")) print_stats_fwd(); }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -3661,17 +3798,62 @@ static VkResult VKAPI_CALL create_device(VkPhysicalDevice pd, const VkDeviceCrea
     VkResult r = rpc_call(VR_CREATE_DEVICE, &b, NULL);
     free(b.p);
     if (r != VK_SUCCESS) { say("装置を作れない (%d)", r); free(d); return r; }
-    say("装置を作った");
+    say("装置を作った（番地 %p）", (void *) d); // 前に消した装置と同じ番地かを記録で見られるように
     InterlockedIncrement(&g_ndev);
     *out = (VkDevice) d;
     return VK_SUCCESS;
 }
 
+// ---- 待つことのあるアプリの DLL を、プロセスが終わるまで外させない ----
+// アプリの糸がこのドライバの中で待っている間に、アプリがその糸の DLL を外すと、待ちから戻った先が無くて落ちる。
+// Unigine Heaven は閉じるとき DXVK の d3d11.dll を FreeLibrary するが、DXVK の装置は消さない。DXVK の dxvk-queue の糸は
+// vkWaitForFences の中で受け手の答え（遠い GPU なので数 ms〜数十 ms）を待っていて、戻った先の d3d11.dll の
+// DxvkCommandList::synchronize がもう無く、閉じるたびに落ちていた（10/10 夜から。d3d11.dll+0xCA280・糸は ThreadFn::threadProc）。
+// そこで、submit・待つ入口を呼んだ DLL を、最初に呼ばれたときに外させないようにする（このドライバ自身と同じ GET_MODULE_HANDLE_EX_FLAG_PIN）。
+// プロセスが終わるときは、ほかの糸を止めてから DLL を外すので、戻り先が消えることはない。
+// vkGetDeviceQueue などはローダーの中継（vulkan-1.dll）から呼ばれるので、アプリから直に呼ばれる submit と待つ入口で調べる。
+// present は録画の道具のフック（TikTok LIVE Studio の game_detour_32.dll など）が中継していることがあり、よその DLL に印を付けないよう調べない
+#ifdef _WIN32
+static struct { uintptr_t lo, hi; } g_pinned[16];
+static volatile LONG g_npinned;
+static void pin_caller(void *ret) {
+    static int on = -1; // IPHONE_VK_PIN_CALLER=0 で前のやり方（外させない印を付けない）
+    if (on < 0) { const char *e = getenv("IPHONE_VK_PIN_CALLER"); on = !(e && *e == '0'); }
+    if (!on) return;
+    uintptr_t a = (uintptr_t) ret;
+    LONG n = g_npinned;
+    for (LONG i = 0; i < n && i < 16; i++) if (a >= g_pinned[i].lo && a < g_pinned[i].hi) return;
+    HMODULE m = NULL;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR) ret, &m) || !m) return;
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *) ((const char *) m + ((const IMAGE_DOS_HEADER *) m)->e_lfanew);
+    static SRWLOCK lk = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lk);
+    n = g_npinned;
+    int have = 0;
+    for (LONG i = 0; i < n && i < 16; i++) if (g_pinned[i].lo == (uintptr_t) m) have = 1;
+    if (!have && n < 16) {
+        g_pinned[n].lo = (uintptr_t) m;
+        g_pinned[n].hi = (uintptr_t) m + nt->OptionalHeader.SizeOfImage;
+        InterlockedExchange(&g_npinned, n + 1); // 範囲を書いてから数を増やす（読む側は錠を取らない）
+        char nm[MAX_PATH] = "?";
+        GetModuleFileNameA(m, nm, sizeof nm);
+        say("この DLL はプロセスが終わるまで外させない：%s", nm);
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
+#define PIN_CALLER() pin_caller(__builtin_return_address(0))
+#else
+#define PIN_CALLER() ((void) 0)
+#endif
+
 static void push_forget_dev(VkDevice dv);
+static void gs_forget_dev(VkDevice dv);
 static void VKAPI_CALL destroy_device(VkDevice dv, const VkAllocationCallbacks *a) {
     (void) a;
     if (!dv) return;
     push_forget_dev(dv);
+    gs_forget_dev(dv);
+    say("装置を消した（番地 %p）", (void *) dv);
     struct dev *d = (struct dev *) dv;
     vr_buf b = { 0 };
     vr_u64(&b, ID(d));
@@ -9300,6 +9482,7 @@ static VkResult VKAPI_CALL reset_fences(VkDevice dv, uint32_t n, const VkFence *
 }
 
 static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *fs, VkBool32 all, uint64_t timeout) {
+    PIN_CALLER();
     // どれも submit に付けた fence で、終わるまで待つ呼び方なら、往復しない。
     // 持ち帰る物があれば引き取る（その MEM_READ の前に受け手が仕事の終わりを待つ）
     // DXVK は「1 秒の期限で待つ」を繰り返す。0.1 秒以上の期限は、期限なしと同じに扱う
@@ -9489,6 +9672,7 @@ static VkResult VKAPI_CALL get_sem_counter(VkDevice dv, VkSemaphore h, uint64_t 
 }
 
 static VkResult VKAPI_CALL wait_sems(VkDevice dv, const VkSemaphoreWaitInfo *wi, uint64_t timeout) {
+    PIN_CALLER();
     struct dev *d = (struct dev *) dv;
     if (timeout == UINT64_MAX && !(wi->flags & VK_SEMAPHORE_WAIT_ANY_BIT)) {
         // それぞれの値を知らせる submit が分かっていれば、往復しない
@@ -9565,6 +9749,7 @@ static VkResult VKAPI_CALL signal_sem(VkDevice dv, const VkSemaphoreSignalInfo *
 }
 
 static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitInfo *si, VkFence f) {
+    PIN_CALLER();
     struct queue *q = (struct queue *) qh;
     struct dev *d = q->d;
     // u1：結んだあとに書いた descriptor（update after bind）と、アドレスで読み書きする buffer を、command buffer の読む・書く範囲に足す。
@@ -9786,6 +9971,7 @@ static VkResult VKAPI_CALL queue_bind_sparse(VkQueue qh, uint32_t n, const VkBin
 }
 
 static VkResult VKAPI_CALL queue_wait_idle(VkQueue qh) {
+    PIN_CALLER();
     struct queue *q = (struct queue *) qh;
     if (real_fence()) progress_wait(q->last_msg, 1e300);
     complete(q->d, q, q->d->serial);
@@ -9801,6 +9987,7 @@ static VkResult VKAPI_CALL queue_wait_idle(VkQueue qh) {
 }
 
 static VkResult VKAPI_CALL device_wait_idle(VkDevice dv) {
+    PIN_CALLER();
     struct dev *d = (struct dev *) dv;
     if (real_fence()) progress_wait(g_submit_msgs, 1e300);
     complete(d, NULL, d->serial);
@@ -10390,6 +10577,7 @@ static void VKAPI_CALL cmd_copy_qpool_results(VkCommandBuffer cbh, VkQueryPool q
 // vkQueueSubmit2：VkSubmitInfo2 を今までの VkSubmitInfo に直して出す。stage は stage1 で 1 の形に直す
 
 static VkResult VKAPI_CALL queue_submit2(VkQueue qh, uint32_t n, const VkSubmitInfo2 *si, VkFence f) {
+    PIN_CALLER();
     if (n == 0) return queue_submit(qh, 0, NULL, f);
     VkSubmitInfo *s1 = calloc(n, sizeof *s1);
     VkTimelineSemaphoreSubmitInfo *tl = calloc(n, sizeof *tl);

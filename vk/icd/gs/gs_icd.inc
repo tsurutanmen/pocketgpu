@@ -137,6 +137,31 @@ static VkDescriptorSetLayout gs_dsl(VkDevice dv) {
     return r;
 }
 
+// destroy_device から呼ぶ。消した装置の C1 の set の形を忘れる。
+// 覚えは装置の番地で引くので、残したままだと、次の装置が同じ番地に作られたとき（Unreal は試しの装置を壊してから作り直す）、
+// 受け手ではもう消えた形で set を取ろうとする。受け手は set を取れず、空の set をつないだ command buffer を
+// iPhone の MoltenVK が submit で読んで落ちた（10/10 19:35・19:42 の bindDescriptorSets・set 1）
+static void gs_forget_dev(VkDevice dv) {
+    struct dsl *old = NULL;
+    AcquireSRWLockExclusive(&g_gs_lock);
+    int n = 0;
+    while (n < 4 && g_gs_dsl[n].dv) n++;
+    for (int k = 0; k < n; k++)
+        if (g_gs_dsl[k].dv == dv) {
+            old = (struct dsl *) g_gs_dsl[k].l;
+            // 探す所は空きで止まるので、最後の物を空いた所へ詰める
+            g_gs_dsl[k] = g_gs_dsl[n - 1];
+            g_gs_dsl[n - 1].dv = VK_NULL_HANDLE;
+            g_gs_dsl[n - 1].l = VK_NULL_HANDLE;
+            break;
+        }
+    ReleaseSRWLockExclusive(&g_gs_lock);
+    if (old) {
+        say("geometry shader の真似：消した装置の set の形を忘れた");
+        dsl_unref(old);
+    }
+}
+
 // create_playout から呼ぶ。後ろに C1 の set を足した layout も作る（アプリが先に set の形を消しても困らないように、今作る）
 static void gs_note_layout(VkDevice dv, uint64_t id, const VkPipelineLayoutCreateInfo *ci) {
     if (!gs_on() || g_gs_inner || ci->setLayoutCount >= 7) return;
@@ -479,6 +504,7 @@ static VkDescriptorSet gs_set(struct cb *c, struct gs_cbst *st, const struct gs_
     }
     if (same) return st->set;
     VkDescriptorSetLayout l = gs_dsl(dv);
+    if (!l) return VK_NULL_HANDLE; // 形を作れない（装置が 5 つ以上など）。alloc_dsets に空の形を渡さない
     struct gs_dpool *p = st->curpool;
     if (p && !p->left) {
         p = p->next;
