@@ -1037,6 +1037,7 @@ struct PhotoTransferView: View {
                     Text(L("送信中はこの画面を開いたままにしてください。ほかのアプリに切り替えると、少しあとで止まります。", "Keep this screen open while sending. If you switch to another app, sending stops after a short time.")).font(.footnote)
                     Button(L("ペアリングをリセット", "Reset pairing")) { askReset = true }
                 }
+                Section { BetaNote() }
             }
             .navigationTitle(L("PC に送る", "Send to PC"))
             .sheet(isPresented: $picking) {

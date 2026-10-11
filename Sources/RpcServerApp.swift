@@ -345,6 +345,7 @@ struct ContentView: View {
                         Text(L("PC で実行：", "On the PC: ") + "webcam_rx --addr \(ip):50064 --code \(webcam.wifiCode)").font(.footnote.monospaced()).textSelection(.enabled)
                     }
                 }
+                Section { BetaNote() }
             }
             .navigationTitle(L("カメラ", "Camera"))
         }
@@ -361,15 +362,17 @@ struct ContentView: View {
                         AudioBridgeStatusRow(model: AudioBridgeModel.shared)
                     }
                 }
-                // AudioBridge が音を始めるときに読む。つないでいる間に変えたときは、次につないだときから
+                // 入力・音の種類・ステレオ（AudioBridge.swift の MicSettingsView）。接続中に変えたら、その場で音を作り直す。
+                // 前の「イヤホンのマイクを使う」（audioHeadsetMic）は、入力の「Bluetooth」に移した
                 Section(L("マイク", "Microphone")) {
-                    Toggle(L("イヤホンのマイクを使う。音質は下がります", "Use the earphone mic. The sound quality is lower."), isOn: $audioHeadsetMic)
+                    MicSettingsView(model: AudioBridgeModel.shared)
                 }
                 // 字幕は PC のアプリが始める（AppleFeatures の 50057 番の live_asr・LiveASR.swift）。ここでは使えるかだけを出す
                 Section(L("字幕", "Captions")) {
                     LabeledContent(L("文字起こし", "Transcription"), value: liveCaptionAvailable ? L("使用できます", "Available") : L("iOS 26 以降で使用できます", "Needs iOS 26 or later"))
                     Text(L("PC の音声をこの iPhone で文字に起こします。字幕は PC の PocketGPU アプリで開始します。", "Transcribes PC audio on this iPhone. Start captions in the PocketGPU app on the PC.")).font(.footnote)
                 }
+                Section { BetaNote() }
             }
             .navigationTitle(L("音と字幕", "Audio and captions"))
         }
@@ -550,5 +553,14 @@ struct MicCamSummaryView: View {
         LabeledContent(L("GPU", "GPU"), value: gpuRunning ? L("アプリを終了するまで動作します", "Runs until you quit the app") : L("使用していません", "Not in use"))
         LabeledContent(L("スピーカーとマイク", "Speaker and mic"), value: !audioOn ? L("オフ", "Off") : audio.connected ? L("接続中", "Connected") : L("PC の接続待ち", "Waiting for the PC"))
         LabeledContent(L("ウェブカメラ", "Webcam"), value: !webcamOn ? L("オフ", "Off") : camera.connected ? camera.detail : L("PC の接続待ち", "Waiting for the PC"))
+    }
+}
+
+// カメラ・音と字幕・PC に送るのタブの下に出す。テスターに先に配る、試験中の機能だと分かるようにする
+struct BetaNote: View {
+    var body: some View {
+        Text(L("試験中の機能です。うまく動かないときは、Discord で教えてください。", "This feature is still being tested. If it does not work well, please tell us on Discord."))
+            .font(.footnote)
+            .foregroundStyle(.secondary)
     }
 }
