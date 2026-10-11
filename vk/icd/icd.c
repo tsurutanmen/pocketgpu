@@ -339,6 +339,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_READ_JPEG_PIPE] = "READ_JPEG_PIPE", [VR_GET_BUFFER_ADDRESS] = "GET_BUFFER_ADDRESS",
     [VR_PACKED] = "PACKED", [VR_CREATE_BUFFER_NR] = "CREATE_BUFFER_NR", [VR_CREATE_IMAGE_NR] = "CREATE_IMAGE_NR", [VR_GET_STATUS] = "GET_STATUS",
     [VR_READ_H264] = "READ_H264", [VR_GET_PROGRESS] = "GET_PROGRESS",
+    [VR_RECORD_CTL] = "RECORD_CTL", [VR_RECORD_FRAME] = "RECORD_FRAME", [VR_RECORD_FETCH] = "RECORD_FETCH",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -5870,6 +5871,9 @@ static void VKAPI_CALL cmd_copy_image_to_buffer(VkCommandBuffer cbh, VkImage im,
 static void VKAPI_CALL get_queue(VkDevice dv, uint32_t fam, uint32_t idx, VkQueue *out);
 
 #ifdef _WIN32
+// 録画（VR_CAP_RECORD・OBS の録画を iPhone で）。窓に出すコマの印を送る（Windows の窓の道だけ）
+#include "record_icd.inc"
+
 static void disp_stop(struct swapchain *sc);
 static int disp_thread_on(void);
 
@@ -5885,6 +5889,7 @@ static void VKAPI_CALL destroy_swapchain(VkDevice dv, VkSwapchainKHR h, const Vk
     struct swapchain *sc = (struct swapchain *) h;
     if (!sc) return;
     if (sc->pend >= 0 && sc->fence[sc->pend]) wait_fences(dv, 1, &sc->fence[sc->pend], VK_TRUE, UINT64_MAX);
+    rc_swapchain_gone(); // 最後の swapchain なら録画を止める（持ち帰りもここ。持ち帰り用の memory を放す前に）
     disp_stop(sc);
     if (g_stall_hwnd == sc->hwnd) g_stall_hwnd = NULL;
     if (sc->pool) destroy_cpool(dv, sc->pool, NULL);
@@ -6087,6 +6092,7 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
     if (ci->oldSwapchain) say("swapchain を作り直した（%u x %u）", sc->w, sc->h);
     else say("swapchain：%u x %u・%u 枚", sc->w, sc->h, sc->n);
     sc->t0 = now_ms();
+    rc_swapchain_made();
     *out = (VkSwapchainKHR) sc;
     return VK_SUCCESS;
 }
@@ -6611,6 +6617,7 @@ static int video_blit(struct swapchain *sc, uint32_t j, uint64_t serial, int now
 
 // 今のコマの JPEG をその場で受け取って、表示の糸に渡す（区切りの待ちがあるときの、遅れの少ないやり方）
 static VkResult blit_now(struct swapchain *sc, uint32_t j, uint64_t serial) {
+    rc_frame(sc, j, serial); // 録画中なら、このコマを受け手に録ってもらう
     VkResult vr = VK_SUCCESS;
     int vk = video_blit(sc, j, serial, 1, &vr);
     if (vk < 0) return vr;
@@ -6644,6 +6651,7 @@ static VkResult blit_now(struct swapchain *sc, uint32_t j, uint64_t serial) {
 }
 
 static VkResult blit(struct swapchain *sc, uint32_t j, uint64_t serial) {
+    rc_frame(sc, j, serial); // 録画中なら、このコマを受け手に録ってもらう
     if (!sc->hwnd) return VK_SUCCESS;
     uint8_t *px = sc->px[j];
     if (sc->use_jpeg && disp_thread_on()) {
@@ -6744,6 +6752,7 @@ static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi)
     VkResult worst = VK_SUCCESS;
     struct swapchain *sc0 = pi->swapchainCount ? (struct swapchain *) pi->pSwapchains[0] : NULL;
     heat_check();
+    rc_tick(sc0); // 録画を始める・止める時か
     double slept = sc0 ? pace_present(sc0) : 0;
     double tp = now_ms();
     if (!g_stat.presents) g_stat.cpu0 = proc_cpu_ms();

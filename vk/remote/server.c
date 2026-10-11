@@ -141,6 +141,7 @@ VKFUNCS_OPT(DECL)
 
 static uint32_t g_caps = VR_CAP_DELTA; // 受け手ができること（あいさつで名乗る）
 static int vid_probe(void);            // 窓に出すコマを H.264 に縮められるか（下の VR_READ_H264 のところ）
+static int rec_available(void);        // 録画できるか（record.h）
 // 空の descriptor（robustness2 の nullDescriptor）を GPU が持つか。持てば装置を作るときに有効にする。
 // 持たなければ（MoltenVK）、空の頂点バッファだけは 0 で埋めた代わりのバッファに差し替える
 static int g_nulldesc_gpu;
@@ -522,6 +523,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
 #endif
     if (g_upscale) caps |= VR_CAP_UPSCALE; // 縮める前に MetalFX で広げられる（アプリが関数を登録したとき）
     if (vid_probe()) caps |= VR_CAP_H264; // 窓に出すコマを H.264 に縮められる（iPhone は VideoToolbox、PC の代役は Media Foundation）
+    if (rec_available()) caps |= VR_CAP_RECORD; // 窓に出すコマと PC の音を高画質で録画できる（iPhone はアプリが登録した AVAssetWriter、PC の代役は Sink Writer）
     // buffer device address（GPU の中のバッファのアドレス）
     if (fbda.bufferDeviceAddress && (v12 || e_bda)) {
         vkGetBufferDeviceAddress = (PFN_vkGetBufferDeviceAddress) load_opt(v12, "vkGetBufferDeviceAddress", e_bda ? "KHR" : NULL);
@@ -3020,6 +3022,9 @@ static void vid_reset(void) {
     for (int i = 0; i < VENC_MAX; i++) venc_drop(&g_venc[i]);
 }
 
+// 録画（VR_CAP_RECORD）。窓に出すコマと PC の音を、受け手が高画質で mp4 に書く
+#include "record.h"
+
 // ---- 1 つの命令を実行する。返事が要るものは reply する ----
 static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     g_cur_op = op;
@@ -4357,6 +4362,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         vkSignalSemaphore(d, &si);
         return 1;
     }
+    case VR_RECORD_CTL: return rec_cmd_ctl(s, r);
+    case VR_RECORD_FRAME: return rec_cmd_frame(r);
+    case VR_RECORD_FETCH: return rec_cmd_fetch(s, r);
     case VR_GET_PROGRESS: {
         // 終わった所までの仕事を一覧から外し（もう終わっているので待たない）、終わった submit の番号を返す
         int k = -1;
@@ -5100,6 +5108,7 @@ static void serve_one(vr_sock c, int remote) {
     serve_client(c);
     g_clients = 0;
     g_cur_remote = 0;
+    rec_on_disconnect(); // 録画中に切れたら書き終える（ファイルは残す）
     pv_clear(); // 次につないだときに、前の接続の絵をアプリの画面に残さない
     if (g_lost) {
 #ifdef _WIN32

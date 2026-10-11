@@ -672,6 +672,10 @@ final class AudioBridgeModel: ObservableObject {
             if flags & IPA.frSilent != 0 { r.writeSilence(frames) } else {
                 body.withUnsafeBytes { r.write($0, frames: frames) }
             }
+            // 録画している間は、PC の音も録画に入れる（GameRecorder・vkr_record_pcm。録画していなければ何もしない）
+            let rate = hello?.spkRate ?? 48000, ch = UInt32(hello?.spkChannels ?? 2)
+            if flags & IPA.frSilent != 0 { vkr_record_pcm(nil, UInt32(frames), rate, ch, index) }
+            else { body.withUnsafeBytes { vkr_record_pcm($0.baseAddress?.assumingMemoryBound(to: Int16.self), UInt32(frames), rate, ch, index) } }
             spkExpected += UInt64(frames)
         case IPA.tPing:
             c.send(content: frameHeader(type: IPA.tPong, index: index), completion: .contentProcessed({ _ in }))

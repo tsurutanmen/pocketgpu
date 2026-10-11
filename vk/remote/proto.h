@@ -41,6 +41,22 @@
 // VR_READ_H264 の返事の頭（32 バイト）：流れの番号（u64）・札（u64）・幅・高さ・印（u32。1 ならキーフレーム）・空き（u32）。
 // そのあとに 1 コマぶんの NAL の並び（Annex B。00 00 00 01 で区切る。キーフレームには SPS と PPS が付く）
 #define VR_H264_HEAD 32u
+// 録画（OBS の録画を iPhone で・道 A）：窓に出すコマと PC の音を、受け手が高画質で符号化して mp4 に書く。
+// PC の音はこの口では送らない。スピーカーの係の口 50063（ipaudio → AudioBridge）で届いた物を、受け手が録画に入れる（vkr_record_pcm）。
+// iPhone は AVAssetWriter（HEVC か H.264・AAC）、PC の代役は Media Foundation の Sink Writer。
+// 番号は、ほかの係と重ならないように離して取った（まとめるときに決め直してよい）
+#define VR_CAP_RECORD 67108864u     // VR_RECORD_CTL・VR_RECORD_FRAME・VR_RECORD_FETCH
+// VR_RECORD_CTL の動作
+#define VR_REC_STOP 0u              // 止めて書き終える（終わるまで待ってから答える）
+#define VR_REC_START 1u             // 始める。中身を書くのは最初の VR_RECORD_FRAME から（その大きさで）
+#define VR_REC_STATUS 2u            // 様子を聞くだけ
+#define VR_REC_DELETE 3u            // 最後に書いたファイルを消す（PC に持ち帰ったあと）
+// VR_RECORD_CTL の行き先の印
+#define VR_REC_KEEP 1u              // 受け手に残す（iPhone は「ファイル」アプリから見える所）
+#define VR_REC_PHOTOS 2u            // 書き終えたら「写真」に入れる（iPhone だけ）
+// 映像の形式
+#define VR_REC_H264 0u
+#define VR_REC_HEVC 1u
 #define VR_CAP_NEW_MASK (VR_CAP_VK13 | VR_CAP_DYNAMIC_RENDERING | VR_CAP_SYNC2 | VR_CAP_RENDER_PASS2 | VR_CAP_CMD10 | VR_CAP_EXT_DYNAMIC_STATE | VR_CAP_QUERY)
 // 1.3 の受け手は、VR_GET_FORMAT_PROPS の返事の後ろに VkFormatProperties3 の 3 つの値（u64）を付ける。古いドライバは読まない
 
@@ -130,6 +146,14 @@ enum vr_op {
     VR_READ_H264,                // [同期] memory・offset・幅・高さ・行の長さ・BGRA か・印（VR_H264_*）・kbps・コマ/秒・キーフレームの間隔（コマ）・
                                  // 流れの番号（u64）・札（u64）→ 頭（VR_H264_HEAD）と 1 コマぶんの H.264。先送りの最初は空（VR_CAP_H264）
     VR_GET_PROGRESS,             // [同期] → 終わった VR_QUEUE_SUBMIT の番号（u64。その番号までの submit は全部終わっている）。GPU は待たない（VR_CAP_PROGRESS）
+    // ---- 録画（VR_CAP_RECORD）。ほかの係が足す命令と番号が重ならないよう 96 から ----
+    VR_RECORD_CTL = 96,          // [同期] 動作（VR_REC_*）・映像の形式（VR_REC_H264/HEVC）・kbps（0 なら受け手が決める）・コマ/秒の目安・幅・高さ（0 なら最初のコマの大きさ）・
+                                 // 音（0 なら音なし・それ以外なら口 50063 で届く PC の音を入れる）・音の数・音の kbps・行き先の印（VR_REC_KEEP など）・名前（u32 の長さ＋UTF-8。空なら受け手が決める）
+                                 // → 状態（u32：0 止まっている・1 録画中・2 失敗した）・コマ（u64）・落としたコマ（u64）・音の標本（u64）・
+                                 //   長さ（u64・µs）・大きさ（u64・バイト）・幅（u32）・高さ（u32）・ファイルの場所（u32 の長さ＋UTF-8）
+    VR_RECORD_FRAME,             // memory・offset・幅・高さ・行の長さ・BGRA か・時刻（u64・µs。PC の時計で、録画を始めた時から）。返事なし。
+                                 // 受け手は、その memory を使う仕事が終わるのを待ってから写す（VR_READ_H264 と同じ待ち方）
+    VR_RECORD_FETCH,             // [同期] 位置（u64）・最大のバイト（u32）→ 全体の大きさ（u64）・中身。最後に書き終えたファイルを PC に持ち帰る
     VR_OP_COUNT
 };
 

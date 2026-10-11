@@ -13,6 +13,8 @@ struct RpcServerApp: App {
         rpc_bridge_init()
         // 窓に出す絵を MetalFX で広げる関数を、受け手に先に渡しておく（PC が頼んだときだけ使う）
         FXUpscaler.register()
+        // 録画の書き手を受け手に渡す（GameRecorder.swift）。PC が頼んだときだけ、iPhone が描いたゲームの絵をそのまま録画する
+        GameRecorder.register()
         // 記録を PC から読めるようにする（USB の 50059 番。PC は app/pc/iphone_applog.py）
         let t = Thread { rpc_bridge_serve_log(50059) }
         t.start()
