@@ -124,6 +124,13 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
 }
 
 __attribute__((constructor)) static void install_crash_handler(void) {
+    // 調べ用：IPHONE_VK_ERR_FILE=パス で、stderr（記録・統計）を「パス.プロセス番号.txt」に向ける（Chrome の GPU プロセスは stderr を持たない）
+    const char *ef = getenv("IPHONE_VK_ERR_FILE");
+    if (ef && *ef) {
+        char path[600];
+        snprintf(path, sizeof path, "%s.%lu.txt", ef, (unsigned long) GetCurrentProcessId());
+        if (freopen(path, "a", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
+    }
     const char *e = getenv("IPHONE_VK_LOG");
     if (e && *e && *e != '0') AddVectoredExceptionHandler(1, crash_handler);
 }
@@ -200,6 +207,8 @@ static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
     double wait_ms[VR_OP_COUNT];
     uint64_t bytes_in, flushes;
+    uint64_t wire_out;             // 線に実際に出たバイト（LZ4 のあと）
+    double send_ms;                // 線に書き出す（send）のにかかった時間
     uint64_t ww_calls, ww_pages;   // 書き込み監視を見た回数・見つかった書いたページ
     uint64_t wdiff_pages, wdiff_sent; // 違う所だけ送ったページの数と、送ったバイト
     uint64_t pack_in, pack_out;    // LZ4 で縮める前と後のバイト
@@ -339,8 +348,96 @@ static int pack_on(void) {
     return v;
 }
 
+// 調べ用：buffer から image への写し（vkCmdCopyBufferToImage）を、形式と大きさごとに数える（IPHONE_VK_STATS_EVERY のときに毎回出す）
+static struct { uint32_t fmt, w, h; uint64_t n; } g_b2i[24];
+static SRWLOCK g_b2i_lock = SRWLOCK_INIT;
+static void b2i_note(uint32_t fmt, uint32_t w, uint32_t h) {
+    AcquireSRWLockExclusive(&g_b2i_lock);
+    int k = -1;
+    for (int i = 0; i < 24; i++)
+        if (g_b2i[i].n && g_b2i[i].fmt == fmt && g_b2i[i].w == w && g_b2i[i].h == h) { k = i; break; }
+    if (k < 0)
+        for (int i = 0; i < 24; i++)
+            if (!g_b2i[i].n) { k = i; g_b2i[i].fmt = fmt; g_b2i[i].w = w; g_b2i[i].h = h; break; }
+    if (k >= 0) g_b2i[k].n++;
+    ReleaseSRWLockExclusive(&g_b2i_lock);
+}
+
+// 調べ用：IPHONE_VK_STATS_EVERY=秒 で、その秒ごとに「毎秒どれだけ送ったか」を記録に出す（Chrome のように最後まで生きていない物の測りに）
+static void stat_tick(void) {
+    static double every = -1, last_t;
+    static uint64_t l_bytes[VR_OP_COUNT], l_wire, l_in, l_pin, l_pout, l_flush, l_calls[VR_OP_COUNT];
+    static double l_wait[VR_OP_COUNT], l_send, l_packms;
+    if (every == 0) return;
+    if (every < 0) {
+        const char *e = getenv("IPHONE_VK_STATS_EVERY");
+        every = e ? atof(e) : 0;
+        last_t = now_ms();
+        if (every <= 0) { every = 0; return; }
+    }
+    double t = now_ms();
+    if (t - last_t < every * 1000.0) return;
+    double dt = (t - last_t) / 1000.0;
+    uint64_t tot = 0, best[3] = { 0, 0, 0 }; int bi[3] = { 0, 0, 0 };
+    for (int i = 1; i < VR_OP_COUNT; i++) {
+        uint64_t d = g_stat.bytes[i] - l_bytes[i];
+        tot += d;
+        for (int k = 0; k < 3; k++)
+            if (d > best[k]) {
+                for (int j = 2; j > k; j--) { best[j] = best[j - 1]; bi[j] = bi[j - 1]; }
+                best[k] = d; bi[k] = i; break;
+            }
+        l_bytes[i] = g_stat.bytes[i];
+    }
+    fprintf(stderr, "[iphone-vk] 毎秒（%.1f 秒）：命令 %.1f MB・線に出た %.1f MB（LZ4 の前→後 %.1f→%.1f）・受け取った %.1f MB・送った回数 %.0f", dt, tot / dt / 1e6,
+            (g_stat.wire_out - l_wire) / dt / 1e6, (g_stat.pack_in - l_pin) / dt / 1e6, (g_stat.pack_out - l_pout) / dt / 1e6,
+            (g_stat.bytes_in - l_in) / dt / 1e6, (g_stat.flushes - l_flush) / dt);
+    for (int k = 0; k < 3; k++)
+        if (best[k]) fprintf(stderr, "・%s %.1f MB", OP_NAME[bi[k]] ? OP_NAME[bi[k]] : "?", best[k] / dt / 1e6);
+    fprintf(stderr, "\n");
+    {
+        // 返事を待った往復と、その待ち（毎秒）。待ちの長い上位 4 つ
+        double wsum = 0, wms[4] = { 0, 0, 0, 0 };
+        uint64_t csum = 0, wc[4] = { 0, 0, 0, 0 };
+        int wi[4] = { 0, 0, 0, 0 };
+        for (int i = 1; i < VR_OP_COUNT; i++) {
+            double w = g_stat.wait_ms[i] - l_wait[i];
+            uint64_t c = g_stat.calls[i] - l_calls[i];
+            wsum += w; csum += c;
+            for (int k = 0; k < 4; k++)
+                if (w > wms[k]) {
+                    for (int j = 3; j > k; j--) { wms[j] = wms[j - 1]; wi[j] = wi[j - 1]; wc[j] = wc[j - 1]; }
+                    wms[k] = w; wi[k] = i; wc[k] = c; break;
+                }
+            l_wait[i] = g_stat.wait_ms[i]; l_calls[i] = g_stat.calls[i];
+        }
+        fprintf(stderr, "[iphone-vk]   往復 毎秒 %.0f 回・待ち 毎秒 %.0f ms（send %.0f ms・LZ4 %.0f ms）：", csum / dt, wsum / dt,
+                (g_stat.send_ms - l_send) / dt, (g_stat.pack_ms - l_packms) / dt);
+        for (int k = 0; k < 4; k++)
+            if (wms[k] > 0) fprintf(stderr, " %s %.0f回 %.0fms", OP_NAME[wi[k]] ? OP_NAME[wi[k]] : "?", wc[k] / dt, wms[k] / dt);
+        fprintf(stderr, "\n");
+        l_send = g_stat.send_ms; l_packms = g_stat.pack_ms;
+    }
+    {
+        AcquireSRWLockExclusive(&g_b2i_lock);
+        int any = 0;
+        for (int i = 0; i < 24; i++)
+            if (g_b2i[i].n > (uint64_t) dt) { /* 毎秒 1 回以上のものだけ */
+                if (!any) fprintf(stderr, "[iphone-vk]   buffer→image の写し（毎秒の回数）：");
+                any = 1;
+                fprintf(stderr, " fmt%u %ux%u ×%.1f", g_b2i[i].fmt, g_b2i[i].w, g_b2i[i].h, g_b2i[i].n / dt);
+            }
+        if (any) fprintf(stderr, "\n");
+        memset(g_b2i, 0, sizeof g_b2i);
+        ReleaseSRWLockExclusive(&g_b2i_lock);
+    }
+    l_wire = g_stat.wire_out; l_in = g_stat.bytes_in; l_pin = g_stat.pack_in; l_pout = g_stat.pack_out; l_flush = g_stat.flushes;
+    last_t = t;
+}
+
 static int flush_locked(void) {
     if (g_dead || g_sock == VR_BAD_SOCK) { g_q.n = 0; return 0; }
+    stat_tick();
     if (g_q.n) g_stat.flushes++;
     // 1 KB 以上なら、命令の並びをまとめて縮め、1 つの命令にして送る。縮まらなければそのまま
     if (g_q.n >= 1024 && g_q.n < (1u << 30) && g_can_pack && pack_on()) {
@@ -356,12 +453,18 @@ static int flush_locked(void) {
             memcpy(pk.p, h, 12);
             g_stat.pack_in += g_q.n;
             g_stat.pack_out += (uint64_t) cl + 12;
+            g_stat.wire_out += (uint64_t) cl + 12;
+            double ts0 = now_ms();
             if (!vr_send_all(g_sock, pk.p, (size_t) cl + 12)) conn_lost("送る所");
+            g_stat.send_ms += now_ms() - ts0;
             g_q.n = 0;
             return !g_dead;
         }
     }
+    g_stat.wire_out += g_q.n;
+    double ts1 = now_ms();
     if (g_q.n && !vr_send_all(g_sock, g_q.p, g_q.n)) conn_lost("送る所");
+    g_stat.send_ms += now_ms() - ts1;
     g_q.n = 0;
     return !g_dead;
 }
@@ -946,6 +1049,8 @@ static SRWLOCK g_hw_lock = SRWLOCK_INIT;
 static int g_engine_dxvk2;
 // アプリのエンジンが Mesa の zink（OpenGL を Vulkan に直す部品）
 static int g_engine_zink;
+// アプリのエンジン名が ANGLE（Chrome・Edge などの OpenGL ES / WebGL を Vulkan に直す部品。アプリの名前は chrome.exe になる）
+static int g_app_angle;
 // アプリのエンジンが vkd3d-proton（DirectX 12 を Vulkan に直す部品）。DXVK 3 の名乗りに加えて、
 // transform feedback・画像の範囲の外・1 要素の揃え・descriptor indexing を名乗る（vkd3d() を見る所）
 static int g_engine_vkd3d;
@@ -2453,6 +2558,23 @@ static void send_write(vr_buf *b, struct mem *m, uint64_t off, uint64_t len) {
     b->n = 0;
 }
 
+// 調べ用：IPHONE_VK_DUMP_MEMW=パスの頭 で、512 KB 以上の MEM_WRITE の中身を「頭_番号_off_len.bin」に最大 40 個書く（動画のコマの中身を調べる用。IPHONE_VK_WDIFF=0 と一緒に）
+static void memw_dump(struct mem *m, uint64_t off, uint64_t len) {
+    static int n = -1;
+    static const char *pre;
+    static double t_start, after;
+    if (n < 0) {
+        pre = getenv("IPHONE_VK_DUMP_MEMW"); n = 0; t_start = now_ms();
+        const char *a = getenv("IPHONE_VK_DUMP_MEMW_AFTER"); // 起動からこの秒数がたってから書く
+        after = a ? atof(a) * 1000.0 : 0;
+    }
+    if (!pre || !*pre || len < 524288 || n >= 40 || now_ms() - t_start < after) return;
+    char path[700];
+    snprintf(path, sizeof path, "%s_%02d_%llx_%llu.bin", pre, n++, (unsigned long long) off, (unsigned long long) len);
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(m->shadow + off, 1, (size_t) len, f); fclose(f); }
+}
+
 // 1 ページを、受け手の中身の写しと 8 バイトずつ比べ、違う所だけを送る。64 バイト未満のすき間はまとめて送る
 static void send_page_diff(vr_buf *b, struct mem *m, size_t pg) {
     uint64_t base = (uint64_t) pg * PAGE;
@@ -2519,6 +2641,7 @@ static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
         }
         uint64_t off = (uint64_t) i * PAGE, len = (uint64_t) (j - i) * PAGE;
         if (off + len > m->size) len = m->size - off;
+        memw_dump(m, off, len);
         vr_u64(&b, ID(m));
         vr_u64(&b, off);
         vr_bytes(&b, m->shadow + off, (uint32_t) len);
@@ -2789,6 +2912,8 @@ static void complete(struct dev *d, struct queue *q, uint64_t upto) {
 static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *a, VkInstance *out) {
     (void) a;
     const VkApplicationInfo *ai = ci ? ci->pApplicationInfo : NULL;
+    if (ai) say("アプリの名前：%s・エンジン：%s", ai->pApplicationName ? ai->pApplicationName : "(なし)", ai->pEngineName ? ai->pEngineName : "(なし)");
+    if (ai && ai->pEngineName && !strcmp(ai->pEngineName, "ANGLE")) g_app_angle = 1;
     if (ai && ai->pEngineName) {
         uint32_t major = (ai->engineVersion >> 22) & 0x7F; // VK_MAKE_VERSION の形
         say("アプリのエンジン：%s %u.%u.%u", ai->pEngineName, major, (ai->engineVersion >> 12) & 0x3FF, ai->engineVersion & 0xFFF);
@@ -8725,6 +8850,7 @@ static void VKAPI_CALL cmd_copy_buffer_to_image(VkCommandBuffer cbh, VkBuffer bb
         free(r2);
         return;
     }
+    for (uint32_t i = 0; i < n; i++) b2i_note(ii ? (uint32_t) ii->ls_fmt : 0, rg[i].imageExtent.width, rg[i].imageExtent.height);
     vr_u32(&c->s, VR_CMD_COPY_BUFFER_TO_IMAGE);
     vr_u64(&c->s, ID(bb));
     vr_u64(&c->s, ID(im));
@@ -9958,7 +10084,7 @@ static VkResult VKAPI_CALL create_qpool(VkDevice dv, const VkQueryPoolCreateInfo
     int nv = 0;
     if (ci->queryType == VK_QUERY_TYPE_OCCLUSION || ci->queryType == VK_QUERY_TYPE_TIMESTAMP) nv = 1;
     else if (ci->queryType == VK_QUERY_TYPE_PIPELINE_STATISTICS) nv = __builtin_popcount(ci->pipelineStatistics);
-    if (nv > 0) qpv_put(id, nv, ci->queryCount, ci->queryType == VK_QUERY_TYPE_OCCLUSION ? 1 : ci->queryType == VK_QUERY_TYPE_PIPELINE_STATISTICS ? 2 : 0);
+    if (nv > 0) qpv_put(id, nv, ci->queryCount, ci->queryType == VK_QUERY_TYPE_OCCLUSION ? 1 : ci->queryType == VK_QUERY_TYPE_PIPELINE_STATISTICS ? 2 : ci->queryType == VK_QUERY_TYPE_TIMESTAMP ? 3 : 0);
     if (getenv("IPHONE_VK_QUERY_LOG")) say("query pool %llu：種類 %d・%u 個・統計 0x%x", (unsigned long long) id, ci->queryType, ci->queryCount, ci->pipelineStatistics);
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
@@ -10003,6 +10129,17 @@ static int q_local(uint64_t qp) {
     ReleaseSRWLockShared(&g_qpv_lock);
     if (kind == 1 && occ_on) return 1;
     if (kind == 2 && ps_on) return 2;
+    // 調べ用：IPHONE_VK_TS_LOCAL=1 で、timestamp の query に往復せず「終わった・今の時刻」と答える。
+    // ANGLE（Chrome）は毎コマ timestamp の query を待たずに読み（flags 0x1）、そのたびに受け手がその submit の終わりまで待つので、
+    // 動画のコマの送りが終わるまで次のコマの仕事に進めない。時刻は本物の GPU の物ではない（時間の測り用に使うアプリでは長さが合わない）
+    static int ts_on = -1;
+    if (ts_on < 0) {
+        // 既定は、アプリの名前が ANGLE のときだけ入れる。IPHONE_VK_TS_LOCAL=1 で必ず・=0 で入れない
+        const char *e = getenv("IPHONE_VK_TS_LOCAL");
+        ts_on = e && *e ? *e == '1' : g_app_angle;
+        if (ts_on) say("timestamp の query は往復せず、今の時刻で答える（ANGLE の毎コマの読みで次のコマが止まらないように）");
+    }
+    if (kind == 3 && ts_on) return 3;
     return 0;
 }
 
@@ -10028,6 +10165,11 @@ static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32
             if (at + (uint64_t) (nv + want_av) * es > size) break;
             uint8_t *dst = (uint8_t *) data + at;
             uint64_t v = local == 1 ? (1u << 20) : 0, one = 1;
+            if (local == 3) {
+                double per = g_hw.props.limits.timestampPeriod > 0 ? g_hw.props.limits.timestampPeriod : 1.0;
+                v = (uint64_t) (now_ms() * 1e6 / per);
+                if (es == 4) v &= 0xffffffffu;
+            }
             for (int k = 0; k < nv; k++) memcpy(dst + (size_t) k * es, &v, es);
             if (want_av) memcpy(dst + (size_t) nv * es, &one, es);
         }
