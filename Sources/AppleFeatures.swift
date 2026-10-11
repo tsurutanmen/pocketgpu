@@ -6,6 +6,13 @@
 //   {"op":"llm",…}・{"op":"llm_status"}     → Apple Intelligence の言葉のモデル（FMBridge.swift・Xcode 26 で組んだときだけ）
 //   {"op":"translate","text":"…","from":"ja","to":"en"} → 翻訳（TranslateBridge.swift・言語が iPhone に入っていること）
 //   {"op":"tts","text":"…","lang":"ja-JP"}  → 読み上げた音声の WAV を base64 で。{"op":"voices"} で声の一覧
+//   ---- work/ai_apps の足し分（app_features.patch）----
+//   {"op":"live_asr",…}                     → 流しっぱなしの文字起こし。このつなぎは流す形に変わる（LiveASR.swift・iOS 26）
+//   {"op":"asr",…,"timestamps":true}        → 区切りの時刻つき（SpeechFile.swift）。"engine":"whisperkit" で WhisperKit（入れて組んだときだけ）
+//   {"op":"tts",…,"gender":"female"}        → 声を性別で選ぶ。"engine":"ttskit" で Qwen3-TTS（入れて組んだときだけ）
+//   {"op":"image_styles"}・{"op":"image_generate",…}・{"op":"sd_install",…} → 絵（ImageGen.swift）
+//   {"op":"coreml_…"}                       → 任意の Core ML モデルを Neural Engine で動かす（CoreMLRemote.swift。約束はそのファイルの頭）
+//   答えの JSON に "bin_len" があるときは、そのあとにもう 1 枠 [u32 長さ][バイト] が続く（CoreMLRemote だけが使う）
 import AVFoundation
 import Foundation
 import Network
@@ -45,11 +52,21 @@ final class AppleFeatures {
             self.readFrame(c) { body in
                 guard let body else { c.cancel(); return }
                 let req = (try? JSONSerialization.jsonObject(with: head)) as? [String: Any] ?? [:]
-                let res = self.handle(req, body)
+                if (req["op"] as? String) == "live_asr" {
+                    self.startLive(c, req) // ここから先、このつなぎは流す形（LiveASR.swift）。next は呼ばない
+                    return
+                }
+                var res = self.handle(req, body)
+                let bin = res.removeValue(forKey: "_bin") as? Data // 答えの 2 枠目（JSON には入れない）
                 let out = (try? JSONSerialization.data(withJSONObject: res)) ?? Data("{}".utf8)
                 var n = UInt32(out.count).littleEndian
                 var frame = Data(bytes: &n, count: 4)
                 frame.append(out)
+                if let bin {
+                    var m = UInt32(bin.count).littleEndian
+                    frame.append(Data(bytes: &m, count: 4))
+                    frame.append(bin)
+                }
                 c.send(content: frame, completion: .contentProcessed { err in
                     if err != nil { c.cancel() } else { self.next(c) }
                 })
@@ -80,9 +97,22 @@ final class AppleFeatures {
             var sys = utsname()
             uname(&sys)
             let model = withUnsafePointer(to: &sys.machine) { $0.withMemoryRebound(to: CChar.self, capacity: 256) { String(cString: $0) } }
-            var features = ["ocr", "asr", "tts", "translate"]
+            var features = ["ocr", "asr", "tts", "translate", "coreml"]
             #if canImport(FoundationModels)
             features.append("llm")
+            #endif
+            #if compiler(>=6.2)
+            if #available(iOS 26.0, *) { features += ["live_asr", "asr_segments"] }
+            #endif
+            features.append("image")
+            #if canImport(WhisperKit)
+            features.append("whisperkit")
+            #endif
+            #if canImport(TTSKit)
+            features.append("ttskit")
+            #endif
+            #if canImport(StableDiffusion)
+            features.append("sd")
             #endif
             return ["features": features, "ios": UIDevice.current.systemVersion, "model": model]
         case "ocr":
@@ -103,18 +133,52 @@ final class AppleFeatures {
             #endif
             return ["error": "この版では翻訳が使えない"]
         case "tts":
+            if (req["engine"] as? String) == "ttskit" {
+                #if canImport(TTSKit)
+                return TTSKitBridge.speak(text: req["text"] as? String ?? "", speaker: req["speaker"] as? String,
+                                          language: req["language"] as? String)
+                #else
+                return ["error": "この版は TTSKit を入れずに組んだ"]
+                #endif
+            }
             return tts(text: req["text"] as? String ?? "", lang: req["lang"] as? String ?? "ja-JP",
-                       rate: req["rate"] as? Double, voice: req["voice"] as? String)
+                       rate: req["rate"] as? Double, voice: req["voice"] as? String, gender: req["gender"] as? String)
         case "voices":
             return ["voices": AVSpeechSynthesisVoice.speechVoices().map {
                 ["id": $0.identifier, "name": $0.name, "lang": $0.language, "quality": $0.quality.rawValue]
             }]
         case "asr":
             return asr(body, lang: req["lang"] as? String ?? "ja-JP", ext: req["ext"] as? String ?? "wav",
-                       onDevice: req["on_device"] as? Bool ?? true, engine: req["engine"] as? String ?? "new")
+                       onDevice: req["on_device"] as? Bool ?? true, engine: req["engine"] as? String ?? "new",
+                       timestamps: req["timestamps"] as? Bool ?? false, words: req["words"] as? Bool ?? false,
+                       model: req["model"] as? String)
+        case "image_styles":
+            return ImageGen.styles()
+        case "image_generate":
+            return ImageGen.generate(req, body)
+        case "sd_install":
+            return ImageGen.sdInstall(req, body)
         default:
+            if op.hasPrefix("coreml_") { return CoreMLRemote.handle(op, req, body) }
             return ["error": "知らない頼み：\(op)"]
         }
+    }
+
+    // ---- 流しっぱなしの文字起こし（LiveASR.swift）----
+    private func startLive(_ c: NWConnection, _ req: [String: Any]) {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            LiveASR.begin(c, req, log: { [weak self] s in self?.log(s) })
+            return
+        }
+        #endif
+        let out = (try? JSONSerialization.data(withJSONObject: ["error": "流しっぱなしの文字起こしは iOS 26 から"])) ?? Data("{}".utf8)
+        var n = UInt32(out.count).littleEndian
+        var frame = Data(bytes: &n, count: 4)
+        frame.append(out)
+        c.send(content: frame, completion: .contentProcessed { [weak self] err in
+            if err != nil { c.cancel() } else { self?.next(c) }
+        })
     }
 
     // ---- Apple Intelligence の言葉のモデル（Foundation Models・iOS 26） ----
@@ -133,7 +197,23 @@ final class AppleFeatures {
     // ---- 音声認識 ----
     // 中身は音声のファイル（wav・m4a など）。一度ファイルに書いてから読ませる。初めてのときは iPhone の画面で許可が要る。
     // engine：new は iOS 26 の SpeechAnalyzer（長い音声向け・標準）、legacy は SFSpeechRecognizer
-    private func asr(_ data: Data, lang: String, ext: String, onDevice: Bool, engine: String) -> [String: Any] {
+    private func asr(_ data: Data, lang: String, ext: String, onDevice: Bool, engine: String,
+                     timestamps: Bool = false, words: Bool = false, model: String? = nil) -> [String: Any] {
+        if engine == "whisperkit" {
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("asr-\(UUID().uuidString).\(ext)")
+            do { try data.write(to: url) } catch { return ["error": "音声を書けない"] }
+            defer { try? FileManager.default.removeItem(at: url) }
+            let t0 = Date()
+            var out: [String: Any]
+            #if canImport(WhisperKit)
+            out = WhisperKitBridge.transcribe(url: url, lang: lang, model: model, words: words)
+            #else
+            out = ["error": "この版は WhisperKit を入れずに組んだ"]
+            #endif
+            out["ms"] = Int(Date().timeIntervalSince(t0) * 1000)
+            log("音声認識：\(out["ms"] ?? 0) ms・WhisperKit")
+            return out
+        }
         let auth = DispatchSemaphore(value: 0)
         var status = SFSpeechRecognizer.authorizationStatus()
         if status == .notDetermined {
@@ -148,7 +228,7 @@ final class AppleFeatures {
         var out: [String: Any]
         #if compiler(>=6.2)
         if engine != "legacy", #available(iOS 26.0, *) {
-            out = SpeechBridge.transcribe(url: url, lang: lang)
+            out = timestamps || words ? SpeechFile.transcribe(url: url, lang: lang, words: words) : SpeechBridge.transcribe(url: url, lang: lang)
         } else {
             out = legacyASR(url: url, lang: lang, onDevice: onDevice)
         }
@@ -199,9 +279,25 @@ final class AppleFeatures {
     private let synthLock = NSLock()
     private var synths: [AVSpeechSynthesizer] = [] // 書き終わるまで手放さない
 
-    private func tts(text: String, lang: String, rate: Double?, voice: String?) -> [String: Any] {
+    // その言語でその性別の、いちばん質の高い声（設定で拡張・プレミアムの声を入れてあればそれ）
+    private func voiceFor(lang: String, gender: String?) -> AVSpeechSynthesisVoice? {
+        let g: AVSpeechSynthesisVoiceGender
+        switch gender ?? "" {
+        case "male": g = .male
+        case "female": g = .female
+        default: return nil
+        }
+        return AVSpeechSynthesisVoice.speechVoices().filter { $0.language == lang && $0.gender == g }
+            .max { $0.quality.rawValue < $1.quality.rawValue }
+    }
+
+    private func tts(text: String, lang: String, rate: Double?, voice: String?, gender: String? = nil) -> [String: Any] {
         let u = AVSpeechUtterance(string: text)
-        if let voice, let v = AVSpeechSynthesisVoice(identifier: voice) { u.voice = v } else { u.voice = AVSpeechSynthesisVoice(language: lang) }
+        if let voice, let v = AVSpeechSynthesisVoice(identifier: voice) {
+            u.voice = v
+        } else {
+            u.voice = voiceFor(lang: lang, gender: gender) ?? AVSpeechSynthesisVoice(language: lang)
+        }
         if let rate { u.rate = Float(rate) }
         let synth = AVSpeechSynthesizer()
         synthLock.lock(); synths.append(synth); synthLock.unlock()
@@ -211,9 +307,11 @@ final class AppleFeatures {
         let done = DispatchSemaphore(value: 0)
         var file: AVAudioFile?
         var failure: String?
+        var outRate: Double = 0
         let t0 = Date()
         synth.write(u) { buf in
             guard let pcm = buf as? AVAudioPCMBuffer else { return }
+            outRate = pcm.format.sampleRate
             if pcm.frameLength == 0 { done.signal(); return } // 終わりの印
             do {
                 if file == nil {
@@ -232,7 +330,7 @@ final class AppleFeatures {
         guard let data = try? Data(contentsOf: url) else { return ["error": "音声を読めない"] }
         let ms = Int(Date().timeIntervalSince(t0) * 1000)
         log("読み上げ：\(text.count) 文字・\(ms) ms")
-        return ["wav_b64": data.base64EncodedString(), "ms": ms, "voice": u.voice?.identifier ?? ""]
+        return ["wav_b64": data.base64EncodedString(), "ms": ms, "voice": u.voice?.identifier ?? "", "sample_rate": Int(outRate)]
     }
 
     // ---- 文字認識（Vision の VNRecognizeTextRequest） ----
