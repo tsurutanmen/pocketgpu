@@ -7,6 +7,7 @@
 #include <vulkan/vulkan.h>
 #include "proto.h"
 #include "wire.h"
+#include "plane_codec.h" // 縮めた平面をほどく（VR_MEM_WRITE_CODED）
 // 命令の並びを縮める LZ4（BSD-2）。この 1 つのファイルの中に取り込む
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -536,6 +537,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     g_fmt3 = (v13 || has_ext(ep, ne, "VK_KHR_format_feature_flags2")) && vkGetPhysicalDeviceFormatProperties2;
     caps |= VR_CAP_D3D; // buffer view と画像の並び方は 1.0 の入口なので、どの GPU でも使える
     caps |= VR_CAP_PACK | VR_CAP_ASYNC_CREATE | VR_CAP_STATUS | VR_CAP_LINK;
+    caps |= VR_CAP_PLANE_CODE; // 縮めた平面をほどける（CPU だけで、どの GPU でも）
     // 頂点の step rate：GPU が拡張を持てば、pipeline の末尾を読んでつなぐ（MoltenVK も持つ）
     {
         uint32_t ne = 0;
@@ -744,6 +746,7 @@ static void sleep_ms(int ms) {
 // 1 つの接続の間に、どこに時間がかかったか
 static struct { double wait_ms, record_ms, submit_ms, paused_ms; uint64_t waits, records, submits; uint64_t wait_by_op[128]; double wait_ms_by_op[128]; } g_st; // 命令の番号は 64 を超える（READ_JPEG_PIPE 73・GET_PROGRESS 81 など）ので 128 まで数える
 static uint32_t g_cur_op; // いま処理している命令（どの命令で GPU を待ったかを数える）
+static struct { uint64_t n, in, out; double ms; } g_pcs; // 縮めた平面をほどいた回数・受け取ったバイト・ほどいたバイト・かかった時間
 // アプリの画面のファンを回すための数。アプリが少しずつ読んで、増えた速さで回す
 static volatile uint64_t g_ops_total;
 static volatile int g_clients;
@@ -3490,6 +3493,38 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         } else vlog("範囲の外への書き込みを捨てた（%llu + %u）", (unsigned long long) off, n);
         return 1;
     }
+    case VR_MEM_WRITE_CODED: {
+        // 縮めた平面（VR_CAP_PLANE_CODE）：memory・offset・番号（VR_MEM_WRITE の末尾と同じ。いつも付く）・縮めた中身（plane_codec.h）
+        uint64_t mid = vr_ru64(r);
+        uint64_t off = vr_ru64(r);
+        uint64_t upto = vr_ru64(r);
+        size_t n = r->bad || r->at > r->n ? 0 : r->n - r->at;
+        const uint8_t *blob = r->bad ? NULL : (const uint8_t *) vr_take(r, n);
+        int k = last_with_mem(mid);
+        {
+            int wide = (int) (upto >> 63);
+            upto &= ~(1ull << 63);
+            int u = -1;
+            for (int i = 0; i < g_nfl; i++) if (g_fl[i].msg <= upto) u = i;
+            if (wide ? u > k : u < k) k = u;
+        }
+        drain_upto(k);
+        ent *e = find(mid);
+        uint64_t need = blob ? pc_blob_bytes(blob, n) : 0;
+        if (!e || !e->map || !need || off > e->size || need > e->size - off) {
+            vlog("縮めた書き込みを捨てた（%llu + %llu・中身 %zu バイト）", (unsigned long long) off, (unsigned long long) need, n);
+            return 1;
+        }
+        double t0 = t_ms();
+        const char *err = "";
+        if (pc_decode(blob, n, (uint8_t *) e->map + off, &err)) vlog("縮めた書き込みをほどけない（%s）。この範囲の中身はでたらめになる", err);
+        else if (e->last) memcpy(e->last + off, (uint8_t *) e->map + off, (size_t) need);
+        g_pcs.n++;
+        g_pcs.in += n;
+        g_pcs.out += need;
+        g_pcs.ms += t_ms() - t0;
+        return 1;
+    }
     case VR_MEM_READ: {
         uint64_t mid = vr_ru64(r);
         uint64_t off = vr_ru64(r), n = vr_ru64(r);
@@ -5119,6 +5154,10 @@ static void serve_client(vr_sock c) {
         vlog("この接続：submit %llu 回 %.0f ms・記録 %llu 回 %.0f ms・GPU を待った %llu 回 %.0f ms・後ろで止めた %.0f ms",
              (unsigned long long) g_st.submits, g_st.submit_ms, (unsigned long long) g_st.records, g_st.record_ms,
              (unsigned long long) g_st.waits, g_st.wait_ms, g_st.paused_ms);
+    if (g_pcs.n)
+        vlog("この接続：縮めた平面 %llu 回・%.1f MB を %.1f MB にほどいた（%.2f 倍）・ほどくのに %.0f ms（1 回 %.2f ms）", (unsigned long long) g_pcs.n,
+             g_pcs.in / 1e6, g_pcs.out / 1e6, g_pcs.in ? (double) g_pcs.out / (double) g_pcs.in : 0.0, g_pcs.ms, g_pcs.ms / (double) g_pcs.n);
+    memset(&g_pcs, 0, sizeof g_pcs);
     if (g_st.waits) {
         char line[400];
         int at = snprintf(line, sizeof line, "GPU を待った命令（命令の番号:回数:ms）");

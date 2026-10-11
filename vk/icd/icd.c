@@ -362,6 +362,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_PACKED] = "PACKED", [VR_CREATE_BUFFER_NR] = "CREATE_BUFFER_NR", [VR_CREATE_IMAGE_NR] = "CREATE_IMAGE_NR", [VR_GET_STATUS] = "GET_STATUS",
     [VR_READ_H264] = "READ_H264", [VR_GET_PROGRESS] = "GET_PROGRESS",
     [VR_RECORD_CTL] = "RECORD_CTL", [VR_RECORD_FRAME] = "RECORD_FRAME", [VR_RECORD_FETCH] = "RECORD_FETCH",
+    [VR_MEM_WRITE_CODED] = "MEM_WRITE_CODED",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -384,6 +385,9 @@ static struct {
     double cpu0;                   // 最初の present のときのプロセスの CPU 時間（ms）
     uint64_t rp_begin, rp_load, rp_store, rp_clear, rp_dload, rp_dstore, rp_same; // render pass を始めた回数と、画面を読み込む・書き戻す・消す attachment の数
     double rp_px;                  // 読み込みと書き戻しの画素の合計（タイルで描く GPU ではここが重い）
+    uint64_t code_n, code_in, code_out; // 縮めて送った平面の数・縮める前と後のバイト（VR_MEM_WRITE_CODED）
+    uint64_t code_same;            // 受け手と同じ中身だったので送らなかった平面の行のバイト
+    double code_ms;                // 縮めるのにかかった時間
 } g_stat;
 // u1（アドレスで読み書きする buffer・結んだあとに書いた descriptor）の数。数えるだけ
 static struct { volatile LONG64 pv, rd_n, wr_n, whole, ub_sets, ub_ents; } g_u1;
@@ -475,6 +479,10 @@ static void print_stats(void) {
     if (g_stat.wdiff_pages)
         fprintf(stderr, "  違う所だけ送ったページ %llu・送ったバイト %llu・丸ごとなら %llu\n", (unsigned long long) g_stat.wdiff_pages,
                 (unsigned long long) g_stat.wdiff_sent, (unsigned long long) g_stat.wdiff_pages * PAGE);
+    if (g_stat.code_n || g_stat.code_same)
+        fprintf(stderr, "  縮めて送った平面 %llu 回：%llu バイトを %llu バイトに（%.2f 倍）・縮めるのに %.1f ms・同じ中身で送らなかった行 %llu バイト\n",
+                (unsigned long long) g_stat.code_n, (unsigned long long) g_stat.code_in, (unsigned long long) g_stat.code_out,
+                g_stat.code_out ? (double) g_stat.code_in / (double) g_stat.code_out : 0.0, g_stat.code_ms, (unsigned long long) g_stat.code_same);
 }
 
 static void print_stats_fwd(void) { print_stats(); }
@@ -500,6 +508,16 @@ static uint64_t new_id(void) { return (1ull << 62) | (uint64_t) InterlockedIncre
 #include "../third_party/lz4/lz4.c"
 #pragma GCC diagnostic pop
 static int g_can_pack; // 受け手が VR_CAP_PACK を名乗った
+
+// 動画のコマの平面を縮める（VR_CAP_PLANE_CODE）。中身の形と縮め方は remote/plane_codec.h（受け手と同じファイル）
+#include "../remote/plane_codec.h"
+static int g_can_code; // 受け手が VR_CAP_PLANE_CODE を名乗り、IPHONE_VK_PLANE_CODE が 0 でない
+// IPHONE_VK_PLANE_CODE：0 で縮めない・1（既定）で 1 画素 1 バイトの形式（R8・3 平面の YUV など）だけ・2 で R8G8（2 バイト）と RGBA8・BGRA8（4 バイト）も
+static int plane_mode(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_PLANE_CODE"); v = e && *e ? atoi(e) : 1; }
+    return v;
+}
 
 // 送る命令の並びを LZ4 で縮めるか（受け手が名乗ったとき。IPHONE_VK_PACK=0 で縮めない）
 static int pack_on(void) {
@@ -528,6 +546,8 @@ static void stat_tick(void) {
     static double every = -1, last_t;
     static uint64_t l_bytes[VR_OP_COUNT], l_wire, l_in, l_pin, l_pout, l_flush, l_calls[VR_OP_COUNT];
     static double l_wait[VR_OP_COUNT], l_send, l_packms;
+    static uint64_t l_cn, l_cin, l_cout;
+    static double l_cms;
     if (every == 0) return;
     if (every < 0) {
         const char *e = getenv("IPHONE_VK_STATS_EVERY");
@@ -591,6 +611,12 @@ static void stat_tick(void) {
         memset(g_b2i, 0, sizeof g_b2i);
         ReleaseSRWLockExclusive(&g_b2i_lock);
     }
+    if (g_stat.code_n != l_cn) {
+        uint64_t ci = g_stat.code_in - l_cin, co = g_stat.code_out - l_cout;
+        fprintf(stderr, "[iphone-vk]   平面を縮めた（毎秒）：%.1f 回・%.1f MB → %.1f MB（%.2f 倍）・縮める %.0f ms\n", (g_stat.code_n - l_cn) / dt, ci / dt / 1e6, co / dt / 1e6,
+                co ? (double) ci / (double) co : 0.0, (g_stat.code_ms - l_cms) / dt);
+    }
+    l_cn = g_stat.code_n; l_cin = g_stat.code_in; l_cout = g_stat.code_out; l_cms = g_stat.code_ms;
     l_wire = g_stat.wire_out; l_in = g_stat.bytes_in; l_pin = g_stat.pack_in; l_pout = g_stat.pack_out; l_flush = g_stat.flushes;
     last_t = t;
 }
@@ -711,6 +737,20 @@ static void rpc_send(uint32_t op, vr_buf *b) {
 static void rpc_flush(void) {
     AcquireSRWLockExclusive(&g_lock);
     flush_locked();
+    ReleaseSRWLockExclusive(&g_lock);
+}
+
+// もう縮めてある大きな命令（頭の 8 バイトを含む msg）を、LZ4 にかけずにそのまま送る。前にためた命令は先に（ふつうに）送り、順は崩さない
+static void rpc_send_raw(uint32_t op, const uint8_t *msg, size_t n) {
+    AcquireSRWLockExclusive(&g_lock);
+    if (op < VR_OP_COUNT) { g_stat.sends[op]++; g_stat.bytes[op] += n; }
+    if (flush_locked()) {
+        g_stat.flushes++;
+        g_stat.wire_out += n;
+        double t0 = now_ms();
+        if (!vr_send_all(g_sock, msg, n)) conn_lost("送る所");
+        g_stat.send_ms += now_ms() - t0;
+    }
     ReleaseSRWLockExclusive(&g_lock);
 }
 
@@ -1648,6 +1688,7 @@ static int hello(void) {
             vr_take(&rd, (size_t) ne * sizeof(VkExtensionProperties));
             if (!rd.bad && rd.at + 4 <= rd.n) g_hw.caps = vr_ru32(&rd); // 古い受け手は付けない
             g_can_pack = (g_hw.caps & VR_CAP_PACK) != 0;
+            g_can_code = (g_hw.caps & VR_CAP_PLANE_CODE) && plane_mode() > 0;
             const char *dl = getenv("IPHONE_VK_DELTA");
             if (dl && *dl == '0') g_hw.caps &= ~VR_CAP_DELTA;
             // 調べ用：IPHONE_VK_CAPS=数 で受け手の caps を絞る（0 なら古い受け手と同じに振る舞う）
@@ -1728,6 +1769,7 @@ static int hello(void) {
                 if (g_hw.props.apiVersion > top)
                     g_hw.props.apiVersion = VK_MAKE_API_VERSION(0, 1, VK_API_VERSION_MINOR(top), VK_API_VERSION_PATCH(g_hw.props.apiVersion));
                 if (g_hw.caps & ~VR_CAP_DELTA) say("受け手ができること（caps）0x%x", g_hw.caps);
+                if (g_can_code) say("動画のコマのような平面は、縮めて送る（VR_MEM_WRITE_CODED）");
                 // GPU が BC を読めなければ、ドライバがほどく（IPHONE_VK_BC=1 で、読める GPU でもほどく・0 でほどかない）
                 const char *bce = getenv("IPHONE_VK_BC");
                 g_bc = bce && *bce ? *bce == '1' : !g_hw.feats.textureCompressionBC;
@@ -1797,6 +1839,9 @@ struct mem {
     int ww;            // Linux：写しを書き込み監視している（userfaultfd）。0 なら全ページを「書いたかもしれない」とする
     volatile LONG wide; // 受け手の帳簿に載らない使い方（アドレスで読み書き・結んだあとに書いた descriptor）をされた。
                         // MEM_WRITE・MEM_READ に「受け手の判定より短くせず、ドライバの番号までは必ず待つ」の印を付ける
+    // 平面の覚え（buffer から image への写しで分かった「どこから・行の長さ・行の数・1 画素のバイト」）。送るときに縮める（VR_MEM_WRITE_CODED）。
+    // 覚えが古くても正しさは変わらない（送るのはいつも、書いたページの今の中身）。縮みが悪くなるだけ
+    struct plh { uint64_t off; uint32_t pitch, rows, bpp, age; } ph[4];
 };
 static SRWLOCK g_muse_lock = SRWLOCK_INIT;
 
@@ -2954,6 +2999,167 @@ static void send_page_diff(vr_buf *b, struct mem *m, size_t pg) {
     g_stat.wdiff_pages++;
 }
 
+// ---- 平面を縮めて送る（VR_MEM_WRITE_CODED） ----
+// 写しの元の buffer の範囲を「平面」として覚え、送るときに、その中の書いたページの行をまとめて縮めて送る。
+// 縮めるのは書いたページの中の行だけ（ページの端の半端な所は、いつもの送り方で送る）。受け手の中身と同じ行は送らない
+#define PLANE_MIN (64u << 10) // これより小さい範囲は縮めない（いつもの送り方の方が軽い）
+static SRWLOCK g_plh_lock = SRWLOCK_INIT;
+static uint32_t g_plh_age;
+
+// 画像の形式と aspect から、平面の 1 画素のバイト（縮めない形式なら 0）
+static uint32_t plane_bpp(VkFormat f, VkImageAspectFlags asp) {
+    int wide = plane_mode() >= 2;
+    switch (f) {
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8_USCALED: case VK_FORMAT_R8_SSCALED:
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R8_SRGB:
+    case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM: case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM: case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
+        return 1;
+    case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM: case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
+        return (asp & VK_IMAGE_ASPECT_PLANE_1_BIT) ? (wide ? 2 : 0) : 1;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8_SRGB:
+        return wide ? 2 : 0;
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT:
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_B8G8R8A8_UINT: case VK_FORMAT_B8G8R8A8_SINT:
+        return wide ? 4 : 0;
+    default:
+        return 0;
+    }
+}
+
+// buffer から image への写し 1 つを、平面として覚える（2D・1 枚の物だけ）
+static void plane_note(const struct buf *bf, VkFormat fmt, const VkBufferImageCopy *r) {
+    if (!g_can_code || !bf || !bf->m || !bf->m->host || !bf->m->shadow) return;
+    if (r->imageExtent.depth != 1 || r->imageSubresource.layerCount != 1 || !r->imageExtent.width || !r->imageExtent.height) return;
+    uint32_t bpp = plane_bpp(fmt, r->imageSubresource.aspectMask);
+    if (!bpp) return;
+    struct mem *m = bf->m;
+    uint64_t rl = r->bufferRowLength ? r->bufferRowLength : r->imageExtent.width;
+    uint64_t pitch = rl * bpp, rows = r->imageExtent.height, off = bf->memoff + r->bufferOffset;
+    if (pitch > PC_MAX_W || pitch * rows < PLANE_MIN || off >= m->size) return;
+    uint64_t end = off + pitch * rows;
+    AcquireSRWLockExclusive(&g_plh_lock);
+    int k = -1;
+    for (int i = 0; i < 4; i++) {
+        struct plh *h = &m->ph[i];
+        if (!h->rows) continue;
+        if (h->off == off && h->pitch == pitch && h->bpp == bpp) { k = i; continue; }
+        // 重なる別の形の覚えは、もう古い（同じバイトを新しい形で使い直した）
+        if (h->off < end && off < h->off + (uint64_t) h->pitch * h->rows) h->rows = 0;
+    }
+    if (k < 0)
+        for (int i = 0; i < 4; i++) if (!m->ph[i].rows) { k = i; break; }
+    if (k < 0) {
+        k = 0;
+        for (int i = 1; i < 4; i++) if (m->ph[i].age < m->ph[k].age) k = i;
+    }
+    m->ph[k] = (struct plh) { off, (uint32_t) pitch, (uint32_t) rows, bpp, ++g_plh_age };
+    ReleaseSRWLockExclusive(&g_plh_lock);
+}
+
+static uint32_t plane_segs(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_PLANE_SEGS"); v = e && atoi(e) > 0 ? atoi(e) : 8; }
+    return (uint32_t) v;
+}
+
+// m の off から rows 行（行の長さ W）を縮めて送る。送れたら 1
+static int plane_put(struct mem *m, uint64_t off, uint32_t W, uint32_t rows, uint32_t bpp) {
+    static SRWLOCK lk = SRWLOCK_INIT; // 縮めるのは 1 つずつ（一時の場所を使い回す）
+    static vr_buf scr, msg;
+    uint32_t segs = plane_segs(), seg_rows = (rows + segs - 1) / segs;
+    if (seg_rows < 16) seg_rows = 16;
+    uint32_t nseg = pc_nseg(rows, seg_rows);
+    AcquireSRWLockExclusive(&lk);
+    if (g_pc_threads_want < 0) {
+        const char *e = getenv("IPHONE_VK_PLANE_THREADS");
+        if (e && *e) g_pc_threads_want = atoi(e);
+    }
+    scr.n = msg.n = 0;
+    vr_reserve(&scr, (size_t) pc_enc_scratch(W, rows, nseg));
+    vr_reserve(&msg, 32 + (size_t) pc_bound(W, rows, nseg));
+    memw_dump(m, off, (uint64_t) W * rows);
+    double t0 = now_ms();
+    uint64_t n = pc_encode(m->shadow + off, W, rows, bpp, seg_rows, msg.p + 32, scr.p);
+    double t1 = now_ms();
+    if (n) {
+        // 頭：命令・長さ・memory・offset・番号（IPHONE_VK_MEMW_UPTO=0 なら「そのメモリを使う仕事を全部待つ」になる大きな番号）
+        uint32_t h[2] = { VR_MEM_WRITE_CODED, (uint32_t) (24 + n) };
+        uint64_t id = ID(m), upto = memw_upto_on() ? memw_upto(m, off, (uint64_t) W * rows) : (MEMW_WIDE - 1);
+        memcpy(msg.p, h, 8);
+        memcpy(msg.p + 8, &id, 8);
+        memcpy(msg.p + 16, &off, 8);
+        memcpy(msg.p + 24, &upto, 8);
+        rpc_send_raw(VR_MEM_WRITE_CODED, msg.p, (size_t) (32 + n));
+        g_stat.code_n++;
+        g_stat.code_in += (uint64_t) W * rows;
+        g_stat.code_out += 32 + n;
+        g_stat.code_ms += t1 - t0;
+    }
+    // 大きなコマのあとは一時の場所を手放す（64 MB を超えたら）
+    if (scr.cap > (64u << 20)) { free(scr.p); scr.p = NULL; scr.cap = 0; }
+    if (msg.cap > (64u << 20)) { free(msg.p); msg.p = NULL; msg.cap = 0; }
+    ReleaseSRWLockExclusive(&lk);
+    return n != 0;
+}
+
+// 平面の行 y（1 行 pitch バイト）が、受け手の中身と違うかもしれないか（知らないページにかかる・写しと違う）
+static int plane_row_changed(struct mem *m, uint64_t at, uint64_t len) {
+    if (!m->sent) return 1;
+    for (size_t pg = (size_t) (at / PAGE); pg <= (size_t) ((at + len - 1) / PAGE); pg++)
+        if (!m->known[pg]) return 1;
+    return memcmp(m->shadow + at, m->sent + at, (size_t) len) != 0;
+}
+
+// 平面 h の行 y0〜y1（どれも書いたページの中）を送る。送り終えた所（受け手と同じになった所）に丸ごと入るページは、書いた印を消す
+static void plane_band(struct mem *m, const struct plh *h, uint64_t y0, uint64_t y1) {
+    uint64_t pitch = h->pitch, ys = y0, ye = y1;
+    while (ys < ye && !plane_row_changed(m, h->off + ys * pitch, pitch)) ys++;
+    while (ye > ys && !plane_row_changed(m, h->off + (ye - 1) * pitch, pitch)) ye--;
+    if (ys < ye) {
+        // 変わった行が少なければ、いつもの送り方（違う所だけ）に任せる
+        if ((ye - ys) * pitch < PLANE_MIN) return;
+        if (!plane_put(m, h->off + ys * pitch, (uint32_t) pitch, (uint32_t) (ye - ys), h->bpp)) return;
+        if (m->sent) memcpy(m->sent + h->off + ys * pitch, m->shadow + h->off + ys * pitch, (size_t) ((ye - ys) * pitch));
+    }
+    g_stat.code_same += (y1 - y0 - (ye - ys)) * pitch;
+    // [y0, y1) の行は、どれも受け手と同じになった。そこに丸ごと入るページは送り終えた
+    uint64_t a = h->off + y0 * pitch, b = h->off + y1 * pitch;
+    for (size_t pg = (size_t) ((a + PAGE - 1) / PAGE); (uint64_t) (pg + 1) * PAGE <= b; pg++) {
+        m->dirty[pg] = 0;
+        if (m->known) m->known[pg] = 1;
+    }
+}
+
+// ページ p0〜p1 のうち、覚えた平面にかかる書いたページの塊を、縮めて送る
+static void plane_send(struct mem *m, size_t p0, size_t p1) {
+    struct plh hs[4];
+    int n = 0;
+    AcquireSRWLockShared(&g_plh_lock);
+    for (int i = 0; i < 4; i++) if (m->ph[i].rows) hs[n++] = m->ph[i];
+    ReleaseSRWLockShared(&g_plh_lock);
+    for (int k = 0; k < n; k++) {
+        const struct plh *h = &hs[k];
+        uint64_t pitch = h->pitch, rows = h->rows;
+        if (h->off >= m->size || !pitch) continue;
+        if (rows > (m->size - h->off) / pitch) rows = (m->size - h->off) / pitch; // 最後の行の隙間がメモリの外なら、その行はいつもの送り方で
+        uint64_t pend = h->off + pitch * rows;
+        size_t q0 = (size_t) (h->off / PAGE), q1 = (size_t) ((pend + PAGE - 1) / PAGE);
+        if (q0 < p0) q0 = p0;
+        if (q1 > p1) q1 = p1;
+        for (size_t i = q0; i < q1;) {
+            if (!m->dirty[i]) { i++; continue; }
+            size_t j = i;
+            while (j < q1 && m->dirty[j]) j++;
+            uint64_t a = (uint64_t) i * PAGE, b = (uint64_t) j * PAGE;
+            if (a < h->off) a = h->off;
+            if (b > pend) b = pend;
+            uint64_t y0 = (a - h->off + pitch - 1) / pitch, y1 = (b - h->off) / pitch;
+            if (y1 > y0 && (y1 - y0) * pitch >= PLANE_MIN) plane_band(m, h, y0, y1);
+            i = j;
+        }
+    }
+}
+
 // off から len バイトのうち、アプリが書いたページを受け手へ送る
 static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
     if (off >= m->size) return;
@@ -2969,6 +3175,8 @@ static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
         m->known = calloc(m->npages, 1);
         if (!m->sent || !m->known) { free(m->sent); free(m->known); m->sent = m->known = NULL; }
     }
+    // 覚えた平面にかかる書いたページは、先に縮めて送る（送った所の印は消える）
+    if (g_can_code && m->shadow && !m->delta && !m->jpeg) plane_send(m, p0, p1);
     for (size_t i = p0; i < p1;) {
         if (!m->dirty[i]) { i++; continue; }
         // 受け手の中身を知っているページは、違う所だけを送る
@@ -9267,6 +9475,8 @@ static void VKAPI_CALL cmd_copy_buffer_to_image(VkCommandBuffer cbh, VkBuffer bb
         return;
     }
     for (uint32_t i = 0; i < n; i++) b2i_note(ii ? (uint32_t) ii->ls_fmt : 0, rg[i].imageExtent.width, rg[i].imageExtent.height);
+    if (g_can_code && ii)
+        for (uint32_t i = 0; i < n; i++) plane_note((const struct buf *) bb, (VkFormat) ii->ls_fmt, &rg[i]);
     vr_u32(&c->s, VR_CMD_COPY_BUFFER_TO_IMAGE);
     vr_u64(&c->s, ID(bb));
     vr_u64(&c->s, ID(im));

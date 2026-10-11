@@ -57,6 +57,9 @@
 // 映像の形式
 #define VR_REC_H264 0u
 #define VR_REC_HEVC 1u
+// 動画のコマの平面（R8 など）を、画質を落とさずに縮めて送る（VR_MEM_WRITE_CODED。中身の形は remote/plane_codec.h）。
+// 番号は、ほかの係（1<<22・1<<23 往復を減らす係、1<<26 録画、1<<28 レイトレ）と重ならないように取った
+#define VR_CAP_PLANE_CODE 33554432u // 1u << 25
 #define VR_CAP_NEW_MASK (VR_CAP_VK13 | VR_CAP_DYNAMIC_RENDERING | VR_CAP_SYNC2 | VR_CAP_RENDER_PASS2 | VR_CAP_CMD10 | VR_CAP_EXT_DYNAMIC_STATE | VR_CAP_QUERY)
 // 1.3 の受け手は、VR_GET_FORMAT_PROPS の返事の後ろに VkFormatProperties3 の 3 つの値（u64）を付ける。古いドライバは読まない
 
@@ -154,6 +157,9 @@ enum vr_op {
     VR_RECORD_FRAME,             // memory・offset・幅・高さ・行の長さ・BGRA か・時刻（u64・µs。PC の時計で、録画を始めた時から）。返事なし。
                                  // 受け手は、その memory を使う仕事が終わるのを待ってから写す（VR_READ_H264 と同じ待ち方）
     VR_RECORD_FETCH,             // [同期] 位置（u64）・最大のバイト（u32）→ 全体の大きさ（u64）・中身。最後に書き終えたファイルを PC に持ち帰る
+    // ---- 縮めた平面の書き込み（VR_CAP_PLANE_CODE）。ほかの係が足す命令と番号が重ならないよう 104 から（録画は 96〜、レイトレは 112〜） ----
+    VR_MEM_WRITE_CODED = 104,    // memory・offset・番号（u64。VR_MEM_WRITE の末尾と同じ意味で、いつも付ける）・縮めた中身（plane_codec.h。
+                                 // ほどくと offset から「幅 × 行の数」バイトの隙間の無い並び）。返事なし。受け手は VR_MEM_WRITE と同じく待ってから書く
     VR_OP_COUNT
 };
 
