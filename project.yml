@@ -5,6 +5,12 @@ packages:
   ArgmaxOSS:
     url: https://github.com/argmaxinc/argmax-oss-swift
     exactVersion: "1.1.1"
+  # 絵の Stable Diffusion を Core ML と Neural Engine で動かす。Apple の ml-stable-diffusion で、MIT。版は 1.1.1 に固定する
+  # 置き場は github.com/apple/ml-stable-diffusion から移った。1.1.1 は swift-transformers に頼らない。main は 0.1.8 にきっちり頼る
+  # モデルはアプリに入れない。PC から work/ai_apps/sd_push.py で送る
+  StableDiffusion:
+    url: https://github.com/apple-aiml-research/ml-stable-diffusion
+    exactVersion: "1.1.1"
 options:
   bundleIdPrefix: com.tsurutanmen
   deploymentTarget:
@@ -22,8 +28,8 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: 計算の受け手
-        CFBundleShortVersionString: "0.7.51"
-        CFBundleVersion: "59"
+        CFBundleShortVersionString: "0.7.52"
+        CFBundleVersion: "60"
         UILaunchScreen: {}
         NSLocalNetworkUsageDescription: PC からの計算の依頼を受け取るために使います
         NSSpeechRecognitionUsageDescription: PC から送られた音声を文字にするために使います
@@ -58,6 +64,9 @@ targets:
         product: WhisperKit
       - package: ArgmaxOSS
         product: TTSKit
+      # Sources/ImageGen.swift が canImport で使う。道具の StableDiffusionSample は入れない
+      - package: StableDiffusion
+        product: StableDiffusion
       - sdk: Metal.framework
       - sdk: Accelerate.framework
       - sdk: Foundation.framework

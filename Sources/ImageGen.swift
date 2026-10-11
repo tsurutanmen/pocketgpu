@@ -12,7 +12,8 @@
 // Image Playground（ImageCreator）：iOS 18.4 から。Apple Intelligence が入っていて、アプリが画面の前にいるときだけ作れる
 //   （後ろだと backgroundCreationForbidden）。絵柄は animation・illustration・sketch（availableStyles に出る物だけ）。
 //   external（ChatGPT など外の絵柄・iOS 26）は文が外の会社に出ていくので、allow_external:true のときだけ
-// Stable Diffusion：apple/ml-stable-diffusion の Swift Package を入れて組んだときだけ（canImport）。Neural Engine で動かす
+// Stable Diffusion：apple/ml-stable-diffusion 1.1.1 の Swift Package を入れて組んだときだけ（canImport・work/ai_pkg/stage2.patch）。Neural Engine で動かす。
+//   使う API は 1.1.1 のソースで確かめた（work/ai_pkg/api_check.md）。空きメモリが足りなければ code low_memory で断る
 import CoreGraphics
 import CoreML
 import Foundation
@@ -165,6 +166,9 @@ enum ImageGen {
     #if canImport(StableDiffusion)
     private static var sdPipe: StableDiffusionPipeline?
     private static var sdName: String?
+    // 生成の前に要る空き（仮）。SD 2.1 base のパレット化で Unet の重さが 650 MB、TextEncoder が 319 MB。
+    // reduceMemory なので 1 度に載るのは 1 部品だが、Unet の展開と途中の計算の分を見ておく
+    static let sdNeedMB = 2000
 
     private static func sdRoot() -> URL { AIShared.store("sd_models") }
 
@@ -180,6 +184,8 @@ enum ImageGen {
         guard let name = (req["model"] as? String) ?? models.first, models.contains(name) else {
             throw AIError("Stable Diffusion のモデルが入っていない（PC の work/ai_apps/sd_push.py で入れる）", code: "not_installed")
         }
+        // reduceMemory では生成のたびに部品を読み直すので、毎回見る
+        try AIShared.checkMemory(needMB: sdNeedMB, what: "Stable Diffusion の絵づくり")
         if sdPipe == nil || sdName != name {
             sdPipe = nil
             let cfg = MLModelConfiguration()
