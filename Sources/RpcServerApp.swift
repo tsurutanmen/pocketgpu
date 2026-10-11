@@ -121,6 +121,9 @@ func readBridge(_ f: (UnsafeMutablePointer<CChar>, Int32) -> Int32) -> String {
     return String(cString: buf)
 }
 
+// 画面は下のタブで 4 つに分ける（案 A）：ホーム・カメラ・音と字幕・設定。
+// 状態と切り替えの値はここにまとめて持ち、どのタブも同じ値を見る。ホームとタブの両方に同じ切り替えがあるので、
+// 切り替えたときの処理（setWebcam など）は切り替えの所ではなく、タブの外側の onChange で 1 回だけ呼ぶ
 struct ContentView: View {
     @State private var addrs = listAddresses()
     @State private var host = ""
@@ -166,7 +169,8 @@ struct ContentView: View {
     @AppStorage(CameraBridge.wifiKey) private var webcamWifi = false
     private let webcam = CameraBridge.shared
     // GPU を使わずに、マイク・スピーカー・カメラだけに使う。オンの間は GPU の受け手（Vulkan の 50060・llama の rpc）を始めない。
-    // 「起動時に自動で開始」もしない。マイク・スピーカー（50063）とカメラ（50064）の口は、それぞれの切り替えのとおり
+    // 「起動時に自動で開始」もしない。マイク・スピーカー（50063）とカメラ（50064）の口は、それぞれの切り替えのとおり。
+    // 画面ではホームの「GPU として使う」の逆（GPU として使うを切ると、このモード）
     @AppStorage("micCamOnly") private var micCamOnly = false
     // 画面の言葉（自動・日本語・English）。ここで読むと、変えたときに画面が描き直される
     @AppStorage("lang") private var lang = AppLang.auto.rawValue
@@ -176,149 +180,18 @@ struct ContentView: View {
     private var running: Bool { !started.isEmpty }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                if micCamOnly {
-                    // マイクとカメラだけのモード：何が動いているかを一番上に出す
-                    Section(L("マイクとカメラだけのモード", "Mic and camera only")) {
-                        MicCamSummaryView(audio: AudioBridgeModel.shared, camera: webcam, audioOn: audioOn, webcamOn: webcamOn, gpuRunning: running)
-                    }
-                } else {
-                    // GPU のカード：ファンの数は機種で、回る速さは PC から来る仕事の量で変わる
-                    Section { GPUCardView() }
-                }
-                Section(L("状態", "Status")) {
-                    if !micCamOnly {
-                        LabeledContent(L("PC", "PC"), value: status.connected ? L("接続中", "Connected") : L("接続待ち", "Waiting"))
-                        LabeledContent(L("フレームレート", "Frame rate"), value: String(format: "%.1f", status.fps))
-                    }
-                    LabeledContent(L("温度", "Temperature")) {
-                        HStack(spacing: 6) {
-                            Circle().fill(status.thermalColor).frame(width: 8, height: 8)
-                            Text(status.thermalText)
-                        }
-                    }
-                    LabeledContent(L("電池", "Battery"), value: status.batteryText)
-                    if status.lowPower {
-                        Text(L("低電力モードがオンです。処理が遅くなる場合があります", "Low Power Mode is on. It may run slower.")).font(.footnote)
-                    }
-                    Toggle(L("iPhone に出力", "Output to this iPhone"), isOn: $showFrames)
-                        .onChange(of: showFrames) { _, on in preview.setOn(on) }
-                    if showFrames {
-                        Toggle(L("全画面表示を横向きに固定する", "Full screen: lock to landscape"), isOn: $fullLandscape)
-                        FramePreviewView(model: preview, status: status)
-                    }
-                    Toggle(L("PC の画面をミラー", "Mirror the PC screen"), isOn: $mirrorOn)
-                        .onChange(of: mirrorOn) { _, on in setMirror(on) }
-                    if mirrorOn {
-                        if !showFrames {
-                            Toggle(L("全画面表示を横向きに固定する", "Full screen: lock to landscape"), isOn: $fullLandscape)
-                        }
-                        ScreenMirrorStatusRow(model: mirror)
-                        ScreenMirrorView(model: mirror)
-                    }
-                    Toggle(L("PC のスピーカーとマイクとして使う", "Use as PC speaker and mic"), isOn: $audioOn)
-                        .onChange(of: audioOn) { _, on in AudioBridgeModel.shared.setOn(on) }
-                    if audioOn {
-                        Toggle(L("イヤホンのマイクを使う。音質は下がります", "Use the earphone mic (lower quality)"), isOn: $audioHeadsetMic)
-                        AudioBridgeStatusRow(model: AudioBridgeModel.shared)
-                    }
-                    Toggle(L("ウェブカメラとして使う", "Use this iPhone as a webcam"), isOn: $webcamOn)
-                        .onChange(of: webcamOn) { _, on in setWebcam(on) }
-                    if webcamOn {
-                        // カメラ・解像度・フレームレート・画質。PC が「おまかせ」にした項目に使う（CameraBridge.swift）
-                        CameraSettingsView(model: webcam)
-                        Toggle(L("Wi-Fi でもウェブカメラに接続できるようにする", "Webcam over Wi-Fi too"), isOn: $webcamWifi)
-                            .onChange(of: webcamWifi) { _, on in webcam.setWifi(on) }
-                        if webcamWifi {
-                            let ip = addrs.first(where: { $0.name == "en0" })?.ip ?? "?"
-                            Text(L("PC で実行：", "On the PC: ") + "webcam_rx --addr \(ip):50064 --code \(webcam.wifiCode)").font(.footnote.monospaced()).textSelection(.enabled)
-                        }
-                        CameraBridgeStatusRow(model: webcam)
-                    }
-                    ShareLink(item: diagnosticsText(status: status, log: log)) {
-                        Label(L("ログを送信", "Send logs"), systemImage: "square.and.arrow.up")
-                    }
-                }
-                Section(L("この iPhone", "This iPhone")) {
-                    Text(devices.isEmpty ? L("読み込み中", "Loading") : devices).font(.footnote.monospaced())
-                    Text(L("アプリが使用できる残りのメモリ：\(availMB) MB", "Memory available to the app: \(availMB) MB")).font(.footnote)
-                    Text(onCPU ? L("現在の計算：CPU", "Computing on: CPU") : L("現在の計算：GPU", "Computing on: GPU")).font(.footnote)
-                }
-                Section {
-                    Picker(L("アドレス", "Address"), selection: $host) {
-                        ForEach(addrs, id: \.ip) { a in
-                            Text("\(a.ip) (\(a.name.hasPrefix("utun") ? "Tailscale" : a.name == "en0" ? "Wi-Fi" : a.name))").tag(a.ip)
-                        }
-                    }
-                    TextField(L("ポート", "Port"), text: $port).keyboardType(.numberPad)
-                    Toggle(L("Metal の GPU で計算する", "Compute on the GPU (Metal)"), isOn: $useGPU)
-                    Toggle(L("USB でも接続を受け付ける", "Also listen over USB"), isOn: $usb)
-                    Toggle(L("インターネット共有でも接続を受け付ける", "Also listen on Personal Hotspot"), isOn: $hotspotListen)
-                    Toggle(L("バックグラウンドでも実行する", "Keep running in the background"), isOn: $keepAlive)
-                        .onChange(of: keepAlive) { _, on in if running { on ? Keeper.shared.start() : Keeper.shared.stop() } }
-                    Toggle(L("起動時に自動で開始", "Start automatically on launch"), isOn: $autoStart)
-                        .disabled(micCamOnly) // マイクとカメラだけのモードでは、自動でも GPU を始めない
-                    Toggle(L("Metal 4 の tensor を使用する。アプリの再起動後に有効になります", "Use Metal 4 tensors (applies after relaunch)"), isOn: $metalTensor)
-                    #if MVK_RT
-                    Toggle(L("試験中のレイトレーシングを使用する。アプリの再起動後に有効になります", "Use experimental ray tracing (applies after relaunch)"), isOn: $rtExperimental)
-                    if rtExperimental {
-                        Text(L("試験用のビルドです。使用できるかどうかはログの vk: の行で確認できます", "Test build. Check the vk: lines in the log to see whether it is available.")).font(.footnote)
-                    }
-                    #endif
-                    Picker(L("言語", "Language"), selection: $lang) {
-                        ForEach(AppLang.allCases) { l in Text(l.label).tag(l.rawValue) }
-                    }
-                } header: { Text(L("接続の受け付け", "Listening")) }
-                Section {
-                    Toggle(L("GPU を使わずにマイクとカメラだけ使う", "Use only the mic and camera, not the GPU"), isOn: $micCamOnly)
-                        .onChange(of: micCamOnly) { _, on in setMicCamOnly(on) }
-                    if micCamOnly {
-                        Text(running
-                             ? L("GPU の接続の受け付けは、アプリを終了すると止まります。次に開いたときは、マイクとカメラだけで始まります。", "GPU listening stops when you quit the app. Next time, only the mic and camera start.")
-                             : L("GPU の接続は受け付けません。マイク・スピーカー・カメラの接続だけを受け付けます。PC では Start-Mic-Camera.cmd を起動してください。", "GPU connections are not accepted. Only the mic, speaker, and camera accept connections. On the PC, open Start-Mic-Camera.cmd."))
-                            .font(.footnote)
-                    }
-                    Button(running ? L("実行中です。停止するにはアプリを終了してください", "Running. Quit the app to stop")
-                                   : micCamOnly ? L("マイクとカメラだけのモードでは GPU を開始しません", "The GPU does not start in mic and camera only mode") : L("開始", "Start")) {
-                        if !host.isEmpty { start(host) }
-                        if usb { start(usbHost) }
-                    }
-                    .disabled(running || micCamOnly || (host.isEmpty && !usb))
-                    if started.contains(host) {
-                        Text(L("PC で実行：", "On the PC: ") + "llama-cli … --rpc \(host):\(port)").font(.footnote.monospaced()).textSelection(.enabled)
-                    }
-                    if started.contains(usbHost) {
-                        Text(L("USB の場合は usb_forward.py の起動後に", "USB: after usb_forward.py,") + " --rpc 127.0.0.1:50053").font(.footnote.monospaced()).textSelection(.enabled)
-                    }
-                    if vkFailed {
-                        Text(L("Vulkan の起動に失敗しました。下のログの vk: の行をチェックしてください", "Vulkan: failed to start (see the vk: lines in the log below)")).font(.footnote)
-                    } else if vkStarted {
-                        Text(L("Vulkan：USB のポート 50060 で接続を受け付けています", "Vulkan: listening on USB port 50060")).font(.footnote.monospaced()).textSelection(.enabled)
-                        if !linkHost.isEmpty {
-                            Text(L("Vulkan：インターネット共有の \(linkHost):50060 でも接続を受け付けています", "Vulkan: also listening on the tethering link \(linkHost):50060")).font(.footnote.monospaced()).textSelection(.enabled)
-                        }
-                    }
-                }
-                #if PUMPKIN
-                Section {
-                    Button(mcRunning ? "実行中です。停止するにはアプリを終了してください" : "マイクラのサーバーを開始") {
-                        MinecraftServer.shared.start()
-                        mcRunning = true
-                    }
-                    .disabled(mcRunning)
-                    if mcRunning, let wifi = addrs.first(where: { $0.name == "en0" })?.ip {
-                        Text("Java 版：\(wifi):25565（同じ Wi-Fi から）").font(.footnote.monospaced()).textSelection(.enabled)
-                    }
-                    Text("中身は Pumpkin（GPL-3.0）。世界は書類の minecraft/ に置く").font(.footnote)
-                } header: { Text("マイクラのサーバー") }
-                #endif
-                Section(L("ログ", "Log")) {
-                    Text(log).font(.caption2.monospaced()).textSelection(.enabled)
-                }
-            }
-            .navigationTitle(L("GPU", "GPU"))
+        TabView {
+            homeTab
+                .tabItem { Label(L("ホーム", "Home"), systemImage: "house") }
+            cameraTab
+                .tabItem { Label(L("カメラ", "Camera"), systemImage: "camera") }
+            audioTab
+                .tabItem { Label(L("音と字幕", "Audio and captions"), systemImage: "mic") }
+            settingsTab
+                .tabItem { Label(L("設定", "Settings"), systemImage: "slider.horizontal.3") }
         }
+        // スイッチとタブの色は案 A の見本に合わせて青にする
+        .tint(.blue)
         .onAppear {
             devices = readBridge { rpc_bridge_devices($0, $1) }
             host = addrs.first(where: { $0.ip.hasPrefix("100.") })?.ip ?? addrs.first(where: { $0.name == "en0" })?.ip ?? addrs.first?.ip ?? ""
@@ -335,6 +208,14 @@ struct ContentView: View {
             vkr_set_paused(phase == .active ? 0 : 1)
             if phase == .active { AudioBridgeModel.shared.foregrounded() }
         }
+        // 切り替えたときの処理。前は切り替えの所に付けていた物を、ここにまとめた（呼ぶ物は同じ）
+        .onChange(of: showFrames) { _, on in preview.setOn(on) }
+        .onChange(of: mirrorOn) { _, on in setMirror(on) }
+        .onChange(of: audioOn) { _, on in AudioBridgeModel.shared.setOn(on) }
+        .onChange(of: webcamOn) { _, on in setWebcam(on) }
+        .onChange(of: webcamWifi) { _, on in webcam.setWifi(on) }
+        .onChange(of: micCamOnly) { _, on in setMicCamOnly(on) }
+        .onChange(of: keepAlive) { _, on in if running { on ? Keeper.shared.start() : Keeper.shared.stop() } }
         .onReceive(tick) { _ in
             vkr_set_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
             status.tick()
@@ -368,6 +249,233 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    // ---- ホーム：GPU のカード・状態・使う機能・iPhone の画面に表示 ----
+
+    private var homeTab: some View {
+        NavigationStack {
+            Form {
+                if micCamOnly {
+                    // マイクとカメラだけのモード：何が動いているかを一番上に出す
+                    Section(L("マイクとカメラだけのモード", "Mic and camera only")) {
+                        MicCamSummaryView(audio: AudioBridgeModel.shared, camera: webcam, audioOn: audioOn, webcamOn: webcamOn, gpuRunning: running)
+                    }
+                } else {
+                    // GPU のカード：ファンの数は機種で、回る速さは PC から来る仕事の量で変わる
+                    Section { GPUCardView() }
+                }
+                Section(L("状態", "Status")) {
+                    if !micCamOnly {
+                        LabeledContent(L("PC", "PC"), value: status.connected ? L("接続中", "Connected") : L("接続待ち", "Waiting"))
+                        LabeledContent(L("フレームレート", "Frame rate"), value: String(format: "%.1f", status.fps))
+                    }
+                    LabeledContent(L("温度", "Temperature")) {
+                        HStack(spacing: 6) {
+                            Circle().fill(status.thermalColor).frame(width: 8, height: 8)
+                            Text(status.thermalText)
+                        }
+                    }
+                    LabeledContent(L("電池", "Battery"), value: status.batteryText)
+                    if status.lowPower {
+                        Text(L("低電力モードがオンです。処理が遅くなる場合があります", "Low Power Mode is on. It may run slower.")).font(.footnote)
+                    }
+                }
+                Section(L("使う機能", "Features")) {
+                    Toggle(L("GPU として使う", "Use as a GPU"), isOn: gpuOn)
+                    if micCamOnly {
+                        Text(running
+                             ? L("GPU の接続の受け付けは、アプリを終了すると止まります。次に開いたときは、マイクとカメラだけで始まります。", "GPU listening stops when you quit the app. Next time, only the mic and camera start.")
+                             : L("GPU の接続は受け付けません。マイク・スピーカー・カメラの接続だけを受け付けます。PC では Start-Mic-Camera.cmd を起動してください。", "GPU connections are not accepted. Only the mic, speaker, and camera accept connections. On the PC, open Start-Mic-Camera.cmd."))
+                            .font(.footnote)
+                    }
+                    Toggle(L("ウェブカメラとして使う", "Use this iPhone as a webcam"), isOn: $webcamOn)
+                    Toggle(L("スピーカーとマイクとして使う", "Use as PC speaker and mic"), isOn: $audioOn)
+                }
+                Section(L("iPhone の画面に表示", "Show on the iPhone screen")) {
+                    Toggle(L("iPhone に出力", "Output to this iPhone"), isOn: $showFrames)
+                    if showFrames {
+                        Toggle(L("全画面表示を横向きに固定する", "Full screen: lock to landscape"), isOn: $fullLandscape)
+                        FramePreviewView(model: preview, status: status)
+                    }
+                    Toggle(L("PC の画面をミラー", "Mirror the PC screen"), isOn: $mirrorOn)
+                    if mirrorOn {
+                        if !showFrames {
+                            Toggle(L("全画面表示を横向きに固定する", "Full screen: lock to landscape"), isOn: $fullLandscape)
+                        }
+                        ScreenMirrorStatusRow(model: mirror)
+                        ScreenMirrorView(model: mirror)
+                    }
+                }
+            }
+            .navigationTitle("PocketGPU")
+        }
+    }
+
+    // 「GPU として使う」はマイクとカメラだけのモードの逆。切ると、このモードに入る（setMicCamOnly は onChange から）
+    private var gpuOn: Binding<Bool> {
+        Binding(get: { !micCamOnly }, set: { micCamOnly = !$0 })
+    }
+
+    // ---- カメラ：ウェブカメラ・映像の設定・Wi-Fi ----
+
+    private var cameraTab: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Toggle(L("ウェブカメラとして使う", "Use this iPhone as a webcam"), isOn: $webcamOn)
+                    if webcamOn {
+                        CameraBridgeStatusRow(model: webcam)
+                    }
+                }
+                // カメラ・解像度・フレームレート・画質・PC からの指定を優先する。PC が「おまかせ」にした項目に使う（CameraBridge.swift）。
+                // 切っている間も、先に決めておけるように出す。変えた値は次につないだときに使う
+                Section(L("映像", "Video")) {
+                    CameraSettingsView(model: webcam)
+                }
+                Section("Wi-Fi") {
+                    Toggle(L("Wi-Fi でもウェブカメラに接続できるようにする", "Webcam over Wi-Fi too"), isOn: $webcamWifi)
+                    if webcamOn && webcamWifi {
+                        let ip = addrs.first(where: { $0.name == "en0" })?.ip ?? "?"
+                        Text(L("PC で実行：", "On the PC: ") + "webcam_rx --addr \(ip):50064 --code \(webcam.wifiCode)").font(.footnote.monospaced()).textSelection(.enabled)
+                    }
+                }
+            }
+            .navigationTitle(L("カメラ", "Camera"))
+        }
+    }
+
+    // ---- 音と字幕：PC のスピーカーとマイク・字幕 ----
+
+    private var audioTab: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Toggle(L("スピーカーとマイクとして使う", "Use as PC speaker and mic"), isOn: $audioOn)
+                    if audioOn {
+                        AudioBridgeStatusRow(model: AudioBridgeModel.shared)
+                    }
+                }
+                // AudioBridge が音を始めるときに読む。つないでいる間に変えたときは、次につないだときから
+                Section(L("マイク", "Microphone")) {
+                    Toggle(L("イヤホンのマイクを使う。音質は下がります", "Use the earphone mic. The sound quality is lower."), isOn: $audioHeadsetMic)
+                }
+                // 字幕は PC のアプリが始める（AppleFeatures の 50057 番の live_asr・LiveASR.swift）。ここでは使えるかだけを出す
+                Section(L("字幕", "Captions")) {
+                    LabeledContent(L("文字起こし", "Transcription"), value: liveCaptionAvailable ? L("使用できます", "Available") : L("iOS 26 以降で使用できます", "Needs iOS 26 or later"))
+                    Text(L("PC の音声をこの iPhone で文字に起こします。字幕は PC の PocketGPU アプリで開始します。", "Transcribes PC audio on this iPhone. Start captions in the PocketGPU app on the PC.")).font(.footnote)
+                }
+            }
+            .navigationTitle(L("音と字幕", "Audio and captions"))
+        }
+    }
+
+    // 流しっぱなしの文字起こし（LiveASR.swift）が使えるか。AppleFeatures の hello が live_asr を名乗るときと同じ決め方
+    private var liveCaptionAvailable: Bool {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) { return true }
+        #endif
+        return false
+    }
+
+    // ---- 設定：接続の受け付け・計算・この iPhone・PC から使う機能・言語・ログ ----
+
+    private var settingsTab: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Picker(L("アドレス", "Address"), selection: $host) {
+                        ForEach(addrs, id: \.ip) { a in
+                            Text(a.ip + L("・", ", ") + Self.addrKind(a)).tag(a.ip)
+                        }
+                    }
+                    TextField(L("ポート", "Port"), text: $port).keyboardType(.numberPad)
+                    Toggle(L("USB でも接続を受け付ける", "Also listen over USB"), isOn: $usb)
+                    Toggle(L("インターネット共有でも接続を受け付ける", "Also listen on Personal Hotspot"), isOn: $hotspotListen)
+                    Toggle(L("バックグラウンドでも実行する", "Keep running in the background"), isOn: $keepAlive)
+                    Toggle(L("起動時に自動で開始", "Start automatically on launch"), isOn: $autoStart)
+                        .disabled(micCamOnly) // マイクとカメラだけのモードでは、自動でも GPU を始めない
+                    // 「起動時に自動で開始」を切ったときは、ここで始める。始めたら、止めるにはアプリを終了する
+                    Button(running ? L("実行中です。停止するにはアプリを終了してください", "Running. Quit the app to stop")
+                                   : micCamOnly ? L("マイクとカメラだけのモードでは GPU を開始しません", "The GPU does not start in mic and camera only mode") : L("開始", "Start")) {
+                        if !host.isEmpty { start(host) }
+                        if usb { start(usbHost) }
+                    }
+                    .disabled(running || micCamOnly || (host.isEmpty && !usb))
+                } header: { Text(L("接続の受け付け", "Listening")) }
+                if running {
+                    // 始めたあとに出す：PC で打つコマンドと、Vulkan の受け付け
+                    Section {
+                        if started.contains(host) {
+                            Text(L("PC で実行：", "On the PC: ") + "llama-cli … --rpc \(host):\(port)").font(.footnote.monospaced()).textSelection(.enabled)
+                        }
+                        if started.contains(usbHost) {
+                            Text(L("USB の場合は usb_forward.py の起動後に", "USB: after usb_forward.py,") + " --rpc 127.0.0.1:50053").font(.footnote.monospaced()).textSelection(.enabled)
+                        }
+                        if vkFailed {
+                            Text(L("Vulkan の起動に失敗しました。下のログの vk: の行をチェックしてください", "Vulkan failed to start. Check the vk: lines in the log below.")).font(.footnote)
+                        } else if vkStarted {
+                            Text(L("Vulkan：USB のポート 50060 で接続を受け付けています", "Vulkan: listening on USB port 50060")).font(.footnote.monospaced()).textSelection(.enabled)
+                            if !linkHost.isEmpty {
+                                Text(L("Vulkan：インターネット共有の \(linkHost):50060 でも接続を受け付けています", "Vulkan: also listening on the tethering link \(linkHost):50060")).font(.footnote.monospaced()).textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+                Section(L("計算", "Computing")) {
+                    Toggle(L("Metal の GPU で計算する", "Compute on the Metal GPU"), isOn: $useGPU)
+                    Toggle(L("Metal 4 の tensor を使用する。アプリの再起動後に有効になります", "Use Metal 4 tensors. Applies after the app restarts."), isOn: $metalTensor)
+                    #if MVK_RT
+                    Toggle(L("試験中のレイトレーシングを使用する。アプリの再起動後に有効になります", "Use experimental ray tracing. Applies after the app restarts."), isOn: $rtExperimental)
+                    if rtExperimental {
+                        Text(L("試験用のビルドです。使用できるかどうかはログの vk: の行で確認できます", "Test build. Check the vk: lines in the log to see whether it is available.")).font(.footnote)
+                    }
+                    #endif
+                }
+                Section(L("この iPhone", "This iPhone")) {
+                    Text(devices.isEmpty ? L("読み込み中", "Loading") : devices).font(.footnote.monospaced())
+                    Text(L("アプリが使用できる残りのメモリ：\(availMB) MB", "Memory available to the app: \(availMB) MB")).font(.footnote)
+                    Text(onCPU ? L("現在の計算：CPU", "Computing on: CPU") : L("現在の計算：GPU", "Computing on: GPU")).font(.footnote)
+                }
+                // 起動したときから USB で待っている受け口。画面での操作は無いので、何があるかだけを出す
+                Section(L("PC から使う機能", "Used from the PC")) {
+                    LabeledContent(L("AI の機能", "AI features"), value: L("USB のポート 50057", "USB port 50057"))
+                    LabeledContent(L("圧縮", "Compression"), value: L("USB のポート 50065", "USB port 50065"))
+                    LabeledContent(L("録画", "Recording"), value: L("USB のポート 50060", "USB port 50060"))
+                    Text(L("どれも PC の PocketGPU アプリから使います。この iPhone で操作する必要はありません。", "All of these are used from the PocketGPU app on the PC. Nothing needs to be done on this iPhone.")).font(.footnote)
+                }
+                Section {
+                    Picker(L("言語", "Language"), selection: $lang) {
+                        ForEach(AppLang.allCases) { l in Text(l.label).tag(l.rawValue) }
+                    }
+                }
+                #if PUMPKIN
+                Section {
+                    Button(mcRunning ? L("実行中です。停止するにはアプリを終了してください", "Running. Quit the app to stop") : L("Minecraft のサーバーを開始", "Start the Minecraft server")) {
+                        MinecraftServer.shared.start()
+                        mcRunning = true
+                    }
+                    .disabled(mcRunning)
+                    if mcRunning, let wifi = addrs.first(where: { $0.name == "en0" })?.ip {
+                        Text(L("Java 版：\(wifi):25565。同じ Wi-Fi から接続できます", "Java Edition: \(wifi):25565. Connect from the same Wi-Fi.")).font(.footnote.monospaced()).textSelection(.enabled)
+                    }
+                    Text(L("サーバーは Pumpkin で、ライセンスは GPL-3.0 です。ワールドは書類の minecraft フォルダに保存します。", "The server is Pumpkin, licensed under GPL-3.0. The world is saved in the minecraft folder in Documents.")).font(.footnote)
+                } header: { Text(L("Minecraft のサーバー", "Minecraft server")) }
+                #endif
+                Section(L("ログ", "Log")) {
+                    ShareLink(item: diagnosticsText(status: status, log: log)) {
+                        Label(L("ログを送信", "Send logs"), systemImage: "square.and.arrow.up")
+                    }
+                    Text(log).font(.caption2.monospaced()).textSelection(.enabled)
+                }
+            }
+            .navigationTitle(L("設定", "Settings"))
+        }
+    }
+
+    // アドレスの種類の名前。Tailscale・Wi-Fi・それ以外は口の名前のまま
+    private static func addrKind(_ a: Addr) -> String {
+        a.name.hasPrefix("utun") ? "Tailscale" : a.name == "en0" ? "Wi-Fi" : a.name
     }
 
     private func setMirror(_ on: Bool) {

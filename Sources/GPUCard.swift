@@ -61,12 +61,20 @@ final class FanModel: ObservableObject {
     }
 }
 
-// ファン 1 つ。枠と 9 枚の羽根と軸
+// ファン 1 つ。枠と 9 枚の羽根と軸。
+// 明るい画面では、白い枠に薄い灰色の羽根（案 A の見本の色）。暗い画面では前と同じ濃い色。熱いときは枠を橙にする
 struct FanView: View {
     let angle: Double
     let hot: Bool
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
+        let dark = scheme == .dark
+        let rimFill = dark ? Color(white: 0.06) : Color(red: 0.98, green: 0.98, blue: 0.99)
+        let line = dark ? Color(white: 0.30) : Color(red: 0.78, green: 0.78, blue: 0.80)
+        let rimLine = hot ? Color.orange : line
+        let bladeFill = dark ? Color(white: 0.26) : Color(red: 0.83, green: 0.83, blue: 0.85)
+        let hubFill = dark ? Color(white: 0.13) : Color.white
         Canvas { ctx, size in
             let r = min(size.width, size.height) / 2.0
             let c = CGPoint(x: size.width / 2.0, y: size.height / 2.0)
@@ -75,8 +83,8 @@ struct FanView: View {
                 return CGPoint(x: c.x + CGFloat(cos(a)) * r * CGFloat(k), y: c.y + CGFloat(sin(a)) * r * CGFloat(k))
             }
             let rim = Path(ellipseIn: CGRect(x: c.x - r + 1, y: c.y - r + 1, width: 2 * r - 2, height: 2 * r - 2))
-            ctx.fill(rim, with: .color(Color(white: 0.06)))
-            ctx.stroke(rim, with: .color(hot ? Color.orange : Color(white: 0.30)), lineWidth: 2)
+            ctx.fill(rim, with: .color(rimFill))
+            ctx.stroke(rim, with: .color(rimLine), lineWidth: 2)
             var blades = Path()
             for i in 0..<9 {
                 let t = angle + Double(i) * 40.0
@@ -86,10 +94,10 @@ struct FanView: View {
                 blades.addQuadCurve(to: pt(t + 22.0, 0.30), control: pt(t + 20.0, 0.65))
                 blades.closeSubpath()
             }
-            ctx.fill(blades, with: .color(Color(white: 0.26)))
+            ctx.fill(blades, with: .color(bladeFill))
             let hub = Path(ellipseIn: CGRect(x: c.x - r * 0.30, y: c.y - r * 0.30, width: r * 0.60, height: r * 0.60))
-            ctx.fill(hub, with: .color(Color(white: 0.13)))
-            ctx.stroke(hub, with: .color(Color(white: 0.30)), lineWidth: 1)
+            ctx.fill(hub, with: .color(hubFill))
+            ctx.stroke(hub, with: .color(line), lineWidth: 1)
         }
     }
 }
@@ -99,35 +107,38 @@ struct GPUCardView: View {
     private let info = GPUCardInfo.current
     private let tick = Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
 
+    // 案 A の見本の形：ファンを並べ、その下に GPU の名前とメモリ、いちばん下に説明と回転数
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 0) {
             TimelineView(.animation) { tl in
                 let a = model.advance(to: tl.date)
-                HStack(spacing: 10) {
+                HStack(spacing: 12) {
                     ForEach(0..<info.fans, id: \.self) { i in
                         // 隣どうしで羽根の向きを少しずらす
                         FanView(angle: a + Double(i) * 13.0, hot: model.hot)
-                            .frame(width: 92, height: 92)
+                            .frame(width: 88, height: 88)
                     }
                 }
                 .frame(maxWidth: .infinity)
             }
-            .padding(.vertical, 12)
-            .background(RoundedRectangle(cornerRadius: 10).fill(Color(white: 0.10)))
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color(white: 0.24), lineWidth: 1))
-            HStack {
-                Text(info.gpuName).font(.footnote.weight(.semibold))
+            .padding(.top, 8)
+            HStack(alignment: .firstTextBaseline) {
+                Text(info.gpuName).font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("\(info.memoryGB) GB").font(.footnote.monospaced())
+                Text("\(info.memoryGB) GB").font(.subheadline).foregroundStyle(.secondary)
             }
+            .padding(.top, 14)
             HStack(spacing: 6) {
-                Circle().fill(model.connected ? Color.green : Color(white: 0.45)).frame(width: 7, height: 7)
-                Text("\(model.rpm) rpm").font(.caption.monospaced())
+                Text(L("PC から処理が届くとファンが回ります", "The fans spin when the PC sends work")).font(.footnote).foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Circle().fill(model.connected ? Color.green : Color(white: 0.6)).frame(width: 7, height: 7)
+                Text("\(model.rpm) rpm").font(.caption.monospaced()).foregroundStyle(.secondary)
                 if model.hot {
                     Image(systemName: "thermometer.high").font(.caption).foregroundStyle(Color.orange)
                 }
-                Spacer()
             }
+            .padding(.top, 3)
+            .padding(.bottom, 4)
         }
         .onReceive(tick) { _ in model.sample() }
     }
