@@ -454,6 +454,16 @@ enum CoreMLRemote {
     private static func describe(_ id: String) -> [String: Any] {
         let url = compiledURL(id)
         guard fm.fileExists(atPath: url.path) else { return err("そのモデルは無い（id \(id)）") }
+        // 読み込まずに説明だけ読む MLModelAsset(url:) は iOS 18 から。古い iOS では読み込んで説明を取る
+        guard #available(iOS 18.0, *) else {
+            do {
+                let d = try MLModel(contentsOf: url).modelDescription
+                return ["inputs": d.inputDescriptionsByName.keys.sorted().compactMap { d.inputDescriptionsByName[$0] }.map(featureJSON),
+                        "outputs": d.outputDescriptionsByName.keys.sorted().compactMap { d.outputDescriptionsByName[$0] }.map(featureJSON)]
+            } catch {
+                return err("モデルの説明を読めない：\(error.localizedDescription)")
+            }
+        }
         do {
             let asset = try MLModelAsset(url: url)
             let box = Box<MLModelDescription>()

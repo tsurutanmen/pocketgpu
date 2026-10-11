@@ -10,7 +10,7 @@
 //        （CoreMLRemote の置き場は 8 GiB を超えると古い順に消すので、Stable Diffusion の部品はそこに置いたままにしない）
 //
 // Image Playground（ImageCreator）：iOS 18.4 から。Apple Intelligence が入っていて、アプリが画面の前にいるときだけ作れる
-//   （後ろだと backgroundCreationForbidden）。絵柄は animation・illustration・sketch・emoji（availableStyles に出る物だけ）。
+//   （後ろだと backgroundCreationForbidden）。絵柄は animation・illustration・sketch（availableStyles に出る物だけ）。
 //   external（ChatGPT など外の絵柄・iOS 26）は文が外の会社に出ていくので、allow_external:true のときだけ
 // Stable Diffusion：apple/ml-stable-diffusion の Swift Package を入れて組んだときだけ（canImport）。Neural Engine で動かす
 import CoreGraphics
@@ -155,7 +155,7 @@ enum ImageGen {
             }
             return nil
         }
-        let known: [String: ImagePlaygroundStyle] = ["animation": .animation, "illustration": .illustration, "sketch": .sketch, "emoji": .emoji]
+        let known: [String: ImagePlaygroundStyle] = ["animation": .animation, "illustration": .illustration, "sketch": .sketch]
         if let s = known[want] { return avail.first { $0.id == s.id } }
         return avail.first { $0.id == want }
     }
