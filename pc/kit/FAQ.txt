@@ -49,6 +49,37 @@ When it is hot, the driver may lower the frame rate. A fan is fine. Do not cool 
 **How do I send a report?**
 "Send logs" in the iPhone app, and on the PC `pocketgpu-start-log.txt` and the file that `report.cmd` writes.
 
+### Webcam, microphone, PocketGPU.exe and captions
+
+| Symptom | What to check | How to fix |
+|---|---|---|
+| PocketGPU iPhone Camera is not in the camera list of Zoom, Discord, OBS or a browser | Did you register the camera? Was that app already open when you registered it? | Start `Start-Mic-Camera.cmd`, and when it asks whether to register the camera, type y and press Enter. You can also press Add under Virtual camera on the Camera page of `PocketGPU.exe`. Then restart the app. The Windows Camera app does not show this camera. |
+| The camera picture stays black | In the iPhone app, is "Use this iPhone as a webcam" on? Is the app in front? | Turn it on, and keep the app in front with the screen on. iOS does not let apps in the background use the camera. |
+| An app that runs as administrator does not show the camera | Does that app run as administrator? | The camera is registered only for your Windows user. Start the app without administrator rights. |
+| The iPhone microphone is not in the microphone list of a call app | Is VB-CABLE installed? | Install it as described in "How do I install VB-CABLE?" below. Then start `Start-Mic-Camera.cmd` again, and choose CABLE Output as the microphone in the call app. |
+| The other person hears an echo | Is the iPhone also used as the PC speaker? | Turn off the speaker, or use earphones. `Start-Mic-Camera.cmd` uses the speaker only when you add -Speaker. |
+| Opening `PocketGPU.exe` shows "Windows protected your PC" | Did you download the kit? | Choose "More info", then "Run anyway". It appears because the app does not have a digital signature yet. |
+| Captions do not appear | Is the iPhone on iOS 26 or later? | Captions use speech recognition on the iPhone, which needs iOS 26 or later. Keep the iPhone app in front. |
+| `RpcServer-*.ipa` cannot be installed on an older iPhone | Is the iPhone on iOS 15 or 16? | Install `PocketCam-*.ipa` instead. It has only the webcam and the microphone. On the PC, use `Start-Mic-Camera.cmd`. |
+
+**Can I use only the webcam and the microphone, without the GPU?**
+Yes. In the iPhone app, turn on "Use only the mic and camera, not the GPU". Then double-click `Start-Mic-Camera.cmd` on the PC. No administrator rights are needed. To stop, press q in its window.
+
+**How do I install VB-CABLE?**
+VB-CABLE is a virtual audio cable made by VB-Audio. It is not in this kit. Download it from vb-audio.com/Cable and extract the zip file. Right-click VBCABLE_Setup_x64.exe, choose "Run as administrator", and press "Install Driver". When it is done, restart the PC. After that, `Start-Mic-Camera.cmd` finds it by itself. In the call app, choose CABLE Output as the microphone.
+
+**How do I remove the camera from the camera list?**
+In `PocketGPU.exe`, open the Camera page and press Remove under Virtual camera. You can also run this command in a Command Prompt: "%LOCALAPPDATA%\PocketGPU\camera\camera_setup.exe" uninstall
+
+**What is PocketGPU.exe?**
+A Windows app that does what the .cmd files do, in one window: the same checks as `Start-PocketGPU.cmd`, running games on the iPhone GPU, the webcam, the microphone and speaker, captions, and recording. Its settings and logs are saved in %LOCALAPPDATA%\PocketGPU.
+
+**What do the captions do?**
+They turn PC audio or the microphone into text on the iPhone and show it in a small window on top of the screen. They can also translate, write a text file for OBS, and save a transcript. Use them from the Captions page of `PocketGPU.exe`. The iPhone needs iOS 26 or later.
+
+**What should I send when the webcam or the microphone does not work?**
+`pocketgpu-miccam-log.txt`, which `Start-Mic-Camera.cmd` writes in this folder.
+
 **Not covered here**: anything else, such as what to do if a specific game crashes, or how many apps a free Apple ID can install. Ask us and we will add it.
 
 ---
@@ -96,5 +127,36 @@ iPhone が熱くなると、ドライバがフレームレートを下げるこ�
 
 **報告はどうやって送りますか？**
 iPhone のアプリの「ログを送信」と、PC の `pocketgpu-start-log.txt` と、`report.cmd` が作成するファイルです。
+
+### ウェブカメラ・マイク・PocketGPU.exe・字幕
+
+| 症状 | チェックすること | 対処方法 |
+|---|---|---|
+| Zoom・Discord・OBS・ブラウザのカメラの一覧に、PocketGPU iPhone Camera が表示されない | カメラを登録しましたか。登録したときに、そのアプリを開いていませんでしたか | `Start-Mic-Camera.cmd` を起動して、カメラを登録するかどうかを聞かれたら、y を入力して Enter キーを押してください。`PocketGPU.exe` のカメラの画面で、「仮想カメラ」の「登録」を押しても登録できます。そのあと、アプリを開き直してください。Windows のカメラアプリには表示されません。 |
+| カメラの映像が黒いままになる | iPhone のアプリで「ウェブカメラとして使う」がオンになっていますか。アプリが前面に表示されていますか | オンにして、アプリを前面に表示したまま、画面をオンにしておいてください。iOS では、バックグラウンドのアプリはカメラを使えません。 |
+| 管理者権限で実行されるアプリに、カメラが表示されない | そのアプリは管理者権限で実行されていませんか | カメラは、今の Windows のユーザーにだけ登録されます。管理者として実行せずに、アプリを起動してください。 |
+| 通話アプリのマイクの一覧に、iPhone のマイクが表示されない | VB-CABLE をインストールしましたか | 下の「VB-CABLE はどうやってインストールしますか？」のとおりにインストールしてください。そのあと `Start-Mic-Camera.cmd` を起動し直して、通話アプリのマイクに「CABLE Output」を選んでください。 |
+| 通話の相手に、エコーが聞こえる | iPhone を PC のスピーカーとしても使っていませんか | スピーカーをオフにするか、イヤホンを使ってください。`Start-Mic-Camera.cmd` は、-Speaker を付けたときだけスピーカーを使います。 |
+| `PocketGPU.exe` を開くと「Windows によって PC が保護されました」と表示される | キットをダウンロードしましたか | 「詳細情報」を押してから、「実行」を押してください。このアプリには、まだデジタル署名がないため表示されます。 |
+| 字幕が表示されない | iPhone の iOS は 26 以降ですか | 字幕は iPhone の音声認識を使うため、iOS 26 以降が必要です。iPhone のアプリは前面に表示したままにしてください。 |
+| 古い iPhone に `RpcServer-*.ipa` をインストールできない | iPhone の iOS は 15 または 16 ですか | 代わりに `PocketCam-*.ipa` をインストールしてください。ウェブカメラとマイクの機能だけがあります。PC では `Start-Mic-Camera.cmd` を使ってください。 |
+
+**GPU を使わずに、ウェブカメラとマイクだけを使えますか？**
+使えます。iPhone のアプリで「GPU を使わずにマイクとカメラだけ使う」をオンにしてから、PC で `Start-Mic-Camera.cmd` をダブルクリックしてください。管理者権限は必要ありません。終了するときは、そのウィンドウで q キーを押してください。
+
+**VB-CABLE はどうやってインストールしますか？**
+VB-CABLE は、VB-Audio の仮想オーディオケーブルです。このキットには含まれていません。vb-audio.com/Cable からダウンロードして、zip ファイルを展開してください。VBCABLE_Setup_x64.exe を右クリックして「管理者として実行」を選び、「Install Driver」を押してください。終わったら、PC を再起動してください。そのあとは、`Start-Mic-Camera.cmd` が自動で見つけます。通話アプリのマイクには「CABLE Output」を選んでください。
+
+**カメラの一覧からカメラを削除するには？**
+`PocketGPU.exe` のカメラの画面を開いて、「仮想カメラ」の「解除」を押してください。コマンドプロンプトで次のコマンドを実行しても削除できます："%LOCALAPPDATA%\PocketGPU\camera\camera_setup.exe" uninstall
+
+**PocketGPU.exe は何ですか？**
+.cmd のファイルでできることを、1 つのウィンドウで操作できる Windows のアプリです。`Start-PocketGPU.cmd` と同じチェック、iPhone の GPU でのゲームの起動、ウェブカメラ、マイクとスピーカー、字幕、録画を使えます。設定とログは %LOCALAPPDATA%\PocketGPU に保存されます。
+
+**字幕では何ができますか？**
+PC の音声かマイクの音声を iPhone で文字に起こして、画面の最前面の小さなウィンドウに表示します。翻訳、OBS 用のテキストファイルへの書き出し、議事録の保存もできます。`PocketGPU.exe` の字幕の画面から使ってください。iPhone に iOS 26 以降が必要です。
+
+**ウェブカメラやマイクが動作しないときは、何を送ればよいですか？**
+`Start-Mic-Camera.cmd` がこのフォルダに作成する `pocketgpu-miccam-log.txt` を送ってください。
 
 **ここに書いていないこと**：特定のゲームがクラッシュしたときの対処方法、無料の Apple ID でインストールできるアプリの数などです。質問してもらえれば、追加します。

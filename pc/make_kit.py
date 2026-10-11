@@ -6,8 +6,15 @@
 # Android の機種を持っている人用に、android\（受け手・start_android.cmd・stop_android.cmd・README_android.txt）と
 # pocketgpu_android.cmd・check_android.cmd も入れる。Android の受け手には印を入れない（Android 側は人ごとの印が dll にあれば足りる）。
 # 試すとき：PGKIT_OUT・PGKIT_KITBUILD・--android-dir で置き場を変えられる（台帳は PGKIT_OUT の下に作る）
-# 入口は 2 つ：Start-PocketGPU.cmd（順に確かめて足りない物を案内する）と Run-on-iPhone-GPU.cmd（1 つのアプリを iPhone の GPU で起動する）。
+# 入口は 3 つ：Start-PocketGPU.cmd（順に確かめて足りない物を案内する）と Run-on-iPhone-GPU.cmd（1 つのアプリを iPhone の GPU で起動する）と
+# Start-Mic-Camera.cmd（GPU を使わずに、iPhone をマイクとカメラにする）。
 # 中身は kit\tools\*.ps1（Windows PowerShell 5.1 だけで動く。Python は要らない）。tools\kit.ini に受け手との約束の版と、アプリの版を書く
+# PC アプリ PocketGPU.exe（work/pcapp2）はキットの一番上に置く。自分の横の iphone_icd.json・dxvk\・pocketgpu.cmd・tools\kit.ini を読み、道具は extras\ から探す
+# カメラ・マイク・字幕の道具と仮想カメラは extras\ にまとめる。PocketGPU.exe（横・tools\・extras\ を探す）と tools\miccam.ps1（extras\・camera\・一番上を探す）の
+# 両方が探す所で、仮想カメラの DLL は camera_setup.exe と同じフォルダに要る（PocketGPU.exe が camera_setup.exe の横から写すため）
+# 古い iPhone（iOS 15・16）用の PocketCam-*.ipa も、RpcServer の IPA と同じ印を足して入れる（カメラとマイクだけのアプリ。PC 側は Start-Mic-Camera.cmd）
+# 新しく足した物（extras\ の道具・PocketGPU.exe・PocketCam の IPA）は、キットのフォルダを作る前に揃っているか見る
+# （途中で止まると同じ人のフォルダが残って、作り直せなくなるため）。入れないときは --no-media・--no-app
 import argparse, csv, datetime, hashlib, os, re, secrets, shutil, zipfile
 
 KITBUILD = os.environ.get('PGKIT_KITBUILD', r'D:\iphone-rpc\kitbuild')        # vk/build_win.sh D:/iphone-rpc/kitbuild icd icd32 tools で組んだ物
@@ -18,8 +25,11 @@ OUT = os.environ.get('PGKIT_OUT', r'D:\iphone-rpc\tester_kit')
 ANDROID_DIR = r'D:\iphone-rpc\androidbuild'   # app\vk\build_android.sh で組んだ受け手（server_aarch64 と server_x86_64）
 PLACE = b'PGKIT-MARK:' + b'#' * 32
 PROTO_H = os.environ.get('PGKIT_PROTO_H', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'vk', 'remote', 'proto.h'))
-# --extras で入れる、Python の要らない道具（C で組んだ物。UCRT だけを使うので VC の部品は要らない）。KITBUILD\extras\ に置く
-EXTRAS = ('ipaudio.exe', 'webcam_rx.exe')
+# カメラ・マイク・字幕の道具と仮想カメラ（C で組んだ物。UCRT だけを使うので VC の部品は要らない）。KITBUILD\extras\ に置く → キットの extras\
+#   webcam_rx.exe・ipaudio.exe・camera_setup.exe・dshow_cam64.dll・dshow_cam32.dll は work/camset/out、livecap.exe は work/livecap
+MEDIA = ('webcam_rx.exe', 'ipaudio.exe', 'livecap.exe', 'camera_setup.exe', 'dshow_cam64.dll', 'dshow_cam32.dll')
+# PC アプリ。work/pcapp2 の build.cmd で組んだ out\PocketGPU.exe を KITBUILD の一番上に置く → キットの一番上
+APP_EXE = 'PocketGPU.exe'
 
 # 窓から使う人と、Steam の起動オプション（"...\pocketgpu.cmd" %command%）用。引数が無ければ Run-on-iPhone-GPU.cmd に回す
 LAUNCH = r'''@echo off
@@ -82,9 +92,15 @@ Steps
    Steam games: put this line in the game's Properties > Launch Options:
        "C:\path\to\this\folder\pocketgpu.cmd" %command%
    Start-PocketGPU.cmd shows this line with the real path and can copy it for you.
+6. To use the iPhone only as a webcam and microphone, without the GPU, double-click Start-Mic-Camera.cmd.
+   In the iPhone app, turn on "Use this iPhone as a webcam" and "Use as PC speaker and mic".
+   Using it as a microphone needs VB-CABLE, which is not in this kit. FAQ.txt explains how to install it.
+   RpcServer-*.ipa needs iOS 17 or later. On an older iPhone with iOS 15 or 16, install PocketCam-*.ipa instead. It has only the webcam and the microphone.
+7. PocketGPU.exe in this folder does all of this in one window: checking, running games, the camera, the microphone, and captions.
 
 Good to know
 - Only programs started this way see the iPhone GPU. Nothing is written to the registry.
+- Start-Mic-Camera.cmd and PocketGPU.exe write to the registry only when you add the camera, and only for your Windows user.
 - Programs that run as administrator cannot see the iPhone GPU. Windows does not pass the settings to them.
 - Only one program at a time can use the iPhone GPU.
 - Do not use games with anti-cheat such as Easy Anti-Cheat, BattlEye, VAC or Vanguard. Your account may be banned.
@@ -94,6 +110,7 @@ Reporting
 - In the iPhone app, tap "Send logs" and send the text to us on Discord or by email.
 - On the PC, send pocketgpu-start-log.txt, which Start-PocketGPU.cmd writes.
   Also double-click report.cmd and send pocketgpu-report.txt. Neither has your user name, PC name or IP.
+- For the webcam and microphone, also send pocketgpu-miccam-log.txt, which Start-Mic-Camera.cmd writes.
 - Please also tell us the PC, the app or game, the resolution, and what happened.
 
 If the connection keeps dropping
@@ -131,9 +148,15 @@ iPhone ではなく Android のスマートフォンを使う場合は、以下�
    Steam のゲームは、ゲームのプロパティの「起動オプション」に次の 1 行を入力してください：
        "C:\このフォルダの場所\pocketgpu.cmd" %command%
    Start-PocketGPU.cmd は、実際のパスに置き換えたこの 1 行を表示して、コピーすることもできます
+6. GPU を使わずに、iPhone をウェブカメラとマイクとしてだけ使う場合は、Start-Mic-Camera.cmd をダブルクリックしてください。
+   iPhone のアプリで「ウェブカメラとして使う」と「PC のスピーカーとマイクとして使う」をオンにしてください。
+   マイクとして使うには VB-CABLE が必要です。このキットには含まれていません。インストールの方法は FAQ.txt に書いてあります。
+   RpcServer-*.ipa には iOS 17 以降が必要です。iOS 15 または 16 の古い iPhone には、代わりに PocketCam-*.ipa をインストールしてください。ウェブカメラとマイクの機能だけがあります
+7. このフォルダの PocketGPU.exe を開くと、チェック・ゲームの起動・カメラ・マイク・字幕を 1 つのウィンドウで操作できます
 
 知っておくこと
 - この方法で起動したアプリだけが、iPhone の GPU を認識できます。レジストリには何も書き込みません
+- Start-Mic-Camera.cmd と PocketGPU.exe は、カメラを登録するときだけ、今の Windows のユーザーの設定としてレジストリに書き込みます
 - 管理者権限で実行されるアプリは、iPhone の GPU を認識できません。Windows が設定を渡さないためです
 - iPhone の GPU を一度に使用できるアプリは 1 つだけです
 - Easy Anti-Cheat、BattlEye、VAC、Vanguard などのアンチチートを導入しているゲームでは使用しないでください。アカウントが停止されることがあります
@@ -143,6 +166,7 @@ iPhone ではなく Android のスマートフォンを使う場合は、以下�
 - iPhone のアプリの「ログを送信」をタップして、そのテキストを Discord かメールで送ってください
 - PC では、Start-PocketGPU.cmd が作成する pocketgpu-start-log.txt を送ってください。
   report.cmd をダブルクリックして作成される pocketgpu-report.txt も送ってください。どちらのファイルにも、ユーザー名・PC 名・IP アドレスは含まれません
+- ウェブカメラとマイクについては、Start-Mic-Camera.cmd が作成する pocketgpu-miccam-log.txt も送ってください
 - PC、アプリやゲームの名前、解像度、何が起きたかも書いてください
 
 接続が何度も切れるとき
@@ -153,18 +177,22 @@ iPhone ではなく Android のスマートフォンを使う場合は、以下�
 - dxvk\：DXVK。Gcenx さんの macOS async 版 1.10.3 で、zlib ライセンスです。dxvk\LICENSE を参照してください
 '''
 
-# --extras のときだけ extras\ に入れる説明。下書き
-EXTRAS_README = r'''PocketGPU extras (draft, experimental)
-- ipaudio.exe: the iPhone as the PC's speaker and microphone. Turn on "Use as PC speaker and mic" in the iPhone app, then run:  ipaudio.exe --usb
-- webcam_rx.exe: the iPhone camera on the PC. Turn on "Use this iPhone as a webcam" in the iPhone app, then run:  webcam_rx.exe --usb
-  Showing it to other apps as a webcam needs a one-time install with administrator rights. That is not in this kit yet.
-These run without Python. Close them with Ctrl+C.
+# extras\ に入れる説明。下書き
+EXTRAS_README = r'''PocketGPU extras. This is a draft.
+Start-Mic-Camera.cmd and PocketGPU.exe use these tools. You do not need to open them yourself.
+- webcam_rx.exe: receives the video from the iPhone camera.
+- ipaudio.exe: uses the iPhone as the PC's speaker and microphone.
+- livecap.exe: shows captions. The iPhone needs iOS 26 or later.
+- camera_setup.exe, dshow_cam64.dll, dshow_cam32.dll: add "PocketGPU iPhone Camera" to the camera list for your Windows user. No administrator rights are needed.
+Keep these files in this folder. Start-Mic-Camera.cmd and PocketGPU.exe look for them here.
 
-PocketGPU の追加ツール。下書きで、試験的なものです
-- ipaudio.exe：iPhone を PC のスピーカーとマイクとして使うツールです。iPhone のアプリで「PC のスピーカーとマイクとして使う」をオンにして、次のコマンドを実行してください：ipaudio.exe --usb
-- webcam_rx.exe：iPhone のカメラの映像を PC に表示するツールです。iPhone のアプリで「ウェブカメラとして使う」をオンにして、次のコマンドを実行してください：webcam_rx.exe --usb
-  他のアプリにウェブカメラとして認識させるには、管理者権限で 1 回だけインストールするものが必要です。それはまだこのキットに含まれていません。
-どちらも Python は不要です。終了するときは Ctrl+C を押してください。
+PocketGPU の追加ツール。この説明は下書きです
+Start-Mic-Camera.cmd と PocketGPU.exe が使うツールです。直接開く必要はありません。
+- webcam_rx.exe：iPhone のカメラの映像を受信します
+- ipaudio.exe：iPhone を PC のスピーカーとマイクとして使います
+- livecap.exe：字幕を表示します。iPhone に iOS 26 以降が必要です
+- camera_setup.exe・dshow_cam64.dll・dshow_cam32.dll：「PocketGPU iPhone Camera」を、今の Windows のユーザーのカメラの一覧に追加します。管理者権限は必要ありません
+これらのファイルは、このフォルダから移動しないでください。Start-Mic-Camera.cmd と PocketGPU.exe は、このフォルダから探します。
 '''
 
 
@@ -522,12 +550,42 @@ def proto_version():
     return int(m.group(1))
 
 
-def newest_ipa():
+def newest_ipa(name='RpcServer'):
+    # IPA_DIR の 名前-x.y.z.ipa のうち一番新しい物。無ければ ValueError
     def ver(n):
-        m = re.match(r'RpcServer-(\d+)\.(\d+)\.(\d+)\.ipa$', n)
+        m = re.match(re.escape(name) + r'-(\d+)\.(\d+)\.(\d+)\.ipa$', n)
         return tuple(map(int, m.groups())) if m else None
     names = [n for n in os.listdir(IPA_DIR) if ver(n)]
     return os.path.join(IPA_DIR, max(names, key=ver))
+
+
+def mark_ipa(src, dst, mark):
+    # Payload/名前.app/ に印のファイル PGKitMark.txt を足した IPA を作る
+    with zipfile.ZipFile(src) as zi, zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED) as zo:
+        app = None
+        for item in zi.infolist():
+            zo.writestr(item, zi.read(item.filename))
+            m = re.match(r'(Payload/[^/]+\.app/)Info\.plist$', item.filename)
+            if m: app = m.group(1)
+        if not app:
+            raise SystemExit(f'{os.path.basename(src)} の中に .app が見つからない')
+        zo.writestr(app + 'PGKitMark.txt', mark.decode())
+
+
+def missing_inputs(a):
+    # 新しく足した物（extras\ の道具・入口・PocketGPU.exe・PocketCam の IPA）が揃っているか。キットのフォルダを作る前に見る
+    miss = []
+    if not a.no_media:
+        miss += [p for p in (os.path.join(KITBUILD, 'extras', n) for n in MEDIA) if not os.path.exists(p)]
+        miss += [p for p in (os.path.join(HERE, 'kit', 'Start-Mic-Camera.cmd'), os.path.join(HERE, 'kit', 'tools', 'miccam.ps1')) if not os.path.exists(p)]
+        if not a.no_ipa:
+            try:
+                newest_ipa('PocketCam')
+            except (OSError, ValueError):
+                miss.append(os.path.join(IPA_DIR, 'PocketCam-*.ipa'))
+    if not a.no_app and not os.path.exists(os.path.join(KITBUILD, APP_EXE)):
+        miss.append(os.path.join(KITBUILD, APP_EXE))
+    return miss
 
 
 def main():
@@ -538,7 +596,9 @@ def main():
     ap.add_argument('--with-x86_64', action='store_true', help='エミュレーター用の server_x86_64 も入れる（試験用・配るキットには入れない）')
     ap.add_argument('--no-android', action='store_true', help='Android の物を入れない（今までと同じ中身）')
     ap.add_argument('--no-ipa', action='store_true', help='iPhone のアプリ（IPA）を入れない（試験用）')
-    ap.add_argument('--extras', action='store_true', help='Python の要らないおまけ（ipaudio.exe・webcam_rx.exe）を extras に入れる。KITBUILD の extras から')
+    ap.add_argument('--no-media', action='store_true', help='カメラ・マイク・字幕の物（extras\\・Start-Mic-Camera.cmd・PocketCam の IPA）を入れない')
+    ap.add_argument('--no-app', action='store_true', help='PC アプリ（PocketGPU.exe）を入れない')
+    ap.add_argument('--extras', action='store_true', help='前の呼び方。今は extras\\ の道具は既定で入るので、付けても何も変わらない')
     a = ap.parse_args()
     ledger = os.path.join(OUT, 'ledger.csv')
     if a.discord_id and os.path.exists(ledger):
@@ -552,6 +612,10 @@ def main():
     kit = os.path.join(OUT, f'PocketGPU-{who}' + (f'-{a.discord_id[-6:]}' if a.discord_id else ''))
     if os.path.exists(kit):
         raise SystemExit(f'{kit} はもうある。同じ人に作り直すなら、先にそのフォルダと zip を片づける')
+    miss = missing_inputs(a)
+    if miss:
+        raise SystemExit('次の物が無い。extras\\ の道具は work/camset/out と work/livecap で、PocketGPU.exe は work/pcapp2 の build.cmd で組んだ物を '
+                         'KITBUILD に置く。入れないなら --no-media・--no-app\n  ' + '\n  '.join(miss))
 
     stamp(os.path.join(KITBUILD, 'iphone_icd.dll'), os.path.join(kit, 'iphone_icd.dll'), mark)
     stamp(os.path.join(KITBUILD, 'x86', 'iphone_icd.dll'), os.path.join(kit, 'x86', 'iphone_icd.dll'), mark)
@@ -599,31 +663,29 @@ def main():
         for name, text in (('pocketgpu_android.cmd', ANDROID_LAUNCH), ('check_android.cmd', ANDROID_CHECK)):
             open(os.path.join(kit, name), 'w', encoding='ascii', newline='\r\n').write(text)
 
-    # Python の要らないおまけ。印は入れない
-    if a.extras:
+    # カメラ・マイク・字幕：extras\ に道具と仮想カメラ、一番上に Start-Mic-Camera.cmd、tools\ に miccam.ps1。印は入れない
+    if not a.no_media:
         edir = os.path.join(kit, 'extras')
         os.makedirs(edir, exist_ok=True)
-        for n in EXTRAS:
-            src = os.path.join(KITBUILD, 'extras', n)
-            if not os.path.exists(src):
-                raise SystemExit(f'{src} が無い。work/audio と work/webcam で組んだ物を置く')
-            shutil.copy2(src, os.path.join(edir, n))
+        for n in MEDIA:
+            shutil.copy2(os.path.join(KITBUILD, 'extras', n), os.path.join(edir, n))
         open(os.path.join(edir, 'README.txt'), 'w', encoding='utf-8-sig', newline='\r\n').write(EXTRAS_README)
+        shutil.copy2(os.path.join(HERE, 'kit', 'Start-Mic-Camera.cmd'), os.path.join(kit, 'Start-Mic-Camera.cmd'))
+        shutil.copy2(os.path.join(HERE, 'kit', 'tools', 'miccam.ps1'), os.path.join(kit, 'tools', 'miccam.ps1'))
 
-    # iPhone のアプリ：Payload/RpcServer.app/ に印のファイルを足した IPA
-    src_ipa = dst_ipa = None
+    # PC アプリ。一番上に置く（自分の横をキットのフォルダとして読む）。印は入れない
+    if not a.no_app:
+        shutil.copy2(os.path.join(KITBUILD, APP_EXE), os.path.join(kit, APP_EXE))
+
+    # iPhone のアプリ：Payload/RpcServer.app/ に印のファイルを足した IPA。古い iPhone 用の PocketCam にも同じ印を足す
+    src_ipa = dst_ipa = cam_ipa = None
     if not a.no_ipa:
         src_ipa = newest_ipa()
         dst_ipa = os.path.join(kit, os.path.basename(src_ipa))
-        with zipfile.ZipFile(src_ipa) as zi, zipfile.ZipFile(dst_ipa, 'w', zipfile.ZIP_DEFLATED) as zo:
-            app = None
-            for item in zi.infolist():
-                zo.writestr(item, zi.read(item.filename))
-                m = re.match(r'(Payload/[^/]+\.app/)Info\.plist$', item.filename)
-                if m: app = m.group(1)
-            if not app:
-                raise SystemExit('IPA の中に .app が見つからない')
-            zo.writestr(app + 'PGKitMark.txt', mark.decode())
+        mark_ipa(src_ipa, dst_ipa, mark)
+        if not a.no_media:
+            cam_ipa = newest_ipa('PocketCam')
+            mark_ipa(cam_ipa, os.path.join(kit, os.path.basename(cam_ipa)), mark)
 
     zpath = kit + '.zip'
     with zipfile.ZipFile(zpath, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -645,6 +707,8 @@ def main():
     print(f'MARK={mark.decode()}')
     if android_sha:
         print(f'ANDROID_SERVER_SHA256={android_sha}')
+    if cam_ipa:
+        print(f'POCKETCAM_IPA={os.path.basename(cam_ipa)}')
 
 
 if __name__ == '__main__':

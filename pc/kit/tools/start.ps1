@@ -277,6 +277,10 @@ Out-Line ('    ' + $steam)
 Out-Line (M '・管理者権限で実行されるゲームやランチャーは、iPhone の GPU を認識できません。' '- Games and launchers that run as administrator cannot see the iPhone GPU.')
 Out-Line (M '・アンチチートを導入しているゲームでは使用しないでください。アカウントが停止されることがあります。' '- Do not use games with anti-cheat. Your account may be banned.')
 Out-Line (M '・使用中は、iPhone のアプリを前面に表示したまま、画面をオンにしておいてください。' '- While you use it, keep the iPhone app in front with the screen on.')
+# PC アプリがあることだけを知らせる。開くかは聞かない（同じチェックをもう一度行うアプリなので、ここで続けて開く必要はない）
+if (Test-Path -LiteralPath (Join-Path $script:KitDir 'PocketGPU.exe')) {
+    Out-Line (M '・このフォルダの PocketGPU.exe を開くと、ゲームの起動・カメラ・マイク・字幕を 1 つのウィンドウで操作できます。' '- Open PocketGPU.exe in this folder to run games and use the camera, microphone, and captions from one window.')
+}
 Out-Line ''
 if (Ask-YesNo (M 'スタートメニューと右クリックメニューの「送る」に「iPhone の GPU で起動」を追加しますか？' 'Add "Run on iPhone GPU" to the Start menu and to the right-click "Send to" menu?')) {
     foreach ($p in (New-PgpuShortcuts)) { Say-OK ((M '作成しました：' 'Created: ') + $p) }
