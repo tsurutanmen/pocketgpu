@@ -36,6 +36,8 @@
 #ifndef _WIN32
 #include <pthread.h>
 #include <unistd.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #endif
 #ifdef __APPLE__
 #include <pthread/qos.h>
@@ -5211,10 +5213,87 @@ int vkr_listen_extra(const char *host) {
     return 0;
 }
 
+// ---- インターネット共有の網の口を選んで待つ（アプリの設定で入り切り） ----
+// 待つのは、名前が bridge で始まり（iOS のインターネット共有は bridge100 など）、IPv4 が 172.20.10.0/28 の口だけ。
+// 0.0.0.0 では待たない（Wi-Fi の en0 で、同じネットワークのほかの人からも届いてしまう）。
+// この iPhone がほかの iPhone の共有に Wi-Fi でつないでいて en0 が 172.20.10.x でも、名前が bridge でないので待たない。
+// bridge の口には、インターネット共有に Wi-Fi でつないだ人も来るので、合言葉は外さない
+static uint32_t g_hs_net = 0xAC140A00u, g_hs_mask = 0xFFFFFFF0u; // 172.20.10.0/28（ホストの並び）
+static int hs_match(const char *name, uint32_t ip) { return name && !strncmp(name, "bridge", 6) && (ip & g_hs_mask) == g_hs_net; }
+
+#ifdef _WIN32
+// PC の代役の試験用：VKR_HOTSPOT_FAKE_FILE に「名前 住所」を 1 行ずつ書くと、それをインターフェースの一覧として読む（呼ばれるたびに読み直す）。
+// 「off」で始まる行があれば、アプリの設定を切ったのと同じ。網は VKR_HOTSPOT_NET（main で読む）で 127.0.0.0/8 などに替える
+static int hs_pick(char *out, size_t cap, int *off) {
+    *off = 0;
+    const char *f = getenv("VKR_HOTSPOT_FAKE_FILE");
+    FILE *fp = f && *f ? fopen(f, "r") : NULL;
+    if (!fp) return 0;
+    char line[200];
+    int found = 0;
+    while (!found && fgets(line, sizeof line, fp)) {
+        char name[64], ip[64];
+        struct in_addr ia;
+        if (!strncmp(line, "off", 3)) { *off = 1; break; }
+        if (sscanf(line, "%63s %63s", name, ip) != 2 || inet_pton(AF_INET, ip, &ia) != 1) continue;
+        if (!hs_match(name, ntohl(ia.s_addr))) continue;
+        snprintf(out, cap, "%s", ip);
+        found = 1;
+    }
+    fclose(fp);
+    return found;
+}
+#else
+static int hs_pick(char *out, size_t cap, int *off) {
+    struct ifaddrs *head = NULL;
+    int found = 0;
+    *off = 0;
+    if (getifaddrs(&head) != 0) return 0;
+    for (struct ifaddrs *p = head; p && !found; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET || !(p->ifa_flags & IFF_UP)) continue;
+        struct in_addr ia = ((struct sockaddr_in *) (void *) p->ifa_addr)->sin_addr;
+        if (!hs_match(p->ifa_name, ntohl(ia.s_addr))) continue;
+        found = inet_ntop(AF_INET, &ia, out, (socklen_t) cap) != NULL;
+    }
+    freeifaddrs(head);
+    return found;
+}
+#endif
+
+// アプリから 1 秒ごとに呼ぶ。on が 1 なら共有の網の口を探して待ち（後から出てきても待ち始め、消えたら閉じる）、0 なら閉じる。
+// out には、いま待っている住所を書く（待っていなければ空）。Vulkan がまだ起きていなければ 2・待とうとして待てなかったら 1・ほかは 0。
+// 待てなかった住所は 5 秒おいてから試し直す（共有を入れた直後で、住所がまだ使えないことがある）
+int vkr_hotspot_tick(int on, char *out, int cap) {
+    static char failed[64];
+    static double retry_at;
+    char want[64] = "";
+    int off = 0, r = 0;
+    if (on && !hs_pick(want, sizeof want, &off)) want[0] = 0;
+    if (off) want[0] = 0;
+    if (strcmp(want, g_extra_host)) {
+        if (!want[0]) {
+            vkr_listen_extra("");
+            failed[0] = 0;
+        } else if (strcmp(want, failed) || t_ms() >= retry_at) {
+            r = vkr_listen_extra(want);
+            if (r == 1) {
+                snprintf(failed, sizeof failed, "%s", want);
+                retry_at = t_ms() + 5000;
+            } else if (r == 0) {
+                failed[0] = 0;
+            }
+        } else {
+            r = 1;
+        }
+    }
+    if (out && cap > 0) snprintf(out, (size_t) cap, "%s", g_extra_host);
+    return r;
+}
+
 int vkr_serve(const char *host, int port) {
     qos_hi();
+    g_main_port = port; // 共有の網の口も同じ番号で待つ。Vulkan が起きるとすぐ vkr_hotspot_tick が開けるので、先に決める
     if (!vk_init()) { vlog("Vulkan を起動できない"); return 1; }
-    g_main_port = port;
     if (g_extra_env) vkr_listen_extra(g_extra_env);
 #ifdef _WIN32
     WSADATA w;
@@ -5294,6 +5373,25 @@ static int fake_upscale(const uint8_t *src, uint32_t w, uint32_t h, uint32_t str
     return 1;
 }
 
+// 試験用（VKR_HOTSPOT=1）：アプリの 1 秒ごとの見直しの真似。待つ口が変わったら記録に出す
+#ifdef _WIN32
+static DWORD WINAPI hs_ticker(LPVOID p) {
+#else
+static void *hs_ticker(void *p) {
+#endif
+    (void) p;
+    char now[64] = "", last[64] = "";
+    for (;;) {
+        int r = vkr_hotspot_tick(1, now, sizeof now);
+        if (r != 2 && strcmp(now, last)) {
+            vlog("試験用：共有の網の口 %s", now[0] ? now : "なし");
+            snprintf(last, sizeof last, "%s", now);
+        }
+        sleep_ms(1000);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     AddVectoredExceptionHandler(1, crash_handler);
@@ -5314,6 +5412,36 @@ int main(int argc, char **argv) {
         WSAStartup(MAKEWORD(2, 2), &w);
 #endif
         g_extra_env = ex; // Vulkan が起きてから開ける（vkr_serve の中）
+    }
+    // 調べ用：VKR_HOTSPOT=1 でアプリと同じく 1 秒ごとに vkr_hotspot_tick を呼ぶ（インターフェースは VKR_HOTSPOT_FAKE_FILE・網は VKR_HOTSPOT_NET=127.0.0.0/8 など）
+    const char *hs = getenv("VKR_HOTSPOT");
+    if (hs && *hs == '1') {
+        const char *nt = getenv("VKR_HOTSPOT_NET");
+        if (nt && *nt) {
+            char b[64];
+            snprintf(b, sizeof b, "%s", nt);
+            char *sl = strchr(b, '/');
+            int bits = sl ? atoi(sl + 1) : 32;
+            if (sl) *sl = 0;
+            struct in_addr ia;
+            if (inet_pton(AF_INET, b, &ia) == 1 && bits >= 1 && bits <= 32) {
+                g_hs_mask = bits == 32 ? 0xffffffffu : ~(0xffffffffu >> bits);
+                g_hs_net = ntohl(ia.s_addr) & g_hs_mask;
+            }
+        }
+        vkr_set_token(getenv("VKR_LINK_TOKEN"));
+        if (!g_token_ok) vlog("VKR_LINK_TOKEN が無い・読めないので、インターネット共有の口は全部断る");
+        g_main_port = argc > 2 ? atoi(argv[2]) : VR_DEFAULT_PORT;
+#ifdef _WIN32
+        WSADATA w;
+        WSAStartup(MAKEWORD(2, 2), &w);
+        HANDLE t = CreateThread(NULL, 0, hs_ticker, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+#else
+        pthread_t t;
+        if (pthread_create(&t, NULL, hs_ticker, NULL) == 0) pthread_detach(t);
+#endif
+        vlog("試験用：1 秒ごとに共有の網の口を探す（VKR_HOTSPOT）");
     }
     return vkr_serve(argc > 1 ? argv[1] : "127.0.0.1", argc > 2 ? atoi(argv[2]) : VR_DEFAULT_PORT);
 }

@@ -32,6 +32,9 @@ int vkr_bw_serve(const char * host, int port);
 // 住所で待ち始め、同じ住所なら何もしない。空の住所なら口を閉じる。PC のドライバは USB の口で住所と合言葉を聞いてからつなぐ
 void vkr_set_token(const char * hex);
 int vkr_listen_extra(const char * host);
+// アプリから 1 秒ごとに呼ぶ。on はアプリの設定（インターネット共有でも待ち受けるか）。受け手が、名前が bridge で始まり IPv4 が 172.20.10.0/28 の口を探して待ち、
+// 消えたら閉じる（0.0.0.0 や Wi-Fi の en0 では待たない）。out に今待っている住所を書く（無ければ空）。Vulkan がまだ起きていなければ 2・待てなければ 1・ほかは 0
+int vkr_hotspot_tick(int on, char * out, int cap);
 void vkr_bw_set_token(const char * hex);
 int vkr_bw_listen_extra(const char * host, int port);
 // マイクラのサーバー（mc/pumpkin-ios・Pumpkin・GPL-3.0）。PUMPKIN を付けて組んだときだけ入っている。止まるまで戻らない

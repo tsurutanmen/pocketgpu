@@ -79,10 +79,8 @@ struct Addr: Hashable { let name: String; let ip: String }
 // インターネット共有の口の合言葉。起動のたびに作り、USB の口で PC のドライバにだけ渡す
 let linkToken: String = (0..<16).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
 
-// インターネット共有を USB で PC に出しているときの住所（bridge100 の 172.20.10.1 など）
-func hotspotAddress() -> String? {
-    listAddresses().first(where: { $0.name.hasPrefix("bridge") || $0.ip.hasPrefix("172.20.10.") })?.ip
-}
+// インターネット共有の網の口（bridge100 の 172.20.10.1 など）を選ぶのは、受け手の C の側（vkr_hotspot_tick）。
+// 前は「名前が bridge か、住所が 172.20.10.」で選んでいて、この iPhone がほかの iPhone の共有に Wi-Fi でつないだときの en0 も拾えた
 
 // この iPhone の IPv4 の住所（Wi-Fi は en0、Tailscale は utun で 100.x）
 func listAddresses() -> [Addr] {
@@ -127,6 +125,8 @@ struct ContentView: View {
     // 後ろに回っても続ける（その間は CPU で計算する）
     @AppStorage("keepAlive") private var keepAlive = true
     @AppStorage("metalTensor") private var metalTensor = true
+    // インターネット共有を USB でつないだ有線の網でも Vulkan と速さを測る口を待つ。初めは切り。合言葉は USB の口で PC に渡す
+    @AppStorage("hotspotListen") private var hotspotListen = false
     @State private var onCPU = false
     @State private var vkStarted = false
     @State private var vkFailed = false
@@ -200,6 +200,7 @@ struct ContentView: View {
                     TextField(L("ポート", "Port"), text: $port).keyboardType(.numberPad)
                     Toggle(L("GPU（Metal）で計算する", "Compute on the GPU (Metal)"), isOn: $useGPU)
                     Toggle(L("USB でも待ち受ける", "Also listen over USB"), isOn: $usb)
+                    Toggle(L("インターネット共有でも待ち受ける", "Also listen on Personal Hotspot"), isOn: $hotspotListen)
                     Toggle(L("バックグラウンドでも動かす", "Keep running in the background"), isOn: $keepAlive)
                         .onChange(of: keepAlive) { _, on in if running { on ? Keeper.shared.start() : Keeper.shared.stop() } }
                     Toggle(L("起動時に自動で開始", "Start automatically on launch"), isOn: $autoStart)
@@ -265,12 +266,14 @@ struct ContentView: View {
             vkr_set_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
             status.tick()
             mirror.tick()
-            // インターネット共有の口が出たら、そこでも待つ（消えたら閉じる）
-            if vkStarted {
-                let h = hotspotAddress() ?? ""
-                if h != linkHost, !vkFailed {
-                    // 2 は Vulkan がまだ起きていない。次の 1 秒でもう一度
-                    if h.withCString({ vkr_listen_extra($0) }) != 2 {
+            // 設定が入っていれば、インターネット共有の網の口が出たら、そこでも待つ（消えたら・設定を切ったら閉じる）
+            if vkStarted && !vkFailed {
+                let cap = 64
+                var buf = [CChar](repeating: 0, count: cap)
+                // 2 は Vulkan がまだ起きていない。次の 1 秒でもう一度
+                if vkr_hotspot_tick(hotspotListen ? 1 : 0, &buf, Int32(cap)) != 2 {
+                    let h = String(cString: buf)
+                    if h != linkHost {
                         linkHost = h
                         h.withCString { _ = vkr_bw_listen_extra($0, 50058) }
                     }
