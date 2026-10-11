@@ -55,6 +55,7 @@
 #define VR_H264_KEY 1u               // このコマをキーフレーム（IDR）にする。ドライバがほどき直すとき
 #define VR_H264_PIPE 2u
 #define VR_H264_UP15 4u              // 縮める前に、絵を 1.5 倍（720p なら 1080p）に広げる（VR_CAP_UPSCALE）。返事の頭の幅と高さは広げた後の物              // 先送り：今のコマを後ろで縮め始めて、ひとつ前に頼んだコマを返す（最初は空）
+#define VR_H264_LATE 8u              // 遅らせて写す（VR_H264_PIPE と一緒に。VR_CAP_H264_LATE）
 // VR_READ_H264 の返事の頭（32 バイト）：流れの番号（u64）・札（u64）・幅・高さ・印（u32。1 ならキーフレーム）・空き（u32）。
 // そのあとに 1 コマぶんの NAL の並び（Annex B。00 00 00 01 で区切る。キーフレームには SPS と PPS が付く）
 #define VR_H264_HEAD 32u
@@ -77,6 +78,16 @@
 // 動画のコマの平面（R8 など）を、画質を落とさずに縮めて送る（VR_MEM_WRITE_CODED。中身の形は remote/plane_codec.h）。
 // 番号は、ほかの係（1<<22・1<<23 往復を減らす係、1<<26 録画、1<<28 レイトレ）と重ならないように取った
 #define VR_CAP_PLANE_CODE 33554432u // 1u << 25
+// まとめて送る（ドライバは受け手が名乗ったときだけ使う。名乗らない古い受け手には今までどおり 1 つずつ送る）：
+//  ・VR_MEM_WRITE_SPANS：1 つのメモリへの小さな書き込みを 1 通にまとめた物
+//  ・VR_ALLOC_DESCRIPTOR_SETS と VR_UPDATE_DESCRIPTOR_SETS は形を変えずに、続けて来た物を 1 通にまとめる
+//    （取るのを全部先に、書き込みは 1 通の並びに）。受け手は 1 通の書き込みを 1 回の vkUpdateDescriptorSets にする
+// 番号は、ほかの係（1<<22・1<<23 往復を減らす係、1<<25 平面、1<<26 録画、1<<28 レイトレ）と重ならないように取った
+#define VR_CAP_BATCH 16777216u      // 1u << 24
+// VR_READ_H264 の印 VR_H264_LATE を受ける（遅らせて写す）：頼まれた時点では GPU を待たずに覚えるだけにし、次の頼みが来たとき
+// （か、そのメモリを書き換える・放す命令の前）に写して縮め始める。返事には縮め終わったいちばん古いコマを入れる（無ければ空）。
+// 受け手は頼みのあいだも次のコマの命令を処理できるので、GPU がコマの間で空かない。コマは頼んだ 2 つ後の返事で届く（先送りより 1 コマ遅い）
+#define VR_CAP_H264_LATE 134217728u // 1u << 27
 #define VR_CAP_NEW_MASK (VR_CAP_VK13 | VR_CAP_DYNAMIC_RENDERING | VR_CAP_SYNC2 | VR_CAP_RENDER_PASS2 | VR_CAP_CMD10 | VR_CAP_EXT_DYNAMIC_STATE | VR_CAP_QUERY)
 // 1.3 の受け手は、VR_GET_FORMAT_PROPS の返事の後ろに VkFormatProperties3 の 3 つの値（u64）を付ける。古いドライバは読まない
 
@@ -184,6 +195,8 @@ enum vr_op {
                                  // primitive の最大数の並び（u32）→ accelerationStructureSize・updateScratchSize・buildScratchSize（u64 ×3）
     // ---- 返事の尾と押し出し（VR_CAP_REPLY_EXT・VR_CAP_PUSH_DONE）。ほかの係と重ならないよう 120 から（録画 96〜・平面 104〜・レイトレ 112〜） ----
     VR_SET_OPTIONS = 120,        // 印（u32。VR_OPT_*）。返事なし。このつなぎの間だけ効く。名乗っていない印は受け手が無視する（VR_CAP_REPLY_EXT）
+    VR_MEM_WRITE_SPANS,          // memory（u64）・番号（u64。VR_MEM_WRITE の末尾と同じ意味で、全部の範囲の中でいちばん後の物）・数（u32）・
+                                 // 数だけ [offset（u64）・中身（u32 の長さ＋バイト）]。受け手は番号まで待ってから、順に書く（VR_CAP_BATCH）
     VR_OP_COUNT
 };
 

@@ -364,7 +364,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_RECORD_CTL] = "RECORD_CTL", [VR_RECORD_FRAME] = "RECORD_FRAME", [VR_RECORD_FETCH] = "RECORD_FETCH",
     [VR_MEM_WRITE_CODED] = "MEM_WRITE_CODED",
     [VR_CREATE_ACCEL] = "CREATE_ACCEL", [VR_DESTROY_ACCEL] = "DESTROY_ACCEL", [VR_GET_ACCEL_SIZES] = "GET_ACCEL_SIZES",
-    [VR_SET_OPTIONS] = "SET_OPTIONS",
+    [VR_SET_OPTIONS] = "SET_OPTIONS", [VR_MEM_WRITE_SPANS] = "MEM_WRITE_SPANS",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -395,6 +395,10 @@ static struct {
     uint64_t q_nr_done;            // query を書いた submit がまだ終わっていないので、往復せずに「まだ」と答えた数
     uint64_t push_req, push_waits; // 押し出しを待つ間に念のため進み具合を聞いた数・押し出しを待った回数
     double push_wait_ms;
+    uint64_t wmsg[VR_OP_COUNT];    // 線に出た命令の数（まとめたあと。まとめる前の数は sends・calls）
+    uint64_t spans;                // VR_MEM_WRITE_SPANS に入れた範囲の数
+    uint64_t vframes;              // H.264 で受け取った中身のあるコマ
+    uint32_t vhash;                // その最初の 150 コマの検算（遅らせて写す形と前の形で同じかを比べる）
 } g_stat;
 // u1（アドレスで読み書きする buffer・結んだあとに書いた descriptor）の数。数えるだけ
 static struct { volatile LONG64 pv, rd_n, wr_n, whole, ub_sets, ub_ents; } g_u1;
@@ -440,6 +444,17 @@ static void print_stats(void) {
         ts += g_stat.sends[i]; tc += g_stat.calls[i]; tb += g_stat.bytes[i]; tw += g_stat.wait_ms[i];
     }
     fprintf(stderr, "  %-24s %9llu %9llu %13llu %10.1f\n", "合計", (unsigned long long) ts, (unsigned long long) tc, (unsigned long long) tb, tw);
+    if (g_stat.vframes)
+        fprintf(stderr, "  H.264 で受け取った中身のあるコマ %llu・最初の %llu コマの検算 %08x\n", (unsigned long long) g_stat.vframes,
+                (unsigned long long) (g_stat.vframes < 150 ? g_stat.vframes : 150), g_stat.vhash);
+    {
+        // まとめたあと、線に出た命令の数（VR_CAP_BATCH）
+        uint64_t all = 0;
+        for (int i = 1; i < VR_OP_COUNT; i++) all += g_stat.wmsg[i];
+        fprintf(stderr, "  線に出た命令：MEM_WRITE %llu・MEM_WRITE_SPANS %llu（範囲 %llu）・ALLOC_DESCRIPTOR_SETS %llu・UPDATE_DESCRIPTOR_SETS %llu・全部 %llu\n",
+                (unsigned long long) g_stat.wmsg[VR_MEM_WRITE], (unsigned long long) g_stat.wmsg[VR_MEM_WRITE_SPANS], (unsigned long long) g_stat.spans,
+                (unsigned long long) g_stat.wmsg[VR_ALLOC_DESCRIPTOR_SETS], (unsigned long long) g_stat.wmsg[VR_UPDATE_DESCRIPTOR_SETS], (unsigned long long) all);
+    }
     fprintf(stderr, "  受け取ったバイト %llu・まとめて送った回数 %llu\n", (unsigned long long) g_stat.bytes_in, (unsigned long long) g_stat.flushes);
     {
         static const char *why[6] = { "storage buffer", "buffer への写し", "fill・update", "画像から buffer へ", "query の結果", "そのほか" };
@@ -634,7 +649,103 @@ static void stat_tick(void) {
     last_t = t;
 }
 
+// ---- descriptor の取る・書くをまとめる（VR_CAP_BATCH） ----
+// DXVK は描画のたびに set を取って（ALLOC_DESCRIPTOR_SETS）すぐ書く（UPDATE_DESCRIPTOR_SETS）。1 コマに数百ずつ、1 つずつの知らせになる。
+// 続けて来たこの 2 つは g_q に入れずに脇にためる。ほかの命令が来るか送るときに、取るのを全部（届いた順）出してから、
+// 書き込みを 1 通（届いた順の並び）にまとめて出す。受け手は 1 通の書き込みを 1 回の vkUpdateDescriptorSets にする（MoltenVK は 1 回ごとが重い）。
+// 結果が変わらない理由：
+//  ・取るのを書き込みより前へ動かすだけ。set を取るのは中身を読まないので、ほかの set への書き込みとの順は答えに関わらない。
+//    同じ set への書き込みは、その set を取った後のまま（取る知らせは全部、書き込みの 1 通より前に出る）
+//  ・書き込みどうしの順は変えない（vkUpdateDescriptorSets も並びの順に書く決まり）
+//  ・ほかの命令（submit・記録・pool の reset・set を返す・消すなど）を追い越さない。どの命令を入れる前にも、ためた物を先に出す。
+//    受け手が書き込みの前に待つ「その set を使う submit」は、まとめても同じ submit の後ろ・同じ submit の前で処理される
+//  ・糸どうしの順：ためるのも出すのも g_lock の中。ある糸の書き込みのあとに別の糸が入れた命令は、必ずためた物の後ろに出る
+static int g_dbatch;              // まとめる（受け手が VR_CAP_BATCH を名乗った。IPHONE_VK_BATCH=0・IPHONE_VK_BATCH_DESC=0 で切る）
+static int g_mbatch;              // 小さな書き込みを VR_MEM_WRITE_SPANS にまとめる（IPHONE_VK_BATCH=0・IPHONE_VK_BATCH_MEMW=0 で切る。下の send_dirty）
+static vr_buf g_da;               // ためた ALLOC_DESCRIPTOR_SETS の知らせ（頭つき・届いた順）
+static size_t g_da_last;          // g_da の中の、最後の知らせの頭の位置
+static int g_da_open;             // 最後の知らせに足してよい（set ごとの数の末尾が無い）
+static uint64_t g_da_dev, g_da_pool;
+static vr_buf g_du;               // まとめた UPDATE_DESCRIPTOR_SETS の中身（装置・数・書き込みの並び）
+static uint64_t g_du_dev;
+static uint32_t g_du_n;           // 書き込みの数
+static int g_du_has;              // g_du に知らせがある
+#define DQ_MAX (1u << 20)         // 1 通をこれより大きくしない
+
+static void dq_flush_locked(void) {
+    if (g_da.n) {
+        vr_put(&g_q, g_da.p, g_da.n);
+        g_stat.bytes[VR_ALLOC_DESCRIPTOR_SETS] += g_da.n;
+        g_da.n = 0;
+        g_da_open = 0;
+    }
+    if (g_du_has) {
+        memcpy(g_du.p + 8, &g_du_dev, 8);
+        memcpy(g_du.p + 16, &g_du_n, 4);
+        uint32_t h[2] = { VR_UPDATE_DESCRIPTOR_SETS, (uint32_t) (g_du.n - 8) };
+        memcpy(g_du.p, h, 8);
+        vr_put(&g_q, g_du.p, g_du.n);
+        g_stat.bytes[VR_UPDATE_DESCRIPTOR_SETS] += g_du.n;
+        g_stat.wmsg[VR_UPDATE_DESCRIPTOR_SETS]++;
+        g_du.n = 0;
+        g_du_n = 0;
+        g_du_has = 0;
+    }
+}
+
+// op の知らせ b を脇にためる。ためたら 1（g_q には入れない）
+static int dq_take_locked(uint32_t op, const vr_buf *b) {
+    if (op == VR_UPDATE_DESCRIPTOR_SETS) {
+        if (b->n < 12) return 0;
+        uint64_t dev;
+        uint32_t nw;
+        memcpy(&dev, b->p, 8);
+        memcpy(&nw, b->p + 8, 4);
+        if (g_du_has && (dev != g_du_dev || g_du.n + b->n > DQ_MAX)) dq_flush_locked();
+        if (!g_du_has) {
+            g_du.n = 0;
+            vr_reserve(&g_du, 20 + b->n);
+            g_du.n = 20; // 頭 8・装置 8・数 4 は出すときに書く
+            g_du_dev = dev;
+            g_du_has = 1;
+        }
+        vr_put(&g_du, b->p + 12, b->n - 12);
+        g_du_n += nw;
+        return 1;
+    }
+    // ALLOC_DESCRIPTOR_SETS：装置・pool・数・(layout・set) の並び（・set ごとの数）。数の末尾が無く、装置と pool が同じなら、前の知らせに足す
+    if (b->n < 20) return 0;
+    uint64_t dev, pool;
+    uint32_t n;
+    memcpy(&dev, b->p, 8);
+    memcpy(&pool, b->p + 8, 8);
+    memcpy(&n, b->p + 16, 4);
+    int plain = b->n == 20 + (size_t) n * 16;
+    if (g_da.n + b->n > DQ_MAX) dq_flush_locked();
+    if (plain && g_da_open && dev == g_da_dev && pool == g_da_pool) {
+        uint32_t h[2], n0;
+        memcpy(h, g_da.p + g_da_last, 8);
+        memcpy(&n0, g_da.p + g_da_last + 8 + 16, 4);
+        vr_put(&g_da, b->p + 20, b->n - 20);
+        h[1] += (uint32_t) (b->n - 20);
+        n0 += n;
+        memcpy(g_da.p + g_da_last, h, 8);
+        memcpy(g_da.p + g_da_last + 8 + 16, &n0, 4);
+        return 1;
+    }
+    uint32_t h[2] = { VR_ALLOC_DESCRIPTOR_SETS, (uint32_t) b->n };
+    g_da_last = g_da.n;
+    vr_put(&g_da, h, 8);
+    vr_put(&g_da, b->p, b->n);
+    g_da_open = plain;
+    g_da_dev = dev;
+    g_da_pool = pool;
+    g_stat.wmsg[VR_ALLOC_DESCRIPTOR_SETS]++;
+    return 1;
+}
+
 static int flush_locked(void) {
+    if (g_da.n || g_du_has) dq_flush_locked();
     if (g_dead || g_sock == VR_BAD_SOCK) { g_q.n = 0; return 0; }
     stat_tick();
     if (g_q.n) g_stat.flushes++;
@@ -669,8 +780,10 @@ static int flush_locked(void) {
 }
 
 static void put_msg_locked(uint32_t op, const vr_buf *b) {
+    if (g_dbatch && (op == VR_ALLOC_DESCRIPTOR_SETS || op == VR_UPDATE_DESCRIPTOR_SETS) && dq_take_locked(op, b)) return;
+    if (g_da.n || g_du_has) dq_flush_locked(); // ためた物は、ほかの命令より先に出す
     uint32_t h[2] = { op, (uint32_t) b->n };
-    if (op < VR_OP_COUNT) g_stat.bytes[op] += 8 + b->n;
+    if (op < VR_OP_COUNT) { g_stat.bytes[op] += 8 + b->n; g_stat.wmsg[op]++; }
     vr_put(&g_q, h, 8);
     vr_put(&g_q, b->p, b->n);
 }
@@ -762,7 +875,7 @@ static void rpc_flush(void) {
 // もう縮めてある大きな命令（頭の 8 バイトを含む msg）を、LZ4 にかけずにそのまま送る。前にためた命令は先に（ふつうに）送り、順は崩さない
 static void rpc_send_raw(uint32_t op, const uint8_t *msg, size_t n) {
     AcquireSRWLockExclusive(&g_lock);
-    if (op < VR_OP_COUNT) { g_stat.sends[op]++; g_stat.bytes[op] += n; }
+    if (op < VR_OP_COUNT) { g_stat.sends[op]++; g_stat.bytes[op] += n; g_stat.wmsg[op]++; }
     if (flush_locked()) {
         g_stat.flushes++;
         g_stat.wire_out += n;
@@ -1824,6 +1937,16 @@ static int hello(void) {
             // 調べ用：IPHONE_VK_CAPS=数 で受け手の caps を絞る（0 なら古い受け手と同じに振る舞う）
             const char *cm = getenv("IPHONE_VK_CAPS");
             if (cm && *cm) g_hw.caps &= (uint32_t) strtoul(cm, NULL, 0);
+            {   // まとめて送る（VR_CAP_BATCH。IPHONE_VK_CAPS で絞ったあとの caps で決める）。IPHONE_VK_BATCH=0 で両方・IPHONE_VK_BATCH_DESC=0・IPHONE_VK_BATCH_MEMW=0 で片方を切る
+                const char *be = getenv("IPHONE_VK_BATCH"), *bd = getenv("IPHONE_VK_BATCH_DESC"), *bm = getenv("IPHONE_VK_BATCH_MEMW");
+                int on = (g_hw.caps & VR_CAP_BATCH) && !(be && *be == '0');
+                AcquireSRWLockExclusive(&g_lock);
+                g_dbatch = on && !(bd && *bd == '0');
+                ReleaseSRWLockExclusive(&g_lock);
+                g_mbatch = on && !(bm && *bm == '0');
+                if (g_dbatch || g_mbatch)
+                    say("小さな知らせをまとめて送る（VR_CAP_BATCH）：書き込み %s・descriptor %s", g_mbatch ? "○" : "×", g_dbatch ? "○" : "×");
+            }
             rd.at = ext_at;
             for (uint32_t i = 0; i < ne; i++) {
                 VkExtensionProperties x;
@@ -3125,8 +3248,52 @@ static void memw_dump(struct mem *m, uint64_t off, uint64_t len) {
     if (f) { fwrite(m->shadow + off, 1, (size_t) len, f); fclose(f); }
 }
 
-// 1 ページを、受け手の中身の写しと 8 バイトずつ比べ、違う所だけを送る。64 バイト未満のすき間はまとめて送る
-static void send_page_diff(vr_buf *b, struct mem *m, size_t pg) {
+// ---- 小さな書き込みを 1 通にまとめる（VR_MEM_WRITE_SPANS・受け手が VR_CAP_BATCH を名乗ったとき） ----
+// 1 回の send_dirty の中で、同じメモリへの小さな書き込み（違う所だけ送るページの切れ端・64 KB 未満の初めて送るページ）を 1 通にためる。
+// 結果が変わらない理由：
+//  ・切り方・中身・書く場所は 1 つずつ送るときと同じ（同じ写しのバイト）。受け手は届いた順に書く
+//  ・受け手の待ち：1 つずつのときは、範囲ごとに「その範囲を使う submit」（番号と last_with_mem の小さい方。wide なら大きい方）まで待ってから書いた。
+//    まとめた物は番号のいちばん後の物を付け、受け手はそこまで 1 回待ってから全部書く。どちらの式も番号について単調なので、
+//    この待ちは 1 つずつのときのいちばん長い待ちとちょうど同じ所まで。1 通の間に受け手が処理する submit は無いので、
+//    書き終わった時点のメモリの中身と、それまでに終わっている GPU の仕事は 1 つずつのときと同じ
+//  ・ほかの命令との順：ためた物は send_dirty の終わり（か、64 KB 以上の塊を送る前）に出す。send_dirty は、その範囲を読む submit より前に呼ばれる
+typedef struct { vr_buf b; struct mem *m; uint32_t n; uint64_t upto; int wide; } wsink;
+
+static void ws_end(wsink *w) {
+    if (!w->n) return;
+    uint64_t id = ID(w->m), up = w->upto | (w->wide ? MEMW_WIDE : 0);
+    memcpy(w->b.p, &id, 8);
+    memcpy(w->b.p + 8, &up, 8);
+    memcpy(w->b.p + 16, &w->n, 4);
+    g_stat.spans += w->n;
+    rpc_send(VR_MEM_WRITE_SPANS, &w->b);
+    w->n = 0;
+    w->upto = 0;
+    w->wide = 0;
+}
+
+static void ws_put(wsink *w, struct mem *m, uint64_t off, uint64_t len) {
+    if (!w->n) {
+        w->b.n = 0;
+        vr_reserve(&w->b, 20 + 12 + (size_t) len);
+        w->b.n = 20; // memory・番号・数は出すときに書く
+        w->m = m;
+    }
+    vr_u64(&w->b, off);
+    vr_bytes(&w->b, m->shadow + off, (uint32_t) len);
+    if (memw_upto_on()) {
+        uint64_t u = mu_upto(m, off, len);
+        if (u > w->upto) w->upto = u;
+        if (m->wide) w->wide = 1;
+    } else {
+        w->upto = MEMW_WIDE - 1; // 番号を付けない 1 つずつの書き込みと同じ「そのメモリを使う仕事を全部待つ」
+    }
+    w->n++;
+    if (w->b.n >= (1u << 20)) ws_end(w);
+}
+
+// 1 ページを、受け手の中身の写しと 8 バイトずつ比べ、違う所だけを送る。64 バイト未満のすき間はまとめて送る（ws があれば ws にためる）
+static void send_page_diff(vr_buf *b, wsink *ws, struct mem *m, size_t pg) {
     uint64_t base = (uint64_t) pg * PAGE;
     size_t plen = (size_t) (m->size - base < PAGE ? m->size - base : PAGE);
     const uint8_t *cur = m->shadow + base;
@@ -3148,7 +3315,8 @@ static void send_page_diff(vr_buf *b, struct mem *m, size_t pg) {
             e = g + w3;
         }
         if (e > plen) e = plen;
-        send_write(b, m, base + a, e - a);
+        if (ws) ws_put(ws, m, base + a, e - a);
+        else send_write(b, m, base + a, e - a);
         memcpy(old + a, cur + a, e - a);
         g_stat.wdiff_sent += e - a;
         a = e;
@@ -3327,6 +3495,7 @@ static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
     lz_settle_dirty(m, p0, p1);
     const size_t chunk = (16u << 20) / PAGE;
     vr_buf b = { 0 };
+    wsink ws = { 0 }, *w = g_mbatch ? &ws : NULL;
     if (wdiff_on() && !m->sent && !m->delta && !m->jpeg) {
         m->sent = malloc(m->npages * PAGE);
         m->known = calloc(m->npages, 1);
@@ -3339,7 +3508,7 @@ static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
         // 受け手の中身を知っているページは、違う所だけを送る
         if (m->sent && m->known[i]) {
             m->dirty[i] = 0;
-            send_page_diff(&b, m, i);
+            send_page_diff(&b, w, m, i);
             i++;
             continue;
         }
@@ -3355,6 +3524,8 @@ static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
         uint64_t off = (uint64_t) i * PAGE, len = (uint64_t) (j - i) * PAGE;
         if (off + len > m->size) len = m->size - off;
         memw_dump(m, off, len);
+        if (w && len < (64u << 10)) { ws_put(w, m, off, len); i = j; continue; }
+        if (w) ws_end(w); // 大きな塊は 1 つで送る。その前に、ためた物を出す（順を変えない）
         vr_u64(&b, ID(m));
         vr_u64(&b, off);
         vr_bytes(&b, m->shadow + off, (uint32_t) len);
@@ -3362,6 +3533,7 @@ static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
         rpc_send(VR_MEM_WRITE, &b);
         i = j;
     }
+    if (w) { ws_end(w); free(ws.b.p); }
     free(b.p);
 }
 
@@ -7203,6 +7375,12 @@ static void disp_give_video(struct swapchain *sc, const vr_buf *out) {
         InitializeConditionVariable(&sc->disp.cv);
         sc->disp.thr = CreateThread(NULL, 0, vdisp_thread, sc, 0, NULL);
     }
+    if (out->n > VR_H264_HEAD && g_stats > 0) {
+        if (!g_stat.vframes) g_stat.vhash = 2166136261u;
+        if (g_stat.vframes < 150)
+            for (size_t i = 0; i < out->n; i++) g_stat.vhash = (g_stat.vhash ^ out->p[i]) * 16777619u;
+        g_stat.vframes++;
+    }
     if (out->n >= VR_H264_HEAD) {
         uint32_t fl;
         memcpy(&fl, out->p + 24, 4);
@@ -7239,11 +7417,16 @@ static void video_fallback(struct swapchain *sc) {
 // （IPHONE_VK_JPEG_PIPE・IPHONE_VK_ASYNC_PRESENT に従う）。受け取ったコマは表示の糸に渡す。
 // 受け手が失敗を返したら、その結果を返す（呼んだ側が JPEG に戻す）
 static VkResult video_request(struct swapchain *sc, uint32_t j, uint64_t serial, int now) {
-    static int pipe = -1, async = -1;
+    static int pipe = -1, async = -1, late = -1;
     if (pipe < 0) {
         const char *p = getenv("IPHONE_VK_JPEG_PIPE"), *a = getenv("IPHONE_VK_ASYNC_PRESENT");
         pipe = (g_hw.caps & VR_CAP_JPEG_PIPE) && !(p && *p == '0');
         async = pipe && !(a && *a == '0');
+        // 遅らせて写す（VR_H264_LATE）：受け手が名乗り、IPHONE_VK_H264_LATE=1 のときだけ。受け手は頼みのところで GPU を待たずに次のコマの命令へ進む。
+        // コマは頼んだ 2 つ後の present で届く（先送りより 1 コマ遅い）
+        const char *l = getenv("IPHONE_VK_H264_LATE");
+        late = async && (g_hw.caps & VR_CAP_H264_LATE) && l && *l == '1';
+        if (late) say("窓の絵（H.264）は、受け手が遅らせて写す（GPU を待たずに次のコマへ進む）");
     }
     if (sc->v_broken) return VK_ERROR_FEATURE_NOT_PRESENT;
     int key = InterlockedExchange(&sc->v_need_key, 0) != 0;
@@ -7254,7 +7437,7 @@ static VkResult video_request(struct swapchain *sc, uint32_t j, uint64_t serial,
     vr_u32(&b, sc->h);
     vr_u32(&b, sc->w * 4);
     vr_u32(&b, sc->fmt == VK_FORMAT_B8G8R8A8_UNORM || sc->fmt == VK_FORMAT_B8G8R8A8_SRGB ? 1 : 0);
-    vr_u32(&b, (key ? VR_H264_KEY : 0) | (!now && pipe ? VR_H264_PIPE : 0) | (sc->upscale ? VR_H264_UP15 : 0));
+    vr_u32(&b, (key ? VR_H264_KEY : 0) | (!now && pipe ? VR_H264_PIPE : 0) | (!now && late ? VR_H264_LATE : 0) | (sc->upscale ? VR_H264_UP15 : 0));
     vr_u32(&b, sc->v_kbps);
     vr_u32(&b, sc->v_fps);
     vr_u32(&b, sc->v_gop);

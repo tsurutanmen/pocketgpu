@@ -599,7 +599,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     caps |= VR_CAP_JPEG | VR_CAP_JPEG_PIPE; // 窓に出すコマを JPEG に縮められる（iPhone は ImageIO、PC の代役は WIC）
 #endif
     if (g_upscale) caps |= VR_CAP_UPSCALE; // 縮める前に MetalFX で広げられる（アプリが関数を登録したとき）
-    if (vid_probe()) caps |= VR_CAP_H264; // 窓に出すコマを H.264 に縮められる（iPhone は VideoToolbox、PC の代役は Media Foundation）
+    if (vid_probe()) caps |= VR_CAP_H264 | VR_CAP_H264_LATE; // 窓に出すコマを H.264 に縮められる（iPhone は VideoToolbox、PC の代役は Media Foundation）・遅らせて写せる
     if (rec_available()) caps |= VR_CAP_RECORD; // 窓に出すコマと PC の音を高画質で録画できる（iPhone はアプリが登録した AVAssetWriter、PC の代役は Sink Writer）
     // buffer device address（GPU の中のバッファのアドレス）
     if (fbda.bufferDeviceAddress && (v12 || e_bda)) {
@@ -642,6 +642,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     caps |= VR_CAP_PROGRESS; // 終わった submit の番号を、GPU を待たずに答える
     caps |= VR_CAP_REPLY_EXT | VR_CAP_PUSH_DONE; // 返事に終わった submit の番号を付ける・終わったら頼まれなくても知らせる（VR_SET_OPTIONS で頼まれたつなぎだけ）
     caps |= VR_CAP_DESC_FLAGS; // binding の flags と set ごとの数を読む（vkd3d-proton）
+    caps |= VR_CAP_BATCH; // 小さな書き込みをまとめた VR_MEM_WRITE_SPANS を受ける・descriptor の取る・書くをまとめた物を受ける
     // 調べ用：VKR_CAPS=数 で名乗る印を絞る（古い受け手のふりをする）
     const char *mask = getenv("VKR_CAPS");
     if (mask && *mask) caps &= (uint32_t) strtoul(mask, NULL, 0);
@@ -829,6 +830,10 @@ static void sleep_ms(int ms) {
 static struct { double wait_ms, record_ms, submit_ms, paused_ms; uint64_t waits, records, submits; uint64_t wait_by_op[128]; double wait_ms_by_op[128]; } g_st; // 命令の番号は 64 を超える（READ_JPEG_PIPE 73・GET_PROGRESS 81 など）ので 128 まで数える
 static uint32_t g_cur_op; // いま処理している命令（どの命令で GPU を待ったかを数える）
 static struct { uint64_t n, in, out; double ms; } g_pcs; // 縮めた平面をほどいた回数・受け取ったバイト・ほどいたバイト・かかった時間
+// 書き込みと descriptor の知らせの数（この接続）：1 つずつの書き込み・まとめた書き込みの通数と範囲の数・descriptor の書き込みの通数と個数・vkUpdateDescriptorSets を呼んだ回数
+static struct { uint64_t memw, spans_msgs, spans, uds_msgs, uds_writes, uds_calls; } g_bst;
+// 命令ごとの処理の時間（この接続・主の糸）：通数・かかった ms・そのうち GPU を待った ms。いつも数える（1 通に 2 回時計を読むだけ）
+static struct { uint64_t n[128]; double ms[128], wait[128]; } g_opt;
 // アプリの画面のファンを回すための数。アプリが少しずつ読んで、増えた速さで回す
 static volatile uint64_t g_ops_total;
 static volatile int g_clients;
@@ -1610,7 +1615,7 @@ static void uds_add(uds_batch *b, VkDevice d, const VkWriteDescriptorSet *w, voi
     b->n++;
 }
 static void uds_flush(uds_batch *b, VkDevice d, int apply) {
-    if (apply && b->n) vkUpdateDescriptorSets(d, b->n, b->w, 0, NULL);
+    if (apply && b->n) { vkUpdateDescriptorSets(d, b->n, b->w, 0, NULL); g_bst.uds_calls++; g_bst.uds_writes += b->n; }
     for (uint32_t i = 0; i < b->n; i++) free(b->info[i]);
     b->n = 0;
 }
@@ -3649,8 +3654,88 @@ static int vp_start(const uint8_t *src) {
     return 1;
 }
 
+// ---- 遅らせて写す（VR_H264_LATE・VR_CAP_H264_LATE） ----
+// 先送り（VR_H264_PIPE）は、頼まれたその場で「そのコマを描く GPU の仕事」が終わるまで主の糸を止めていた。
+// その間、受け手は次のコマの命令（書き込み・記録・submit）を処理できず、GPU はコマの間で空く。
+// 遅らせる形では、頼みを覚えるだけで GPU を待たずに次の命令へ進み、写して縮め始めるのは「次の頼み」が来たとき
+// （か、そのメモリを書き換える・放す命令の前）にする。そのときには次のコマの submit がもう GPU に入っているので、待っても GPU は空かない。
+// 返事には、縮め終わった物のいちばん古い物を入れる（無ければ空）。コマの遅れは先送りより 1 コマ増える（頼んだ 2 つ後の返事で届く）。
+// 縮める順・中身は先送りと同じ（同じコマを同じ順に縮める）。写すのは、そのコマの GPU の仕事が終わったあと・メモリが書き換わる前
+static struct {
+    int on;
+    uint64_t mid, off, stream, tag;
+    uint64_t msg; // 頼まれた時点で、このメモリを使う submit のいちばん後の物の番号（0 なら、もう終わっている）
+    uint32_t w, h, stride, bgra, flags, kbps, fps, gop;
+} g_vh;
+#define VQ_MAX 4
+static struct { vr_buf b[VQ_MAX]; int head, n, fail; } g_vq; // 縮め終わった物の列（古い順）
+static struct { uint64_t reqs, started, dropped, forced, overflow; double wait_ms, join_ms; } g_vhs; // 数え（この接続）
+
+static void vq_push(const uint8_t *p, size_t n) {
+    if (g_vq.n == VQ_MAX) { g_vq.head = (g_vq.head + 1) % VQ_MAX; g_vq.n--; g_vhs.overflow++; } // ふつうは起きない（頼み 1 つに出来上がり 1 つ）
+    vr_buf *b = &g_vq.b[(g_vq.head + g_vq.n) % VQ_MAX];
+    b->n = 0;
+    vr_put(b, p, n);
+    g_vq.n++;
+}
+
+// 縮めている物を待って、出来上がりを列に入れる
+static void vh_collect(void) {
+    vp_join();
+    if (g_vp.has) {
+        g_vp.has = 0;
+        if (g_vp.ok) vq_push(g_vp.out.p, g_vp.out.n);
+        else g_vq.fail = 1;
+    }
+}
+
+// 覚えた頼みを写して縮め始める。その前に、そのコマの GPU の仕事（頼まれた時点でこのメモリを使っていた submit まで）を待つ
+static void vh_complete(void) {
+    if (!g_vh.on) return;
+    g_vh.on = 0;
+    double t0 = t_ms();
+    int u = -1;
+    for (int i = 0; i < g_nfl; i++) if (g_fl[i].msg && g_fl[i].msg <= g_vh.msg) u = i;
+    drain_upto(u);
+    g_vhs.wait_ms += t_ms() - t0;
+    if (g_err != VK_SUCCESS) return;
+    double t1 = t_ms();
+    vh_collect();
+    g_vhs.join_ms += t_ms() - t1;
+    ent *e = find(g_vh.mid);
+    if (!e || !e->map || g_vh.off > e->size || (uint64_t) g_vh.stride * g_vh.h > e->size - g_vh.off) { g_vhs.dropped++; return; }
+    g_vp.w = g_vh.w, g_vp.h = g_vh.h, g_vp.stride = g_vh.stride, g_vp.bgra = g_vh.bgra, g_vp.flags = g_vh.flags & ~VR_H264_LATE;
+    g_vp.kbps = g_vh.kbps, g_vp.fps = g_vh.fps, g_vp.gop = g_vh.gop, g_vp.stream = g_vh.stream, g_vp.tag = g_vh.tag;
+    if (vp_start((const uint8_t *) e->map + g_vh.off)) g_vhs.started++;
+    else g_vq.fail = 1;
+}
+
+// メモリ mid を書き換える・放す命令の前：覚えた頼みがそのメモリなら、先に写す（放すなら捨てる。縮めていないので並びは崩れない）
+static void vh_before_mem(uint64_t mid, int freeing) {
+    if (!g_vh.on || g_vh.mid != mid) return;
+    if (freeing) { g_vh.on = 0; g_vhs.dropped++; return; }
+    g_vhs.forced++;
+    vh_complete();
+}
+
+// 遅らせる形の物を全部捨てる（接続が切れた・装置を消す・遅らせない頼みが来た）。捨てたら 1
+static int vh_reset(void) {
+    int any = g_vh.on || g_vq.n;
+    g_vh.on = 0;
+    g_vq.n = 0;
+    g_vq.head = 0;
+    g_vq.fail = 0;
+    return any;
+}
+
 // 接続が切れたとき：縮めている途中なら待ち、エンコーダを全部閉じる（次につないだ人に前の人のコマを見せない）
 static void vid_reset(void) {
+    vh_reset();
+    if (g_vhs.reqs)
+        vlog("この接続：H.264 を遅らせて写した %llu 回（写した %llu・捨てた %llu・書き換えの前に写した %llu・列があふれた %llu）・GPU を待つ %.0f ms・前のコマを待つ %.0f ms",
+             (unsigned long long) g_vhs.reqs, (unsigned long long) g_vhs.started, (unsigned long long) g_vhs.dropped, (unsigned long long) g_vhs.forced,
+             (unsigned long long) g_vhs.overflow, g_vhs.wait_ms, g_vhs.join_ms);
+    memset(&g_vhs, 0, sizeof g_vhs);
     vp_join();
     g_vp.has = g_vp.ok = 0;
     g_vp.out.n = 0;
@@ -3969,6 +4054,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     }
     case VR_DESTROY_DEVICE: {
         uint64_t id = vr_ru64(r);
+        if (g_vh.on) { g_vh.on = 0; g_vhs.dropped++; }
         VkDevice h = DEV(id), other = VK_NULL_HANDLE;
         int ndev = 0;
         for (size_t i = 0; i < g_cap; i++)
@@ -4069,6 +4155,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_FREE_MEMORY: {
         VkDevice d = DEV(vr_ru64(r));
         uint64_t id = vr_ru64(r);
+        vh_before_mem(id, 1);
         vkFreeMemory(d, OBJ(VkDeviceMemory, id), NULL);
         del(id);
         return 1;
@@ -4088,6 +4175,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t off = vr_ru64(r);
         uint32_t n;
         const void *d = vr_rbytes(r, &n);
+        vh_before_mem(mid, 0);
         // ドライバが「書く範囲を GPU が使う submit の番号」を付けていれば、そこまでだけ待つ（付いていなければ、そのメモリを使う仕事を全部待つ）
         int k = last_with_mem(mid);
         if (r->at + 8 <= r->n) {
@@ -4105,6 +4193,38 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             memcpy((uint8_t *) e->map + off, d, n);
             if (e->last) memcpy(e->last + off, d, n);
         } else vlog("範囲の外への書き込みを捨てた（%llu + %u）", (unsigned long long) off, n);
+        g_bst.memw++;
+        return 1;
+    }
+    case VR_MEM_WRITE_SPANS: {
+        // まとめた書き込み（VR_CAP_BATCH）：memory・番号・数・[offset・中身] の並び。
+        // 待つのは 1 回だけ。番号は全部の範囲の中でいちばん後の物なので、1 つずつ送られた VR_MEM_WRITE を順に処理したときの待ちの
+        // いちばん長い物と同じ所まで待つ（どれも同じメモリなので、自分の判定 last_with_mem も同じ）。そのあと届いた順に書く
+        uint64_t mid = vr_ru64(r);
+        uint64_t upto = vr_ru64(r);
+        uint32_t n = vr_ru32(r);
+        vh_before_mem(mid, 0);
+        int k = last_with_mem(mid);
+        {
+            int wide = (int) (upto >> 63);
+            upto &= ~(1ull << 63);
+            int u = -1;
+            for (int i = 0; i < g_nfl; i++) if (g_fl[i].msg <= upto) u = i;
+            if (wide ? u > k : u < k) k = u;
+        }
+        drain_upto(k);
+        ent *e = find(mid);
+        for (uint32_t i = 0; i < n && !r->bad; i++) {
+            uint64_t off = vr_ru64(r);
+            uint32_t len;
+            const void *d = vr_rbytes(r, &len);
+            if (e && e->map && d && off <= e->size && len <= e->size - off) {
+                memcpy((uint8_t *) e->map + off, d, len);
+                if (e->last) memcpy(e->last + off, d, len);
+            } else vlog("範囲の外への書き込みを捨てた（%llu + %u）", (unsigned long long) off, len);
+        }
+        g_bst.spans_msgs++;
+        g_bst.spans += n;
         return 1;
     }
     case VR_MEM_WRITE_CODED: {
@@ -4112,6 +4232,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t mid = vr_ru64(r);
         uint64_t off = vr_ru64(r);
         uint64_t upto = vr_ru64(r);
+        vh_before_mem(mid, 0);
         size_t n = r->bad || r->at > r->n ? 0 : r->n - r->at;
         const uint8_t *blob = r->bad ? NULL : (const uint8_t *) vr_take(r, n);
         int k = last_with_mem(mid);
@@ -4231,20 +4352,59 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         static uint64_t vn, vbytes, vkeys;
         double t0 = t_ms();
         uint64_t mid = vr_ru64(r);
-        drain_upto(last_with_mem(mid));
-        vt_wait += t_ms() - t0;
-        if (g_err != VK_SUCCESS) return reply(s, g_err);
-        ent *e = find(mid);
         uint64_t off = vr_ru64(r);
         uint32_t w = vr_ru32(r), h = vr_ru32(r), stride = vr_ru32(r), bgra = vr_ru32(r), flags = vr_ru32(r);
         uint32_t kbps = vr_ru32(r), fps = vr_ru32(r), gop = vr_ru32(r);
         uint64_t stream = vr_ru64(r), tag = vr_ru64(r);
-        if (r->bad || !e || !e->map || w == 0 || h == 0 || w > 16384 || h > 16384 || stride < (uint64_t) w * 4 || off > e->size ||
-            (uint64_t) stride * h > e->size - off)
-            return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
         if (!kbps || kbps > 1000000) kbps = 8000;
         if (!fps || fps > 1000) fps = 60;
         if (!gop) gop = 600;
+        if ((flags & VR_H264_LATE) && (flags & VR_H264_PIPE)) {
+            // 遅らせる形（上の g_vh）：ひとつ前の頼みをいま写して縮め始め、この頼みは覚えるだけ。GPU は待たない（ひとつ前のコマの分は待つことがある）
+            if (g_err != VK_SUCCESS) return reply(s, g_err);
+            ent *e = find(mid);
+            if (r->bad || !e || !e->map || w == 0 || h == 0 || w > 16384 || h > 16384 || stride < (uint64_t) w * 4 || off > e->size ||
+                (uint64_t) stride * h > e->size - off)
+                return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
+            vh_complete();
+            if (g_err != VK_SUCCESS) return reply(s, g_err);
+            int k = last_with_mem(mid);
+            g_vh.on = 1;
+            g_vh.mid = mid, g_vh.off = off, g_vh.w = w, g_vh.h = h, g_vh.stride = stride, g_vh.bgra = bgra, g_vh.flags = flags;
+            g_vh.kbps = kbps, g_vh.fps = fps, g_vh.gop = gop, g_vh.stream = stream, g_vh.tag = tag;
+            g_vh.msg = k >= 0 ? g_fl[k].msg : 0;
+            g_vhs.reqs++;
+            vt_wait += t_ms() - t0;
+            if (g_vq.fail) { vh_reset(); return reply(s, VK_ERROR_FEATURE_NOT_PRESENT); }
+            size_t before = g_out.n;
+            if (g_vq.n) {
+                vr_buf *b = &g_vq.b[g_vq.head];
+                vr_put(&g_out, b->p, b->n);
+                g_vq.head = (g_vq.head + 1) % VQ_MAX;
+                g_vq.n--;
+            }
+            if (g_out.n > before) {
+                uint32_t f = 0;
+                memcpy(&f, g_out.p + before + 24, 4);
+                vbytes += g_out.n - before - VR_H264_HEAD;
+                vkeys += f & 1;
+                g_frames_total++;
+                if (++vn % 100 == 0)
+                    vlog("H.264（遅らせて写す）：%llu コマ・頼みで待つ %.1f ms・平均 %.1f KB・キーフレーム %llu 枚（100 コマあたり）",
+                         (unsigned long long) vn, vt_wait / 100, vbytes / 1024.0 / 100, (unsigned long long) vkeys),
+                        vt_wait = vt_join_ms = vt_enc = 0, vbytes = vkeys = 0;
+            }
+            return reply(s, 0);
+        }
+        // 遅らせない頼み：遅らせる形で覚えた物・縮め終わった物が残っていれば捨て、並びが崩れないようにキーフレームにする
+        if (vh_reset()) flags |= VR_H264_KEY;
+        drain_upto(last_with_mem(mid));
+        vt_wait += t_ms() - t0;
+        if (g_err != VK_SUCCESS) return reply(s, g_err);
+        ent *e = find(mid);
+        if (r->bad || !e || !e->map || w == 0 || h == 0 || w > 16384 || h > 16384 || stride < (uint64_t) w * 4 || off > e->size ||
+            (uint64_t) stride * h > e->size - off)
+            return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
         const uint8_t *src = (const uint8_t *) e->map + off;
         size_t before = g_out.n;
         if (flags & VR_H264_PIPE) {
@@ -4581,6 +4741,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_UPDATE_DESCRIPTOR_SETS: {
         VkDevice d = DEV(vr_ru64(r));
         uint32_t nw = vr_ru32(r);
+        g_bst.uds_msgs++;
         uint64_t dbg_prev = 0;
         for (uint32_t i = 0; i < nw; i++) {
             VkWriteDescriptorSet w = { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
@@ -4964,6 +5125,15 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             return 1;
         }
         VkFence f = OBJ(VkFence, vr_ru64(r));
+        if (g_vh.on) {
+            int uses = ncb_all > ncid; // 64 本を超えて覚えきれないときは、使うものとする
+            for (uint32_t k = 0; k < ncid && !uses; k++) {
+                cbinfo *c = cbi(cids[k], 0);
+                if (c && c->mems)
+                    for (uint32_t j = 0; j < c->mems->n; j++) if (c->mems->ids[j] == g_vh.mid) { uses = 1; break; }
+            }
+            if (uses) vh_before_mem(g_vh.mid, 0);
+        }
         // 同時に走らせる submit は 64 本まで（VKR_MAXFL=n で変える・0 なら上限なし）。
         // 代役の RTX で whisper を流すと、128 本では GPU を失い、64 本までなら通った。原因はまだわからない
         {
@@ -5897,14 +6067,19 @@ static void serve_client(vr_sock c) {
                 pos += 8;
                 if (ih[1] > raw - pos) { ok = 0; break; }
                 vr_rd r2 = { pk + pos, ih[1], 0, 0 };
+                double t0 = t_ms(), w0 = g_st.wait_ms;
                 if (!handle(c, ih[0], &r2)) ok = 0;
+                if (ih[0] < 128) { g_opt.n[ih[0]]++; g_opt.ms[ih[0]] += t_ms() - t0; g_opt.wait[ih[0]] += g_st.wait_ms - w0; }
                 pos += ih[1];
             }
             if (!ok) break;
             continue;
         }
         vr_rd r = { buf, h[1], 0, 0 };
-        if (!handle(c, h[0], &r)) break;
+        double t0 = t_ms(), w0 = g_st.wait_ms;
+        int hk = handle(c, h[0], &r);
+        if (h[0] < 128) { g_opt.n[h[0]]++; g_opt.ms[h[0]] += t_ms() - t0; g_opt.wait[h[0]] += g_st.wait_ms - w0; }
+        if (!hk) break;
     }
     free(buf);
     free(pk);
@@ -5916,6 +6091,31 @@ static void serve_client(vr_sock c) {
         vlog("この接続：縮めた平面 %llu 回・%.1f MB を %.1f MB にほどいた（%.2f 倍）・ほどくのに %.0f ms（1 回 %.2f ms）", (unsigned long long) g_pcs.n,
              g_pcs.in / 1e6, g_pcs.out / 1e6, g_pcs.in ? (double) g_pcs.out / (double) g_pcs.in : 0.0, g_pcs.ms, g_pcs.ms / (double) g_pcs.n);
     memset(&g_pcs, 0, sizeof g_pcs);
+    if (g_bst.memw || g_bst.spans_msgs || g_bst.uds_msgs)
+        vlog("この接続：書き込み 1 つずつ %llu 通・まとめて %llu 通（範囲 %llu）・descriptor の書き込み %llu 通（%llu 個・vkUpdateDescriptorSets %llu 回）",
+             (unsigned long long) g_bst.memw, (unsigned long long) g_bst.spans_msgs, (unsigned long long) g_bst.spans,
+             (unsigned long long) g_bst.uds_msgs, (unsigned long long) g_bst.uds_writes, (unsigned long long) g_bst.uds_calls);
+    memset(&g_bst, 0, sizeof g_bst);
+    {
+        // 主の糸が命令の処理にかけた時間（GPU を待った時間を除く）の上位 8 つ。命令の番号は proto.h（13 MEM_WRITE・26 ALLOC_DESCRIPTOR_SETS・28 UPDATE_DESCRIPTOR_SETS・121 MEM_WRITE_SPANS）
+        char line[600];
+        uint64_t tn = 0;
+        double tms = 0, tw = 0;
+        for (int i = 0; i < 128; i++) { tn += g_opt.n[i]; tms += g_opt.ms[i]; tw += g_opt.wait[i]; }
+        int at = snprintf(line, sizeof line, "命令の処理（主の糸・GPU を待った時間を除く）：全部 %llu 通 %.0f ms（待ち %.0f ms）・上位（番号:通:ms）", (unsigned long long) tn, tms - tw, tw);
+        int used[128] = { 0 };
+        for (int k = 0; k < 8; k++) {
+            int bi = -1;
+            for (int i = 0; i < 128; i++)
+                if (!used[i] && g_opt.n[i] && (bi < 0 || g_opt.ms[i] - g_opt.wait[i] > g_opt.ms[bi] - g_opt.wait[bi])) bi = i;
+            if (bi < 0) break;
+            used[bi] = 1;
+            at += snprintf(line + at, sizeof line - at, " %d:%llu:%.1f", bi, (unsigned long long) g_opt.n[bi], g_opt.ms[bi] - g_opt.wait[bi]);
+            if (at >= (int) sizeof line - 32) break;
+        }
+        if (tn) vlog("%s", line);
+        memset(&g_opt, 0, sizeof g_opt);
+    }
     if (g_st.waits) {
         char line[400];
         int at = snprintf(line, sizeof line, "GPU を待った命令（命令の番号:回数:ms）");
