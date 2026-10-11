@@ -634,7 +634,7 @@ struct CameraBridgeStatusRow: View {
     }
 
     private var text: String {
-        guard model.connected else { return L("PC を待っている", "Waiting for the PC") }
+        guard model.connected else { return L("PC の接続待ち", "Waiting for the PC") }
         return L("毎秒 \(String(format: "%.1f", model.fps)) コマ", "\(String(format: "%.1f", model.fps)) fps") + "・" + model.detail
     }
 }

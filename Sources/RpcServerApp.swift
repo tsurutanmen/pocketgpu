@@ -178,37 +178,37 @@ struct ContentView: View {
                     }
                     LabeledContent(L("電池", "Battery"), value: status.batteryText)
                     if status.lowPower {
-                        Text(L("低電力モードがオン。遅くなることがある", "Low Power Mode is on. It may run slower.")).font(.footnote)
+                        Text(L("低電力モードがオンです。処理が遅くなる場合があります", "Low Power Mode is on. It may run slower.")).font(.footnote)
                     }
                     Toggle(L("iPhone に出力", "Output to this iPhone"), isOn: $showFrames)
                         .onChange(of: showFrames) { _, on in preview.setOn(on) }
                     if showFrames {
-                        Toggle(L("全画面は横向きで固定", "Full screen: lock to landscape"), isOn: $fullLandscape)
+                        Toggle(L("全画面表示を横向きに固定する", "Full screen: lock to landscape"), isOn: $fullLandscape)
                         FramePreviewView(model: preview, status: status)
                     }
                     Toggle(L("PC の画面をミラー", "Mirror the PC screen"), isOn: $mirrorOn)
                         .onChange(of: mirrorOn) { _, on in setMirror(on) }
                     if mirrorOn {
                         if !showFrames {
-                            Toggle(L("全画面は横向きで固定", "Full screen: lock to landscape"), isOn: $fullLandscape)
+                            Toggle(L("全画面表示を横向きに固定する", "Full screen: lock to landscape"), isOn: $fullLandscape)
                         }
                         ScreenMirrorStatusRow(model: mirror)
                         ScreenMirrorView(model: mirror)
                     }
-                    Toggle(L("PC のスピーカーとマイクにする", "Use as PC speaker and mic"), isOn: $audioOn)
+                    Toggle(L("PC のスピーカーとマイクとして使う", "Use as PC speaker and mic"), isOn: $audioOn)
                         .onChange(of: audioOn) { _, on in AudioBridgeModel.shared.setOn(on) }
                     if audioOn {
-                        Toggle(L("イヤホンのマイクを使う（音質が下がる）", "Use the earphone mic (lower quality)"), isOn: $audioHeadsetMic)
+                        Toggle(L("イヤホンのマイクを使う。音質は下がります", "Use the earphone mic (lower quality)"), isOn: $audioHeadsetMic)
                         AudioBridgeStatusRow(model: AudioBridgeModel.shared)
                     }
-                    Toggle(L("iPhone をウェブカメラにする", "Use this iPhone as a webcam"), isOn: $webcamOn)
+                    Toggle(L("ウェブカメラとして使う", "Use this iPhone as a webcam"), isOn: $webcamOn)
                         .onChange(of: webcamOn) { _, on in setWebcam(on) }
                     if webcamOn {
-                        Toggle(L("ウェブカメラを Wi-Fi でもつなげる", "Webcam over Wi-Fi too"), isOn: $webcamWifi)
+                        Toggle(L("Wi-Fi でもウェブカメラに接続できるようにする", "Webcam over Wi-Fi too"), isOn: $webcamWifi)
                             .onChange(of: webcamWifi) { _, on in webcam.setWifi(on) }
                         if webcamWifi {
                             let ip = addrs.first(where: { $0.name == "en0" })?.ip ?? "?"
-                            Text(L("PC で：", "On the PC: ") + "webcam_rx --addr \(ip):50064 --code \(webcam.wifiCode)").font(.footnote.monospaced()).textSelection(.enabled)
+                            Text(L("PC で実行：", "On the PC: ") + "webcam_rx --addr \(ip):50064 --code \(webcam.wifiCode)").font(.footnote.monospaced()).textSelection(.enabled)
                         }
                         CameraBridgeStatusRow(model: webcam)
                     }
@@ -218,8 +218,8 @@ struct ContentView: View {
                 }
                 Section(L("この iPhone", "This iPhone")) {
                     Text(devices.isEmpty ? L("読み込み中", "Loading") : devices).font(.footnote.monospaced())
-                    Text(L("アプリが使えるメモリの残り：\(availMB) MB", "Memory available to the app: \(availMB) MB")).font(.footnote)
-                    Text(onCPU ? L("いまの計算：CPU", "Computing on: CPU") : L("いまの計算：GPU", "Computing on: GPU")).font(.footnote)
+                    Text(L("アプリが使用できる残りのメモリ：\(availMB) MB", "Memory available to the app: \(availMB) MB")).font(.footnote)
+                    Text(onCPU ? L("現在の計算：CPU", "Computing on: CPU") : L("現在の計算：GPU", "Computing on: GPU")).font(.footnote)
                 }
                 Section {
                     Picker(L("アドレス", "Address"), selection: $host) {
@@ -228,41 +228,41 @@ struct ContentView: View {
                         }
                     }
                     TextField(L("ポート", "Port"), text: $port).keyboardType(.numberPad)
-                    Toggle(L("GPU（Metal）で計算する", "Compute on the GPU (Metal)"), isOn: $useGPU)
-                    Toggle(L("USB でも待ち受ける", "Also listen over USB"), isOn: $usb)
-                    Toggle(L("インターネット共有でも待ち受ける", "Also listen on Personal Hotspot"), isOn: $hotspotListen)
-                    Toggle(L("バックグラウンドでも動かす", "Keep running in the background"), isOn: $keepAlive)
+                    Toggle(L("Metal の GPU で計算する", "Compute on the GPU (Metal)"), isOn: $useGPU)
+                    Toggle(L("USB でも接続を受け付ける", "Also listen over USB"), isOn: $usb)
+                    Toggle(L("インターネット共有でも接続を受け付ける", "Also listen on Personal Hotspot"), isOn: $hotspotListen)
+                    Toggle(L("バックグラウンドでも実行する", "Keep running in the background"), isOn: $keepAlive)
                         .onChange(of: keepAlive) { _, on in if running { on ? Keeper.shared.start() : Keeper.shared.stop() } }
                     Toggle(L("起動時に自動で開始", "Start automatically on launch"), isOn: $autoStart)
-                    Toggle(L("Metal 4 の tensor を使う・開き直すと効く", "Use Metal 4 tensors (applies after relaunch)"), isOn: $metalTensor)
+                    Toggle(L("Metal 4 の tensor を使用する。アプリの再起動後に有効になります", "Use Metal 4 tensors (applies after relaunch)"), isOn: $metalTensor)
                     Picker(L("言語", "Language"), selection: $lang) {
                         ForEach(AppLang.allCases) { l in Text(l.label).tag(l.rawValue) }
                     }
-                } header: { Text(L("待ち受け", "Listening")) }
+                } header: { Text(L("接続の受け付け", "Listening")) }
                 Section {
-                    Button(running ? L("実行中・停止はアプリを終了", "Running. Quit the app to stop") : L("開始", "Start")) {
+                    Button(running ? L("実行中です。停止するにはアプリを終了してください", "Running. Quit the app to stop") : L("開始", "Start")) {
                         if !host.isEmpty { start(host) }
                         if usb { start(usbHost) }
                     }
                     .disabled(running || (host.isEmpty && !usb))
                     if started.contains(host) {
-                        Text(L("PC で：", "On the PC: ") + "llama-cli … --rpc \(host):\(port)").font(.footnote.monospaced()).textSelection(.enabled)
+                        Text(L("PC で実行：", "On the PC: ") + "llama-cli … --rpc \(host):\(port)").font(.footnote.monospaced()).textSelection(.enabled)
                     }
                     if started.contains(usbHost) {
-                        Text(L("USB：usb_forward.py のあと", "USB: after usb_forward.py,") + " --rpc 127.0.0.1:50053").font(.footnote.monospaced()).textSelection(.enabled)
+                        Text(L("USB の場合は usb_forward.py の起動後に", "USB: after usb_forward.py,") + " --rpc 127.0.0.1:50053").font(.footnote.monospaced()).textSelection(.enabled)
                     }
                     if vkFailed {
-                        Text(L("Vulkan：起動に失敗（下のログの vk: を見る）", "Vulkan: failed to start (see the vk: lines in the log below)")).font(.footnote)
+                        Text(L("Vulkan の起動に失敗しました。下のログの vk: の行を確認してください", "Vulkan: failed to start (see the vk: lines in the log below)")).font(.footnote)
                     } else if vkStarted {
-                        Text(L("Vulkan：USB の 50060 番で待ち受け中", "Vulkan: listening on USB port 50060")).font(.footnote.monospaced()).textSelection(.enabled)
+                        Text(L("Vulkan：USB のポート 50060 で接続を受け付けています", "Vulkan: listening on USB port 50060")).font(.footnote.monospaced()).textSelection(.enabled)
                         if !linkHost.isEmpty {
-                            Text(L("Vulkan：インターネット共有の口 \(linkHost):50060 でも待ち受け中", "Vulkan: also listening on the tethering link \(linkHost):50060")).font(.footnote.monospaced()).textSelection(.enabled)
+                            Text(L("Vulkan：インターネット共有の \(linkHost):50060 でも接続を受け付けています", "Vulkan: also listening on the tethering link \(linkHost):50060")).font(.footnote.monospaced()).textSelection(.enabled)
                         }
                     }
                 }
                 #if PUMPKIN
                 Section {
-                    Button(mcRunning ? "実行中・停止はアプリを終了" : "マイクラのサーバーを始める") {
+                    Button(mcRunning ? "実行中です。停止するにはアプリを終了してください" : "マイクラのサーバーを開始") {
                         MinecraftServer.shared.start()
                         mcRunning = true
                     }

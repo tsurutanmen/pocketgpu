@@ -710,9 +710,9 @@ struct AudioBridgeStatusRow: View {
     private var text: String {
         guard model.connected else { return L("接続待ち", "Waiting") }
         var parts: [String] = []
-        if model.speakerActive { parts.append(L("スピーカー \(Int(model.fillMs)) ms ため", "Speaker \(Int(model.fillMs)) ms buffered")) }
+        if model.speakerActive { parts.append(L("スピーカーのバッファ \(Int(model.fillMs)) ms", "Speaker \(Int(model.fillMs)) ms buffered")) }
         if model.micActive { parts.append(L("マイク", "Mic")) }
-        if model.micWaitsForeground { parts.append(L("マイクはアプリを前に出すと始まる", "Mic starts when the app is in front")) }
+        if model.micWaitsForeground { parts.append(L("マイクはアプリを前面に表示すると開始します", "Mic starts when the app is in front")) }
         // いま音が出ている所と、マイクの音を取っている所（イヤホンの名前など）
         let route = AVAudioSession.sharedInstance().currentRoute
         if model.speakerActive, let out = route.outputs.first?.portName { parts.append(L("出力：\(out)", "Out: \(out)")) }
