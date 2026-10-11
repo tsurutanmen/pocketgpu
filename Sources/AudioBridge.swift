@@ -25,6 +25,34 @@ private enum IPA {
 
 // ---- 小さな道具 ----
 
+// マイクの許可。AVAudioApplication は iOS 17 から。それより前は AVAudioSession の同じ物（iOS 17 で非推奨）を使う
+// （あとで作る iOS 15 からのカメラとマイクだけの軽い版で、このファイルをそのまま使うため）
+private enum MicPermission {
+    case granted, denied, undetermined
+    static var current: MicPermission {
+        if #available(iOS 17.0, *) {
+            switch AVAudioApplication.shared.recordPermission {
+            case .granted: return .granted
+            case .denied: return .denied
+            default: return .undetermined
+            }
+        } else {
+            switch AVAudioSession.sharedInstance().recordPermission {
+            case .granted: return .granted
+            case .denied: return .denied
+            default: return .undetermined
+            }
+        }
+    }
+    static func request() {
+        if #available(iOS 17.0, *) {
+            AVAudioApplication.requestRecordPermission { _ in }
+        } else {
+            AVAudioSession.sharedInstance().requestRecordPermission { _ in }
+        }
+    }
+}
+
 private final class UnfairLock {
     private let p = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
     init() { p.initialize(to: os_unfair_lock()) }
@@ -277,9 +305,9 @@ final class AudioBridgeModel: ObservableObject {
     func setOn(_ v: Bool) {
         guard v != on else { return }
         on = v
-        if v, AVAudioApplication.shared.recordPermission == .undetermined {
+        if v, MicPermission.current == .undetermined {
             // 許可の確認は前にいる間に出す。許可されなければマイクは使えないがスピーカーは使える
-            AVAudioApplication.requestRecordPermission { _ in }
+            MicPermission.request()
         }
         queue.async { [weak self] in
             guard let self else { return }
@@ -444,12 +472,12 @@ final class AudioBridgeModel: ObservableObject {
         let wantMic = h.flags & IPA.fMic != 0
         let exclusive = h.flags & IPA.fExclusive != 0
         let fg = UIApplication.shared.applicationState == .active
-        let perm = AVAudioApplication.shared.recordPermission
+        let perm = MicPermission.current
         // マイクは前に出ているときしか始められない（後ろから新しく録りはじめるのは OS が断る）
         let micAllowed = wantMic && fg && perm == .granted
         var info = EngineInfo(speakerOK: false, micOK: false, needsForeground: wantMic && !fg, hwRate: 0, ioUs: 0, outUs: 0, inUs: 0)
         if wantMic && perm == .denied { log("音：マイクが許可されていない。設定アプリで許可すると使える") }
-        if wantMic && perm == .undetermined { AVAudioApplication.requestRecordPermission { _ in } }
+        if wantMic && perm == .undetermined { MicPermission.request() }
         if wantMic && !fg { queue.async { [weak self] in self?.wantMicLater = true }; micWaitsForeground = true }
         do { try configureSession(mic: micAllowed, exclusive: exclusive) } catch {
             log("音：セッションを始められない：\(error)")
@@ -699,12 +727,16 @@ final class AudioBridgeModel: ObservableObject {
 
 // ---- 画面（仮）----
 
-// 「状態」に出す 1 行
+// 「状態」に出す 1 行。iOS 15 でも使えるように LabeledContent（iOS 16 から）は使わない
 struct AudioBridgeStatusRow: View {
     @ObservedObject var model: AudioBridgeModel
 
     var body: some View {
-        LabeledContent(L("PC の音", "PC audio"), value: text)
+        HStack {
+            Text(L("PC の音", "PC audio"))
+            Spacer()
+            Text(text).foregroundColor(.secondary).multilineTextAlignment(.trailing)
+        }
     }
 
     private var text: String {

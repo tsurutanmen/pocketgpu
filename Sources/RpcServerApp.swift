@@ -165,6 +165,9 @@ struct ContentView: View {
     // ウェブカメラを Wi-Fi でもつなげる（合言葉つき）。CameraBridge が読む
     @AppStorage(CameraBridge.wifiKey) private var webcamWifi = false
     private let webcam = CameraBridge.shared
+    // GPU を使わずに、マイク・スピーカー・カメラだけに使う。オンの間は GPU の受け手（Vulkan の 50060・llama の rpc）を始めない。
+    // 「起動時に自動で開始」もしない。マイク・スピーカー（50063）とカメラ（50064）の口は、それぞれの切り替えのとおり
+    @AppStorage("micCamOnly") private var micCamOnly = false
     // 画面の言葉（自動・日本語・English）。ここで読むと、変えたときに画面が描き直される
     @AppStorage("lang") private var lang = AppLang.auto.rawValue
     @Environment(\.scenePhase) private var scenePhase
@@ -175,11 +178,20 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             Form {
-                // GPU のカード：ファンの数は機種で、回る速さは PC から来る仕事の量で変わる
-                Section { GPUCardView() }
+                if micCamOnly {
+                    // マイクとカメラだけのモード：何が動いているかを一番上に出す
+                    Section(L("マイクとカメラだけのモード", "Mic and camera only")) {
+                        MicCamSummaryView(audio: AudioBridgeModel.shared, camera: webcam, audioOn: audioOn, webcamOn: webcamOn, gpuRunning: running)
+                    }
+                } else {
+                    // GPU のカード：ファンの数は機種で、回る速さは PC から来る仕事の量で変わる
+                    Section { GPUCardView() }
+                }
                 Section(L("状態", "Status")) {
-                    LabeledContent(L("PC", "PC"), value: status.connected ? L("接続中", "Connected") : L("接続待ち", "Waiting"))
-                    LabeledContent(L("毎秒のコマ数", "Frames per second"), value: String(format: "%.1f", status.fps))
+                    if !micCamOnly {
+                        LabeledContent(L("PC", "PC"), value: status.connected ? L("接続中", "Connected") : L("接続待ち", "Waiting"))
+                        LabeledContent(L("フレームレート", "Frame rate"), value: String(format: "%.1f", status.fps))
+                    }
                     LabeledContent(L("温度", "Temperature")) {
                         HStack(spacing: 6) {
                             Circle().fill(status.thermalColor).frame(width: 8, height: 8)
@@ -214,6 +226,8 @@ struct ContentView: View {
                     Toggle(L("ウェブカメラとして使う", "Use this iPhone as a webcam"), isOn: $webcamOn)
                         .onChange(of: webcamOn) { _, on in setWebcam(on) }
                     if webcamOn {
+                        // カメラ・解像度・フレームレート・画質。PC が「おまかせ」にした項目に使う（CameraBridge.swift）
+                        CameraSettingsView(model: webcam)
                         Toggle(L("Wi-Fi でもウェブカメラに接続できるようにする", "Webcam over Wi-Fi too"), isOn: $webcamWifi)
                             .onChange(of: webcamWifi) { _, on in webcam.setWifi(on) }
                         if webcamWifi {
@@ -244,6 +258,7 @@ struct ContentView: View {
                     Toggle(L("バックグラウンドでも実行する", "Keep running in the background"), isOn: $keepAlive)
                         .onChange(of: keepAlive) { _, on in if running { on ? Keeper.shared.start() : Keeper.shared.stop() } }
                     Toggle(L("起動時に自動で開始", "Start automatically on launch"), isOn: $autoStart)
+                        .disabled(micCamOnly) // マイクとカメラだけのモードでは、自動でも GPU を始めない
                     Toggle(L("Metal 4 の tensor を使用する。アプリの再起動後に有効になります", "Use Metal 4 tensors (applies after relaunch)"), isOn: $metalTensor)
                     #if MVK_RT
                     Toggle(L("試験中のレイトレーシングを使用する。アプリの再起動後に有効になります", "Use experimental ray tracing (applies after relaunch)"), isOn: $rtExperimental)
@@ -256,11 +271,20 @@ struct ContentView: View {
                     }
                 } header: { Text(L("接続の受け付け", "Listening")) }
                 Section {
-                    Button(running ? L("実行中です。停止するにはアプリを終了してください", "Running. Quit the app to stop") : L("開始", "Start")) {
+                    Toggle(L("GPU を使わずにマイクとカメラだけ使う", "Use only the mic and camera, not the GPU"), isOn: $micCamOnly)
+                        .onChange(of: micCamOnly) { _, on in setMicCamOnly(on) }
+                    if micCamOnly {
+                        Text(running
+                             ? L("GPU の接続の受け付けは、アプリを終了すると止まります。次に開いたときは、マイクとカメラだけで始まります。", "GPU listening stops when you quit the app. Next time, only the mic and camera start.")
+                             : L("GPU の接続は受け付けません。マイク・スピーカー・カメラの接続だけを受け付けます。PC では Start-Mic-Camera.cmd を起動してください。", "GPU connections are not accepted. Only the mic, speaker, and camera accept connections. On the PC, open Start-Mic-Camera.cmd."))
+                            .font(.footnote)
+                    }
+                    Button(running ? L("実行中です。停止するにはアプリを終了してください", "Running. Quit the app to stop")
+                                   : micCamOnly ? L("マイクとカメラだけのモードでは GPU を開始しません", "The GPU does not start in mic and camera only mode") : L("開始", "Start")) {
                         if !host.isEmpty { start(host) }
                         if usb { start(usbHost) }
                     }
-                    .disabled(running || (host.isEmpty && !usb))
+                    .disabled(running || micCamOnly || (host.isEmpty && !usb))
                     if started.contains(host) {
                         Text(L("PC で実行：", "On the PC: ") + "llama-cli … --rpc \(host):\(port)").font(.footnote.monospaced()).textSelection(.enabled)
                     }
@@ -332,8 +356,8 @@ struct ContentView: View {
             log = readBridge { rpc_bridge_log($0, $1) }
             availMB = Int(os_proc_available_memory() / 1_048_576)
             onCPU = rpc_bridge_last_on_cpu() != 0
-            // USB はすぐ、Tailscale はつながるのを待って、自動で始める
-            if autoStart {
+            // USB はすぐ、Tailscale はつながるのを待って、自動で始める。マイクとカメラだけのモードでは始めない
+            if autoStart && !micCamOnly {
                 if usb { start(usbHost) }
                 if started.allSatisfy({ $0 == usbHost }) {
                     addrs = listAddresses()
@@ -366,7 +390,16 @@ struct ContentView: View {
         }
     }
 
+    // マイクとカメラだけのモードに入れたら、スピーカーとマイク・ウェブカメラもオンにする（GPU の受け手は始めない）。
+    // 切ったときは何も止めない（オンにした物は、それぞれの切り替えで止める）
+    private func setMicCamOnly(_ on: Bool) {
+        guard on else { return }
+        if !audioOn { audioOn = true; AudioBridgeModel.shared.setOn(true) }
+        if !webcamOn { webcamOn = true; setWebcam(true) }
+    }
+
     private func start(_ h: String) {
+        guard !micCamOnly else { return } // マイクとカメラだけのモードでは、GPU の受け手（llama の rpc・Vulkan）を始めない
         guard let p = Int32(port), !h.isEmpty, !started.contains(h) else { return }
         started.insert(h)
         UIApplication.shared.isIdleTimerDisabled = true // GPU を使えるのは前にいる間だけなので、画面はつけたままにする
@@ -389,5 +422,20 @@ struct ContentView: View {
             v.qualityOfService = .userInteractive // 省電力のコアに回されると、同じゲームが半分の速さになる
             v.start()
         }
+    }
+}
+
+// マイクとカメラだけのモードで、一番上に出す「何が動いているか」。音とカメラの接続の変化で描き直す
+struct MicCamSummaryView: View {
+    @ObservedObject var audio: AudioBridgeModel
+    @ObservedObject var camera: CameraBridge
+    let audioOn: Bool
+    let webcamOn: Bool
+    let gpuRunning: Bool
+
+    var body: some View {
+        LabeledContent(L("GPU", "GPU"), value: gpuRunning ? L("アプリを終了するまで動作します", "Runs until you quit the app") : L("使用していません", "Not in use"))
+        LabeledContent(L("スピーカーとマイク", "Speaker and mic"), value: !audioOn ? L("オフ", "Off") : audio.connected ? L("接続中", "Connected") : L("PC の接続待ち", "Waiting for the PC"))
+        LabeledContent(L("ウェブカメラ", "Webcam"), value: !webcamOn ? L("オフ", "Off") : camera.connected ? camera.detail : L("PC の接続待ち", "Waiting for the PC"))
     }
 }
