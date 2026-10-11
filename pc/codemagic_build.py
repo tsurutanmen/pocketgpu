@@ -1,6 +1,7 @@
 # Codemagic で iPhone の受け手を組み、IPA を取ってきて配り口（D:\iphone-rpc\ipa\serve）に置く。
 #   python codemagic_build.py            master を組む
 #   python codemagic_build.py --fetch ID 組み終わった ID の IPA を取ってくるだけ
+#   python codemagic_build.py --workflow ios-lite   古い iPhone 用の PocketCam を組む
 # トークンは D:\iphone-rpc\secrets\codemagic_token.txt（リポジトリの外）。記録には出さない
 import argparse, json, os, sys, time, urllib.request, zipfile, plistlib, shutil
 
@@ -50,12 +51,18 @@ def fetch(b):
     with urllib.request.urlopen(req, timeout=300) as r, open(tmp, "wb") as f:
         shutil.copyfileobj(r, f)
     z = zipfile.ZipFile(tmp)
-    info = plistlib.loads(z.read([n for n in z.namelist() if n.endswith(".app/Info.plist")][0]))
+    plist = [n for n in z.namelist() if n.endswith(".app/Info.plist") and n.count("/") == 2][0]
+    info = plistlib.loads(z.read(plist))
     z.close()
     ver, num = info.get("CFBundleShortVersionString"), info.get("CFBundleVersion")
-    d = os.path.join(IPA_DIR, "dl" + ver.replace(".", ""))  # 0.7.29 → dl0729（Actions のときと同じ名前）
+    app = plist.split("/")[1][:-4]  # Payload/PocketCam.app/Info.plist → PocketCam
+    if app == "PocketCam":
+        d = os.path.join(IPA_DIR, "pocketcam" + ver.replace(".", ""))
+        name = f"PocketCam-{ver}.ipa"
+    else:
+        d = os.path.join(IPA_DIR, "dl" + ver.replace(".", ""))  # 0.7.29 → dl0729（Actions のときと同じ名前）
+        name = f"RpcServer-{ver}.ipa"
     os.makedirs(d, exist_ok=True)
-    name = f"RpcServer-{ver}.ipa"
     shutil.move(tmp, os.path.join(d, name))
     shutil.copy(os.path.join(d, name), os.path.join(IPA_DIR, "serve", name))
     # 配り口の住所はリポジトリに書かない。環境変数 IPA_URL_BASE か、secrets の ipa_url_base.txt から読む
@@ -68,10 +75,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fetch", help="組み終わった build の ID")
     ap.add_argument("--branch", default="master")
+    ap.add_argument("--workflow", default=WORKFLOW)
     a = ap.parse_args()
     if a.fetch:
         return fetch(call("GET", f"/builds/{a.fetch}").get("build", {}))
-    r = call("POST", "/builds", {"appId": APP, "workflowId": WORKFLOW, "branch": a.branch})
+    r = call("POST", "/builds", {"appId": APP, "workflowId": a.workflow, "branch": a.branch})
     bid = r.get("buildId")
     print("build", bid, flush=True)
     if not bid:

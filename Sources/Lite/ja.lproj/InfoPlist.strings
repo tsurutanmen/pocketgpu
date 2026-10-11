@@ -1,0 +1,4 @@
+/* PocketCam：カメラ・マイク・ローカルネットワークの許可を聞くときに iOS が出す文（日本語）。英語は en.lproj */
+"NSCameraUsageDescription" = "この iPhone のカメラを PC のウェブカメラとして使うために使用します";
+"NSMicrophoneUsageDescription" = "PC の通話や録音で、この iPhone のマイクの音を使うために使用します";
+"NSLocalNetworkUsageDescription" = "Wi-Fi で PC からウェブカメラに接続できるようにするために使用します";

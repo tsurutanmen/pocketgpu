@@ -21,13 +21,15 @@ targets:
     platform: iOS
     sources:
       - path: Sources
+        # 古い iPhone 用の軽いアプリ PocketCam だけのファイル（C の関数の代わり・@main・Info.plist）は入れない
+        excludes: ["Lite", "Lite/**"]
       # Vulkan の命令の受け手（PC 側のドライバは vk/icd）
       - path: vk/remote
         includes: ["server.c", "bw.c", "proto.h", "wire.h", "video.h"]
     info:
       path: Sources/Info.plist
       properties:
-        CFBundleDisplayName: 計算の受け手
+        CFBundleDisplayName: PocketGPU
         CFBundleShortVersionString: "0.7.55"
         CFBundleVersion: "63"
         UILaunchScreen: {}
@@ -84,3 +86,36 @@ targets:
       - sdk: VideoToolbox.framework
       - sdk: CoreMedia.framework
       - sdk: CoreVideo.framework
+  # 古い iPhone（iOS 15・16。iPhone 8 など）用の軽いアプリ。iPhone を PC のウェブカメラとマイクとしてだけ使う。
+  # 入れるのは CameraBridge.swift・AudioBridge.swift・Lang.swift と Sources/Lite だけ。GPU の機能・llama.cpp・MoltenVK・AI のパッケージは入れない。
+  # PC 側は本体と同じ（USB の 50064 番と 50063 番）。組み方は ci/build_lite.sh（Codemagic の ios-lite）
+  PocketCam:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Sources
+        includes: ["CameraBridge.swift", "AudioBridge.swift", "Lang.swift"]
+      # C の関数の代わり・画面・権限の文の日英（ja.lproj・en.lproj の InfoPlist.strings）
+      - path: Sources/Lite
+    info:
+      path: Sources/Lite/Info.plist
+      properties:
+        CFBundleDisplayName: PocketCam
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        NSCameraUsageDescription: この iPhone のカメラを PC のウェブカメラとして使うために使用します
+        NSMicrophoneUsageDescription: PC の通話や録音で、この iPhone のマイクの音を使うために使用します
+        NSLocalNetworkUsageDescription: Wi-Fi で PC からウェブカメラに接続できるようにするために使用します
+        # 接続中は、画面を消してもほかのアプリに切り替えても、マイクとスピーカーを続ける（カメラは iOS が止める）
+        UIBackgroundModes: [audio]
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tsurutanmen.pocketcam
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+        CODE_SIGN_IDENTITY: ""

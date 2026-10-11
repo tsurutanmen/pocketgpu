@@ -1,0 +1,4 @@
+/* PocketCam: the text iOS shows when it asks for camera, microphone, and local network access (English). Japanese is in ja.lproj */
+"NSCameraUsageDescription" = "Used to make this iPhone's camera a webcam for your PC.";
+"NSMicrophoneUsageDescription" = "Used to send this iPhone's microphone sound to calls and recordings on your PC.";
+"NSLocalNetworkUsageDescription" = "Used to let your PC connect to the webcam over Wi-Fi.";

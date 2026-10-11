@@ -614,8 +614,16 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private func makeEncoder(w: Int, h: Int, fps: Int, kbps: Int, gop: Int) -> VTCompressionSession? {
         var s: VTCompressionSession?
         let spec = [kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String: true] as CFDictionary
-        let st = VTCompressionSessionCreate(allocator: nil, width: Int32(w), height: Int32(h), codecType: kCMVideoCodecType_H264, encoderSpecification: spec,
+        var st = VTCompressionSessionCreate(allocator: nil, width: Int32(w), height: Int32(h), codecType: kCMVideoCodecType_H264, encoderSpecification: spec,
                                             imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &s)
+        if st != noErr || s == nil {
+            // 低遅延のモードを持つエンコーダが無いとき（古い iPhone の軽いアプリ PocketCam のため）は、ふつうのエンコーダで作り直す。
+            // 低遅延で作れる機種ではここを通らないので、動きは前と同じ
+            log("ウェブカメラ：低遅延のエンコーダを作れない（\(st)）。ふつうのエンコーダで作る")
+            s = nil
+            st = VTCompressionSessionCreate(allocator: nil, width: Int32(w), height: Int32(h), codecType: kCMVideoCodecType_H264, encoderSpecification: nil,
+                                            imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &s)
+        }
         guard st == noErr, let s else { log("ウェブカメラ：エンコーダを作れない（\(st)）"); return nil }
         func set(_ k: CFString, _ v: CFTypeRef) { _ = VTSessionSetProperty(s, key: k, value: v) }
         set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
