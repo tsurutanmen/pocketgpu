@@ -22,6 +22,8 @@ struct RpcServerApp: App {
         b.start()
         // Apple の機能（文字認識など）を Windows から使う受け口（50057 番。PC は app/pc/apple_ocr.py）
         AppleFeatures.shared.start()
+        // 重い圧縮を PC から頼まれる口（Compress.swift。USB の 50065 番。PC は iphone_compress.py）
+        CompressService.shared.start()
     }
     var body: some Scene { WindowGroup { ContentView() } }
 }
@@ -144,6 +146,9 @@ struct ContentView: View {
     private let mirror = ScreenMirrorModel.shared
     // この iPhone を PC のスピーカーとマイクにする（AudioBridge.swift。PC は ipaudio.exe）。オンの間だけ USB の 50063 番で待つ
     @AppStorage("audioBridge") private var audioOn = false
+    // iPhone のカメラを PC のウェブカメラにする（CameraBridge.swift。PC は webcam_rx.exe）。オンの間だけ USB の 50064 番で待つ
+    @AppStorage("webcam") private var webcamOn = false
+    private let webcam = CameraBridge.shared
     // 画面の言葉（自動・日本語・English）。ここで読むと、変えたときに画面が描き直される
     @AppStorage("lang") private var lang = AppLang.auto.rawValue
     @Environment(\.scenePhase) private var scenePhase
@@ -188,6 +193,11 @@ struct ContentView: View {
                         .onChange(of: audioOn) { _, on in AudioBridgeModel.shared.setOn(on) }
                     if audioOn {
                         AudioBridgeStatusRow(model: AudioBridgeModel.shared)
+                    }
+                    Toggle(L("iPhone をウェブカメラにする", "Use this iPhone as a webcam"), isOn: $webcamOn)
+                        .onChange(of: webcamOn) { _, on in setWebcam(on) }
+                    if webcamOn {
+                        CameraBridgeStatusRow(model: webcam)
                     }
                     ShareLink(item: diagnosticsText(status: status, log: log)) {
                         Label(L("ログを送信", "Send logs"), systemImage: "square.and.arrow.up")
@@ -263,6 +273,7 @@ struct ContentView: View {
             preview.setOn(showFrames)
             setMirror(mirrorOn)
             AudioBridgeModel.shared.setOn(audioOn)
+            setWebcam(webcamOn)
         }
         .onChange(of: scenePhase) { _, phase in
             // 後ろに回ると GPU が使えない。前に戻ったら GPU に戻す
@@ -275,6 +286,7 @@ struct ContentView: View {
             vkr_set_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
             status.tick()
             mirror.tick()
+            webcam.tick()
             // 設定が入っていれば、インターネット共有の網の口が出たら、そこでも待つ（消えたら・設定を切ったら閉じる）
             if vkStarted && !vkFailed {
                 let cap = 64
@@ -310,7 +322,17 @@ struct ContentView: View {
         // 映している間は画面を消さない。受け手が動いている間は受け手がつけたままにしているので、そのままにする
         if on {
             UIApplication.shared.isIdleTimerDisabled = true
-        } else if !running {
+        } else if !running && !webcamOn {
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
+    }
+
+    private func setWebcam(_ on: Bool) {
+        webcam.setOn(on)
+        // カメラを使う間は画面を消さない（iOS は、アプリが前にいない間はカメラを使わせない）
+        if on {
+            UIApplication.shared.isIdleTimerDisabled = true
+        } else if !running && !mirrorOn {
             UIApplication.shared.isIdleTimerDisabled = false
         }
     }
