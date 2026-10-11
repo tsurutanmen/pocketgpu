@@ -1,4 +1,10 @@
 name: RpcServer
+# 文字起こしの WhisperKit と読み上げの TTSKit。Argmax の argmax-oss-swift で、MIT。版は 1.1.1 に固定する
+# モデルはアプリに入れない。初回に iPhone が Hugging Face から落とす
+packages:
+  ArgmaxOSS:
+    url: https://github.com/argmaxinc/argmax-oss-swift
+    exactVersion: "1.1.1"
 options:
   bundleIdPrefix: com.tsurutanmen
   deploymentTarget:
@@ -16,8 +22,8 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: 計算の受け手
-        CFBundleShortVersionString: "0.7.50"
-        CFBundleVersion: "58"
+        CFBundleShortVersionString: "0.7.51"
+        CFBundleVersion: "59"
         UILaunchScreen: {}
         NSLocalNetworkUsageDescription: PC からの計算の依頼を受け取るために使います
         NSSpeechRecognitionUsageDescription: PC から送られた音声を文字にするために使います
@@ -47,6 +53,11 @@ targets:
         CODE_SIGNING_REQUIRED: "NO"
         CODE_SIGN_IDENTITY: ""
     dependencies:
+      # Sources/WhisperKitBridge.swift と TTSKitBridge.swift が canImport で使う。SpeakerKit と道具の argmax-cli は入れない
+      - package: ArgmaxOSS
+        product: WhisperKit
+      - package: ArgmaxOSS
+        product: TTSKit
       - sdk: Metal.framework
       - sdk: Accelerate.framework
       - sdk: Foundation.framework

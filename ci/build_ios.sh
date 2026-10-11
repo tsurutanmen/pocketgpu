@@ -55,9 +55,21 @@ command -v xcodegen > /dev/null || brew install xcodegen
 xcodegen generate
 
 set -o pipefail
-xcodebuild -project RpcServer.xcodeproj -scheme RpcServer -configuration Release \
+# Swift Package（project.yml の packages）を先に取りに行く。取れないときや版が合わないときの誤りはここで出る
+xcodebuild -resolvePackageDependencies -project RpcServer.xcodeproj -scheme RpcServer -derivedDataPath dd
+# 実際に決まった版（argmax-oss-swift 1.1.1・ml-stable-diffusion 1.1.1 になっているか）
+cat RpcServer.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved 2> /dev/null || true
+# 記録は build.log に全部残す。tail だけだと最初の誤りが切れるので、失敗したら error の行を先に出す
+if ! xcodebuild -project RpcServer.xcodeproj -scheme RpcServer -configuration Release \
     -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath dd \
-    CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" ${EXTRA[@]+"${EXTRA[@]}"} build | tail -60
+    CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" ${EXTRA[@]+"${EXTRA[@]}"} build > build.log 2>&1; then
+    grep -n -E "error:|unsafe build flags|cannot be used as a dependency" build.log | head -80 || true
+    tail -40 build.log
+    exit 1
+fi
+tail -60 build.log
+# Swift Package を入れた分の大きさを段ごとに比べるため
+ls -la dd/Build/Products/Release-iphoneos/RpcServer.app/RpcServer
 rm -rf Payload RpcServer.ipa
 mkdir -p Payload && cp -R dd/Build/Products/Release-iphoneos/RpcServer.app Payload/
 # メモリの上限を上げる許可を付けて仮の署名をしておく（AltStore が署名し直すときに引き継ぐ）

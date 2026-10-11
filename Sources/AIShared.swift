@@ -4,6 +4,7 @@ import CoreGraphics
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
+import os
 
 final class AIBox<T>: @unchecked Sendable {
     var value: T?
@@ -33,6 +34,23 @@ enum AIShared {
         if let e = box.error { throw e }
         guard let v = box.value else { throw AIError("答えが空") }
         return v
+    }
+
+    // 重いモデルを読む前に、iOS がいまこのアプリに許すメモリの空きを見て、足りなければ投げる。
+    // Vulkan の受け手（vk/remote/server.c）は確保のたびにこの値を見て断れるが、Core ML の読み込みは見ずに取るので、
+    // 超えるとアプリごと止められて Vulkan の仕事も切れる。needMB は仮の値。0 が返る所（シミュレーター）では見ない
+    static func checkMemory(needMB: Int, what: String) throws {
+        let avail = Int(os_proc_available_memory()) >> 20
+        if avail > 0, avail < needMB {
+            throw AIError("メモリの空きが足りません。\(what)に \(needMB) MB 必要ですが、いまの空きは \(avail) MB です", code: "low_memory")
+        }
+    }
+
+    // 失敗の答え。AIError に code があれば付ける（PC はこの名前で HTTP の番号を決める）
+    static func failure(_ prefix: String, _ error: Error) -> [String: Any] {
+        var r: [String: Any] = ["error": prefix + error.localizedDescription]
+        if let e = error as? AIError, let code = e.code { r["code"] = code }
+        return r
     }
 
     // JSONSerialization は NaN と無限大で落ちる（例外なので try? でも防げない）。0 にして 1 ms に丸める

@@ -20,3 +20,5 @@ workflows:
         script: bash ci/build_ios.sh
     artifacts:
       - RpcServer.ipa
+      # 組んだときの記録の全部（ci/build_ios.sh が書く）
+      - build.log
