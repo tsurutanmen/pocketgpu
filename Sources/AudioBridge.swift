@@ -423,7 +423,10 @@ final class AudioBridgeModel: ObservableObject {
     private func configureSession(mic: Bool, exclusive: Bool) throws {
         let s = AVAudioSession.sharedInstance()
         if mic {
-            var o: AVAudioSession.CategoryOptions = [.defaultToSpeaker]
+            // iPhone につないだイヤホンがあれば、そこへ出す（AirPods などは A2DP で音質を保つ）。
+            // 「イヤホンのマイクを使う」なら Bluetooth の通話の形（HFP）にして、イヤホンのマイクを取る。そのときは音質が下がる
+            var o: AVAudioSession.CategoryOptions = [.defaultToSpeaker, .allowBluetoothA2DP]
+            if UserDefaults.standard.bool(forKey: "audioHeadsetMic") { o.insert(.allowBluetooth) }
             if !exclusive { o.insert(.mixWithOthers) }
             try s.setCategory(.playAndRecord, mode: .default, options: o)
         } else {
@@ -710,6 +713,10 @@ struct AudioBridgeStatusRow: View {
         if model.speakerActive { parts.append(L("スピーカー \(Int(model.fillMs)) ms ため", "Speaker \(Int(model.fillMs)) ms buffered")) }
         if model.micActive { parts.append(L("マイク", "Mic")) }
         if model.micWaitsForeground { parts.append(L("マイクはアプリを前に出すと始まる", "Mic starts when the app is in front")) }
+        // いま音が出ている所と、マイクの音を取っている所（イヤホンの名前など）
+        let route = AVAudioSession.sharedInstance().currentRoute
+        if model.speakerActive, let out = route.outputs.first?.portName { parts.append(L("出力：\(out)", "Out: \(out)")) }
+        if model.micActive, let inp = route.inputs.first?.portName { parts.append(L("マイク：\(inp)", "Mic: \(inp)")) }
         return parts.isEmpty ? L("接続中", "Connected") : parts.joined(separator: L("・", ", "))
     }
 }

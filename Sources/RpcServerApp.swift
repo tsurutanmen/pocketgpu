@@ -148,8 +148,12 @@ struct ContentView: View {
     private let mirror = ScreenMirrorModel.shared
     // この iPhone を PC のスピーカーとマイクにする（AudioBridge.swift。PC は ipaudio.exe）。オンの間だけ USB の 50063 番で待つ
     @AppStorage("audioBridge") private var audioOn = false
+    // iPhone につないだ Bluetooth のイヤホンのマイクを使う（音質が下がる）。AudioBridge が読む
+    @AppStorage("audioHeadsetMic") private var audioHeadsetMic = false
     // iPhone のカメラを PC のウェブカメラにする（CameraBridge.swift。PC は webcam_rx.exe）。オンの間だけ USB の 50064 番で待つ
     @AppStorage("webcam") private var webcamOn = false
+    // ウェブカメラを Wi-Fi でもつなげる（合言葉つき）。CameraBridge が読む
+    @AppStorage(CameraBridge.wifiKey) private var webcamWifi = false
     private let webcam = CameraBridge.shared
     // 画面の言葉（自動・日本語・English）。ここで読むと、変えたときに画面が描き直される
     @AppStorage("lang") private var lang = AppLang.auto.rawValue
@@ -194,11 +198,18 @@ struct ContentView: View {
                     Toggle(L("PC のスピーカーとマイクにする", "Use as PC speaker and mic"), isOn: $audioOn)
                         .onChange(of: audioOn) { _, on in AudioBridgeModel.shared.setOn(on) }
                     if audioOn {
+                        Toggle(L("イヤホンのマイクを使う（音質が下がる）", "Use the earphone mic (lower quality)"), isOn: $audioHeadsetMic)
                         AudioBridgeStatusRow(model: AudioBridgeModel.shared)
                     }
                     Toggle(L("iPhone をウェブカメラにする", "Use this iPhone as a webcam"), isOn: $webcamOn)
                         .onChange(of: webcamOn) { _, on in setWebcam(on) }
                     if webcamOn {
+                        Toggle(L("ウェブカメラを Wi-Fi でもつなげる", "Webcam over Wi-Fi too"), isOn: $webcamWifi)
+                            .onChange(of: webcamWifi) { _, on in webcam.setWifi(on) }
+                        if webcamWifi {
+                            let ip = addrs.first(where: { $0.name == "en0" })?.ip ?? "?"
+                            Text(L("PC で：", "On the PC: ") + "webcam_rx --addr \(ip):50064 --code \(webcam.wifiCode)").font(.footnote.monospaced()).textSelection(.enabled)
+                        }
                         CameraBridgeStatusRow(model: webcam)
                     }
                     ShareLink(item: diagnosticsText(status: status, log: log)) {

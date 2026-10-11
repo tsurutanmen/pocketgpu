@@ -30,6 +30,9 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     @Published private(set) var connected = false
     @Published private(set) var fps = 0.0
     @Published private(set) var detail = "" // 例：1920×1080・30 コマ/秒・背面
+    // Wi-Fi でつなぐときの合言葉（起動のたびに変わる 6 けた）。PC は webcam_rx --addr iPhoneの住所:50064 --code これ
+    let wifiCode = UInt32.random(in: 100_000...999_999)
+    static let wifiKey = "webcamWifi"
 
     private var on = false
     private var lastTick = Date()
@@ -39,7 +42,10 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     // ここから下は q の上だけで触る
     private let q = DispatchQueue(label: "camera-bridge", qos: .userInitiated)
     private var listener: NWListener?
+    private var wifiListener: NWListener? // 設定で入れたときだけ。Wi-Fi の口で待ち、合言葉を確かめる
+    private var wifiMisses = 0              // 合言葉の違いが 5 回続いたら Wi-Fi の口を閉じる（当てずっぽうを止める）
     private var conn: NWConnection?
+    private var connRemote = false
     private var connID = 0
     private var listening = false
     private var failNoted = false
@@ -92,7 +98,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             guard let self else { return }
             self.appActive = active
             self.listening = v
-            if v { self.listen() } else { self.close() }
+            if v { self.listen(); self.listenWifi() } else { self.close() }
         }
     }
 
@@ -157,14 +163,51 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             l.cancel()
             log("ウェブカメラの口を閉じた")
         }
+        closeWifi()
         failNoted = false
     }
 
+    // 画面の糸から呼ぶ。Wi-Fi でも待つかを切り替える（ウェブカメラがオンの間だけ効く）
+    func setWifi(_ v: Bool) {
+        q.async { [weak self] in
+            guard let self else { return }
+            if v && self.listening { self.wifiMisses = 0; self.listenWifi() } else if !v { self.closeWifi() }
+        }
+    }
+
+    private func listenWifi() {
+        guard listening, wifiListener == nil, UserDefaults.standard.bool(forKey: Self.wifiKey), let p = NWEndpoint.Port(rawValue: Self.port) else { return }
+        let params = NWParameters.tcp
+        params.requiredInterfaceType = .wifi // Wi-Fi の口だけ。合言葉の無い頼みは断る
+        params.allowLocalEndpointReuse = true
+        guard let l = try? NWListener(using: params, on: p) else { log("ウェブカメラ：Wi-Fi の口を開けない"); return }
+        l.stateUpdateHandler = { [weak self, weak l] st in
+            guard let self, let l, l === self.wifiListener else { return }
+            if case .ready = st { self.log("ウェブカメラ：Wi-Fi の \(Self.port) 番でも待っている（合言葉つき）") }
+            if case .failed = st { self.wifiListener = nil; l.cancel() }
+        }
+        l.newConnectionHandler = { [weak self, weak l] c in
+            guard let self, let l, l === self.wifiListener else { c.cancel(); return }
+            self.accept(c, remote: true)
+        }
+        wifiListener = l
+        l.start(queue: q)
+    }
+
+    private func closeWifi() {
+        if let l = wifiListener {
+            wifiListener = nil
+            l.cancel()
+            log("ウェブカメラ：Wi-Fi の口を閉じた")
+        }
+    }
+
     // 一度に 1 本。新しいつなぎが来たら、古い方を切る（PC の橋渡しを開き直したとき、切れ残りを待たない）
-    private func accept(_ c: NWConnection) {
+    private func accept(_ c: NWConnection, remote: Bool = false) {
         if let old = conn { drop(old) }
         connID += 1
         conn = c
+        connRemote = remote
         c.stateUpdateHandler = { [weak self, weak c] st in
             guard let self, let c else { return }
             switch st {
@@ -221,6 +264,17 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private func handle(_ c: NWConnection, _ type: UInt32, _ body: [UInt8]) {
         switch type {
         case Msg.hello where body.count >= 32:
+            if connRemote {
+                guard body.count >= 36, Self.u32(body, 32) == wifiCode else {
+                    wifiMisses += 1
+                    log("ウェブカメラ：Wi-Fi の合言葉が違う（\(wifiMisses) 回目）")
+                    sendAck(status: 6, w: 0, h: 0, fps: 0, kbps: 0, camera: 0)
+                    q.asyncAfter(deadline: .now() + 0.2) { [weak self] in if let self, c === self.conn { self.drop(c) } }
+                    if wifiMisses >= 5 { closeWifi() }
+                    return
+                }
+                wifiMisses = 0
+            }
             let f = (0..<8).map { Self.u32(body, $0 * 4) } // version, width, height, fps, kbps, gop, camera, flags
             startSession(c, version: f[0], width: Int(f[1]), height: Int(f[2]), fps: Int(f[3]), kbps: Int(f[4]), gop: Int(f[5]), camera: f[6], flags: f[7])
         case Msg.reqKey:
