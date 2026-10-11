@@ -252,7 +252,7 @@ struct ContentView: View {
                         Text(L("USB の場合は usb_forward.py の起動後に", "USB: after usb_forward.py,") + " --rpc 127.0.0.1:50053").font(.footnote.monospaced()).textSelection(.enabled)
                     }
                     if vkFailed {
-                        Text(L("Vulkan の起動に失敗しました。下のログの vk: の行を確認してください", "Vulkan: failed to start (see the vk: lines in the log below)")).font(.footnote)
+                        Text(L("Vulkan の起動に失敗しました。下のログの vk: の行をチェックしてください", "Vulkan: failed to start (see the vk: lines in the log below)")).font(.footnote)
                     } else if vkStarted {
                         Text(L("Vulkan：USB のポート 50060 で接続を受け付けています", "Vulkan: listening on USB port 50060")).font(.footnote.monospaced()).textSelection(.enabled)
                         if !linkHost.isEmpty {
