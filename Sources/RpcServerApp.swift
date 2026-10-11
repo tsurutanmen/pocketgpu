@@ -34,6 +34,8 @@ struct RpcServerApp: App {
         AppleFeatures.shared.start()
         // 重い圧縮を PC から頼まれる口（Compress.swift。USB の 50065 番。PC は iphone_compress.py）
         CompressService.shared.start()
+        // iPhone の写真と動画を PC へ送る口（PhotoTransfer.swift。USB の 50066 番はいつも待ち、Wi-Fi は画面の切り替えのとおり。PC は photo_rx.exe）
+        PhotoTransfer.shared.start()
     }
     var body: some Scene { WindowGroup { ContentView() } }
 }
@@ -121,7 +123,7 @@ func readBridge(_ f: (UnsafeMutablePointer<CChar>, Int32) -> Int32) -> String {
     return String(cString: buf)
 }
 
-// 画面は下のタブで 4 つに分ける（案 A）：ホーム・カメラ・音と字幕・設定。
+// 画面は下のタブで 5 つに分ける（案 A に「PC に送る」を足した）：ホーム・PC に送る・カメラ・音と字幕・設定。
 // 状態と切り替えの値はここにまとめて持ち、どのタブも同じ値を見る。ホームとタブの両方に同じ切り替えがあるので、
 // 切り替えたときの処理（setWebcam など）は切り替えの所ではなく、タブの外側の onChange で 1 回だけ呼ぶ
 struct ContentView: View {
@@ -183,6 +185,9 @@ struct ContentView: View {
         TabView {
             homeTab
                 .tabItem { Label(L("ホーム", "Home"), systemImage: "house") }
+            // iPhone の写真と動画を PC へ送る（PhotoTransfer.swift）
+            PhotoTransferView()
+                .tabItem { Label(L("PC に送る", "Send to PC"), systemImage: "photo.on.rectangle.angled") }
             cameraTab
                 .tabItem { Label(L("カメラ", "Camera"), systemImage: "camera") }
             audioTab
