@@ -37,7 +37,17 @@
 #include <pthread.h>
 #include <unistd.h>
 #endif
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #include "video.h"
+
+// iPhone では受け手の糸を速いコアに置いてもらう。既定の糸は省電力のコアに回されることがあり、同じ Heaven が毎秒 58 と 32 に分かれた
+static void qos_hi(void) {
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+}
 #ifdef __ANDROID__
 #include <android/log.h>
 // Android には ImageIO も WIC も無いので、JPEG は stb_image_write（public domain / MIT・https://github.com/nothings/stb）の小さな書き手で縮める
@@ -2127,6 +2137,7 @@ static DWORD WINAPI jp_thread(LPVOID a) {
 #else
 static void *jp_thread(void *a) {
     (void) a;
+    qos_hi();
     jp_encode();
     return NULL;
 }
@@ -2961,6 +2972,7 @@ static DWORD WINAPI vp_thread(LPVOID a) {
 #else
 static void *vp_thread(void *a) {
     (void) a;
+    qos_hi();
     vp_encode();
     return NULL;
 }
@@ -5117,6 +5129,7 @@ static DWORD WINAPI extra_thread(LPVOID p) {
 #else
 static void *extra_thread(void *p) {
 #endif
+    qos_hi();
     vr_sock ls = (vr_sock) (uintptr_t) p;
     for (;;) {
         vr_sock c = accept(ls, NULL, NULL);
@@ -5199,6 +5212,7 @@ int vkr_listen_extra(const char *host) {
 }
 
 int vkr_serve(const char *host, int port) {
+    qos_hi();
     if (!vk_init()) { vlog("Vulkan を起動できない"); return 1; }
     g_main_port = port;
     if (g_extra_env) vkr_listen_extra(g_extra_env);

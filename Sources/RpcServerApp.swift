@@ -323,6 +323,7 @@ struct ContentView: View {
                 DispatchQueue.main.async { vkFailed = true }
             }
             v.stackSize = 8 << 20
+            v.qualityOfService = .userInteractive // 省電力のコアに回されると、同じゲームが半分の速さになる
             v.start()
         }
     }
