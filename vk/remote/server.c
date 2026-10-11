@@ -156,6 +156,9 @@ static int rec_available(void);        // 録画できるか（record.h）
 // 空の descriptor（robustness2 の nullDescriptor）を GPU が持つか。持てば装置を作るときに有効にする。
 // 持たなければ（MoltenVK）、空の頂点バッファだけは 0 で埋めた代わりのバッファに差し替える
 static int g_nulldesc_gpu;
+// 調べ用（ffhang）：VKR_HANG_NULLDESC=1 で iPhone のふりでも GPU の本物の空の descriptor を使う。VKR_HANG_ROBUST2=1 で robustBufferAccess2・robustImageAccess2 を有効にする
+static int hang_env(const char *k) { const char *e = getenv(k); return e && *e == '1'; }
+static int g_hang_subst[8]; // 代わりの物に差し替えた数（0 texel・1 画像・2 buffer・3 頂点）
 static int g_divisor; // GPU が VK_EXT_vertex_attribute_divisor を持つ
 // 試験用（Android 版）：VKR_FAKE_DIVISOR=1 なら、GPU が VK_EXT_vertex_attribute_divisor を持たなくても持つと名乗る。
 // Android エミュレーターの Vulkan（gfxstream）はこの拡張を隠すが、DirectX 12（vkd3d-proton）は無いと装置を作らない。
@@ -632,7 +635,8 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
         VkPhysicalDeviceRobustness2FeaturesEXT r2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT };
         VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &r2 };
         vkGetPhysicalDeviceFeatures2(g_pd, &f2);
-        g_nulldesc_gpu = r2.nullDescriptor == VK_TRUE && !like_ios();
+        g_nulldesc_gpu = r2.nullDescriptor == VK_TRUE && (!like_ios() || hang_env("VKR_HANG_NULLDESC"));
+        if (like_ios() && g_nulldesc_gpu) vlog("ffhang：iPhone のふりだが本物の空の descriptor を使う（VKR_HANG_NULLDESC）");
     }
     caps |= VR_CAP_NULL_DESC;
     caps |= VR_CAP_PROGRESS; // 終わった submit の番号を、GPU を待たずに答える
@@ -2546,6 +2550,102 @@ static VkImageView dummy_iview(VkDevice d) {
     return v;
 }
 
+// ---- ffhang：空の画像の代わりを、同じ layout・binding に前に書かれた見え方と同じ種類（2D・配列・cube・3D）と形式で作る ----
+// 前は 1 x 1 の 2D・RGBA8 の 1 種類だけで、shader が配列・cube・3D・整数の画像を読む所に入ると、GPU の不正になりうる
+static int viewfix_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("VKR_HANG_VIEWFIX"); v = e && *e == '1'; } return v; }
+typedef struct { uint64_t lay; uint32_t key, vt, fmt, used; } vlearn;
+static vlearn g_vlearn[8192];
+static vlearn *vlearn_at(uint64_t lay, uint32_t key, int create) {
+    uint64_t h = (lay * 0x9E3779B97F4A7C15ull) ^ ((uint64_t) key * 0xC2B2AE3D27D4EB4Full);
+    for (uint32_t i = 0; i < 64; i++) {
+        vlearn *v = &g_vlearn[(h + i) & 8191];
+        if (v->used && v->lay == lay && v->key == key) return v;
+        if (!v->used) { if (!create) return NULL; v->used = 1; v->lay = lay; v->key = key; return v; }
+    }
+    return NULL;
+}
+typedef struct { VkDevice d; uint32_t vt, fmt, storage; VkImage img; VkDeviceMemory mem; VkImageView v; } tdummy;
+static tdummy g_tdummy[64];
+static int g_ntdummy;
+static int fmt_is_plain_color(VkFormat f) {
+    return f >= VK_FORMAT_R4G4_UNORM_PACK8 && f <= VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && !(f >= VK_FORMAT_R64_UINT && f <= VK_FORMAT_R64G64B64A64_SFLOAT);
+}
+static int fmt_cls(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_B8G8R8A8_UINT: case VK_FORMAT_A8B8G8R8_UINT_PACK32:
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_A2R10G10B10_UINT_PACK32: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32A32_UINT:
+    case VK_FORMAT_S8_UINT: return 1;
+    case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_B8G8R8A8_SINT: case VK_FORMAT_A8B8G8R8_SINT_PACK32:
+    case VK_FORMAT_A2B10G10R10_SINT_PACK32: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16A16_SINT:
+    case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32B32_SINT: case VK_FORMAT_R32G32B32A32_SINT: return 2;
+    default: return 0;
+    }
+}
+static VkImageView dummy_iview_typed(VkDevice d, uint32_t vt, VkFormat want, int storage) {
+    if (!d || g_paused) return VK_NULL_HANDLE;
+    // 形式：ふつうの色の形式で、使い道（sampled・storage・塗る）を持てばそのまま。だめなら同じ数の種類（float・uint・sint）の RGBA
+    VkFormat f = want;
+    VkFormatProperties fp;
+    memset(&fp, 0, sizeof fp);
+    if (fmt_is_plain_color(f)) vkGetPhysicalDeviceFormatProperties(g_pd, f, &fp);
+    VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT | (storage ? VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT : 0);
+    if (!fmt_is_plain_color(f) || (fp.optimalTilingFeatures & need) != need) {
+        int c = fmt_is_plain_color(f) ? fmt_cls(f) : 0;
+        f = c == 1 ? VK_FORMAT_R8G8B8A8_UINT : c == 2 ? VK_FORMAT_R8G8B8A8_SINT : VK_FORMAT_R8G8B8A8_UNORM;
+    }
+    for (int i = 0; i < g_ntdummy; i++)
+        if (g_tdummy[i].d == d && g_tdummy[i].vt == vt && g_tdummy[i].fmt == (uint32_t) f && g_tdummy[i].storage == (uint32_t) storage) return g_tdummy[i].v;
+    if (g_ntdummy >= 64) return VK_NULL_HANDLE;
+    int cube = vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+    VkImageCreateInfo ic = { .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0,
+                             .imageType = (vt == VK_IMAGE_VIEW_TYPE_1D || vt == VK_IMAGE_VIEW_TYPE_1D_ARRAY) ? VK_IMAGE_TYPE_1D : vt == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
+                             .format = f, .extent = { 1, 1, 1 }, .mipLevels = 1, .arrayLayers = cube ? 6 : 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                             .tiling = VK_IMAGE_TILING_OPTIMAL,
+                             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0),
+                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    tdummy t = { d, vt, (uint32_t) f, (uint32_t) storage, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
+    if (vkCreateImage(d, &ic, NULL, &t.img) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(d, t.img, &req);
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = dummy_mem_type(req.memoryTypeBits) };
+    if (vkAllocateMemory(d, &ai, NULL, &t.mem) != VK_SUCCESS) { vkDestroyImage(d, t.img, NULL); return VK_NULL_HANDLE; }
+    vkBindImageMemory(d, t.img, t.mem, 0);
+    VkImageViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t.img, .viewType = (VkImageViewType) vt, .format = f,
+                                 .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, cube ? 6 : 1 } };
+    if (vkCreateImageView(d, &vc, NULL, &t.v) != VK_SUCCESS) { vkDestroyImage(d, t.img, NULL); vkFreeMemory(d, t.mem, NULL); return VK_NULL_HANDLE; }
+    VkCommandPoolCreateInfo pc = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = 0 };
+    VkCommandPool pool;
+    if (vkCreateCommandPool(d, &pc, NULL, &pool) == VK_SUCCESS) {
+        VkCommandBufferAllocateInfo ca = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+        VkCommandBuffer cb;
+        if (vkAllocateCommandBuffers(d, &ca, &cb) == VK_SUCCESS) {
+            VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+            vkBeginCommandBuffer(cb, &bi);
+            VkImageMemoryBarrier ib = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                        .image = t.img, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS } };
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+            VkClearColorValue zero = { 0 };
+            vkCmdClearColorImage(cb, t.img, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &ib.subresourceRange);
+            ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            ib.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            ib.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+            vkEndCommandBuffer(cb);
+            VkQueue q;
+            vkGetDeviceQueue(d, 0, 0, &q);
+            VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb };
+            if (vkQueueSubmit(q, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS) vkQueueWaitIdle(q);
+        }
+        vkDestroyCommandPool(d, pool, NULL);
+    }
+    g_tdummy[g_ntdummy++] = t;
+    vlog("ffhang：空の画像の代わりを作った（見え方の種類 %u・形式 %d・storage %d・頼まれた形式 %d）", vt, (int) f, storage, (int) want);
+    return t.v;
+}
+
 // 空の texel buffer の見え方の代わり
 static VkBufferView dummy_bview(VkDevice d) {
     if (g_dummy_bview || !d) return g_dummy_bview;
@@ -2585,6 +2685,60 @@ static VkBuffer dummy_vb(void) {
     g_dummy_mem = m;
     vlog("空の頂点バッファの代わりを作った");
     return b;
+}
+
+// ---- ffhang：空の「書ける」descriptor（storage buffer・storage texel buffer・storage image）の書き込み先を、読む側の 0 の代わりと分ける ----
+// 前は、空の storage buffer も空の uniform・頂点も同じ 1 MiB の「0 の buffer」に差し替えていた。shader が空の UAV に書くと
+// （D3D11 では捨てられる書き込み）その 0 の buffer が汚れ、あとで空の cbuffer や頂点を読む shader が 0 でない値を読む
+static int sepdummy_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("VKR_HANG_SEPDUMMY"); v = e && *e == '1'; } return v; }
+static VkBuffer g_sink_buf;
+static VkDeviceMemory g_sink_mem;
+static VkBufferView g_sink_bview;
+static VkDevice g_sink_dev;
+static VkBuffer dummy_sink(VkDevice d) {
+    if (g_sink_buf && g_sink_dev == d) return g_sink_buf;
+    if (!d) return VK_NULL_HANDLE;
+    VkBufferCreateInfo bc = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 1u << 20,
+                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT };
+    VkBuffer b;
+    if (vkCreateBuffer(d, &bc, NULL, &b) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(d, b, &req);
+    VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = dummy_mem_type(req.memoryTypeBits) };
+    VkDeviceMemory m;
+    if (vkAllocateMemory(d, &ai, NULL, &m) != VK_SUCCESS) { vkDestroyBuffer(d, b, NULL); return VK_NULL_HANDLE; }
+    vkBindBufferMemory(d, b, m, 0);
+    g_sink_buf = b; g_sink_mem = m; g_sink_dev = d; g_sink_bview = VK_NULL_HANDLE;
+    vlog("ffhang：空の storage の書き込み先を別に作った（VKR_HANG_SEPDUMMY）");
+    return b;
+}
+static VkBufferView dummy_sink_bview(VkDevice d) {
+    if (g_sink_bview && g_sink_dev == d) return g_sink_bview;
+    VkBuffer b = dummy_sink(d);
+    if (!b) return VK_NULL_HANDLE;
+    VkBufferViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = b, .format = VK_FORMAT_R32_UINT, .range = 65536 };
+    if (vkCreateBufferView(d, &vc, NULL, &g_sink_bview) != VK_SUCCESS) g_sink_bview = VK_NULL_HANDLE;
+    return g_sink_bview;
+}
+
+// ---- ffhang：0 のはずの代わりの buffer（空の頂点・cbuffer・storage の代わり）が汚れていないかを時々見る ----
+static void dummy_dirty_check(const char *why) {
+    static int nlog;
+    static size_t last_nz;
+    { static unsigned k; if ((++k % 4) == 0) vlog("ffhang：空の代わりの数 texel %d・画像 %d・buffer %d・型つき画像 %d・型が分からない画像 %d（%s）", g_hang_subst[0], g_hang_subst[1], g_hang_subst[2], g_hang_subst[3], g_hang_subst[4], why); }
+    if (!g_dummy_vb || !g_dummy_mem || !g_dev || nlog >= 40) return;
+    void *p = NULL;
+    if (vkMapMemory(g_dev, g_dummy_mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p) return;
+    const uint32_t *w = (const uint32_t *) p;
+    size_t nz = 0, first = (size_t) -1;
+    uint32_t fv = 0;
+    for (size_t i = 0; i < (1u << 20) / 4; i++) if (w[i]) { if (first == (size_t) -1) { first = i * 4; fv = w[i]; } nz++; }
+    vkUnmapMemory(g_dev, g_dummy_mem);
+    if (nz != last_nz) {
+        nlog++;
+        vlog("ffhang：0 の代わりの buffer（1 MiB）の 0 でない 4 バイト %zu 個（最初は %zu バイト目の 0x%08x）・%s", nz, first == (size_t) -1 ? 0 : first, fv, why);
+        last_nz = nz;
+    }
 }
 
 // ---- 先送りの JPEG（VR_READ_JPEG_PIPE） ----
@@ -3779,8 +3933,15 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 return reply(s, VK_ERROR_FEATURE_NOT_PRESENT);
             }
         }
-        VkPhysicalDeviceRobustness2FeaturesEXT r2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, .nullDescriptor = VK_TRUE };
-        if (g_nulldesc_gpu) {
+        VkPhysicalDeviceRobustness2FeaturesEXT r2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, .nullDescriptor = g_nulldesc_gpu ? VK_TRUE : VK_FALSE };
+        if (hang_env("VKR_HANG_ROBUST2")) {
+            r2.robustBufferAccess2 = r2.robustImageAccess2 = VK_TRUE;
+            feats.robustBufferAccess = VK_TRUE;
+            if (!has_f) { has_f = 1; }
+            vlog("ffhang：robustBufferAccess2・robustImageAccess2 を有効にする（VKR_HANG_ROBUST2）");
+        }
+        vlog("ffhang：装置の robustBufferAccess %u（DXVK が頼んだ値）", (unsigned) feats.robustBufferAccess);
+        if (g_nulldesc_gpu || r2.robustBufferAccess2) {
             int has = 0;
             for (uint32_t i = 0; i < n_names; i++) if (!strcmp(names[i], "VK_EXT_robustness2")) has = 1;
             if (!has && n_names < 64) names[n_names++] = "VK_EXT_robustness2";
@@ -4169,6 +4330,40 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t id = vr_ru64(r);
         uint32_t n;
         const void *code = vr_rbytes(r, &n);
+        // ffhang：cbuffer を 4096 個の vec4（64 KiB）の uniform として宣言した module（範囲の外を読みうる。DXVK が 0 を返す前提で範囲を絞る）と、
+        // 同じ物を storage buffer で読む module（DXVK 1.10 の d3d11.constantBufferRangeCheck の形）を数える
+        if (code && n >= 20 && (n % 4) == 0) {
+            static unsigned n_mod, n_ubo64k, n_ssbo_rt;
+            const uint32_t *w = (const uint32_t *) code;
+            uint32_t nw = n / 4, bound = w[3] < 4000000 ? w[3] : 0;
+            uint8_t *isvec4 = bound ? calloc(bound, 1) : NULL; // 1：vec4・2：4096 個の vec4 の配列・4：Block・8：BufferBlock・16：64 KiB の配列を持つ struct
+            uint32_t *cval = bound ? calloc(bound, 4) : NULL;
+            int arr4096 = 0, ptr_uni = 0, rt_vec4 = 0, ptr_sb = 0;
+            if (isvec4 && cval) {
+                for (uint32_t i = 5; i < nw;) {
+                    uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+                    if (!len || i + len > nw) break;
+                    if (op == 23 && len >= 4 && w[i + 1] < bound && w[i + 3] == 4) isvec4[w[i + 1]] = 1;
+                    else if (op == 43 && len >= 4 && w[i + 2] < bound) cval[w[i + 2]] = w[i + 3];
+                    else if (op == 71 && len >= 3 && w[i + 1] < bound && (w[i + 2] == 2 || w[i + 2] == 3)) isvec4[w[i + 1]] |= w[i + 2] == 2 ? 4 : 8;
+                    else if (op == 28 && len >= 4 && w[i + 1] < bound && w[i + 2] < bound && w[i + 3] < bound && (isvec4[w[i + 2]] & 1) && cval[w[i + 3]] == 4096) isvec4[w[i + 1]] |= 2;
+                    else if (op == 30 && len >= 3 && w[i + 1] < bound) {
+                        for (uint32_t k = 2; k < len; k++) if (w[i + k] < bound && (isvec4[w[i + k]] & 2)) {
+                            if (isvec4[w[i + 1]] & 4) arr4096 = 1;        // uniform（Block）
+                            if (isvec4[w[i + 1]] & 8) rt_vec4 = 1;        // storage（BufferBlock）
+                        }
+                    }
+                    else if (op == 29 && len >= 3 && w[i + 2] < bound && isvec4[w[i + 2]]) rt_vec4 = 1;
+                    else if (op == 32 && len >= 4) { if (w[i + 2] == 2) ptr_uni = 1; if (w[i + 2] == 12) ptr_sb = 1; }
+                    i += len;
+                }
+            }
+            free(isvec4); free(cval);
+            n_mod++;
+            if (arr4096 && ptr_uni) n_ubo64k++;
+            if (rt_vec4 || (ptr_sb && 0)) n_ssbo_rt++;
+            if ((n_mod % 200) == 0 || n_mod == 50) vlog("ffhang：shader module %u 個・64 KiB の cbuffer を uniform（Block）で宣言 %u 個・storage（BufferBlock）で宣言 %u 個", n_mod, n_ubo64k, n_ssbo_rt);
+        }
         VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = n, .pCode = code };
         VkShaderModule m;
         if (code && vkCreateShaderModule(d, &ci, NULL, &m) == VK_SUCCESS) put(id, (uint64_t) m, K_SHADER);
@@ -4364,7 +4559,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             if (res == VK_SUCCESS) {
                 put(id, (uint64_t) ds, K_DSET);
                 ent *se = find(id);
-                if (se) se->aux = pid; // どの pool から取ったか
+                if (se) { se->aux = pid; se->size = (uint64_t) (uintptr_t) l; } // どの pool から取ったか・ffhang：layout
             } else vlog("descriptor set を取れない (%d)", res);
         }
         free(vcount);
@@ -4429,7 +4624,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 for (uint32_t k = 0; k < w.descriptorCount; k++) {
                     uint64_t vid = vr_ru64(r);
                     tv[k] = OBJ(VkBufferView, vid);
-                    if (!tv[k] && !g_nulldesc_gpu) tv[k] = dummy_bview(d); // 空の見え方は代わりの物に
+                    if (!tv[k] && !g_nulldesc_gpu) { tv[k] = sepdummy_on() && w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ? dummy_sink_bview(d) : VK_NULL_HANDLE; if (!tv[k]) tv[k] = dummy_bview(d); if (g_hang_subst[0]++ < 5) vlog("ffhang：空の texel buffer（種類 %d・binding %u）を代わりに", (int) w.descriptorType, w.dstBinding + k); } // 空の見え方は代わりの物に
                     ent *ve = find(vid);
                     if (se && ve && ve->aux) idlist_add(&se->list, ve->aux); // 見え方の aux はもとの buffer
                 }
@@ -4473,9 +4668,22 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     ii[k].imageView = OBJ(VkImageView, vid);
                     ii[k].imageLayout = (VkImageLayout) vr_ru32(r);
                     // 画像の要る種類で空なら、代わりの画像を入れる（GPU が空の descriptor を持たないとき）
+                    uint32_t vkey = (w.dstBinding << 12) + w.dstArrayElement + k;
+                    if (viewfix_on() && se && vid && w.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLER) {
+                        ent *ve = find(vid);
+                        vlearn *vl = ve && ve->kind == K_VIEW && ve->size ? vlearn_at(se->size, vkey, 1) : NULL;
+                        if (vl) { vl->vt = (uint32_t) (ve->size >> 32); vl->fmt = (uint32_t) ve->size; }
+                    }
                     if (!ii[k].imageView && !g_nulldesc_gpu && w.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLER) {
-                        ii[k].imageView = dummy_iview(d);
+                        vlearn *vl = viewfix_on() && se ? vlearn_at(se->size, vkey, 0) : NULL;
+                        ii[k].imageView = vl ? dummy_iview_typed(d, vl->vt, (VkFormat) vl->fmt, w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) : VK_NULL_HANDLE;
+                        if (vl && g_hang_subst[3]++ < 20) vlog("ffhang：空の画像（種類 %d・binding %u）を見え方の種類 %u・形式 %u の代わりに", (int) w.descriptorType, w.dstBinding + k, vl->vt, vl->fmt);
+                        if (!vl && viewfix_on() && g_hang_subst[4]++ < 20) vlog("ffhang：空の画像（種類 %d・binding %u）は前の見え方が分からない。2D RGBA8 の代わりに", (int) w.descriptorType, w.dstBinding + k);
+                        if (!ii[k].imageView && sepdummy_on() && w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                            ii[k].imageView = dummy_iview_typed(d, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, 1); // 書ける代わりは読む代わりと別
+                        if (!ii[k].imageView) ii[k].imageView = dummy_iview(d);
                         ii[k].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                        if (g_hang_subst[1]++ < 20) vlog("ffhang：空の画像（種類 %d・binding %u・layout %d）を 2D RGBA8 の代わりに", (int) w.descriptorType, w.dstBinding + k, (int) ii[k].imageLayout);
                     }
                     if (se && vid) idlist_add(&se->list, vid); // 見え方の aux はもとの画像のメモリ
                 }
@@ -4504,14 +4712,16 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             for (uint32_t k = 0; k < w.descriptorCount && !g_nulldesc_gpu; k++)
                 if (!bi[k].buffer && dummy_vb()) {
                     int ubo = w.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || w.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-                    bi[k].buffer = dummy_vb();
+                    bi[k].buffer = !ubo && sepdummy_on() && dummy_sink(d) ? dummy_sink(d) : dummy_vb(); // ffhang：書ける種類は別の書き込み先へ
                     bi[k].offset = 0;
                     bi[k].range = ubo ? 16384 : VK_WHOLE_SIZE; // uniform は仕様の下限の 16 KiB に収める
+                    if (g_hang_subst[2]++ < 10) vlog("ffhang：空の buffer（種類 %d・binding %u）を代わりに", (int) w.descriptorType, w.dstBinding + k);
                 }
             w.pBufferInfo = bi;
             if (w.dstSet) uds_add(&g_uds, d, &w, bi); else free(bi); // 取れなかった set（layout が無いなど）には書かない（NVIDIA は落ちる）
         }
         uds_flush(&g_uds, d, !r->bad);
+        { static unsigned nupd; if ((++nupd % 500) == 0) dummy_dirty_check("descriptor の書き込み 500 回ごと"); }
         return 1;
     }
     case VR_CREATE_COMMAND_POOL: {
@@ -5035,6 +5245,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             put(id, (uint64_t) v, K_VIEW);
             ent *ie = find(iid), *ve = find(id);
             if (ve && ie) ve->aux = ie->aux; // 見え方からも、もとの画像のメモリが分かるように
+            if (ve) ve->size = ((uint64_t) ci.viewType << 32) | (uint32_t) ci.format; // ffhang：空の画像の代わりを同じ形で作るため
         } else {
             vlog("image view を作れない (%d)", res);
         }
@@ -5732,6 +5943,7 @@ static void serve_one(vr_sock c, int remote) {
 #ifdef _WIN32
         // PC の代役（RTX）は、GPU を失うと同じプロセスでは Vulkan を作り直しても装置を作れない（-3 が続く）。
         // プロセスごと終わり、立て直しは外の台本に任せる
+        dummy_dirty_check("GPU を失った時");
         vlog("GPU を失ったので終わる（代役は立て直しが要る）");
         exit(3);
 #endif
