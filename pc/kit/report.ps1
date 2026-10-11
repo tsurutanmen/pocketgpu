@@ -1,9 +1,9 @@
-﻿# PocketGPU 動作報告の作成（試す人が自分の PC で実行）
+﻿# PocketGPU 動作報告の作成。試す人が自分の PC で実行します
 #   PowerShell で実行:  powershell -ExecutionPolicy Bypass -File report.ps1
-# 1 つのテキストファイル pocketgpu-report.txt を作ります。
-# 入れる物: Windows の版 / CPU / GPU の一覧 / 配った印 / Apple Mobile Device Service / iTunes / iPhone が USB で見えるか
-# 入れない物: ユーザー名・PC 名・IP アドレス・パスのユーザー名の部分（最後にまとめて伏せます）
-# 管理者の権限は要りません。
+# 1 つのテキストファイル pocketgpu-report.txt を作成します。
+# 含める内容: Windows のバージョン / CPU / GPU の一覧 / 配布時の識別用の印 / Apple Mobile Device Service / Apple Devices / Apple のサービスのポート / iTunes / iPhone が USB で認識されているか
+# 含めない内容: ユーザー名・PC 名・IP アドレス・パスのユーザー名の部分。最後にまとめて伏せます
+# 管理者権限は必要ありません。
 
 $ErrorActionPreference = 'SilentlyContinue'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -58,7 +58,7 @@ if ($gpu) {
 Add('')
 
 # --- 配った印（iphone_icd.dll の中の PGKIT-MARK: に続く 32 文字）---
-Add('[Kit mark / 配った印]')
+Add('[Kit mark / 識別用の印]')
 $dll = Join-Path $here 'iphone_icd.dll'
 if (Test-Path $dll) {
     $bytes = [System.IO.File]::ReadAllBytes($dll)
@@ -69,7 +69,7 @@ if (Test-Path $dll) {
         $mark = $txt.Substring($i + $tag.Length, 32)
         Add('  ' + $mark)
     } else {
-        Add('  Mark not found in iphone_icd.dll / 印が見つかりませんでした')
+        Add('  Mark not found in iphone_icd.dll / 識別用の印が見つかりませんでした')
     }
 } else {
     Add('  iphone_icd.dll is not in this folder. Run this from the kit folder. / キットのフォルダで実行してください')
@@ -83,8 +83,18 @@ if (-not $svc) { $svc = Get-Service -DisplayName 'Apple Mobile Device Service' -
 if ($svc) {
     Add('  Status / 状態: ' + $svc.Status + ', startup / スタートアップ: ' + $svc.StartType)
 } else {
-    Add('  Not found. iTunes may not be installed. / 見つかりません。iTunes が入っていないかもしれません')
+    Add('  Not found. Normal with Apple Devices from the Microsoft Store. / 見つかりません。Microsoft Store の Apple Devices を使っている場合は、正常です')
 }
+Add('')
+
+# --- Microsoft Store の Apple Devices と、Apple のサービスのポート 127.0.0.1:27015 ---
+Add('[Apple Devices]')
+$ad = Get-AppxPackage -Name 'AppleInc.AppleDevices' -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($ad) { Add('  version ' + $ad.Version) } else { Add('  Not found / 見つかりません') }
+Add('')
+Add('[Apple service port 27015 / Apple のサービスのポート]')
+$tc = New-Object System.Net.Sockets.TcpClient
+try { $tc.Connect('127.0.0.1', 27015); Add('  Listening / 待ち受けています') } catch { Add('  Not listening / 待ち受けていません') } finally { $tc.Close() }
 Add('')
 
 # --- iTunes が入っているか ---
@@ -122,7 +132,7 @@ if ($pnp) {
         Add('  ' + $d.FriendlyName + '  (' + $d.Status + ')')
     }
 } else {
-    Add('  No Apple device found. Plug in the iPhone, unlock it, and run this again. / iPhone を差してロックを外してから、もう一度実行してください')
+    Add('  No Apple device found. Plug in the iPhone, unlock it, and run this again. / iPhone を USB ケーブルで接続してロックを解除してから、もう一度実行してください')
 }
 Add('')
 
@@ -139,8 +149,8 @@ $enc = New-Object System.Text.UTF8Encoding($true)
 [System.IO.File]::WriteAllText($out, $body + "`r`n", $enc)
 
 Write-Host ''
-Write-Host 'Created pocketgpu-report.txt in this folder. / このフォルダに pocketgpu-report.txt を作りました'
-Write-Host 'Please send its contents on Discord. It does not include your user name, PC name, or IP address. / 中身を Discord で送ってください。ユーザー名・PC 名・IP は入っていません'
+Write-Host 'Created pocketgpu-report.txt in this folder. / このフォルダに pocketgpu-report.txt を作成しました'
+Write-Host 'Please send its contents on Discord. It does not include your user name, PC name, or IP address. / 内容を Discord で送ってください。ユーザー名・PC 名・IP アドレスは含まれていません'
 Write-Host ''
-Write-Host '----- report / 中身 -----'
+Write-Host '----- report / 内容 -----'
 Write-Host $body
