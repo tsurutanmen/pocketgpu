@@ -102,8 +102,8 @@ targets:
       path: Sources/Lite/Info.plist
       properties:
         CFBundleDisplayName: PocketCam
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.1.1"
+        CFBundleVersion: "2"
         UILaunchScreen: {}
         NSCameraUsageDescription: この iPhone のカメラを PC のウェブカメラとして使うために使用します
         NSMicrophoneUsageDescription: PC の通話や録音で、この iPhone のマイクの音を使うために使用します
