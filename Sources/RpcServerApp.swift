@@ -142,6 +142,8 @@ struct ContentView: View {
     // コマが届くたびに描き直すのは絵の所だけにしたいので、ここでは見張らない
     @AppStorage("screenMirror") private var mirrorOn = false
     private let mirror = ScreenMirrorModel.shared
+    // この iPhone を PC のスピーカーとマイクにする（AudioBridge.swift。PC は ipaudio.exe）。オンの間だけ USB の 50063 番で待つ
+    @AppStorage("audioBridge") private var audioOn = false
     // 画面の言葉（自動・日本語・English）。ここで読むと、変えたときに画面が描き直される
     @AppStorage("lang") private var lang = AppLang.auto.rawValue
     @Environment(\.scenePhase) private var scenePhase
@@ -181,6 +183,11 @@ struct ContentView: View {
                         }
                         ScreenMirrorStatusRow(model: mirror)
                         ScreenMirrorView(model: mirror)
+                    }
+                    Toggle(L("PC のスピーカーとマイクにする", "Use as PC speaker and mic"), isOn: $audioOn)
+                        .onChange(of: audioOn) { _, on in AudioBridgeModel.shared.setOn(on) }
+                    if audioOn {
+                        AudioBridgeStatusRow(model: AudioBridgeModel.shared)
                     }
                     ShareLink(item: diagnosticsText(status: status, log: log)) {
                         Label(L("ログを送信", "Send logs"), systemImage: "square.and.arrow.up")
@@ -255,12 +262,14 @@ struct ContentView: View {
             // 前にオンにしたまま閉じたなら、開いたときから出す
             preview.setOn(showFrames)
             setMirror(mirrorOn)
+            AudioBridgeModel.shared.setOn(audioOn)
         }
         .onChange(of: scenePhase) { _, phase in
             // 後ろに回ると GPU が使えない。前に戻ったら GPU に戻す
             rpc_bridge_set_background(phase == .background ? 1 : 0)
             // Vulkan の受け手は、前にいない間（切り替えの途中も含む）は GPU に仕事を出さずに待つ
             vkr_set_paused(phase == .active ? 0 : 1)
+            if phase == .active { AudioBridgeModel.shared.foregrounded() }
         }
         .onReceive(tick) { _ in
             vkr_set_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
