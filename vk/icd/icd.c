@@ -364,6 +364,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_RECORD_CTL] = "RECORD_CTL", [VR_RECORD_FRAME] = "RECORD_FRAME", [VR_RECORD_FETCH] = "RECORD_FETCH",
     [VR_MEM_WRITE_CODED] = "MEM_WRITE_CODED",
     [VR_CREATE_ACCEL] = "CREATE_ACCEL", [VR_DESTROY_ACCEL] = "DESTROY_ACCEL", [VR_GET_ACCEL_SIZES] = "GET_ACCEL_SIZES",
+    [VR_SET_OPTIONS] = "SET_OPTIONS",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -389,6 +390,11 @@ static struct {
     uint64_t code_n, code_in, code_out; // 縮めて送った平面の数・縮める前と後のバイト（VR_MEM_WRITE_CODED）
     uint64_t code_same;            // 受け手と同じ中身だったので送らなかった平面の行のバイト
     double code_ms;                // 縮めるのにかかった時間
+    uint64_t ext_in, push_in;      // 尾の付いた返事・押し出しの知らせを読んだ数
+    uint64_t ext_adv, push_adv;    // そのうち g_done_msg を進めた数
+    uint64_t q_nr_done;            // query を書いた submit がまだ終わっていないので、往復せずに「まだ」と答えた数
+    uint64_t push_req, push_waits; // 押し出しを待つ間に念のため進み具合を聞いた数・押し出しを待った回数
+    double push_wait_ms;
 } g_stat;
 // u1（アドレスで読み書きする buffer・結んだあとに書いた descriptor）の数。数えるだけ
 static struct { volatile LONG64 pv, rd_n, wr_n, whole, ub_sets, ub_ents; } g_u1;
@@ -463,6 +469,12 @@ static void print_stats(void) {
     if (ls_on()) ls_print();
     if (g_lso_n[0] || g_lso_n[1]) fprintf(stderr, "  load_store_op_none：アプリが渡した NONE は LOAD %ld 個・STORE %ld 個（%s）\n", g_lso_n[0], g_lso_n[1], g_lso_fix ? "LOAD・STORE に直して送った" : "そのまま送った");
     fprintf(stderr, "  往復せずに済ませた待ち %llu\n", (unsigned long long) g_stat.skipped);
+    if (g_stat.ext_in || g_stat.push_in)
+        fprintf(stderr, "  返事の尾：尾 %llu（番号を進めた %llu）・押し出し %llu（進めた %llu）・押し出しを待った %llu 回 %.1f ms・念のため聞いた %llu・"
+                        "query を往復せず「まだ」 %llu\n",
+                (unsigned long long) g_stat.ext_in, (unsigned long long) g_stat.ext_adv, (unsigned long long) g_stat.push_in,
+                (unsigned long long) g_stat.push_adv, (unsigned long long) g_stat.push_waits, g_stat.push_wait_ms,
+                (unsigned long long) g_stat.push_req, (unsigned long long) g_stat.q_nr_done);
     if (g_stat.presents)
         fprintf(stderr, "  present %llu 回 %.1f ms（うち窓に描く %llu 回 %.1f ms）\n", (unsigned long long) g_stat.presents, g_stat.present_ms,
                 (unsigned long long) g_stat.blits, g_stat.blit_ms);
@@ -735,9 +747,15 @@ static void rpc_send(uint32_t op, vr_buf *b) {
     b->n = 0;
 }
 
+static int g_push;
+static unsigned g_pend_n;
+static void rx_pump_locked(void);
 static void rpc_flush(void) {
     AcquireSRWLockExclusive(&g_lock);
     flush_locked();
+    // 押し出しの知らせを、読まずにためない（ためすぎると受け手の送りが詰まり、命令を読む糸まで止まる）。
+    // 窓の絵の返事を待っている間は、その返事を読む所に任せる（ここで大きな返事を読み切るのを待たない）
+    if (g_push && !g_pend_n) rx_pump_locked();
     ReleaseSRWLockExclusive(&g_lock);
 }
 
@@ -807,7 +825,8 @@ static void stall_banner(double sec) {
     banner(t);
 }
 
-static int recv_head(uint32_t h[2], uint32_t op) {
+// 返事の頭（8 バイト）を、届くまで待って読む。尾と押し出しは下の recv_head が扱う
+static int recv_head_raw(uint32_t h[2], uint32_t op) {
     static double giveup = -1;
     if (giveup < 0) { const char *e = getenv("IPHONE_VK_GIVEUP"); giveup = e ? atof(e) : 0; }
     // 窓の無い計算のアプリ（画像生成など）は GPU の 1 回の仕事が数秒かかることがあるので、GPU を待つ命令は 20 秒まで黙る
@@ -852,29 +871,111 @@ static int recv_head(uint32_t h[2], uint32_t op) {
 // 返事は頼んだ順にしか届かないので、ほかの返事を読む所は、先にこの列を全部読む（read_deferred_locked）。
 // 前は進み具合の問い合わせを rpc_call で錠を持ったまま待ち、受け手がそれより前の仕事をこなす間（実機で 1 回 6 ms ほど）、
 // DXVK の submit を送る糸まで止めていた。IPHONE_VK_PROGRESS_ASYNC=0 で前のやり方
-enum { PEND_DEFER = 1, PEND_PROGRESS = 2 };
+// PEND_STATUS：2 秒ごとの熱の問い合わせ（VR_GET_STATUS）。前は rpc_call で present の中から往復を待ち、受け手がそれより前の仕事を
+// こなす間（代役で 1 回 35〜37 ms・lavapipe の Heaven で 1 回 290 ms）アプリの糸を止めていた。いまは頼むだけにして、次の present で読む
+enum { PEND_DEFER = 1, PEND_PROGRESS = 2, PEND_STATUS = 3 };
+static int g_status_out;                // 答えを待っている熱の問い合わせがある
+static volatile int g_status_ready;     // 答えが届いた（heat_check が使う）
+static VkResult g_status_r;
+static uint32_t g_status_v;
 static unsigned char g_pend[64];
 static unsigned g_pend_head, g_pend_n;
 static int g_prog_out;                  // 答えを待っている進み具合の問い合わせがある
 static volatile uint64_t g_done_msg;    // 受け手が「終わった」と答えた submit の番号（下の「fence を本当の進み具合で答える」で使う）
 
+// ---- 返事の尾と押し出し（VR_CAP_REPLY_EXT・VR_CAP_PUSH_DONE） ----
+// 受け手はどの返事にも「終わった submit の番号」を付け（尾）、submit が終わるたびに頼まれなくても知らせる（押し出し）。
+// 読む所はどれも recv_head を通るので、ここで尾を外して g_done_msg を進め、押し出しは読み捨てて次を読む。
+// 尾の通し番号が読んだ返事の数と合わなければ、返事の取り違えなので切る。
+// IPHONE_VK_REPLY_EXT=0 で尾を頼まない・IPHONE_VK_PUSH=0 で押し出しを頼まない
+static int g_ext_on;          // 尾を頼んだ
+static int g_push;            // 押し出しを頼んだ
+static uint32_t g_rx_seq;     // このつなぎで読んだ返事の数（押し出しは数えない）
+static uint32_t g_rx_ext_from;// この番号の返事から尾が付く
+static uint32_t g_epoch;      // 装置が全部なくなって submit の番号を数え直した回数（受け手と同じに数える）
+
+static void note_done(uint64_t done, uint32_t ep, int push) {
+    if (ep != g_epoch || done <= g_done_msg) return; // 数え直す前の番号は使わない
+    g_done_msg = done;
+    if (push) g_stat.push_adv++;
+    else g_stat.ext_adv++;
+}
+
+// 返事の頭を読む（尾があれば尾も）。押し出しの知らせは読み捨てて次を読む。
+// wait=0 なら待たない：届いている物が押し出しだけで尽きたら 2（返事は読んでいない）。1＝返事の頭を読んだ・0＝切れた
+static int rx_head(uint32_t h[2], uint32_t op, int wait) {
+    for (;;) {
+        if (!wait) {
+            WSAPOLLFD pf = { .fd = g_sock, .events = POLLRDNORM };
+            if (g_dead || WSAPoll(&pf, 1, 0) <= 0) return g_dead ? 0 : 2;
+            if (!vr_recv_all(g_sock, h, 8)) { conn_lost("返事を読む所"); return 0; }
+            if (h[1] > (512u << 20)) { say("受け手の返事が大きすぎる（%u バイト）", h[1]); conn_lost("返事の長さ"); return 0; }
+        } else if (!recv_head_raw(h, op)) {
+            return 0;
+        }
+        if (!g_ext_on || g_rx_seq < g_rx_ext_from) { g_rx_seq++; return 1; }
+        uint8_t x[VR_EXT_BYTES];
+        if (!vr_recv_all(g_sock, x, sizeof x)) { conn_lost("返事の尾"); return 0; }
+        uint64_t done;
+        uint32_t seq, ep;
+        memcpy(&done, x, 8);
+        memcpy(&seq, x + 8, 4);
+        memcpy(&ep, x + 12, 4);
+        g_stat.bytes_in += VR_EXT_BYTES;
+        if (seq == VR_PUSH_SEQ) {
+            // 頭が [1, 0] なら「これ以降は知らせない」（受け手の見張りの一覧が満ちた・GPU を失った）。進み具合の問い合わせに戻る
+            if (h[1] || h[0] > 1) { say("押し出しの知らせの形がおかしい（%u・%u）", h[0], h[1]); conn_lost("押し出しの形"); return 0; }
+            if (h[0] == 1 && g_push) { g_push = 0; say("受け手が終わった submit の押し出しをやめた。進み具合を聞くやり方に戻る"); }
+            g_stat.push_in++;
+            g_stat.bytes_in += 8;
+            note_done(done, ep, 1);
+            continue;
+        }
+        if (seq != g_rx_seq) {
+            say("返事の順番が合わない（受け手の通し番号 %u・読んだ数 %u・命令 %u）", seq, g_rx_seq, op);
+            conn_lost("返事の取り違え");
+            return 0;
+        }
+        g_rx_seq++;
+        g_stat.ext_in++;
+        note_done(done, ep, 0);
+        return 1;
+    }
+}
+
+static int recv_head(uint32_t h[2], uint32_t op) { return rx_head(h, op, 1) == 1; }
+
 static void pend_push_locked(int kind) {
     if (g_pend_n < sizeof g_pend) g_pend[(g_pend_head + g_pend_n++) % sizeof g_pend] = (unsigned char) kind;
 }
 
-// 列の先頭の返事を 1 つ読む。読めなければ 0（つながりが切れた）
-static int pend_read_one_locked(void) {
+// 列の先頭の返事を 1 つ読む。1＝読んだ・0＝切れた・2＝待たない（wait=0）で、まだ届いていない
+static int pend_read_one_locked(int wait) {
     if (!g_pend_n) return 0;
     int kind = g_pend[g_pend_head];
+    uint32_t h[2];
+    int got = rx_head(h, kind == PEND_DEFER ? g_defer.op : kind == PEND_STATUS ? VR_GET_STATUS : VR_GET_PROGRESS, wait);
+    if (got == 2) return 2;
     g_pend_head = (g_pend_head + 1) % sizeof g_pend;
     g_pend_n--;
-    uint32_t h[2];
+    if (kind == PEND_STATUS) {
+        g_status_out = 0;
+        if (!got) return 0;
+        uint8_t st[64];
+        if (h[1] > sizeof st || (h[1] && !vr_recv_all(g_sock, st, h[1]))) { conn_lost("熱の返事の途中"); return 0; }
+        g_stat.bytes_in += 8 + h[1];
+        g_status_r = (VkResult) (int32_t) h[0];
+        g_status_v = 0;
+        if (h[1] >= 4) memcpy(&g_status_v, st, 4);
+        g_status_ready = 1;
+        return 1;
+    }
     if (kind == PEND_DEFER) {
         g_defer.active = 0;
         g_defer.ready = 1;
         g_defer.r = VK_ERROR_DEVICE_LOST;
         g_defer.out.n = 0;
-        if (!recv_head(h, g_defer.op)) return 0;
+        if (!got) return 0;
         vr_reserve(&g_defer.out, h[1]);
         if (h[1] && !vr_recv_all(g_sock, g_defer.out.p, h[1])) { conn_lost("窓の絵の返事の途中"); return 0; }
         g_defer.out.n = h[1];
@@ -883,14 +984,15 @@ static int pend_read_one_locked(void) {
         return 1;
     }
     g_prog_out = 0;
-    if (!recv_head(h, VR_GET_PROGRESS)) return 0;
+    if (!got) return 0;
     uint8_t tmp[64];
     if (h[1] > sizeof tmp || (h[1] && !vr_recv_all(g_sock, tmp, h[1]))) { conn_lost("進み具合の返事の途中"); return 0; }
     g_stat.bytes_in += 8 + h[1];
     if ((int32_t) h[0] == VK_SUCCESS && h[1] >= 8) {
         uint64_t v;
         memcpy(&v, tmp, 8);
-        if (v > g_done_msg) g_done_msg = v;
+        // 尾があれば、この答えも数え直しの回数を確かめてから使う（尾で同じ番号がもう入っている）
+        if (!(g_ext_on && g_rx_seq > g_rx_ext_from) && v > g_done_msg) g_done_msg = v;
     }
     return 1;
 }
@@ -898,8 +1000,23 @@ static int pend_read_one_locked(void) {
 // g_lock の中で、送り終えたあとに呼ぶ。たまっている返事を頼んだ順に全部読む
 static void read_deferred_locked(void) {
     while (g_pend_n && !g_dead)
-        if (!pend_read_one_locked()) break;
-    if (g_dead) { g_pend_n = 0; g_prog_out = 0; g_defer.active = 0; }
+        if (pend_read_one_locked(1) != 1) break;
+    if (g_dead) { g_pend_n = 0; g_prog_out = 0; g_status_out = 0; g_defer.active = 0; }
+}
+
+// g_lock の中で、届いている物を待たずに読めるだけ読む（押し出しの知らせと、列の返事）
+static void rx_pump_locked(void) {
+    while (!g_dead && g_sock != VR_BAD_SOCK) {
+        if (g_pend_n) {
+            if (pend_read_one_locked(0) != 1) break;
+        } else {
+            uint32_t h[2];
+            int got = rx_head(h, 0, 0);
+            if (got == 1) { say("頼んでいない返事が来た（%d・%u バイト）", (int32_t) h[0], h[1]); conn_lost("頼んでいない返事"); }
+            break;
+        }
+    }
+    if (g_dead) { g_pend_n = 0; g_prog_out = 0; g_status_out = 0; g_defer.active = 0; }
 }
 
 // 頼んで、返事は待たない。返事は rpc_take_deferred で受け取る（受け取る前に頼めるのは 1 つだけ）
@@ -928,11 +1045,7 @@ static VkResult rpc_take_deferred(vr_buf *out) {
         // 返事が届いた分だけ錠の中で読み、まだなら錠の外で 1 ms ずつ待つ。待つ間にほかの糸が先に読んでもよい（g_defer.ready に入る）
         for (;;) {
             AcquireSRWLockExclusive(&g_lock);
-            if (g_defer.active && flush_locked()) {
-                WSAPOLLFD pf = { .fd = g_sock, .events = POLLRDNORM };
-                while (g_defer.active && g_pend_n && !g_dead && WSAPoll(&pf, 1, 0) > 0)
-                    if (!pend_read_one_locked()) break;
-            }
+            if (g_defer.active && flush_locked()) rx_pump_locked();
             int done = !g_defer.active || g_dead;
             ReleaseSRWLockExclusive(&g_lock);
             if (done) break;
@@ -1226,6 +1339,9 @@ static int connect_locked(void) {
     g_submit_msgs = 0; // 受け手もつながるたびに数え直す
     g_pend_n = 0;
     g_prog_out = 0;
+    g_status_out = 0;
+    g_rx_seq = g_rx_ext_from = g_epoch = 0; // 尾と押し出しは、あいさつのあとに頼み直す
+    g_ext_on = g_push = 0;
 #ifdef _WIN32
     WSADATA w;
     WSAStartup(MAKEWORD(2, 2), &w);
@@ -1817,6 +1933,32 @@ static int hello(void) {
                 }
                 g_hw.ok = 1;
                 say("受け手の GPU：%s", g_hw.props.deviceName);
+                // 返事に「終わった submit の番号」の尾を付けてもらい、受け手が名乗れば submit の終わりも知らせてもらう。
+                // 名乗らない古い受け手には送らない。IPHONE_VK_REPLY_EXT=0・IPHONE_VK_PUSH=0 で頼まない
+                {
+                    const char *ee = getenv("IPHONE_VK_REPLY_EXT"), *pe = getenv("IPHONE_VK_PUSH");
+                    uint32_t fl = 0;
+                    if ((g_hw.caps & VR_CAP_REPLY_EXT) && !(ee && *ee == '0')) {
+                        fl |= VR_OPT_REPLY_EXT;
+                        if ((g_hw.caps & VR_CAP_PUSH_DONE) && !(pe && *pe == '0')) fl |= VR_OPT_PUSH_DONE;
+                    }
+                    if (fl) {
+                        vr_buf ob = { 0 };
+                        vr_u32(&ob, fl);
+                        AcquireSRWLockExclusive(&g_lock);
+                        g_stat.sends[VR_SET_OPTIONS]++;
+                        put_msg_locked(VR_SET_OPTIONS, &ob);
+                        if (flush_locked()) {
+                            // いま答えを待っている返事（列の分）までは尾が無い。その次から付く
+                            g_rx_ext_from = g_rx_seq + g_pend_n;
+                            g_ext_on = 1;
+                            g_push = (fl & VR_OPT_PUSH_DONE) != 0;
+                        }
+                        ReleaseSRWLockExclusive(&g_lock);
+                        free(ob.p);
+                        say("返事に終わった submit の番号を付けてもらう%s", g_push ? "・終わったら知らせてもらう" : "");
+                    }
+                }
                 // あいさつが済んだら、計算を待つ間は切らない
                 sock_rcvtimeo(g_sock, 0);
             }
@@ -3400,31 +3542,54 @@ static void progress_request(void) {
 
 // 届いている返事だけを読む（待たない）。進み具合の答えを読めたら 1
 static int progress_take(void) {
-    int got = 0;
     AcquireSRWLockExclusive(&g_lock);
     double t0 = now_ms();
-    WSAPOLLFD pf = { .fd = g_sock, .events = POLLRDNORM };
-    while (g_prog_out && g_pend_n && !g_dead && WSAPoll(&pf, 1, 0) > 0) {
-        int kind = g_pend[g_pend_head];
-        if (!pend_read_one_locked()) break;
-        if (kind == PEND_PROGRESS) { got = 1; break; }
-    }
-    if (g_dead) { g_pend_n = 0; g_prog_out = 0; }
+    int had = g_prog_out;
+    rx_pump_locked(); // 届いている物を全部（進み具合の答え・窓の絵・押し出し）
+    int got = had && !g_prog_out;
     g_stat.wait_ms[VR_GET_PROGRESS] += now_ms() - t0;
     ReleaseSRWLockExclusive(&g_lock);
     return got;
 }
 
+// 押し出しを頼んだとき：知らせの来ない submit（受け手で出せなかった物など）に備え、番号がしばらく進まなければ念のため進み具合を聞く。
+// 前は 20 ms だったが、GPU の 1 コマが 20 ms を超えると（代役の lavapipe の Heaven・重い場面の iPhone）待つたびに聞き、
+// 押し出しで減らした GET_PROGRESS の往復が戻ってきた。受け手は出した submit を全部見張るので、ここは本当の念のため。
+// IPHONE_VK_PUSH_FALLBACK_MS で変える（既定 100）
+// 数え始めは「番号が進んだ時」か「待ち始めた時」（前の呼び出しから間が空いたら、新しい待ちとして数え直す）
+static volatile uint64_t g_push_seen;
+static double g_push_t, g_push_last;
+static void push_fallback(void) {
+    static double after = -1;
+    if (after < 0) { const char *e = getenv("IPHONE_VK_PUSH_FALLBACK_MS"); after = e && *e ? atof(e) : 100; }
+    double t = now_ms();
+    if (t - g_push_last > after) g_push_t = t;
+    g_push_last = t;
+    if (g_done_msg != g_push_seen) { g_push_seen = g_done_msg; g_push_t = t; return; }
+    if (t - g_push_t < after) return;
+    g_push_t = t;
+    g_stat.push_req++;
+    progress_request();
+}
+
 // 受け手に終わった submit の番号を聞く（GPU は待たない）。
-// 錠を持たずに待つやり方では、頼んで、届いていれば読むだけ（届いていなければ前の答えのまま）
+// 錠を持たずに待つやり方では、頼んで、届いていれば読むだけ（届いていなければ前の答えのまま）。
+// 押し出しを頼んだときは聞かずに、届いている知らせを読むだけ
 static void progress_poll(void) {
+    if (g_push) {
+        AcquireSRWLockExclusive(&g_lock);
+        rx_pump_locked();
+        ReleaseSRWLockExclusive(&g_lock);
+        push_fallback();
+        return;
+    }
     if (progress_async()) {
         progress_request();
         progress_take();
         return;
     }
     vr_buf b = { 0 }, out = { 0 };
-    if (rpc_call(VR_GET_PROGRESS, &b, &out) == VK_SUCCESS && out.n >= 8) {
+    if (rpc_call(VR_GET_PROGRESS, &b, &out) == VK_SUCCESS && out.n >= 8 && !g_ext_on) { // 尾があれば番号は尾で入っている
         uint64_t v;
         memcpy(&v, out.p, 8);
         if (v > g_done_msg) g_done_msg = v;
@@ -3433,11 +3598,33 @@ static void progress_poll(void) {
     free(out.p);
 }
 
+// 押し出しを頼んだときの待ち方：問い合わせずに、受け手の知らせが届くのを錠の外で待つ（届けば WSAPoll がすぐ起きる）
+static int push_wait(uint64_t msg, double ms) {
+    double t0 = now_ms();
+    g_stat.push_waits++;
+    for (;;) {
+        AcquireSRWLockExclusive(&g_lock);
+        rx_pump_locked();
+        int dead = g_dead;
+        ReleaseSRWLockExclusive(&g_lock);
+        double t = now_ms();
+        if (g_done_msg >= msg || dead || t - t0 >= ms) {
+            g_stat.push_wait_ms += t - t0;
+            return g_done_msg >= msg || dead;
+        }
+        push_fallback();
+        WSAPOLLFD pf = { .fd = g_sock, .events = POLLRDNORM };
+        double left = ms - (t - t0);
+        WSAPoll(&pf, 1, left >= 5 ? 5 : left >= 1 ? (int) left : 1);
+    }
+}
+
 // submit の番号 msg まで終わるのを待つ。ms 待っても終わらなければ 0。
 // 錠を持たずに待つやり方では、問い合わせを 1 つ出しておき、答えが届くまで錠を放して 1 ms ずつ眠る。
 // 待っている間も、ほかの糸は submit を送れる
 static int progress_wait(uint64_t msg, double ms) {
     if (!msg || g_done_msg >= msg) return 1;
+    if (g_push) return push_wait(msg, ms);
     double t0 = now_ms();
     for (int n = 0;; n++) {
         if (progress_async()) {
@@ -4323,6 +4510,7 @@ static void VKAPI_CALL destroy_device(VkDevice dv, const VkAllocationCallbacks *
         AcquireSRWLockExclusive(&g_lock);
         g_submit_msgs = 0;
         g_done_msg = 0;
+        g_epoch++; // 受け手も数え直す。これより前の数え方の番号（尾・押し出し）は使わない
         ReleaseSRWLockExclusive(&g_lock);
     }
     for (int i = 0; i < 16; i++) free(d->queues[i]);
@@ -7176,10 +7364,38 @@ static VkResult blit(struct swapchain *sc, uint32_t j, uint64_t serial) {
 // iOS は熱いと自分で GPU を遅くするが、コマ数を落として熱を出さない方が、速さの上がり下がりが少ない
 static int g_heat = -1;
 static double g_heat_gap;
+static void heat_apply(VkResult r, uint32_t h);
+// 熱の問い合わせを返事を待たずに出す（IPHONE_VK_STATUS_ASYNC=0 で前の待つやり方）
+static int status_async(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_STATUS_ASYNC"); v = !(e && *e == '0'); }
+    return v;
+}
+
 static void heat_check(void) {
     static double last;
     if (!(g_hw.caps & VR_CAP_STATUS) || g_dead) return;
     double t = now_ms();
+    if (status_async()) {
+        // 前に頼んだ答えが届いていれば使い、2 秒たっていれば次を頼む（答えは返事の列で読む。ほかの返事を読む所が先に読んでもよい）
+        AcquireSRWLockExclusive(&g_lock);
+        if (g_status_out) rx_pump_locked();
+        int ready = g_status_ready;
+        VkResult r = g_status_r;
+        uint32_t h = g_status_v;
+        g_status_ready = 0;
+        if (!g_status_out && !g_dead && t - last >= 2000) {
+            last = t;
+            vr_buf b = { 0 };
+            g_stat.calls[VR_GET_STATUS]++;
+            put_msg_locked(VR_GET_STATUS, &b);
+            free(b.p);
+            if (flush_locked()) { g_status_out = 1; pend_push_locked(PEND_STATUS); }
+        }
+        ReleaseSRWLockExclusive(&g_lock);
+        if (ready) heat_apply(r, h);
+        return;
+    }
     if (t - last < 2000) return;
     last = t;
     vr_buf b = { 0 }, out = { 0 };
@@ -7188,6 +7404,10 @@ static void heat_check(void) {
     uint32_t h = 0;
     if (r == VK_SUCCESS && out.n >= 4) memcpy(&h, out.p, 4);
     free(out.p);
+    heat_apply(r, h);
+}
+
+static void heat_apply(VkResult r, uint32_t h) {
     if (r != VK_SUCCESS || h > 3 || (int) h == g_heat) return;
     static double fps = -1;
     if (fps < 0) { const char *e = getenv("IPHONE_VK_HEAT_FPS"); fps = e ? atof(e) : 30; }
@@ -10891,6 +11111,25 @@ static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32
             g_qrc_hits++;
             return VK_SUCCESS;
         }
+        // 書いた submit がまだ終わっていないと分かっていれば（返事の尾と押し出しで g_done_msg が進む）、往復せずに「まだ」と答える。
+        // 待つ印が無いので「まだ」でよい。前は受け手がその submit を待ってから読み、待たない読みが GPU 待ちになっていた。
+        // 回って読み直すアプリ（Unreal）は、押し出し（または念のための問い合わせ）で番号が進んでから 1 回だけ往復する。IPHONE_VK_QUERY_DONE=0 で切る
+        static int qdone = -1;
+        if (qdone < 0) { const char *e = getenv("IPHONE_VK_QUERY_DONE"); qdone = !(e && *e == '0'); }
+        if (n == 1 && qdone && g_ext_on && wm && wm != UINT64_MAX && g_done_msg < wm) {
+            AcquireSRWLockExclusive(&g_lock);
+            rx_pump_locked();
+            ReleaseSRWLockExclusive(&g_lock);
+            if (g_done_msg < wm) {
+                if (g_push) push_fallback();
+                else progress_request();
+                if ((uint64_t) (nv + want_av) * es <= size && want_av) memset((uint8_t *) data + (size_t) nv * es, 0, es);
+                g_stat.skipped++;
+                g_stat.q_nr_done++;
+                free(b.p);
+                return VK_NOT_READY;
+            }
+        }
         if (nrc && qnr_hit(ID(qp), first, wm, nsub)) {
             // まだ。欄の値は書かず、「終わったか」だけ 0 を書く（受け手に聞いたときと同じ）
             if ((uint64_t) (nv + want_av) * es <= size && want_av) memset((uint8_t *) data + (size_t) nv * es, 0, es);
@@ -10904,7 +11143,10 @@ static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32
             // IPHONE_VK_QUERY_BATCH=2 なら、それまでに送った submit を全部待ってから読む（往復は減り、1 回の待ちは長くなる）
             static int qall = -1;
             if (qall < 0) { const char *e = getenv("IPHONE_VK_QUERY_BATCH"); qall = e && *e == '2'; }
+            uint64_t wm0 = wm;
             if (qall && nsub > wm) wm = nsub;
+            // 終わったと分かっている submit が書いた query も一緒に読む（受け手は待たずに読める）。往復 1 回で覚える数が増える
+            else if (qdone && g_ext_on && g_done_msg > wm) wm = g_done_msg;
             uint32_t lo, hi;
             qrc_range(ID(qp), first, wm, &lo, &hi);
             uint32_t span = hi - lo + 1;
@@ -10924,7 +11166,7 @@ static VkResult VKAPI_CALL get_qpool_results(VkDevice dv, VkQueryPool qp, uint32
             free(out.p);
             if (r < 0) return r;
             if (qrc_get(ID(qp), first, es, want_av, data, size)) return VK_SUCCESS;
-            if (nrc) qnr_put(ID(qp), first, wm, nsub);
+            if (nrc) qnr_put(ID(qp), first, qall ? wm : wm0, nsub);
             if ((uint64_t) (nv + want_av) * es <= size && want_av) memset((uint8_t *) data + (size_t) nv * es, 0, es);
             return VK_NOT_READY;
         }

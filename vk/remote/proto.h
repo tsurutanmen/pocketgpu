@@ -39,6 +39,18 @@
 // descriptor の種類 VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR（1 つにつき acceleration structure の番号 u64）。
 // ray tracing pipeline（SBT）はまだ入らない。番号はほかの係（1<<22・1<<23 往復を減らす・1<<25 平面・1<<26 録画）と重ならないよう 1<<28
 #define VR_CAP_RT 268435456u
+// 返事の尾（VR_SET_OPTIONS の VR_OPT_REPLY_EXT を受けたつなぎだけ）：どの返事も、頭の 8 バイトのすぐ後ろに 16 バイトを足す。
+//   終わった submit の番号（u64。VR_GET_PROGRESS と同じ意味）・返事の通し番号（u32。このつなぎで送った返事を 0 から数える。尾を付ける前の返事も数える）・
+//   数え直しの回数（u32。装置が全部なくなって submit の番号を 0 に戻した回数）。頭の長さ（2 つ目）は尾を含まない
+#define VR_CAP_REPLY_EXT 4194304u   // 1u << 22（命令は VR_SET_OPTIONS = 120）
+// 押し出し（VR_OPT_PUSH_DONE を受けたつなぎだけ。VR_OPT_REPLY_EXT と一緒に使う）：submit が GPU で終わったら、頼まれなくても
+// 頭 [0, 0] と尾 [終わった submit の番号・VR_PUSH_SEQ・数え直しの回数] だけの知らせを送る。返事と返事の間にだけ入る（返事の途中には入らない）。
+// 通し番号は進めない。頭が [1, 0] の知らせは「これ以降は知らせない」（受け手が見張りきれなくなった。尾の番号はそのときまでの物）
+#define VR_CAP_PUSH_DONE 8388608u   // 1u << 23
+#define VR_OPT_REPLY_EXT 1u
+#define VR_OPT_PUSH_DONE 2u
+#define VR_EXT_BYTES 16u
+#define VR_PUSH_SEQ 0xffffffffu
 // VR_READ_H264 の印
 #define VR_H264_KEY 1u               // このコマをキーフレーム（IDR）にする。ドライバがほどき直すとき
 #define VR_H264_PIPE 2u
@@ -170,6 +182,8 @@ enum vr_op {
     VR_DESTROY_ACCEL,            // device・id
     VR_GET_ACCEL_SIZES,          // [同期] device・build の種類（u32）・build の形（種類・flags・mode の u32 ×3 と vr_accel_geoms。アドレスは 0）・
                                  // primitive の最大数の並び（u32）→ accelerationStructureSize・updateScratchSize・buildScratchSize（u64 ×3）
+    // ---- 返事の尾と押し出し（VR_CAP_REPLY_EXT・VR_CAP_PUSH_DONE）。ほかの係と重ならないよう 120 から（録画 96〜・平面 104〜・レイトレ 112〜） ----
+    VR_SET_OPTIONS = 120,        // 印（u32。VR_OPT_*）。返事なし。このつなぎの間だけ効く。名乗っていない印は受け手が無視する（VR_CAP_REPLY_EXT）
     VR_OP_COUNT
 };
 

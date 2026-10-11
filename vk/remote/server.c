@@ -636,6 +636,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     }
     caps |= VR_CAP_NULL_DESC;
     caps |= VR_CAP_PROGRESS; // 終わった submit の番号を、GPU を待たずに答える
+    caps |= VR_CAP_REPLY_EXT | VR_CAP_PUSH_DONE; // 返事に終わった submit の番号を付ける・終わったら頼まれなくても知らせる（VR_SET_OPTIONS で頼まれたつなぎだけ）
     caps |= VR_CAP_DESC_FLAGS; // binding の flags と set ごとの数を読む（vkd3d-proton）
     // 調べ用：VKR_CAPS=数 で名乗る印を絞る（古い受け手のふりをする）
     const char *mask = getenv("VKR_CAPS");
@@ -1003,6 +1004,8 @@ static void mark_blocked(uint8_t *blk) {
     }
 }
 
+static void watch_forget(VkFence f); // 見張りの糸が待っている fence を、reset する・消す前に放してもらう（下の「返事の尾と押し出し」）
+
 // k 番目までに出した仕事が終わるのを待って、一覧から外す。CPU からの合図を待っている物は待たずに残す
 static void drain_upto(int k) {
     if (k < 0 || !g_nfl) return;
@@ -1033,6 +1036,7 @@ static void drain_upto(int k) {
         free(g_fl[i].snap);
         g_fl[i].snap = NULL;
         if (!g_fl[i].own) continue;
+        watch_forget(g_fl[i].f);
         vkResetFences(g_dev, 1, &g_fl[i].f);
         if (g_nfpool < 64) g_fpool[g_nfpool++] = g_fl[i].f;
         else vkDestroyFence(g_dev, g_fl[i].f, NULL);
@@ -1083,6 +1087,238 @@ static void grave_sweep(VkDevice dev) {
 }
 
 static void drain(void) { drain_upto(g_nfl - 1); grave_sweep(VK_NULL_HANDLE); }
+
+// ---- 返事の尾と、終わった submit の押し出し（VR_CAP_REPLY_EXT・VR_CAP_PUSH_DONE） ----
+// 尾：どの返事にも「終わった submit の番号」を付け、ドライバが VR_GET_PROGRESS を往復させずに fence の進みを知れるようにする。
+// 押し出し：主の糸は命令を順に処理するので、VR_GET_PROGRESS の返事は前に積まれた命令（GPU を待つ MEM_WRITE・JPEG など）の後になる。
+// 見張りの糸が submit の終わりを待ち、終わったらすぐ知らせる。送るのは主の糸の返事と錠で分ける（返事の途中には入れない）
+static int g_rx_ext;          // このつなぎで返事に尾を付ける
+static uint32_t g_reply_seq;  // このつなぎで送った返事の数
+static uint32_t g_epoch;      // このつなぎで submit の番号を 0 に戻した回数
+#ifdef _WIN32
+static SRWLOCK g_send_lk = SRWLOCK_INIT;
+static void send_lock(void) { AcquireSRWLockExclusive(&g_send_lk); }
+static void send_unlock(void) { ReleaseSRWLockExclusive(&g_send_lk); }
+#else
+static pthread_mutex_t g_send_mx = PTHREAD_MUTEX_INITIALIZER;
+static void send_lock(void) { pthread_mutex_lock(&g_send_mx); }
+static void send_unlock(void) { pthread_mutex_unlock(&g_send_mx); }
+#endif
+
+// 尾に入れる「終わった submit の番号」。頭から終わった仕事を一覧から外して（VR_GET_PROGRESS と同じ。終わっているので待たない）数える
+static uint64_t done_now(void) {
+    if (!g_dev) return g_nfl ? 0 : g_submit_msgs;
+    int k = -1;
+    for (int i = 0; i < g_nfl; i++) {
+        if (vkGetFenceStatus(g_dev, g_fl[i].f) != VK_SUCCESS) break;
+        k = i;
+    }
+    if (k >= 0) drain_upto(k);
+    return g_nfl ? (g_fl[0].msg ? g_fl[0].msg - 1 : 0) : g_submit_msgs;
+}
+
+// 見張り：submit に付いた fence（アプリの物か自前の物）を、別の糸が出した順に待ち、終わったらすぐ知らせる。
+// 前は空の submit に見張り用の fence を付けていたが、submit が倍になる。fence はそのまま借りる。
+// 主の糸がその fence を reset・消す前には watch_forget を呼ぶ（見張りが待っている最中なら待ち終わるまで待ち、一覧の印は「終わった」に替える）。
+// 主の糸が reset・消すのは終わった fence だけ（まだの物は名前を付け替える：VR_RESET_FENCES）
+#define WATCH_RING 512
+static struct {
+    int on;            // このつなぎで頼まれた
+    int run, started;  // 糸が動いている
+    vr_sock s;
+    VkDevice dev;
+    VkFence f[WATCH_RING]; // VK_NULL_HANDLE：主の糸が reset・消した（もう終わっている）
+    uint64_t m[WATCH_RING];
+    int head, n;
+    VkFence cur;       // 見張りが錠の外で待っている fence
+    uint64_t sent;     // 最後に知らせた番号
+    uint32_t epoch;
+    uint64_t pushes, adds;
+#ifdef _WIN32
+    SRWLOCK lk;
+    CONDITION_VARIABLE cv;
+    HANDLE thr;
+#else
+    pthread_mutex_t mx;
+    pthread_cond_t cv;
+    pthread_t thr;
+#endif
+} g_watch = {
+#ifdef _WIN32
+    .lk = SRWLOCK_INIT, .cv = CONDITION_VARIABLE_INIT,
+#else
+    .mx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER,
+#endif
+};
+#ifdef _WIN32
+static void watch_lock(void) { AcquireSRWLockExclusive(&g_watch.lk); }
+static void watch_unlock(void) { ReleaseSRWLockExclusive(&g_watch.lk); }
+static void watch_wait(void) { SleepConditionVariableSRW(&g_watch.cv, &g_watch.lk, INFINITE, 0); }
+static void watch_wake(void) { WakeAllConditionVariable(&g_watch.cv); }
+#else
+static void watch_lock(void) { pthread_mutex_lock(&g_watch.mx); }
+static void watch_unlock(void) { pthread_mutex_unlock(&g_watch.mx); }
+static void watch_wait(void) { pthread_cond_wait(&g_watch.cv, &g_watch.mx); }
+static void watch_wake(void) { pthread_cond_broadcast(&g_watch.cv); }
+#endif
+
+// stop=1：これ以降は知らせない（ドライバは VR_GET_PROGRESS の問い合わせに戻る）。done はそのときまでに分かっている番号
+static void watch_push(uint64_t done, int stop) {
+    uint8_t m[8 + VR_EXT_BYTES];
+    uint32_t h[2] = { stop ? 1u : 0u, 0 }, seq = VR_PUSH_SEQ, ep = g_watch.epoch;
+    memcpy(m, h, 8);
+    memcpy(m + 8, &done, 8);
+    memcpy(m + 16, &seq, 4);
+    memcpy(m + 20, &ep, 4);
+    send_lock();
+    vr_send_all(g_watch.s, m, sizeof m); // 送れなければ、主の糸が次の読みか送りで切れたことに気づく
+    send_unlock();
+    g_watch.pushes++;
+}
+
+static void watch_loop(void) {
+    for (;;) {
+        watch_lock();
+        while (g_watch.run && !g_watch.n) watch_wait();
+        if (!g_watch.run) { watch_unlock(); return; }
+        VkFence f = g_watch.f[g_watch.head];
+        VkResult w = VK_SUCCESS;
+        if (f) {
+            g_watch.cur = f;
+            watch_unlock();
+            w = vkWaitForFences(g_watch.dev, 1, &f, VK_TRUE, 50000000ull);
+            watch_lock();
+            g_watch.cur = VK_NULL_HANDLE;
+            watch_wake(); // watch_forget で待っている主の糸を起こす
+        }
+        if (w == VK_TIMEOUT) { watch_unlock(); continue; }
+        if (w != VK_SUCCESS) {
+            // GPU を失ったなど：知らせるのをやめる（ドライバは VR_GET_PROGRESS に戻る）
+            g_watch.run = 0;
+            watch_wake();
+            watch_unlock();
+            watch_push(g_watch.sent, 1);
+            return;
+        }
+        // 頭（いま待ち終えた物。外すのは見張りだけなので、まだ頭にある）と、その後ろの終わっている物をまとめて外す。
+        // 番号は出した順なので、外した最後の物の番号までが全部終わっている。主の糸が「終わった」に替えた物（NULL）もそのまま外す
+        uint64_t done = 0;
+        for (int first = 1; g_watch.n; first = 0) {
+            VkFence hf = g_watch.f[g_watch.head];
+            if (!first && hf && vkGetFenceStatus(g_watch.dev, hf) != VK_SUCCESS) break;
+            done = g_watch.m[g_watch.head];
+            g_watch.head = (g_watch.head + 1) % WATCH_RING;
+            g_watch.n--;
+        }
+        watch_wake(); // 一覧が満ちて待っている主の糸を起こす
+        watch_unlock();
+        if (done > g_watch.sent) {
+            g_watch.sent = done;
+            watch_push(done, 0);
+        }
+    }
+}
+#ifdef _WIN32
+static DWORD WINAPI watch_thread(LPVOID a) { (void) a; watch_loop(); return 0; }
+#else
+// iPhone では主の糸と同じく速いコアに置く（省電力のコアに回ると、知らせが遅れてドライバの待ちが延びる）
+static void *watch_thread(void *a) { (void) a; qos_hi(); watch_loop(); return NULL; }
+#endif
+
+// 主の糸が fence を reset する・消す前に呼ぶ
+static void watch_forget(VkFence f) {
+    if (!g_watch.started || !f) return;
+    watch_lock();
+    while (g_watch.cur == f) watch_wait();
+    for (int i = 0; i < g_watch.n; i++) {
+        int at = (g_watch.head + i) % WATCH_RING;
+        if (g_watch.f[at] == f) g_watch.f[at] = VK_NULL_HANDLE;
+    }
+    watch_unlock();
+}
+
+// 見張りを止める（装置を消す前・つなぎが切れたとき・数え直す前に呼ぶ）。fence は主の糸の物なので消さない
+static void watch_stop(void) {
+    if (!g_watch.started) return;
+    watch_lock();
+    g_watch.run = 0;
+    watch_wake();
+    watch_unlock();
+#ifdef _WIN32
+    WaitForSingleObject(g_watch.thr, INFINITE);
+    CloseHandle(g_watch.thr);
+#else
+    pthread_join(g_watch.thr, NULL);
+#endif
+    g_watch.started = 0;
+    g_watch.n = g_watch.head = 0;
+    g_watch.cur = VK_NULL_HANDLE;
+    g_watch.dev = VK_NULL_HANDLE;
+    vlog("終わった submit の見張りを止めた（知らせた %llu 回・見張った submit %llu）", (unsigned long long) g_watch.pushes, (unsigned long long) g_watch.adds);
+}
+
+// 糸を起こしたばかりなら 2（いまの仕事の一覧を全部積んである）・動いていれば 1・使えなければ 0
+static int watch_start(vr_sock s) {
+    if (g_watch.started) return g_watch.run;
+    if (!g_dev) return 0;
+    g_watch.dev = g_dev;
+    g_watch.s = s;
+    g_watch.epoch = g_epoch;
+    g_watch.sent = 0;
+    g_watch.pushes = g_watch.adds = 0;
+    g_watch.n = g_watch.head = 0;
+    g_watch.cur = VK_NULL_HANDLE;
+    // まだ終わっていない仕事（drain のあとでも、CPU からの合図を待つ物は残る）を先に積む。積まずに後の submit を知らせると、
+    // 残った仕事より先の番号を「終わった」と言ってしまう
+    for (int i = 0; i < g_nfl && g_watch.n < WATCH_RING; i++) {
+        g_watch.f[g_watch.n] = g_fl[i].f;
+        g_watch.m[g_watch.n++] = g_fl[i].msg;
+    }
+    g_watch.run = 1;
+#ifdef _WIN32
+    g_watch.thr = CreateThread(NULL, 0, watch_thread, NULL, 0, NULL);
+    g_watch.started = g_watch.thr != NULL;
+#else
+    g_watch.started = pthread_create(&g_watch.thr, NULL, watch_thread, NULL) == 0;
+#endif
+    if (!g_watch.started) {
+        g_watch.run = 0;
+        g_watch.on = 0;
+        g_watch.n = 0;
+        vlog("見張りの糸を作れないので、終わった submit を知らせない");
+        watch_push(0, 1);
+        return 0;
+    }
+    return 2;
+}
+
+// submit の番号 msg を fence f 付きで出したあとに呼ぶ
+// （fence が無い submit は無い：受け手が自前の物を付ける）
+static void watch_add(vr_sock s, VkFence f, uint64_t msg) {
+    if (!g_watch.on || !f) return;
+    int st = watch_start(s);
+    if (st != 1) return; // 起こしたばかりなら、この submit も一覧から積んである
+    watch_lock();
+    int full = g_watch.n == WATCH_RING;
+    if (full) {
+        // GPU が 512 本遅れている（CPU からの合図を待つ仕事が止まっているなど）。飛ばして後の番号を知らせると、飛ばした仕事を
+        // 「終わった」と言ってしまうので、このつなぎではもう積まない。積んである分は知らせてから、やめたことを伝える。
+        // 待って空きを作ると、合図の命令を読む主の糸が止まって抜けられない
+        g_watch.on = 0;
+    } else if (g_watch.run) {
+        int at = (g_watch.head + g_watch.n) % WATCH_RING;
+        g_watch.f[at] = f;
+        g_watch.m[at] = msg;
+        g_watch.n++;
+        g_watch.adds++;
+        watch_wake();
+    }
+    watch_unlock();
+    if (full) {
+        vlog("見張りの一覧が満ちたので、終わった submit の押し出しをやめる");
+        watch_push(0, 1);
+    }
+}
 
 // 待たれている timeline の値のうち、まだ届いていない物を受け手が合図する（つなぎが切れたあとだけ使う）
 static int unblock_waits(void) {
@@ -1294,7 +1530,9 @@ static void dev_free(VkDevice dev, int last) {
 
 static void cleanup(void) {
     drain();
+    watch_stop(); // 見張りが待つ fence は装置の物なので、装置を消す前に止める。数え直す前に止めて、古い番号を新しい数え方で知らせない
     g_submit_msgs = 0;
+    g_epoch++;
     // 合図を待ったまま残った仕事は、待たれている値を受け手が合図して流してから待つ
     for (int round = 0; g_nfl && g_dev && round < 8; round++) {
         int n = unblock_waits();
@@ -1388,7 +1626,25 @@ static int peer_gone(vr_sock s) {
 
 static int reply(vr_sock s, int32_t result) {
     uint32_t h[2] = { (uint32_t) result, (uint32_t) g_out.n };
-    int ok = vr_send_all(s, h, 8) && vr_send_all(s, g_out.p, g_out.n);
+    int ok;
+    if (g_rx_ext) {
+        // 頭のすぐ後ろに尾（終わった submit の番号・通し番号・数え直しの回数）。小さな返事は 1 回で送る
+        uint8_t m[8 + VR_EXT_BYTES + 256];
+        uint64_t done = done_now();
+        uint32_t seq = g_reply_seq, ep = g_epoch;
+        memcpy(m, h, 8);
+        memcpy(m + 8, &done, 8);
+        memcpy(m + 16, &seq, 4);
+        memcpy(m + 20, &ep, 4);
+        size_t k = 8 + VR_EXT_BYTES;
+        if (g_out.n <= 256) { if (g_out.n) memcpy(m + k, g_out.p, g_out.n); k += g_out.n; }
+        send_lock();
+        ok = vr_send_all(s, m, k) && (g_out.n <= 256 || vr_send_all(s, g_out.p, g_out.n));
+        send_unlock();
+    } else {
+        ok = vr_send_all(s, h, 8) && vr_send_all(s, g_out.p, g_out.n);
+    }
+    g_reply_seq++;
     g_out.n = 0;
     return ok;
 }
@@ -3540,6 +3796,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             if (g_dev && g_dev != dev) {
                 // 2 つ目の装置（CTS の試験が自分で作る物など）。手伝いの物は前の装置の上にあるので、新しい装置で作り直す
                 drain();
+                watch_stop(); // 次の submit のときに、新しい装置で見張り直す
                 jp_reset();
                 vid_reset();
                 helpers_free(g_dev);
@@ -3561,6 +3818,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (!h || ndev <= 1) { cleanup(); return 1; }
         // ほかの装置が残る：この装置の物だけを片づける（前は全部を片づけ、残った装置で作ると落ちていた）
         drain();
+        watch_stop(); // 消す装置の fence を見張りが待たないように。次の submit のときに、残る装置で見張り直す
         if (g_dev == h) {
             jp_reset();
             vid_reset();
@@ -4350,6 +4608,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_DESTROY_FENCE: {
         VkDevice d = DEV(vr_ru64(r));
         uint64_t id = vr_ru64(r);
+        watch_forget(OBJ(VkFence, id));
         vkDestroyFence(d, OBJ(VkFence, id), NULL);
         del(id);
         return 1;
@@ -4371,8 +4630,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     for (int j = 0; j < g_nfl; j++) if (g_fl[j].f == f[i]) g_fl[j].own = 1;
                     VkFence nf = own_fence();
                     if (nf) put(fid[i], (uint64_t) nf, K_FENCE);
-                    else { drain_upto(k); vkResetFences(d, 1, &f[i]); }
+                    else { drain_upto(k); watch_forget(f[i]); vkResetFences(d, 1, &f[i]); }
                 } else {
+                    watch_forget(f[i]);
                     vkResetFences(d, 1, &f[i]);
                 }
             }
@@ -4586,6 +4846,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 }
             }
             memcpy(e->cbs, cids, ncid * sizeof *cids);
+            watch_add(s, f, my_msg); // 頼まれていれば、終わったら見張りの糸から知らせる
         } else {
             if (!g_err) vlog("vkQueueSubmit 失敗 (%d)。この接続ではもう GPU を使えない", res);
             if (res < 0) g_err = res;
@@ -4654,6 +4915,17 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         grave_sweep(VK_NULL_HANDLE);
         vr_u64(&g_out, g_nfl ? (g_fl[0].msg ? g_fl[0].msg - 1 : 0) : g_submit_msgs);
         return reply(s, g_err);
+    }
+    case VR_SET_OPTIONS: {
+        // このつなぎの間だけ効く印。名乗っていない印は無視する
+        uint32_t f = vr_ru32(r);
+        int ext = (f & VR_OPT_REPLY_EXT) && (g_caps & VR_CAP_REPLY_EXT);
+        int push = ext && (f & VR_OPT_PUSH_DONE) && (g_caps & VR_CAP_PUSH_DONE);
+        if (!push) watch_stop();
+        g_rx_ext = ext;
+        g_watch.on = push;
+        vlog("返事の尾 %s・終わった submit の押し出し %s", ext ? "あり" : "なし", push ? "あり" : "なし");
+        return 1;
     }
     case VR_GET_LINK: {
         // USB の口からだけ答える（インターネット共有の口から来た相手には、合言葉を教えない）
@@ -5385,6 +5657,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
 
 static void serve_client(vr_sock c) {
     vr_nodelay(c);
+    // 返事の尾と押し出しは、つなぎごとに頼まれてから
+    g_rx_ext = 0;
+    g_reply_seq = 0;
+    g_epoch = 0;
+    g_watch.on = 0;
     uint8_t *buf = NULL, *pk = NULL;
     size_t cap = 0, pcap = 0;
     for (;;) {
