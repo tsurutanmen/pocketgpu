@@ -42,6 +42,10 @@ import VideoToolbox
 //   立てない PC（古い webcam_rx）には、今までどおり何も増やさない。
 //   PC の SET は、画面で変えたときと同じ道を通す（画面の糸で UserDefaults に書き、controlsChanged か settingsChanged）。
 //   だから画面にもすぐ出て、次に開いたときも残る。画面と PC の両方で変えたら、あとから変えた方が残る
+//
+// 10/13（work/ios1013b）Wi-Fi のつなぎは、HELLO の合言葉を確かめてから古いつなぎと入れ替える（accept・acceptWifi）。
+//   前は、つながった時点で古いつなぎを切っていたので、同じ Wi-Fi にいる人が、合言葉を知らなくても何度でも PC のカメラを切れた。
+//   USB（127.0.0.1）の扱いは前のまま：つながったらすぐ入れ替える
 final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureMetadataOutputObjectsDelegate {
     static let shared = CameraBridge()
     static let port: UInt16 = 50064
@@ -175,6 +179,10 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private var listener: NWListener?
     private var wifiListener: NWListener? // 設定で入れたときだけ。Wi-Fi の口で待ち、合言葉を確かめる
     private var wifiMisses = 0              // 合言葉の違いが 5 回続いたら Wi-Fi の口を閉じる（当てずっぽうを止める）
+    private var pending: [NWConnection] = [] // Wi-Fi で来て、合言葉をまだ確かめていないつなぎ。確かめるまで conn には入れない（古いつなぎに触らない）
+    private static let maxPending = 4        // 確かめ中のつなぎの数の上限。超えたら、いちばん古いのを閉じる
+    private static let pendingSeconds = 10.0 // HELLO がこの秒数までに来ないつなぎは閉じる（PC は、つないですぐに HELLO を送る）
+    private static let maxFirstHello = 256   // 確かめる前に読む HELLO の長さの上限（本物は 32〜40 バイト）
     private var conn: NWConnection?
     private var connRemote = false
     private var connID = 0
@@ -464,14 +472,18 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             l.cancel()
             log("ウェブカメラ：Wi-Fi の口を閉じた")
         }
+        cancelPending() // 口を閉じたら、確かめ中のつなぎも通さない（入れ替わったあとのつなぎは、そのまま）
     }
 
-    // 一度に 1 本。新しいつなぎが来たら、古い方を切る（PC の橋渡しを開き直したとき、切れ残りを待たない）
+    // 一度に 1 本。新しいつなぎが来たら、古い方を切る（PC の橋渡しを開き直したとき、切れ残りを待たない）。
+    // USB（127.0.0.1）はすぐ入れ替える。Wi-Fi は同じ Wi-Fi の誰でもつなげるので、HELLO の合言葉を確かめてから入れ替える
+    // （つながった時点で切ると、合言葉を知らない人が何度でも PC のカメラを切れた）
     private func accept(_ c: NWConnection, remote: Bool = false) {
+        if remote { acceptWifi(c); return }
         if let old = conn { drop(old) }
         connID += 1
         conn = c
-        connRemote = remote
+        connRemote = false
         c.stateUpdateHandler = { [weak self, weak c] st in
             guard let self, let c else { return }
             switch st {
@@ -482,6 +494,100 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         log("ウェブカメラ：PC がつながった")
         c.start(queue: q)
         readMessage(c)
+    }
+
+    // ---- Wi-Fi のつなぎ：合言葉を確かめてから入れ替える（すべて q の上） ----
+
+    // まだ conn には入れない。HELLO を 1 つ読み、合言葉が合ってから古いつなぎと入れ替える。
+    // 合言葉が違う・HELLO ではない・10 秒たっても来ないつなぎは、古い方に触らずに閉じる。確かめ中は 4 本まで（超えたら古い方から閉じる）
+    private func acceptWifi(_ c: NWConnection) {
+        while pending.count >= Self.maxPending { pending.removeFirst().cancel() }
+        pending.append(c)
+        c.stateUpdateHandler = { [weak self, weak c] st in
+            guard let self, let c else { return }
+            switch st {
+            case .failed, .cancelled:
+                self.forgetPending(c)
+                self.drop(c) // 入れ替わったあとに切れたとき。conn でなければ何もしない
+            default: break
+            }
+        }
+        c.start(queue: q)
+        q.asyncAfter(deadline: .now() + Self.pendingSeconds) { [weak self, weak c] in
+            guard let self, let c, self.forgetPending(c) else { return } // もう入れ替わった・閉じた物は何もしない
+            self.log("ウェブカメラ：Wi-Fi のつなぎから HELLO が来ないので閉じた")
+            c.cancel()
+        }
+        readFirstHello(c)
+    }
+
+    // 合言葉を確かめる前に読むのは、最初の HELLO 1 つだけ（[u32 型][u32 長さ][中身]）。ほかの型・変な長さ・途中で切れたときは閉じる
+    private func readFirstHello(_ c: NWConnection) {
+        readExactly(c, 8) { [weak self] h in
+            guard let self, self.isPending(c) else { return }
+            guard let h else { self.closePending(c); return }
+            let b = [UInt8](h)
+            let type = Self.u32(b, 0), len = Int(Self.u32(b, 4))
+            guard type == Msg.hello, len >= 32, len <= Self.maxFirstHello else {
+                self.log("ウェブカメラ：Wi-Fi の最初の頼みが HELLO ではないので閉じた")
+                self.closePending(c)
+                return
+            }
+            self.readExactly(c, len) { [weak self] body in
+                guard let self, self.isPending(c) else { return }
+                guard let body else { self.closePending(c); return }
+                let hello = [UInt8](body)
+                guard self.codeOK(hello) else { self.refuseWifi(c); return }
+                self.promoteWifi(c)
+                self.handle(c, Msg.hello, hello) // 合言葉は合っている。あとは USB のつなぎと同じ道
+                self.readMessage(c)
+            }
+        }
+    }
+
+    // HELLO の 32 バイト目からの 4 バイトが、この起動の合言葉か
+    private func codeOK(_ body: [UInt8]) -> Bool {
+        body.count >= 36 && Self.u32(body, 32) == wifiCode
+    }
+
+    // 合言葉が合った：ここで初めて古いつなぎ（USB でも Wi-Fi でも）と入れ替える
+    private func promoteWifi(_ c: NWConnection) {
+        forgetPending(c)
+        if let old = conn { drop(old) }
+        connID += 1
+        conn = c
+        connRemote = true
+        log("ウェブカメラ：PC がつながった")
+    }
+
+    // 合言葉が違う：古いつなぎには触らず、このつなぎだけ断って閉じる。違いが 5 回続いたら Wi-Fi の口を閉じる（前と同じ）
+    private func refuseWifi(_ c: NWConnection) {
+        forgetPending(c)
+        wifiMisses += 1
+        log("ウェブカメラ：Wi-Fi の合言葉が違う（\(wifiMisses) 回目）。いまのつなぎはそのまま")
+        sendAck(status: 6, w: 0, h: 0, fps: 0, kbps: 0, camera: 0, flags: 0, to: c)
+        q.asyncAfter(deadline: .now() + 0.2) { c.cancel() } // ACK が出てから切る
+        if wifiMisses >= 5 { closeWifi() }
+    }
+
+    private func isPending(_ c: NWConnection) -> Bool { pending.contains { $0 === c } }
+
+    @discardableResult
+    private func forgetPending(_ c: NWConnection) -> Bool {
+        guard let i = pending.firstIndex(where: { $0 === c }) else { return false }
+        pending.remove(at: i)
+        return true
+    }
+
+    private func closePending(_ c: NWConnection) {
+        forgetPending(c)
+        c.cancel()
+    }
+
+    private func cancelPending() {
+        let list = pending
+        pending.removeAll()
+        for c in list { c.cancel() }
     }
 
     // いまのつなぎなら、カメラとエンコーダを止めて切る
@@ -536,7 +642,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         switch type {
         case Msg.hello where body.count >= 32:
             if connRemote {
-                guard body.count >= 36, Self.u32(body, 32) == wifiCode else {
+                guard codeOK(body) else {
                     wifiMisses += 1
                     log("ウェブカメラ：Wi-Fi の合言葉が違う（\(wifiMisses) 回目）")
                     sendAck(status: 6, w: 0, h: 0, fps: 0, kbps: 0, camera: 0, flags: 0)
@@ -2195,8 +2301,8 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
     // ---- 送る ----
 
-    private func sendMsg(_ type: UInt32, _ body: Data) {
-        guard let c = conn else { return }
+    private func sendMsg(_ type: UInt32, _ body: Data, to target: NWConnection? = nil) {
+        guard let c = target ?? conn else { return } // target は、まだ conn に入れていない Wi-Fi のつなぎ（合言葉が違うと断るとき）だけ
         var d = Data()
         Self.appendLE32(&d, type)
         Self.appendLE32(&d, UInt32(body.count))
@@ -2204,14 +2310,14 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         c.send(content: d, completion: .contentProcessed { _ in })
     }
 
-    private func sendAck(status: Int32, w: Int, h: Int, fps: Int, kbps: Int, camera: UInt32, flags: UInt32) {
+    private func sendAck(status: Int32, w: Int, h: Int, fps: Int, kbps: Int, camera: UInt32, flags: UInt32, to target: NWConnection? = nil) {
         var d = Data()
         Self.appendLE32(&d, Self.version)
         Self.appendLE32(&d, UInt32(bitPattern: status))
         Self.appendLE32(&d, UInt32(w)); Self.appendLE32(&d, UInt32(h)); Self.appendLE32(&d, UInt32(fps)); Self.appendLE32(&d, UInt32(kbps))
         Self.appendLE32(&d, camera)
         Self.appendLE32(&d, flags)
-        sendMsg(Msg.ack, d)
+        sendMsg(Msg.ack, d, to: target)
     }
 
     private func sendEvent(_ code: UInt32, _ arg: UInt32) {

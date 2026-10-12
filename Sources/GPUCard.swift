@@ -104,8 +104,10 @@ struct FanView: View {
 
 struct GPUCardView: View {
     @StateObject private var model = FanModel()
+    // 親が描き直して View が作り直されても、同じ時計を使う（ScreenDimmer.swift の RepeatingTick）。
+    // 前は let に Timer.publish を持っていて、作り直されるたびに新しい時計になり、0.25 秒より短い間に描き直されると 1 度も鳴らなかった
+    @StateObject private var tick = RepeatingTick(every: 0.25)
     private let info = GPUCardInfo.current
-    private let tick = Timer.publish(every: 0.25, on: .main, in: .common).autoconnect()
 
     // 案 A の見本の形：ファンを並べ、その下に GPU の名前とメモリ、いちばん下に説明と回転数
     var body: some View {
@@ -140,6 +142,6 @@ struct GPUCardView: View {
             .padding(.top, 3)
             .padding(.bottom, 4)
         }
-        .onReceive(tick) { _ in model.sample() }
+        .onReceive(tick.fired) { _ in model.sample() }
     }
 }
