@@ -30,11 +30,13 @@
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
+#include <stddef.h>
 #include <strings.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <time.h>
 #include <wchar.h>

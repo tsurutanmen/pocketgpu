@@ -2,7 +2,10 @@
 # Linux 用（WSL・Steam Deck を含む）を gcc で組む。窓は X11（xcb・Xlib）に JPEG の絵で出す。動画（H.264）と読み戻しの遅延は無い版。
 # X・libturbojpeg は動くときに dlopen するので、組むときに要るのは gcc と Vulkan のヘッダだけ。
 #   vk/build_linux.sh [出す所]                  既定は vk/build_linux
-#   vk/build_linux.sh [出す所] icd tests        icd・tests・server から選ぶ（server は Linux で受け手を組む。lavapipe などが受け手になる）
+#   vk/build_linux.sh [出す所] icd tests        icd・tests・server・probe から選ぶ（server は Linux で受け手を組む。lavapipe などが受け手になる）
+#                                               probe はキットの道具 pgpu-probe（start-pocketgpu.sh と run-on-iphone-gpu.sh が使う）
+# 配るキット用に古い glibc に合わせて組むときは LINUX_CC で組む物を替える（pc/make_linux_kit.py は Windows でもこれと同じ zig cc で組む）：
+#   LINUX_CC="zig cc -target x86_64-linux-gnu.2.31 -mcpu=baseline" vk/build_linux.sh 出す所 icd probe
 # Vulkan のヘッダ：VK_HEADERS=フォルダ があればそれ、無ければ third_party/Vulkan-Headers/include、それも無ければシステムの物
 # 使い方（組んだあと）：
 #   VK_ICD_FILENAMES=出す所/iphone_icd_linux.json IPHONE_VK=受け手の住所:50061 出す所/vecadd iPhone
@@ -15,7 +18,7 @@ WHAT=${*:-icd tests}
 if [ -n "$VK_HEADERS" ]; then VKH=-I$VK_HEADERS
 elif [ -d ../../third_party/Vulkan-Headers/include ]; then VKH=-I$PWD/../../third_party/Vulkan-Headers/include
 else VKH=; fi
-CC="gcc -O2 -g -Wall -Wextra -Wno-unused-parameter"
+CC="${LINUX_CC:-gcc} -O2 -g -Wall -Wextra -Wno-unused-parameter"
 mkdir -p "$OUT"
 for w in $WHAT; do
     case $w in
@@ -34,6 +37,10 @@ for w in $WHAT; do
         $CC $VKH -Itests tests/wsitri.c -o "$OUT/wsitri" -ldl
         $CC $VKH -Itests/linux_shim tests/wwbench.c -o "$OUT/wwbench" -ldl -l:libvulkan.so.1
         echo "試験：$OUT/{vecadd,tri,tri13,copyimg,pushdesc,copydesc,extlist,wsitri,wwbench}"
+        ;;
+    probe)
+        $CC $VKH tools/pgpu_probe.c -o "$OUT/pgpu-probe" -ldl
+        echo "キットの道具：$OUT/pgpu-probe"
         ;;
     server)
         $CC -w $VKH -DVR_SERVER_MAIN remote/server.c -o "$OUT/vk_server_linux" -lpthread -ldl -lm -l:libvulkan.so.1

@@ -1315,6 +1315,58 @@ static vr_sock unix_connect(const char *path) {
     sock_rcvtimeo(s, 5000);
     return s;
 }
+
+// usbmuxd の受け渡し役（キットの pgpu-probe broker）から、usbmuxd につないだ口をもらう。
+// Steam の入れ物（pressure-vessel）や Flatpak の中では /run が別なので /var/run/usbmuxd が見えない。
+// 受け渡し役は外で動き、名前だけの Unix socket（@pocketgpu-usbmuxd-<uid>。網の名前空間が同じなら入れ物の中からも見える）で待つ。
+// 頼まれると、同じ利用者か（SO_PEERCRED）を見てから usbmuxd につなぎ、その口を SCM_RIGHTS で渡す。
+// そのあとの通り道は usbmuxd に直接つながるので、受け渡し役はデータを中継しない（遅くならない）
+// 受け渡し役の名前に使う uid。入れ物が利用者の名前空間を分けて uid を写していても（unshare -Ur では 0 に見える）、
+// /proc/self/uid_map で外の uid に戻す。分けていなければそのまま（0 0 4294967295）
+static unsigned mux_outer_uid(void) {
+    unsigned u = (unsigned) getuid();
+    FILE *f = fopen("/proc/self/uid_map", "r");
+    if (f) {
+        unsigned long in, out, cnt;
+        while (fscanf(f, "%lu %lu %lu", &in, &out, &cnt) == 3)
+            if (u >= in && u - in < cnt) { u = (unsigned) (out + (u - in)); break; }
+        fclose(f);
+    }
+    return u;
+}
+
+static vr_sock broker_get(const char *name) {
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    size_t n = strlen(name);
+    if (n + 1 > sizeof a.sun_path) return INVALID_SOCKET;
+    memcpy(a.sun_path + 1, name, n); // 先頭の 0 で、ファイルの無い名前だけの socket
+    vr_sock s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s == INVALID_SOCKET) return s;
+    if (connect(s, (struct sockaddr *) &a, (socklen_t) (offsetof(struct sockaddr_un, sun_path) + 1 + n)) != 0) { closesocket(s); return INVALID_SOCKET; }
+    sock_rcvtimeo(s, 5000);
+    char b = 0;
+    struct iovec iov = { &b, 1 };
+    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
+    memset(&u, 0, sizeof u);
+    struct msghdr m;
+    memset(&m, 0, sizeof m);
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = u.buf;
+    m.msg_controllen = sizeof u.buf;
+    ssize_t r = recvmsg(s, &m, MSG_CMSG_CLOEXEC);
+    closesocket(s);
+    int fd = -1;
+    if (r == 1)
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c))
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) memcpy(&fd, CMSG_DATA(c), sizeof fd);
+    if (r != 1 || b != 'K') { if (fd >= 0) close(fd); return INVALID_SOCKET; } // 'K' 以外は「usbmuxd につながらない」
+    if (fd < 0) return INVALID_SOCKET;
+    sock_rcvtimeo(fd, 5000);
+    return fd;
+}
 #endif
 
 // usbmuxd の口を開く。どこにつないだかを where に書く
@@ -1322,17 +1374,33 @@ static vr_sock unix_connect(const char *path) {
 //   IPHONE_VK_MUX=/パス か unix:パス  その Unix socket（Linux。Steam Deck で usbmuxd を入れ物の中で動かして、口をホームに置くときなど）
 //   IPHONE_VK_MUX が無ければ USBMUXD_SOCKET_ADDRESS（libusbmuxd と同じ書き方：UNIX:パス か 住所:番号）
 //   それも無ければ Windows は 127.0.0.1:27015（Apple Mobile Device Service）、Linux は /var/run/usbmuxd
+//   Linux：IPHONE_VK_MUX=@名前 は受け渡し役（broker_get）。何も決めずに /var/run/usbmuxd につながらないときは、
+//   受け渡し役 @pocketgpu-usbmuxd-<uid> を試す（Steam の入れ物の中など。IPHONE_VK_MUX_BROKER=0 で試さない）
 static vr_sock mux_open(char *where, size_t nw) {
     const char *mp = getenv("IPHONE_VK_MUX");
     const char *env = mp && *mp ? mp : getenv("USBMUXD_SOCKET_ADDRESS");
     char a[300] = "";
     if (env && *env) snprintf(a, sizeof a, "%s", env);
 #ifndef _WIN32
+    int dflt = !a[0];
     if (!a[0]) snprintf(a, sizeof a, "/var/run/usbmuxd");
+    if (a[0] == '@') {
+        snprintf(where, nw, "usbmuxd の受け渡し役 %s", a);
+        return broker_get(a + 1);
+    }
     const char *path = !strncmp(a, "UNIX:", 5) || !strncmp(a, "unix:", 5) ? a + 5 : a[0] == '/' ? a : NULL;
     if (path) {
         snprintf(where, nw, "usbmuxd の口 %s", path);
-        return unix_connect(path);
+        vr_sock s = unix_connect(path);
+        const char *bk = getenv("IPHONE_VK_MUX_BROKER");
+        if (s == INVALID_SOCKET && dflt && !(bk && *bk == '0')) {
+            char name[64];
+            snprintf(name, sizeof name, "pocketgpu-usbmuxd-%u", mux_outer_uid());
+            s = broker_get(name);
+            snprintf(where, nw, s == INVALID_SOCKET ? "usbmuxd の口 %s（受け渡し役 @%s も無い）" : "usbmuxd の受け渡し役 @%s", s == INVALID_SOCKET ? path : name, name);
+            if (s != INVALID_SOCKET) say("%s が見えないので、%s から usbmuxd の口をもらった", path, where);
+        }
+        return s;
     }
 #else
     if (!a[0]) snprintf(a, sizeof a, "27015");
