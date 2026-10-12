@@ -5,6 +5,8 @@
 //   {"op":"asr","lang":"ja-JP","ext":"wav"} → 中身は音声のファイル。音声認識の結果（標準は iOS 26 の SpeechAnalyzer）
 //   {"op":"llm",…}・{"op":"llm_status"}     → Apple Intelligence の言葉のモデル（FMBridge.swift・Xcode 26 で組んだときだけ）
 //   {"op":"translate","text":"…","from":"ja","to":"en"} → 翻訳（TranslateBridge.swift・言語が iPhone に入っていること）
+//      失敗は {"error": 短い理由, "code": not_installed・unsupported・empty・timeout・failed, "detail": 詳しい理由}（0.7.60 から）
+//   {"op":"translate_prepare","from":"en","to":"ja"} → 翻訳の準備だけ。{"ok":true,"ready":true} か失敗（0.7.60 から。前の版は「知らない頼み」）
 //   {"op":"tts","text":"…","lang":"ja-JP"}  → 読み上げた音声の WAV を base64 で。{"op":"voices"} で声の一覧
 //   ---- work/ai_apps の足し分（app_features.patch）----
 //   {"op":"live_asr",…}                     → 流しっぱなしの文字起こし。このつなぎは流す形に変わる（LiveASR.swift・iOS 26）
@@ -104,6 +106,9 @@ final class AppleFeatures {
             #if compiler(>=6.2)
             if #available(iOS 26.0, *) { features += ["live_asr", "asr_segments"] }
             #endif
+            #if compiler(>=6.2) && canImport(Translation)
+            if #available(iOS 26.0, *) { features.append("translate_prepare") }
+            #endif
             features.append("image")
             #if canImport(WhisperKit)
             features.append("whisperkit")
@@ -128,6 +133,28 @@ final class AppleFeatures {
                 let t0 = Date()
                 var r = TranslateBridge.run(text: text, from: from, to: to)
                 r["ms"] = Int(Date().timeIntervalSince(t0) * 1000)
+                if r["error"] != nil {
+                    // 詳しい理由は記録だけに書く。PC には短い理由と種類を返す
+                    log("翻訳：訳せなかった \(from)→\(to)・\(r["code"] as? String ?? "")・\(r["detail"] as? String ?? "")")
+                }
+                return r
+            }
+            #endif
+            return ["error": "この版では翻訳が使えない"]
+        case "translate_prepare":
+            let from = req["from"] as? String ?? "ja"
+            let to = req["to"] as? String ?? "en"
+            #if compiler(>=6.2) && canImport(Translation)
+            if #available(iOS 26.0, *) {
+                let t0 = Date()
+                var r = TranslateBridge.prepare(from: from, to: to)
+                let ms = Int(Date().timeIntervalSince(t0) * 1000)
+                r["ms"] = ms
+                if r["error"] != nil {
+                    log("翻訳の準備：できなかった \(from)→\(to)・\(ms) ms・\(r["code"] as? String ?? "")・\(r["detail"] as? String ?? "")")
+                } else {
+                    log("翻訳の準備：できた \(from)→\(to)・\(ms) ms・温め \(r["warm"] as? String ?? "")")
+                }
                 return r
             }
             #endif

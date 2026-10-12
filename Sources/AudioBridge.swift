@@ -17,6 +17,13 @@ import os
 //            0 で flags に 0x4 があれば 3（前の PC の --voiceproc）
 //   ACK の 32〜35 バイト目：使った音の種類・入力の種類・ステレオの印・入力の機器の ch 数。前の PC は読まない
 //   一度 ACK に書いた rate・ch・形は、イヤホンの抜き差しで音を作り直しても変えない（足りない ch は AVAudioMixerNode が増やす）
+// あとからマイクを始める（0.7.60 で直した。work/fix1012）：
+//   アプリが後ろにいる間につながると、マイクは始められないので ACK は mic=no（aMicNeedsForeground）にする。
+//   アプリが前に出たら、このつなぎのまま ACK で伝えた形でマイクを始め、MIC の塊を送り出す。前の PC も届いた塊をそのまま鳴らす。
+//   前に出たことは scenePhase と didBecomeActive で知るが、それを取りこぼしても 1 秒ごとの見回り（sendStats）が始める。
+//   前面で始めるのに失敗したら、1・2・4…30 秒おいて試し直す
+//   ACK の flags の 0x0008（aMicLater）：このつなぎのまま、あとでマイクを始める。前の PC は読まない
+//   STATS の 33〜36 バイト目：アプリの状態（sFront など）・いまの入力の種類・予約 2。前の PC は 32 バイトだけ読む
 // 受け取るのは後ろの糸で、音を出すのは AVAudioSourceNode の実時間の糸。間は「ため」（PlayoutRing）で渡す。
 // ため方は work/audio/pc/proto.h の IpaPlayout と同じ：目標の長さまでためてから鳴らし、機器の時計とのずれは
 // 読む速さを最大 ±0.5% 変えて吸収し（比例＋積分）、足りなければ無音で埋めてためなおし、多すぎれば古い方を捨てる。
@@ -26,7 +33,9 @@ import os
 private enum IPA {
     static let tSpk: UInt8 = 1, tMic: UInt8 = 2, tPing: UInt8 = 3, tPong: UInt8 = 4, tStats: UInt8 = 5, tBye: UInt8 = 6
     static let fSpeaker: UInt16 = 0x0001, fMic: UInt16 = 0x0002, fVoiceProc: UInt16 = 0x0004, fExclusive: UInt16 = 0x0008
-    static let aSpeakerOK: UInt16 = 0x0001, aMicOK: UInt16 = 0x0002, aMicNeedsForeground: UInt16 = 0x0004
+    static let aSpeakerOK: UInt16 = 0x0001, aMicOK: UInt16 = 0x0002, aMicNeedsForeground: UInt16 = 0x0004, aMicLater: UInt16 = 0x0008
+    // STATS の 33 バイト目：アプリが前面にある・マイクが動いている・マイクを待っている・マイクが許可されていない
+    static let sFront: UInt8 = 0x01, sMicRunning: UInt8 = 0x02, sMicWaiting: UInt8 = 0x04, sMicDenied: UInt8 = 0x08
     static let frSilent: UInt8 = 0x01
     static let maxPayload = 1 << 20
     // マイクの PCM の形（HELLO と ACK の mic_format）
@@ -423,6 +432,7 @@ final class AudioBridgeModel: ObservableObject {
     @Published private(set) var speakerActive = false
     @Published private(set) var micActive = false
     @Published private(set) var micWaitsForeground = false
+    @Published private(set) var micRetrying = false // 前面で始めるのに失敗して、試し直している
     @Published private(set) var fillMs = 0.0
     @Published private(set) var ioMs = 0.0
     // 画面に出す、いま使っている入力と出力の名前。マイクの形（例：48 kHz・ステレオ・32 ビット）
@@ -458,10 +468,21 @@ final class AudioBridgeModel: ObservableObject {
     private var micIndex: UInt64 = 0
     private var micSent: UInt64 = 0, micDropped: UInt64 = 0
     private var pendingSends = 0
-    private var wantMicLater = false // 前に出ていなくてマイクを始められなかった
+    private var wantMicLater = false // マイクが要るのに始まっていない（前に出ていなかった・始めるのに失敗した）
+    private var micStarting = false // あとから始めるのを、いま試している
+    private var micRetryAt: DispatchTime? // 前面で失敗したあと、次に試してよい時刻
+    private var micRetryDelay = 1.0
+    private var appFront = false // 1 秒ごとに main で見た値。STATS で PC に伝える
+    private var micDenied = false
+    private var curInputKind: UInt8 = 0
     private var rebuildSeq = 0
 
-    private init() {}
+    private init() {
+        // SwiftUI の scenePhase のほかに、こちらでも前に出たのを知る（Lite はこれだけ。どちらから呼ばれても 1 回だけ始める）
+        NotificationCenter.default.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.foregrounded()
+        }
+    }
 
     private func log(_ s: String) { (s + "\n").withCString { rpc_bridge_log_line($0) } }
 
@@ -481,18 +502,15 @@ final class AudioBridgeModel: ObservableObject {
         if !v { DispatchQueue.main.async { [weak self] in self?.stopEngine() } }
     }
 
-    // アプリが前に出たときに呼ぶ。マイクを始められずに待っていたら始め直す
+    // アプリが前に出たときに呼ぶ。マイクを始められずに待っていたら、いまのつなぎのまま始める。
+    // 前は、ここで印を下ろしてから始めていたので、始めるのに失敗する（前面の状態がまだ変わっていないなど）と、もう試さなかった。
+    // いまは印を残したまま試し、始まったときだけ下ろす。ここで始まらなくても、1 秒ごとの見回り（sendStats）が始める
     func foregrounded() {
         queue.async { [weak self] in
-            guard let self, self.wantMicLater, let h = self.hello, let p = self.micPromise else { return }
-            let r = self.ring // スピーカーなしのときは nil
-            self.wantMicLater = false
-            self.log("音：前に出たので、マイクを始める")
-            DispatchQueue.main.async { [weak self] in
-                self?.startEngine(h, ring: r, promise: p) { micRing, _ in
-                    self?.queue.async { self?.attachMic(micRing) }
-                }
-            }
+            guard let self else { return }
+            self.micRetryAt = nil
+            self.micRetryDelay = 1
+            self.startMicIfWaiting("前に出たので", force: true)
         }
     }
 
@@ -573,6 +591,10 @@ final class AudioBridgeModel: ObservableObject {
         statsTimer?.cancel(); statsTimer = nil
         ring = nil; micRing = nil; hello = nil; micPromise = nil
         wantMicLater = false
+        micStarting = false
+        micRetryAt = nil
+        micRetryDelay = 1
+        curInputKind = 0
         rebuildSeq += 1 // 待っている作り直しを取り消す
         c.cancel()
         log("音：切れた")
@@ -582,6 +604,7 @@ final class AudioBridgeModel: ObservableObject {
             self?.speakerActive = false
             self?.micActive = false
             self?.micWaitsForeground = false
+            self?.micRetrying = false
             self?.fillMs = 0
             self?.inputName = ""
             self?.outputName = ""
@@ -609,6 +632,7 @@ final class AudioBridgeModel: ObservableObject {
                     guard c === self.conn, id == self.connID else { return }
                     self.micRing = micRing
                     self.micPromise = MicPromise(rate: info.micRate, channels: info.micChannels, format: info.micFormat)
+                    self.noteMicResult(info)
                     self.sendAck(c, info)
                     self.startTimers(c)
                     self.readFrame(c)
@@ -625,6 +649,8 @@ final class AudioBridgeModel: ObservableObject {
 
     private struct EngineInfo {
         var speakerOK = false, micOK = false, needsForeground = false
+        // wantMic：PC がマイクを頼んだ。triedMic：前面で許可もあり、マイクを始めようとした。micLater：あとで始める見込みがある（許可されていなくはない）
+        var wantMic = false, triedMic = false, micLater = false
         var hwRate: UInt32 = 0, ioUs: UInt32 = 0, outUs: UInt32 = 0, inUs: UInt32 = 0
         var micRate = 48000, micChannels = 1
         var micFormat: UInt16 = IPA.fmtS16
@@ -788,6 +814,9 @@ final class AudioBridgeModel: ObservableObject {
         let wantStereo = promise.map { $0.channels >= 2 } ?? (h.micChannels >= 2 && st.stereo)
         var info = EngineInfo()
         info.needsForeground = wantMic && !fg
+        info.wantMic = wantMic
+        info.triedMic = micAllowed
+        info.micLater = wantMic && perm != .denied
         info.micRate = promise?.rate ?? min(askRate, 48000)
         info.micChannels = promise?.channels ?? (wantStereo ? 2 : 1)
         info.micFormat = promise?.format ?? Self.micFormat(h)
@@ -800,7 +829,8 @@ final class AudioBridgeModel: ObservableObject {
         }
         if wantMic && perm == .denied { log("音：マイクが許可されていない。設定アプリで許可すると使える") }
         if wantMic && perm == .undetermined { MicPermission.request() }
-        if wantMic && !fg { queue.async { [weak self] in self?.wantMicLater = true }; micWaitsForeground = true }
+        // あとで始める印（wantMicLater）は、done を受けた側が noteMicResult で立てる
+        micWaitsForeground = wantMic && !fg
         let sess: SessionInfo
         do {
             sess = try configureSession(mic: micAllowed, exclusive: exclusive, mode: mode, settings: st, wantStereo: wantStereo,
@@ -983,10 +1013,11 @@ final class AudioBridgeModel: ObservableObject {
                     }
                     self.rebuildTimes.append(now)
                     self.log("音：\(why)。音を作り直す")
-                    self.startEngine(h, ring: r, promise: p) { [weak self] micRing, _ in
+                    self.startEngine(h, ring: r, promise: p) { [weak self] micRing, info in
                         self?.queue.async { [weak self] in
                             guard let self, c === self.conn, id == self.connID else { return }
                             self.micRing = micRing
+                            self.noteMicResult(info) // 後ろで作り直したときは、前に出たら始め直す
                         }
                     }
                 }
@@ -1006,11 +1037,52 @@ final class AudioBridgeModel: ObservableObject {
         }
     }
 
-    // 前に出てからマイクだけ足したとき
-    private func attachMic(_ mr: MicRing?) {
-        guard conn != nil else { return }
-        micRing = mr
-        DispatchQueue.main.async { [weak self] in self?.micWaitsForeground = false }
+    // ---- あとからマイクを始める（queue の上）----
+
+    // マイクを待っているなら、いまのつなぎのまま始める。ACK で伝えた rate・ch・形（micPromise）で始めるので、PC は同じ形のまま受けられる。
+    // force でなければ、失敗のあとの待ち時間（micRetryAt）を守る。前面にないときは、作り直さずに次の見回りを待つ（スピーカーの音を止めないため）
+    private func startMicIfWaiting(_ why: String, force: Bool = false) {
+        guard wantMicLater, !micStarting, let c = conn, let h = hello, let p = micPromise else { return }
+        if !force, let at = micRetryAt, DispatchTime.now() < at { return }
+        micStarting = true
+        let r = ring, id = connID
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard UIApplication.shared.applicationState == .active, MicPermission.current == .granted else {
+                self.queue.async { self.micStarting = false }
+                return
+            }
+            self.log("音：\(why)。マイクを始める")
+            self.startEngine(h, ring: r, promise: p) { micRing, info in
+                self.queue.async {
+                    self.micStarting = false
+                    guard c === self.conn, id == self.connID else { return }
+                    self.micRing = micRing
+                    self.noteMicResult(info)
+                }
+            }
+        }
+    }
+
+    // 音を始めた・作り直したあとに呼ぶ。マイクが要るのに始まっていなければ印を立て、前面で失敗したなら待ってから試し直す
+    private func noteMicResult(_ info: EngineInfo) {
+        var retrying = false
+        if !info.wantMic || info.micOK {
+            if wantMicLater && info.micOK { log("音：マイクを始めた。PC にはこのつなぎのまま送る") }
+            wantMicLater = false
+            micRetryAt = nil
+            micRetryDelay = 1
+        } else {
+            wantMicLater = true
+            if info.triedMic {
+                micRetryAt = DispatchTime.now() + micRetryDelay
+                log("音：マイクを始められなかった。\(Int(micRetryDelay)) 秒後にもう一度試す")
+                micRetryDelay = min(micRetryDelay * 2, 30)
+                retrying = true
+            }
+        }
+        curInputKind = info.micOK ? info.inputKind : 0
+        DispatchQueue.main.async { [weak self] in self?.micRetrying = retrying }
     }
 
     // ---- 送る（queue の上）----
@@ -1023,6 +1095,7 @@ final class AudioBridgeModel: ObservableObject {
         if i.speakerOK { f |= IPA.aSpeakerOK }
         if i.micOK { f |= IPA.aMicOK }
         if i.needsForeground { f |= IPA.aMicNeedsForeground }
+        if i.micLater && !i.micOK { f |= IPA.aMicLater } // このつなぎのまま、あとで始める。PC はつなぎ直さずに待てる
         o.u16(f)
         o.u32(UInt32(i.micRate))   // 前に出ていなくても、あとで始めたら必ずこの rate・ch・形で送る
         o.u16(UInt16(i.micChannels)); o.u16(i.micFormat)
@@ -1104,10 +1177,26 @@ final class AudioBridgeModel: ObservableObject {
             o.zeros(24)
         }
         o.u32(UInt32(truncatingIfNeeded: micSent)); o.u32(UInt32(truncatingIfNeeded: micDropped))
-        c.send(content: frameHeader(type: IPA.tStats, length: 32) + o.d, completion: .contentProcessed({ _ in }))
+        // 0.7.60 で足した 4 バイト。前の PC は初めの 32 バイトだけ読む
+        var state: UInt8 = 0
+        if appFront { state |= IPA.sFront }
+        if micRing != nil { state |= IPA.sMicRunning }
+        if wantMicLater { state |= IPA.sMicWaiting }
+        if micDenied { state |= IPA.sMicDenied }
+        o.u8(state); o.u8(curInputKind); o.u8(0); o.u8(0)
+        c.send(content: frameHeader(type: IPA.tStats, length: UInt32(o.d.count)) + o.d, completion: .contentProcessed({ _ in }))
         DispatchQueue.main.async { [weak self] in
-            self?.fillMs = fillMs
-            self?.pollRoute()
+            guard let self else { return }
+            self.fillMs = fillMs
+            self.pollRoute()
+            // 前面にあるかとマイクの許可を見て、マイクを待っていれば始める（前に出た知らせを取りこぼしても、1 秒以内に始まる）
+            let front = UIApplication.shared.applicationState == .active
+            let perm = MicPermission.current
+            self.queue.async {
+                self.appFront = front
+                self.micDenied = perm == .denied
+                if front && perm == .granted { self.startMicIfWaiting("アプリが前面にある") }
+            }
         }
     }
 
@@ -1202,7 +1291,8 @@ struct AudioBridgeStatusRow: View {
         var parts: [String] = []
         if model.speakerActive { parts.append(L("スピーカーのバッファ \(Int(model.fillMs)) ms", "Speaker \(Int(model.fillMs)) ms buffered")) }
         if model.micActive { parts.append(L("マイク", "Mic")) }
-        if model.micWaitsForeground { parts.append(L("マイクはアプリを前面に表示すると開始します", "Mic starts when the app is in front")) }
+        if model.micRetrying { parts.append(L("マイクの開始に失敗したため、もう一度試しています", "The mic failed to start and is trying again")) }
+        else if model.micWaitsForeground { parts.append(L("マイクはアプリを前面に表示すると開始します", "Mic starts when the app is in front")) }
         return parts.isEmpty ? L("接続中", "Connected") : parts.joined(separator: L("・", ", "))
     }
 }
