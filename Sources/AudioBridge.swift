@@ -24,6 +24,12 @@ import os
 //   前面で始めるのに失敗したら、1・2・4…30 秒おいて試し直す
 //   ACK の flags の 0x0008（aMicLater）：このつなぎのまま、あとでマイクを始める。前の PC は読まない
 //   STATS の 33〜36 バイト目：アプリの状態（sFront など）・いまの入力の種類・予約 2。前の PC は 32 バイトだけ読む
+// 10/13 に直した（work/fix1013）：
+//   マイクだけを頼まれて、まだマイクを始められない（許可が未決定・拒否・アプリが前にない）ときは、AVAudioEngine を作らない。
+//   部品が 1 つも付いていないエンジンを prepare・start すると、例外（inputNode != nullptr || outputNode != nullptr）で落ちていた。
+//   そのときはセッションの値だけを ACK に書き、前に出たら startMicIfWaiting がエンジンを作る。
+//   AVAudioSinkNode は形を変えない（rate を変えられない）ので、sink は機器の rate のままつなぐ。Bluetooth（16・24 kHz）や
+//   44.1 kHz の USB の機器では、ACK で伝えた rate に、送る前（queue の上）で AVAudioConverter が変える（MicResampler）。ch は今までどおり AVAudioMixerNode が合わせる
 // 受け取るのは後ろの糸で、音を出すのは AVAudioSourceNode の実時間の糸。間は「ため」（PlayoutRing）で渡す。
 // ため方は work/audio/pc/proto.h の IpaPlayout と同じ：目標の長さまでためてから鳴らし、機器の時計とのずれは
 // 読む速さを最大 ±0.5% 変えて吸収し（比例＋積分）、足りなければ無音で埋めてためなおし、多すぎれば古い方を捨てる。
@@ -358,6 +364,9 @@ final class MicGain {
 
 final class MicRing {
     let channels: Int
+    let rate: Int // 輪に入っている音の rate（機器の rate。sink は rate を変えないため）
+    // 機器の rate が ACK で伝えた rate と違うときだけ作る。送りの糸（queue）だけが触る
+    var resampler: MicResampler?
     private let cap: Int
     private let buf: UnsafeMutablePointer<Float>
     private var wr: UInt64 = 0, rd: UInt64 = 0
@@ -365,6 +374,7 @@ final class MicRing {
 
     init(rate: Int, channels: Int) {
         self.channels = max(1, min(2, channels))
+        self.rate = rate
         cap = max(rate, 8000) // 1 秒
         buf = UnsafeMutablePointer<Float>.allocate(capacity: cap * self.channels)
         buf.initialize(repeating: 0, count: cap * self.channels)
@@ -419,6 +429,95 @@ final class MicRing {
         lock.lock(); defer { lock.unlock() }
         let n = min(frames, Int(wr - rd))
         rd += UInt64(n)
+    }
+}
+
+// 機器の rate（Bluetooth の 16・24 kHz、USB の 44.1 kHz など）の音を、ACK で PC に伝えた rate に変える。送りの糸（queue）だけで使う。
+// AVAudioSinkNode は形を変えないので、sink は機器の rate のまま MicRing に積み、ここで AVAudioConverter を通す。ch は変えない
+final class MicResampler {
+    let channels: Int
+    private static let maxIn: AVAudioFrameCount = 2048 // 一度に変える機器のコマの数
+    private let outRate: Int
+    private let conv: AVAudioConverter
+    private let inBuf: AVAudioPCMBuffer
+    private let outBuf: AVAudioPCMBuffer
+    private let tmp: UnsafeMutablePointer<Float>
+    private var fifo: [Float] = [] // 送る rate に変えた音。ch の交互
+
+    init?(inRate: Int, outRate: Int, channels: Int) {
+        let ch = max(1, min(2, channels))
+        let n = Int(MicResampler.maxIn)
+        guard inRate > 0, outRate > 0,
+              let fi = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Double(inRate), channels: AVAudioChannelCount(ch), interleaved: false),
+              let fo = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Double(outRate), channels: AVAudioChannelCount(ch), interleaved: false),
+              let cv = AVAudioConverter(from: fi, to: fo),
+              let ib = AVAudioPCMBuffer(pcmFormat: fi, frameCapacity: MicResampler.maxIn),
+              // 出る数は、入れた数 × rate の比。変換の中にためる分の余りを足して、入れた分を 1 回で使い切れる大きさにする
+              let ob = AVAudioPCMBuffer(pcmFormat: fo, frameCapacity: AVAudioFrameCount(n * outRate / inRate + 1024))
+        else { return nil }
+        self.channels = ch
+        self.outRate = outRate
+        conv = cv
+        inBuf = ib
+        outBuf = ob
+        tmp = UnsafeMutablePointer<Float>.allocate(capacity: n * ch)
+        tmp.initialize(repeating: 0, count: n * ch)
+    }
+    deinit { tmp.deallocate() }
+
+    // 輪にたまった機器の音を取り出せるだけ取り出し、rate を変えて fifo に積む
+    func pull(from mr: MicRing) {
+        let ch = channels
+        guard mr.channels == ch, let src = inBuf.floatChannelData else { return }
+        while true {
+            let n = min(mr.available, Int(MicResampler.maxIn))
+            guard n > 0, mr.pop(tmp, frames: n) else { return }
+            // ch の交互を、ch ごとの並びに分ける
+            for c in 0..<ch {
+                let d = src[c]
+                for i in 0..<n { d[i] = tmp[i * ch + c] }
+            }
+            inBuf.frameLength = AVAudioFrameCount(n)
+            outBuf.frameLength = 0
+            let ib = inBuf
+            var given = false
+            // 入れるのは 1 回だけ。2 回目は「今は無い」と答える（続きの音は次に来る）
+            let st = conv.convert(to: outBuf, error: nil) { _, status in
+                if given {
+                    status.pointee = .noDataNow
+                    return nil
+                }
+                given = true
+                status.pointee = .haveData
+                return ib
+            }
+            if st == .error { return }
+            let m = Int(outBuf.frameLength)
+            if m > 0, let o = outBuf.floatChannelData {
+                fifo.reserveCapacity(fifo.count + m * ch)
+                for i in 0..<m {
+                    for c in 0..<ch { fifo.append(o[c][i]) }
+                }
+            }
+            // 1 秒より多くたまった（起きない見込み）ら、古い方を捨てる
+            let over = fifo.count / ch - outRate
+            if over > 0 { fifo.removeFirst(over * ch) }
+        }
+    }
+
+    var available: Int { fifo.count / channels }
+
+    // frames コマ（frames × ch 個）を out に取り出す。足りなければ false
+    func pop(_ out: UnsafeMutablePointer<Float>, frames: Int) -> Bool {
+        let n = frames * channels
+        guard fifo.count >= n else { return false }
+        for i in 0..<n { out[i] = fifo[i] }
+        fifo.removeFirst(n)
+        return true
+    }
+
+    func discard(_ frames: Int) {
+        fifo.removeFirst(min(frames * channels, fifo.count))
     }
 }
 
@@ -831,9 +930,12 @@ final class AudioBridgeModel: ObservableObject {
         if wantMic && perm == .undetermined { MicPermission.request() }
         // あとで始める印（wantMicLater）は、done を受けた側が noteMicResult で立てる
         micWaitsForeground = wantMic && !fg
+        // 鳴らす物も、いま始めるマイクも無い（マイクだけを頼まれて、まだ始められない）。このときはエンジンを作らないので、
+        // ほかのアプリの音も止めない（EXCLUSIVE でも混ぜる形にする）
+        let nothingToRun = ring == nil && !micAllowed
         let sess: SessionInfo
         do {
-            sess = try configureSession(mic: micAllowed, exclusive: exclusive, mode: mode, settings: st, wantStereo: wantStereo,
+            sess = try configureSession(mic: micAllowed, exclusive: exclusive && !nothingToRun, mode: mode, settings: st, wantStereo: wantStereo,
                                         preferredRate: Double(max(48000, promise?.rate ?? askRate)))
         } catch {
             log("音：セッションを始められない：\(error)")
@@ -848,6 +950,29 @@ final class AudioBridgeModel: ObservableObject {
         info.inputKind = sess.inputKind
         if sess.stereoCapable { info.flags2 |= IPA.a2StereoCapable }
         lastInputsSig = micAllowed ? Self.inputsSignature() : ""
+        // エンジンを作らずに終える。部品が 1 つも付いていない AVAudioEngine を prepare・start すると、
+        // 例外（required condition is false: inputNode != nullptr || outputNode != nullptr）で落ちるため。
+        // ACK にはセッションの値だけを書く。マイクは、前に出て許可があれば startMicIfWaiting がこのつなぎのまま始める
+        func finishWithoutEngine(_ why: String) {
+            info.speakerOK = false
+            info.micOK = false
+            info.hwRate = UInt32(s.sampleRate)
+            info.ioUs = UInt32(s.ioBufferDuration * 1e6)
+            info.outUs = UInt32(s.outputLatency * 1e6)
+            info.inUs = UInt32(s.inputLatency * 1e6)
+            ioMs = s.ioBufferDuration * 1000
+            speakerActive = false
+            micActive = false
+            micDetail = ""
+            updateRouteNames()
+            log("音：\(why)。エンジンは作らない（マイクを待つ=\(info.micLater)）")
+            done(nil, info)
+        }
+        if nothingToRun {
+            let permText = perm == .granted ? "あり" : (perm == .denied ? "なし" : "未決定")
+            finishWithoutEngine(wantMic ? "マイクだけを頼まれたが、まだマイクを始められない（前面=\(fg)・許可=\(permText)）" : "スピーカーもマイクも頼まれていない")
+            return
+        }
         let e = AVAudioEngine()
         var micRing: MicRing?
         if let ring {
@@ -883,22 +1008,42 @@ final class AudioBridgeModel: ObservableObject {
                 info.hwInChannels = UInt8(min(255, inFmt.channelCount))
                 if promise == nil { info.micChannels = wantStereo && inFmt.channelCount >= 2 ? 2 : 1 }
                 if info.micChannels >= 2 && inFmt.channelCount >= 2 { info.flags2 |= IPA.a2StereoOn }
-                let outFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Double(info.micRate),
-                                           channels: AVAudioChannelCount(info.micChannels), interleaved: false)!
-                let mr = MicRing(rate: info.micRate, channels: info.micChannels)
-                // 入力 →（rate と ch を合わせる。ch が足りなければ増やし、多ければ混ぜる）→ sink。sink は機器の塊のまま渡す
-                let mix = AVAudioMixerNode()
-                e.attach(mix)
-                e.connect(e.inputNode, to: mix, format: inFmt)
-                let sink = AVAudioSinkNode { _, frameCount, abl -> OSStatus in
-                    mr.write(UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: abl)), frames: Int(frameCount))
-                    return noErr
+                // AVAudioSinkNode は形を変えない（rate を変えられない）ので、sink は機器の rate のままつなぐ。
+                // ACK で伝えた rate と違えば（Bluetooth の 16・24 kHz、USB の 44.1 kHz など）、送る前に MicResampler が変える
+                let inRate = Int(inFmt.sampleRate.rounded())
+                let sinkFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: inFmt.sampleRate,
+                                            channels: AVAudioChannelCount(info.micChannels), interleaved: false)!
+                let mr = MicRing(rate: inRate, channels: info.micChannels)
+                var rateOK = true
+                if inRate != info.micRate {
+                    if let rs = MicResampler(inRate: inRate, outRate: info.micRate, channels: info.micChannels) {
+                        mr.resampler = rs
+                        inDesc += "（\(info.micRate)Hz に変えて送る）"
+                    } else {
+                        rateOK = false
+                        log("音：マイクの rate を \(inRate)Hz から \(info.micRate)Hz に変えられない")
+                    }
                 }
-                e.attach(sink)
-                e.connect(mix, to: sink, format: outFmt)
-                micRing = mr
-                info.micOK = true
+                if rateOK {
+                    // 入力 →（ch を合わせる。足りなければ増やし、多ければ混ぜる。rate は変えない）→ sink。sink は機器の塊のまま渡す
+                    let mix = AVAudioMixerNode()
+                    e.attach(mix)
+                    e.connect(e.inputNode, to: mix, format: inFmt)
+                    let sink = AVAudioSinkNode { _, frameCount, abl -> OSStatus in
+                        mr.write(UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: abl)), frames: Int(frameCount))
+                        return noErr
+                    }
+                    e.attach(sink)
+                    e.connect(mix, to: sink, format: sinkFmt)
+                    micRing = mr
+                    info.micOK = true
+                }
             }
+        }
+        if !info.speakerOK && !info.micOK {
+            // マイクの入力の形が取れなかった（スピーカーなし）。付けた部品が無いので、始めると例外で落ちる
+            finishWithoutEngine("マイクを始められなかった（エンジンの入力=\(inDesc)）")
+            return
         }
         e.prepare()
         do { try e.start() } catch {
@@ -1125,16 +1270,25 @@ final class AudioBridgeModel: ObservableObject {
         let chunk = p.rate / 100
         let ch = mr.channels
         guard ch == p.channels else { return } // 形が合わない輪は使わない（起きない見込み）
+        // 機器の rate が ACK の rate と違うときは、ここで rate を変えてから送る。変える物が無いのに rate が違う輪は使わない（起きない見込み）
+        let rs = mr.resampler
+        if let rs { rs.pull(from: mr) } else if mr.rate != p.rate { return }
+        func available() -> Int { rs?.available ?? mr.available }
         let bps = p.format == IPA.fmtF32 ? 4 : p.format == IPA.fmtS24 ? 3 : 2
         var pcm = [Float](repeating: 0, count: chunk * ch)
-        while mr.available >= chunk {
+        while available() >= chunk {
             if pendingSends > 20 { // PC が受けていない。古い方を捨て、番号だけ進める（PC は抜けとして無音で埋める）
-                mr.discard(chunk)
+                if let rs { rs.discard(chunk) } else { mr.discard(chunk) }
                 micDropped += UInt64(chunk)
                 micIndex += UInt64(chunk)
                 continue
             }
-            guard pcm.withUnsafeMutableBufferPointer({ mr.pop($0.baseAddress!, frames: chunk) }) else { break }
+            let got = pcm.withUnsafeMutableBufferPointer { buf -> Bool in
+                let dst = buf.baseAddress!
+                if let rs { return rs.pop(dst, frames: chunk) }
+                return mr.pop(dst, frames: chunk)
+            }
+            guard got else { break }
             let n = chunk * ch
             var bytes = [UInt8](repeating: 0, count: n * bps)
             switch p.format {

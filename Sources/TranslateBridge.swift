@@ -10,20 +10,65 @@
 //   - 準備のあとでも、準備の遅れに見える失敗（unsupportedSourceLanguage など）は、0.5 秒・1.5 秒おいて訳し直す
 //   - 失敗の答えは短くする：{"error": 短い理由, "code": 種類, "detail": 詳しい理由}。前の livecap は error をそのまま字幕に出していた
 //   PC の livecap は字幕を始めるときに {"op":"translate_prepare"} を送り、最初の文より先に準備を済ませる（AppleFeatures.swift）
+// 10/13 に直した（work/fix1013）：
+//   時間切れ（訳すのは 2 分・準備は 60 秒）で待つのをやめたあとも、見捨てた Task は動き続け、gate を持たずに session と ready を書いていた。
+//   それが次の頼み（gate を持っている）と競り合う。そこで組ごとに世代（gen）を持ち、時間切れで世代を進める。
+//   中の値は錠（mu）の中で読み書きし、書くのは、その頼みを始めたときの世代が今の世代と同じ Task だけにする
 #if compiler(>=6.2) && canImport(Translation)
 import Foundation
 import Translation
 
 @available(iOS 26.0, *)
 enum TranslateBridge {
-    // 言語の組ごとの状態。gate を持っている間だけ中を触る
+    // 言語の組ごとの状態。頼みは gate で 1 つずつにする。中の値は mu の中で触り、書けるのは今の世代（gen）の Task だけ
     private final class Pair: @unchecked Sendable {
         let from: String, to: String
         let gate = DispatchSemaphore(value: 1)
-        var session: TranslationSession?
-        var ready = false
-        var notInstalledAt: Date? // 言語が入っていなかった時刻。そこから 30 秒は、準備を待たずにすぐ失敗を返す
+        private let mu = NSLock()
+        private var gen = 0
+        private var cur: TranslationSession?
+        private var ready = false
+        private var notInstalledAt: Date? // 言語が入っていなかった時刻。そこから 30 秒は、準備を待たずにすぐ失敗を返す
         init(from: String, to: String) { self.from = from; self.to = to }
+
+        // gate を持っている頼みが、Task を始める前に読む
+        var generation: Int { mu.lock(); defer { mu.unlock() }; return gen }
+        var isPrepared: Bool { mu.lock(); defer { mu.unlock() }; return ready }
+        var notInstalledSince: Date? { mu.lock(); defer { mu.unlock() }; return notInstalledAt }
+
+        // 時間切れ（gate を持ったまま呼ぶ）。世代を進めて見捨てた Task に書かせず、次は作り直して準備から
+        func abandon() {
+            mu.lock(); defer { mu.unlock() }
+            gen += 1
+            cur = nil
+            ready = false
+        }
+
+        // その世代の TranslationSession。無ければ作る。見捨てた世代には nil を返す（もう何もしない）
+        func sessionFor(_ g: Int) -> TranslationSession? {
+            mu.lock(); defer { mu.unlock() }
+            guard g == gen else { return nil }
+            if let s = cur { return s }
+            let s = TranslationSession(installedSource: Locale.Language(identifier: from), target: Locale.Language(identifier: to))
+            cur = s
+            return s
+        }
+
+        func setReady(_ g: Int) {
+            mu.lock(); defer { mu.unlock() }
+            if g == gen { ready = true }
+        }
+
+        func setNotInstalled(_ g: Int, _ at: Date?) {
+            mu.lock(); defer { mu.unlock() }
+            if g == gen { notInstalledAt = at }
+        }
+
+        // 言語が消された。次は作り直して準備から
+        func reset(_ g: Int) {
+            mu.lock(); defer { mu.unlock() }
+            if g == gen { cur = nil; ready = false }
+        }
     }
 
     private static let lock = NSLock()
@@ -43,16 +88,16 @@ enum TranslateBridge {
         let p = pair(from, to)
         p.gate.wait()
         defer { p.gate.signal() }
+        let g = p.generation
         let done = DispatchSemaphore(value: 0)
         var out: [String: Any] = [:]
         Task {
-            out = await translate(p, text)
+            out = await translate(p, g, text)
             done.signal()
         }
         if done.wait(timeout: .now() + 120) == .timedOut {
-            // 止まった物は使わない。次は作り直して準備から
-            p.session = nil
-            p.ready = false
+            // 止まった物は使わない。世代を進めて、見捨てた Task がこのあとの頼みの状態を書かないようにし、次は作り直して準備から
+            p.abandon()
             return fail(p, code: "timeout", L("時間内に終わりませんでした", "It did not finish in time"), detail: "2 分で終わらなかった")
         }
         return out
@@ -63,42 +108,40 @@ enum TranslateBridge {
         let p = pair(from, to)
         p.gate.wait()
         defer { p.gate.signal() }
+        let g = p.generation
         let done = DispatchSemaphore(value: 0)
         var out: [String: Any] = [:]
         Task {
-            out = await warmUp(p, wait: 20)
+            out = await warmUp(p, g, wait: 20)
             done.signal()
         }
         if done.wait(timeout: .now() + 60) == .timedOut {
-            p.session = nil
-            p.ready = false
+            p.abandon()
             return fail(p, code: "timeout", L("時間内に終わりませんでした", "It did not finish in time"), detail: "準備が 60 秒で終わらなかった")
         }
         return out
     }
 
-    private static func session(_ p: Pair) -> TranslationSession {
-        if let s = p.session { return s }
-        let s = TranslationSession(installedSource: Locale.Language(identifier: p.from), target: Locale.Language(identifier: p.to))
-        p.session = s
-        return s
+    // 見捨てた世代の Task が、続きをやめるときに返す（頼んだ側はもう待っていないので、誰にも届かない）
+    private static func abandoned(_ p: Pair) -> [String: Any] {
+        fail(p, code: "timeout", L("時間内に終わりませんでした", "It did not finish in time"), detail: "時間切れのあとで止めた")
     }
 
     // 言語が入って訳せる状態（isReady）になるのを wait 秒まで待ち、短い文を 1 回訳して温める
-    private static func warmUp(_ p: Pair, wait: Double) async -> [String: Any] {
+    private static func warmUp(_ p: Pair, _ g: Int, wait: Double) async -> [String: Any] {
         let t0 = Date()
-        let s = session(p)
+        guard let s = p.sessionFor(g) else { return abandoned(p) }
         var installed = await s.isReady
         while !installed && Date().timeIntervalSince(t0) < wait {
             try? await Task.sleep(nanoseconds: 500_000_000)
             installed = await s.isReady
         }
         if !installed {
-            p.notInstalledAt = Date()
+            p.setNotInstalled(g, Date())
             return fail(p, code: "not_installed", L("言語データがダウンロードされていません", "The language data is not downloaded"),
                         detail: "isReady が \(Int(wait)) 秒 false のまま。\(p.from) と \(p.to) の言語が入っていない")
         }
-        p.notInstalledAt = nil
+        p.setNotInstalled(g, nil)
         // 温める。ここで失敗しても準備は終わったことにする（本番の文は translate が訳し直す）
         var warm = "ok"
         for delay in [0.0, 0.5, 1.0] {
@@ -112,20 +155,20 @@ enum TranslateBridge {
                 if !transient(error) { break }
             }
         }
-        p.ready = true
+        p.setReady(g)
         return ["ok": true, "ready": true, "warm": warm, "wait_ms": Int(Date().timeIntervalSince(t0) * 1000)]
     }
 
-    private static func translate(_ p: Pair, _ text: String) async -> [String: Any] {
-        if !p.ready {
-            if let at = p.notInstalledAt, Date().timeIntervalSince(at) < 30 {
+    private static func translate(_ p: Pair, _ g: Int, _ text: String) async -> [String: Any] {
+        if !p.isPrepared {
+            if let at = p.notInstalledSince, Date().timeIntervalSince(at) < 30 {
                 return fail(p, code: "not_installed", L("言語データがダウンロードされていません", "The language data is not downloaded"),
                             detail: "言語が入っていない。\(Int(Date().timeIntervalSince(at))) 秒前にチェックした")
             }
-            let r = await warmUp(p, wait: 15)
+            let r = await warmUp(p, g, wait: 15)
             if r["error"] != nil { return r }
         }
-        let s = session(p)
+        guard let s = p.sessionFor(g) else { return abandoned(p) }
         var last: Error?
         for delay in [0.0, 0.5, 1.5] {
             if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
@@ -138,9 +181,8 @@ enum TranslateBridge {
             }
         }
         if let e = last, TranslationError.notInstalled ~= e {
-            // 言語が消された。次は作り直して準備から
-            p.session = nil
-            p.ready = false
+            // 言語が消された。次は作り直して準備から（見捨てた世代なら何もしない）
+            p.reset(g)
         }
         return failure(p, last)
     }

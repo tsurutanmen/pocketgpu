@@ -815,8 +815,10 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                 // 手ぶれ補正。オフ以外は写る範囲が狭くなる。標準とシネマティックは遅れが増える
                 if cn.isVideoStabilizationSupported { cn.preferredVideoStabilizationMode = Self.stabMode(r.stab) }
             }
-            if r.face { addFaceOutput(s) }
+            // シネマティックを先に入れてから、顔の出力を足す。シネマティックの間は、顔の出力の metadataObjectTypes を
+            // requiredMetadataObjectTypesForCinematicVideoCapture と同じにしないと例外で落ちる（前は [.face] にしていて、両方を入れると落ちた）
             cineOn = enableCinematic(input, r)
+            if r.face { addFaceOutput(s, cinematic: cineOn) }
         } catch {
             s.commitConfiguration()
             deviceInput = nil
@@ -865,8 +867,15 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         }
         let ctlOn = ctl
         log("ウェブカメラ：\(changed ? "切り替えた" : "始める") \(aw)×\(ah)・\(fr) コマ/秒・\(kb) kbps・カメラ \(r.camera)（\(dev.localizedName)）・回転 \(r.rot)・反転 \(r.connMirror ? 1 : 0)・切り抜き \(pool != nil ? 1 : 0)・手ぶれ補正 \(r.stab)・シネマティック \(cineOn ? 1 : 0)・ACK flags \(ackFlags)")
-        // startRunning は返ってくるまでに時間がかかるので、カメラの糸で（前のカメラの stopRunning のあとに並ぶ）
-        captureQueue.async { s.startRunning() }
+        // startRunning は返ってくるまでに時間がかかるので、カメラの糸で（前のカメラの stopRunning のあとに並ぶ）。
+        // ライトは走り始めてからもう一度当てる。走らせる前（上の liveApply(initial:)）に点けても、走り始めで消えて点かないことがあった
+        captureQueue.async { [weak self] in
+            s.startRunning()
+            self?.q.async {
+                guard let self, self.session === s, let input = self.deviceInput else { return }
+                self.applyTorch(input.device)
+            }
+        }
         let name = Self.cameraName(r.camera)
         let note = Self.pcNoteText(r, w: aw, h: ah, fps: fr)
         let skipped = r.rotSkipped
@@ -901,11 +910,22 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         return true
     }
 
-    // 顔の位置を調べる出力（切り抜きを顔に合わせるときだけ）。顔の検出はカメラの中で行われ、重くない
-    private func addFaceOutput(_ s: AVCaptureSession) {
+    // 顔の位置を調べる出力（切り抜きを顔に合わせるときだけ）。顔の検出はカメラの中で行われ、重くない。
+    // シネマティック（iOS 26）を入れたあとに呼ぶ。シネマティックの間は、metadataObjectTypes を requiredMetadataObjectTypesForCinematicVideoCapture
+    // にしないと NSInvalidArgumentException で落ちる（Apple の資料）。そのときは届いた物のうち .face だけを使う（metadataOutput が型で選ぶ）
+    private func addFaceOutput(_ s: AVCaptureSession, cinematic: Bool) {
         let mo = AVCaptureMetadataOutput()
         guard s.canAddOutput(mo) else { log("ウェブカメラ：顔の位置を調べる出力を足せない"); return }
         s.addOutput(mo)
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *), cinematic {
+            let need = mo.requiredMetadataObjectTypesForCinematicVideoCapture
+            mo.metadataObjectTypes = need
+            mo.setMetadataObjectsDelegate(self, queue: metaQueue)
+            if !need.contains(.face) { log("ウェブカメラ：シネマティックの間は、このカメラは顔の位置を出さない") }
+            return
+        }
+        #endif
         if mo.availableMetadataObjectTypes.contains(.face) {
             mo.metadataObjectTypes = [.face]
             mo.setMetadataObjectsDelegate(self, queue: metaQueue)
@@ -2157,17 +2177,15 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         if thermal { thermalSettingChanged() }
     }
 
-    // 画面の糸。画面を暗くする・戻す。画面のライトを出しているときは、閉じて明るさが戻ってから暗くする
+    // 画面の糸。画面を暗くする・戻す。画面のライトを出しているときは、閉じてから暗くする。
+    // ライトの明るさは setLight(false) がその場で元に戻すので、続けて暗くしてよい。前は 0.6 秒後に暗くしていて、
+    // 閉じる動きの終わりにライトの画面（onDisappear）が明るさを戻すのと競り合い、明るさが最大のまま残ることがあった
     private func ctlDim(_ on: Bool) {
         let dm = ScreenDimmer.shared
         guard on else { dm.setDim(false); return }
         guard UIApplication.shared.applicationState == .active else { return }
-        if dm.light {
-            dm.setLight(false)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { dm.setDim(true) }
-        } else {
-            dm.setDim(true)
-        }
+        if dm.light { dm.setLight(false) }
+        dm.setDim(true)
     }
 
     private static func u16(_ b: [UInt8], _ at: Int) -> UInt16 { UInt16(b[at]) | UInt16(b[at + 1]) << 8 }
@@ -2858,10 +2876,11 @@ struct CameraControlsView: View {
 // 画面のライト：画面を白くして明るさを最大にし、前から顔を照らす。タップか、アプリが前からいなくなると元の明るさに戻す。
 // 出している間は、自動で画面を暗くする働き（ScreenDimmer）を止める。
 // camctl2：出すのは ScreenDimmer.light（カメラタブのボタンと PC の両方）。暖かい色は出している間に PC から変えても変わるように、設定を直接読む
+// 明るさを最大にする・元に戻す・自動で暗くするのを止めるのは ScreenDimmer.setLight がする（閉じると isPresented の Binding から setLight(false) が呼ばれる）。
+// 前はこの画面の onAppear と onDisappear で明るさを変えていて、閉じる動きの終わりの onDisappear が、そのあとに暗くした明るさを上書きしていた
 struct ScreenLightView: View {
     @AppStorage(CameraBridge.Key.screenWarm) private var warm = false
     @Environment(\.dismiss) private var dismiss
-    @State private var saved: CGFloat?
 
     var body: some View {
         ZStack {
@@ -2871,17 +2890,6 @@ struct ScreenLightView: View {
         .contentShape(Rectangle())
         .onTapGesture { dismiss() }
         .statusBar(hidden: true)
-        .onAppear {
-            ScreenDimmer.shared.setHold(true)
-            if let s = ScreenDimmer.currentScreen() {
-                saved = s.brightness
-                s.brightness = 1
-            }
-        }
-        .onDisappear {
-            if let s = ScreenDimmer.currentScreen(), let b = saved { s.brightness = b }
-            ScreenDimmer.shared.setHold(false)
-        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in dismiss() }
     }
 }

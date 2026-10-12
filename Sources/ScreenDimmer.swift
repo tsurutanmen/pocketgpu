@@ -25,6 +25,7 @@ final class ScreenDimmer: ObservableObject {
 
     // ここから下は画面の糸だけで触る
     private var savedBrightness: CGFloat?
+    private var lightBrightness: CGFloat? // 画面のライトを出す前の明るさ
     private var lastActivity = Date()
     private var hold = false // 画面のライトを出している間は、自動で暗くしない
     private var watcherInstalled = false
@@ -55,10 +56,21 @@ final class ScreenDimmer: ObservableObject {
         lastActivity = Date()
     }
 
-    // camctl2：画面のライトを出す・閉じる。出すときは暗いのをやめ、出している間は自動で暗くしない
+    // camctl2：画面のライトを出す・閉じる。出すときは暗いのをやめ、出している間は自動で暗くしない。
+    // 明るさもここで最大にし、閉じるときにその場で戻す（10/13・work/fix1013）。前はライトの画面の onAppear と onDisappear で変えていたので、
+    // PC から「ライト」のあとに「暗くする」が来ると、閉じる動きの終わりの onDisappear が暗くした明るさを上書きし、明るさが最大のまま残ることがあった
     func setLight(_ on: Bool) {
         guard on != light else { return }
         if on && dimmed { setDim(false) }
+        if on {
+            if let s = Self.currentScreen() {
+                lightBrightness = s.brightness
+                s.brightness = 1
+            }
+        } else {
+            if let s = Self.currentScreen(), let b = lightBrightness { s.brightness = b }
+            lightBrightness = nil
+        }
         light = on
         hold = on
         lastActivity = Date()
@@ -111,19 +123,35 @@ private final class ActivityRecognizer: UIGestureRecognizer {
     }
 }
 
+// 描き直しても数え直さない時計（10/13・work/fix1013）。View の let に Timer.publish(...).autoconnect() を持つと、
+// 親が描き直して View が作り直されるたびに新しい時計になり、0 から数え直す。親が決めた間隔より短い間に描き直すと一度も鳴らない
+// （本体の画面は 1 秒ごとに描き直すので、自動で暗くする 1 秒の見回りと、焼き付きを防ぐ 20 秒の移動が鳴らなかった）。
+// @StateObject に持たせて、View が作り直されても同じ時計を使う。鳴ったことは fired で知らせる（@Published ではないので、鳴っても描き直さない）
+final class RepeatingTick: ObservableObject {
+    let fired = PassthroughSubject<Date, Never>()
+    private var timer: Timer?
+
+    init(every seconds: TimeInterval) {
+        let t = Timer(timeInterval: seconds, repeats: true) { [weak self] _ in self?.fired.send(Date()) }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+    deinit { timer?.invalidate() }
+}
+
 // 本体の画面のいちばん外に付ける：暗い間は下の画面を透明にして描かず、黒い覆いを重ねる。1 秒ごとに自動で暗くするかを見る。
 // connected は「カメラかマイクが接続中か」。onDim は暗くした・戻したときに呼ぶ（iPhone に出力のプレビューを止めるなど）
 struct ScreenDimHost: ViewModifier {
     let connected: () -> Bool
     let onDim: (Bool) -> Void
     @ObservedObject private var dimmer = ScreenDimmer.shared
-    private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    @StateObject private var tick = RepeatingTick(every: 1)
 
     func body(content: Content) -> some View {
         content
             .opacity(dimmer.dimmed ? 0 : 1)
             .overlay(ScreenDimOverlay(connected: connected()))
-            .onReceive(tick) { _ in dimmer.autoTick(connected: connected()) }
+            .onReceive(tick.fired) { _ in dimmer.autoTick(connected: connected()) }
             .onReceive(dimmer.changes) { on in onDim(on) }
             // camctl2：画面のライト。カメラタブのボタンと PC の両方から出す
             .fullScreenCover(isPresented: Binding(get: { dimmer.light }, set: { dimmer.setLight($0) })) { ScreenLightView() }
@@ -136,7 +164,7 @@ struct ScreenDimOverlay: View {
     let connected: Bool
     @ObservedObject private var dimmer = ScreenDimmer.shared
     @State private var spot = 0
-    private let move = Timer.publish(every: 20, on: .main, in: .common).autoconnect()
+    @StateObject private var move = RepeatingTick(every: 20)
     private static let spots: [CGPoint] = [CGPoint(x: 0.3, y: 0.08), CGPoint(x: 0.7, y: 0.92), CGPoint(x: 0.7, y: 0.1), CGPoint(x: 0.3, y: 0.9),
                                            CGPoint(x: 0.5, y: 0.12), CGPoint(x: 0.5, y: 0.88), CGPoint(x: 0.35, y: 0.5), CGPoint(x: 0.65, y: 0.5)]
 
@@ -158,7 +186,7 @@ struct ScreenDimOverlay: View {
             .contentShape(Rectangle())
             .onTapGesture { dimmer.setDim(false) }
             .statusBar(hidden: true)
-            .onReceive(move) { _ in spot = (spot + 1) % Self.spots.count }
+            .onReceive(move.fired) { _ in spot = (spot + 1) % Self.spots.count }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in dimmer.setDim(false) }
         }
     }
@@ -216,7 +244,7 @@ struct ThermalBadge: View {
     var dim = false // 暗くしている間の覆いに出すときは、暗い色にする
     @State private var state = ProcessInfo.processInfo.thermalState
     @State private var blinkOff = false
-    private let blink = Timer.publish(every: 0.6, on: .main, in: .common).autoconnect()
+    @StateObject private var blink = RepeatingTick(every: 0.6) // 親が描き直しても点滅の間隔が乱れないように（RepeatingTick）
 
     var body: some View {
         HStack(spacing: 6) {
@@ -232,7 +260,7 @@ struct ThermalBadge: View {
         .onReceive(NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification).receive(on: RunLoop.main)) { _ in
             state = ProcessInfo.processInfo.thermalState
         }
-        .onReceive(blink) { _ in
+        .onReceive(blink.fired) { _ in
             if state == .critical { blinkOff.toggle() } else if blinkOff { blinkOff = false }
         }
     }
