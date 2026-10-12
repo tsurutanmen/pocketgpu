@@ -43,7 +43,7 @@ h1 { font-size: 24px; }
 </head>
 <body>
 <h1>iPhone を Windows の GPU に：ロードマップ</h1>
-<p class="lead">上が Lv 1、下が Lv 100 で、10 段に分けた。はじめは 1 本の道で、進むほど枝分かれして、最後にゴールへ集まる。2026 年 10 月 12 日の夜中の時点。</p>
+<p class="lead">上が Lv 1、下が Lv 100 で、10 段に分けた。はじめは 1 本の道で、進むほど枝分かれして、最後にゴールへ集まる。2026 年 10 月 13 日の夜中の時点。</p>
 <div class="legend"><span class="l-done">できた</span><span class="l-now">いま</span><span class="l-next">これから</span><span class="l-idea">案・まだ試していない</span><span class="l-cross">ほかの枝の成果を使うところ</span></div>
 
 <div class="wrap"><div class="map">
@@ -69,9 +69,9 @@ h1 { font-size: 24px; }
     d="M250,0 C250,22 50,22 50,44 M250,0 L250,44 M350,0 L350,44 M550,0 L550,44"/></svg></div>
 
   <div class="lv"><b>Lv 31〜40</b>重いゲーム</div>
-  <div class="cell" style="grid-column:2"><div class="node now"><span class="tag">仲間・ほぼ済み</span><b>招待制で試す人を集める</b><small>報告の道具・配る物に人ごとの印・中核は渡さない・Discord。10/11 にカメラとマイクを先に配ると Discord で知らせた</small></div></div>
+  <div class="cell" style="grid-column:2"><div class="node done"><span class="tag">仲間・済み</span><b>招待制で試す人を集める</b><small>報告の道具・配る物に人ごとの印・中核は渡さない・Discord。10/12 までにキットを 4 人が受け取った。Google ドライブに止められたので、Cloudflare から配るようにした。入れ方とゲームの起動の手順はフォーラムに</small></div></div>
   <div class="cell h1" style="grid-column:4"><div class="node done"><span class="tag">広さ・済み</span><b>DirectX 12 の 12_0・OpenGL 3 以上</b><small>10/11 に DirectX 12 の tiled resources も本物の iPhone で通った。OpenGL 3.3 と Chrome の WebGL 2 も iPhone で動く</small></div></div>
-  <div class="cell" style="grid-column:5"><div class="node now"><span class="tag">速さ・いま</span><b>重いゲームも動く速さ</b><small>10/11 に FF XV のベンチが本物の iPhone で 3D の場面まで描けた。数分で iPhone の GPU が止まる件を調べている。10/12 に小さな知らせを 1 通にまとめ、CPU の代役で 1 コマの通数が 929 から 46 に減った</small></div></div>
+  <div class="cell" style="grid-column:5"><div class="node now"><span class="tag">速さ・いま</span><b>重いゲームも動く速さ</b><small>10/11 に FF XV のベンチが本物の iPhone で 3D の場面まで描けた。数分で iPhone の GPU が止まる件を調べている。10/12 に小さな知らせを 1 通にまとめ、CPU の代役で 1 コマの通数が 929 から 46 に減った。FF XV が範囲の外を読んでいたのを、ドライバで抑えるようにした</small></div></div>
   <div class="cell" style="grid-column:7"><div class="node idea"><span class="tag">映像と音</span><b>iPhone の GPU のモニターが 1 枚</b><small>仮のモニター。触るとマウスになる</small></div></div>
 
   <div class="link"><svg viewBox="0 0 600 44" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke"
@@ -79,10 +79,10 @@ h1 { font-size: 24px; }
 
   <div class="lv"><b>Lv 41〜50</b>見せる</div>
   <div class="cell" style="grid-column:2"><div class="node now"><span class="tag">宣伝・いま</span><b>同じものさしで点数を出す</b><small>10/11 に GPU の無いノート（i5-1135G7）で比べた。llama.cpp は iPhone が Iris Xe の 3.9 倍、文を作る速さも上。Heaven は 1 回だけ上回った</small></div></div>
-  <div class="cell" style="grid-column:4"><div class="node now"><span class="tag">広さ・動き始めた</span><b>Steam Deck と Linux</b><small>10/11 に Linux 版の第一歩。窓なしで計算と画面外の描画が通った</small></div></div>
+  <div class="cell" style="grid-column:4"><div class="node now"><span class="tag">広さ・動き始めた</span><b>Steam Deck と Linux</b><small>10/11 に Linux 版の第一歩。ウィンドウなしで計算と画面外の描画が通った。10/13 に Linux のキットを試す人に配った。カメラとマイクは作っている途中</small></div></div>
   <div class="cell" style="grid-column:5"><div class="node now"><span class="tag">速さ・動いた</span><b>MetalFX で小さく描いて広げる</b><small>10/10 の 0.7.42 で、720p を iPhone で 1080p に広げて約 1.5 倍。4K への近道</small></div></div>
   <div class="cell" style="grid-column:6"><div class="node now"><span class="tag">つなぎ方・いま</span><b>USB を太くする</b><small>10/11 にノートの USB-C で行き毎秒 128 MB・帰り 169 MB。ケーブルと挿す口で 6 倍違った。10/12 の 0.7.58 で、写真と動画を USB と Wi-Fi の 2 本で同時に送れる。偽の iPhone で 2 本の足し算の 98%</small></div></div>
-  <div class="cell" style="grid-column:7"><div class="node now"><span class="tag">映像と音・試作</span><b>iPhone をスピーカー・マイク・カメラに</b><small>10/12 の 0.7.58 で、カメラの種類・解像度・フレームレート・画質を選べる。マイクは加工なし・ステレオ・有線イヤホン。GPU を使わない、マイクとカメラだけのモードも。古い iPhone 用の PocketCam と Android 版、PC のアプリもできた。偽の iPhone で通った。本物はこれから</small></div></div>
+  <div class="cell" style="grid-column:7"><div class="node now"><span class="tag">映像と音・試作</span><b>iPhone をスピーカー・マイク・カメラに</b><small>10/12 の 0.7.58 で、カメラの種類・解像度・フレームレート・画質を選べる。マイクは加工なし・ステレオ・有線イヤホン。GPU を使わない、マイクとカメラだけのモードも。古い iPhone 用の PocketCam と Android 版、PC のアプリもできた。10/12 に本物の iPhone のマイクを Discord と OBS で使えた。0.7.62 で、ピント・ズーム・反転・回転・水平・ライトを PC から操作できる。使っている間は画面を暗くし、温度を 3 色で出す。スピーカーは遅れが残る</small></div></div>
 
   <div class="link"><svg viewBox="0 0 600 44" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke"
     d="M50,0 L50,44 M250,0 C250,22 150,22 150,44 M250,0 L250,44 M350,0 L350,44 M450,0 L450,44 M550,0 L550,44"/><path class="x" vector-effect="non-scaling-stroke" d="M450,0 C450,22 350,22 350,44"/></svg></div>
@@ -92,7 +92,7 @@ h1 { font-size: 24px; }
   <div class="cell" style="grid-column:3"><div class="node now"><span class="tag">AI・試作</span><b>iPhone の AI の回路を PC から</b><small>10/11 に Core ML のモデルを PC から送る作りと、PC の音を iPhone で字幕にする道具ができた。字幕の道具は C で小さく作り直してキットに入れた。本物の iPhone で試すのはこれから</small></div></div>
   <div class="cell" style="grid-column:4"><div class="node"><span class="tag">広さ</span><b>試すアプリの表 100 本</b><small>動く・動かないを毎回測る</small></div></div>
   <div class="cell" style="grid-column:5"><div class="node"><span class="tag">速さ</span><b>4K で毎秒 60 コマ</b><small>フル HD の 4 倍の絵</small></div></div>
-  <div class="cell" style="grid-column:6"><div class="node now"><span class="tag">つなぎ方・いま</span><b>入れる手順が 1 回</b><small>10/11 に Start-PocketGPU.cmd が PC と iPhone を順にチェックして、直し方を出すようになった。PC のアプリ PocketGPU.exe でも 1 つのウィンドウで操作できる。抜き差しでつなぎ直せるようにする</small></div></div>
+  <div class="cell" style="grid-column:6"><div class="node now"><span class="tag">つなぎ方・いま</span><b>入れる手順が 1 回</b><small>10/11 に Start-PocketGPU.cmd が PC と iPhone を順にチェックして、直し方を出すようになった。PC のアプリ PocketGPU.exe でも 1 つのウィンドウで操作できる。10/13 に、一度入れた人へ更新を配る仕組みができた。PC は Update-PocketGPU.cmd、iPhone は AltStore で更新できる。抜き差しでつなぎ直せるようにする</small></div></div>
   <div class="cell" style="grid-column:7"><div class="node idea"><span class="tag">映像と音</span><b>PC・iPhone・モニター</b><small>iPhone に差したモニターに、iPhone が描いた絵を出す</small></div></div>
 
   <div class="link"><svg viewBox="0 0 600 44" preserveAspectRatio="none"><path vector-effect="non-scaling-stroke"
@@ -101,7 +101,7 @@ h1 { font-size: 24px; }
   <div class="lv"><b>Lv 61〜70</b>120 コマ</div>
   <div class="cell pass" style="grid-column:2"></div>
   <div class="cell" style="grid-column:3"><div class="node idea"><span class="tag">計算</span><b>圧縮と解凍を iPhone に</b><small>重い圧縮を PC と iPhone で分け合う。7z の最高圧縮のように遅い物ほど効く。10/11 に調べると、速い圧縮は USB が先に詰まる</small></div></div>
-  <div class="cell" style="grid-column:4"><div class="node now"><span class="tag">広さ・動き始めた</span><b>Android</b><small>10/10 にエミュレーターで受け手が動き、絵も H.264 で返せた。試す人のキットにも入った。10/11 に GPU・カメラ・マイクを 1 つのアプリにまとめた。本物の Android はこれから</small></div></div>
+  <div class="cell" style="grid-column:4"><div class="node now"><span class="tag">広さ・動き始めた</span><b>Android</b><small>10/10 にエミュレーターで受け手が動き、絵も H.264 で返せた。試す人のキットにも入った。10/11 に GPU・カメラ・マイクを 1 つのアプリにまとめた。10/12 にフォーラムで試す人に配った。本物の Android はこれから</small></div></div>
   <div class="cell" style="grid-column:5"><div class="node idea"><span class="tag">速さ</span><b>毎秒 120 コマ</b><small>MetalFX でコマとコマの間の絵を作る</small></div></div>
   <div class="cell" style="grid-column:6"><div class="node"><span class="tag">つなぎ方</span><b>App Store に出す</b><small>誰でも入れられる。7 日ごとの入れ直しが無くなる</small></div></div>
   <div class="cell" style="grid-column:7"><div class="node now"><span class="tag">映像と音・試作</span><b>OBS の録画と配信を iPhone で</b><small>10/11 に、iPhone が自分で描いたゲームの絵をそのまま録画する作りを試作。iPhone の回線から YouTube や Twitch に配信する</small></div></div>
