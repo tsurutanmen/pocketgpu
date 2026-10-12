@@ -2099,7 +2099,7 @@ struct CameraControlsView: View {
             if cinematic && c.cinematic {
                 Text(L("背景をぼかしている間は、ピントは自動で合わせます。", "While the background is blurred, focus is automatic.")).font(.footnote)
             } else if c.focusAuto || c.focusManual {
-                let modes = [0] + (c.focusLock ? [1] : []) + (c.focusManual ? [2] : [])
+                let modes: [Int] = [0] + (c.focusLock ? [1] : []) + (c.focusManual ? [2] : [])
                 let mode = modes.contains(focus) ? focus : 0
                 Picker(L("ピント", "Focus"), selection: pick($focus, modes)) {
                     Text(L("自動", "Auto")).tag(0)
@@ -2132,7 +2132,7 @@ struct CameraControlsView: View {
 
     private func exposureSection(_ c: CameraCaps) -> some View {
         Section(L("明るさ", "Brightness")) {
-            let modes = [0] + (c.expLock ? [1] : []) + (c.expManual ? [2] : [])
+            let modes: [Int] = [0] + (c.expLock ? [1] : []) + (c.expManual ? [2] : [])
             let mode = modes.contains(exposure) ? exposure : 0
             Picker(L("明るさ", "Brightness"), selection: pick($exposure, modes)) {
                 Text(L("自動", "Auto")).tag(0)
@@ -2173,7 +2173,7 @@ struct CameraControlsView: View {
 
     private func colorSection(_ c: CameraCaps) -> some View {
         Section(L("色", "Color")) {
-            let modes = [0] + (c.wbLock ? [1] : []) + (c.wbTemp ? [2] : [])
+            let modes: [Int] = [0] + (c.wbLock ? [1] : []) + (c.wbTemp ? [2] : [])
             let mode = modes.contains(wb) ? wb : 0
             Picker(L("ホワイトバランス", "White balance"), selection: pick($wb, modes)) {
                 Text(L("自動", "Auto")).tag(0)
