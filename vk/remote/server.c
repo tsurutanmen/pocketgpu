@@ -4026,6 +4026,23 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             vlog("ffhang：robustBufferAccess2・robustImageAccess2 を有効にする（VKR_HANG_ROBUST2）");
         }
         vlog("ffhang：装置の robustBufferAccess %u（DXVK が頼んだ値）", (unsigned) feats.robustBufferAccess);
+        // 調べ用（ffhang2・代役だけ）：VKR_LIKE_IOS_NOROBUST=1 で、名乗りはそのままに、範囲の外の読み書きの守りを GPU で有効にしない。
+        // iPhone の MoltenVK は robustBufferAccess と robustImageAccess を「ある」と答えるが、Metal は buffer の範囲を確かめない。
+        // 代役の GPU は本当に確かめるので、範囲の外の読みが 0 になり、iPhone で起きることが起きない。その違いを消す
+        if (hang_env("VKR_LIKE_IOS_NOROBUST")) {
+            feats.robustBufferAccess = VK_FALSE;
+            r2.robustBufferAccess2 = r2.robustImageAccess2 = VK_FALSE;
+            for (VkBaseOutStructure *b = head; b; b = b->pNext) {
+                if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES) ((VkPhysicalDeviceImageRobustnessFeatures *) b)->robustImageAccess = VK_FALSE;
+                else if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES) ((VkPhysicalDeviceVulkan13Features *) b)->robustImageAccess = VK_FALSE;
+                else if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT) {
+                    ((VkPhysicalDeviceRobustness2FeaturesEXT *) b)->robustBufferAccess2 = VK_FALSE;
+                    ((VkPhysicalDeviceRobustness2FeaturesEXT *) b)->robustImageAccess2 = VK_FALSE;
+                } else if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT)
+                    ((VkPhysicalDevicePipelineRobustnessFeaturesEXT *) b)->pipelineRobustness = VK_FALSE;
+            }
+            vlog("ffhang2：iPhone のふり：範囲の外の守りを GPU で有効にしない（VKR_LIKE_IOS_NOROBUST）");
+        }
         if (g_nulldesc_gpu || r2.robustBufferAccess2) {
             int has = 0;
             for (uint32_t i = 0; i < n_names; i++) if (!strcmp(names[i], "VK_EXT_robustness2")) has = 1;

@@ -8324,6 +8324,213 @@ done:
     return o;
 }
 
+// 範囲の外の読み書きの守り（ffhang2）。iPhone の MoltenVK は robustBufferAccess を「ある」と答えるが、Metal は buffer の範囲を確かめない。
+// DXVK は robustBufferAccess に頼って、範囲の外を読むシェーダーをそのまま出す（FF XV では、storage buffer の終わりの先を読む頂点と計算、
+// texel buffer を -1 番で読む計算が見つかった）。iPhone ではそこで別の物の中身を読み、GPU が止まる（10/11 の実機）。
+// そこで、受け手に送る前のシェーダーで、範囲の確かめを足す：
+//   storage buffer の終わりの長さの決まらない配列の添字 → OpArrayLength で min(添字, 長さ-1) に。読みは範囲の外なら 0 にする
+//   texel buffer の読み（OpImageFetch・OpImageRead）の位置 → OpImageQuerySize で min(位置, 大きさ-1) に。範囲の外なら 0
+//   texel buffer の書き（OpImageWrite）と storage buffer の書き・atomic → 位置を縮めるだけ（Vulkan の robustBufferAccess で許される形）
+// 受け手が Apple の GPU のときだけ。IPHONE_VK_ROBUST=1 で必ず・0 で足さない
+static int robust_spv_on(void) {
+    const char *e = getenv("IPHONE_VK_ROBUST");
+    if (e && *e) return *e == '1';
+    return g_hw.props.vendorID == 0x106b;
+}
+static int spv_has_rt(uint32_t op) { // 結果の型と結果を持つ命令（x[1] が型・x[2] が結果）
+    return (op >= 41 && op <= 46) || (op >= 50 && op <= 52) || op == 12 || op == 55 || op == 57 || op == 59 || op == 61 ||
+           (op >= 65 && op <= 68) || op == 70 || (op >= 77 && op <= 84) || (op >= 86 && op <= 107 && op != 99) ||
+           (op >= 109 && op <= 124) || (op >= 126 && op <= 152) || (op >= 154 && op <= 205) || (op >= 207 && op <= 215) ||
+           (op >= 227 && op <= 242 && op != 228) || op == 245 || (op >= 305 && op <= 320);
+}
+static uint32_t *spv_robust(const uint32_t *w, size_t nw, size_t *n) {
+    if (!robust_spv_on() || nw < 5 || w[0] != 0x07230203) return NULL;
+    uint32_t bound = w[3];
+    if (bound > 4000000) return NULL;
+    uint32_t *tdef = calloc(bound, sizeof *tdef), *rty = calloc(bound, sizeof *rty), *cval = calloc(bound, sizeof *cval);
+    uint32_t *ptee = calloc(bound, sizeof *ptee), *psc = calloc(bound, sizeof *psc), *rtm = calloc(bound, sizeof *rtm);
+    uint32_t *inb = calloc(bound, sizeof *inb), *nul = calloc(bound, sizeof *nul);
+    uint8_t *deco = calloc(bound, 1), *iscon = calloc(bound, 1), *cand = calloc(bound, 1), *needn = calloc(bound, 1);
+    uint32_t *o = NULL;
+    size_t k = 0;
+    if (!tdef || !rty || !cval || !ptee || !psc || !rtm || !inb || !nul || !deco || !iscon || !cand || !needn) goto done;
+    uint32_t t_u32 = 0, t_bool = 0, bvec[5] = { 0 }, glsl = 0, c_u1 = 0;
+    int has_iq = 0, n_ac = 0, n_ld = 0, n_tx = 0, n_tw = 0;
+    size_t fn_start = 0, mm_at = 0;
+    // 1：型・定数・飾り・変数を集める
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > nw) goto done;
+        const uint32_t *x = &w[i];
+        if (op == 17 && wc >= 2 && x[1] == 50) has_iq = 1;
+        if (op == 11 && wc >= 3 && !memcmp(&x[2], "GLSL.std.450", 12)) glsl = x[1];
+        if (op == 14 && !mm_at) mm_at = i;
+        if (op == 54 && !fn_start) fn_start = i;
+        if (op >= 19 && op <= 39 && wc >= 2 && x[1] < bound) tdef[x[1]] = (uint32_t) i;
+        if (op == 20 && wc == 2 && !t_bool) t_bool = x[1];
+        if (op == 21 && wc == 4 && x[2] == 32 && x[3] == 0 && !t_u32) t_u32 = x[1];
+        if (op == 32 && wc == 4 && x[1] < bound) { psc[x[1]] = x[2]; ptee[x[1]] = x[3]; }
+        if (op == 43 && wc == 4 && x[2] < bound) { cval[x[2]] = x[3]; iscon[x[2]] = 1; }
+        if (op == 71 && wc >= 3 && x[1] < bound && (x[2] == 2 || x[2] == 3)) deco[x[1]] |= x[2] == 2 ? 1 : 2; // Block・BufferBlock
+        if (spv_has_rt(op) && wc >= 3 && x[2] < bound) rty[x[2]] = x[1];
+        i += wc;
+    }
+    if (!fn_start || !mm_at) goto done;
+    for (size_t i = 5; i < fn_start;) { // bool のベクトル・uint の 1
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        const uint32_t *x = &w[i];
+        if (op == 23 && wc == 4 && t_bool && x[2] == t_bool && x[3] <= 4 && !bvec[x[3]]) bvec[x[3]] = x[1];
+        if (op == 43 && wc == 4 && t_u32 && x[1] == t_u32 && x[3] == 1 && !c_u1) c_u1 = x[2];
+        i += wc;
+    }
+    // storage buffer の変数：最後のメンバーが長さの決まらない配列なら、その番号 + 1 を rtm に
+    for (size_t i = 5; i < fn_start;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        const uint32_t *x = &w[i];
+        if (op == 59 && wc >= 4 && x[1] < bound && x[2] < bound) {
+            uint32_t pt = x[1], sc = psc[pt], st = ptee[pt];
+            if (st < bound && tdef[st] && (w[tdef[st]] & 0xffff) == 30 && ((sc == 12 && (deco[st] & 1)) || (sc == 2 && (deco[st] & 2)))) {
+                const uint32_t *sd = &w[tdef[st]];
+                uint32_t nm = (sd[0] >> 16) - 2, last = nm ? sd[2 + nm - 1] : 0;
+                if (nm && last < bound && tdef[last] && (w[tdef[last]] & 0xffff) == 29) rtm[x[2]] = nm; // 番号 + 1
+            }
+        }
+        i += wc;
+    }
+    // 2：直す所を数え、要る型を決める
+    for (size_t i = fn_start; i < nw;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        const uint32_t *x = &w[i];
+        if ((op == 65 || op == 66) && wc >= 6 && x[3] < bound && rtm[x[3]] && iscon[x[4]] && cval[x[4]] + 1 == rtm[x[3]]) { cand[x[2]] = 1; n_ac++; }
+        else if ((op == 65 || op == 66) && wc >= 4 && x[3] < bound && cand[x[3]] && x[2] < bound) cand[x[2]] = 2; // 直した所の先
+        else if (op == 61 && wc >= 4 && x[3] < bound && cand[x[3]] && x[1] < bound && tdef[x[1]]) {
+            uint32_t top = w[tdef[x[1]]] & 0xffff;
+            if (top == 21 || top == 22 || (top == 23 && w[tdef[x[1]] + 3] <= 4)) { needn[x[1]] = 1; n_ld++; }
+        } else if ((op == 95 || op == 98 || op == 99) && wc >= (op == 99 ? 4u : 5u)) {
+            uint32_t img = op == 99 ? x[1] : x[3];
+            uint32_t it = img < bound ? rty[img] : 0;
+            if (it && it < bound && tdef[it] && (w[tdef[it]] & 0xffff) == 25 && w[tdef[it] + 3] == 5) {
+                if (op == 99) n_tw++;
+                else if (x[1] < bound && tdef[x[1]] && (w[tdef[x[1]]] & 0xffff) == 23 && w[tdef[x[1]] + 3] <= 4) { needn[x[1]] = 1; n_tx++; }
+            }
+        }
+        i += wc;
+    }
+    if (!n_ac && !n_tx && !n_tw) goto done;
+    // 3：書き直す（足す物は、型・定数を関数の前に。足す命令はその場に）
+    o = malloc((nw * 4 + 256) * sizeof *o);
+    if (!o) goto done;
+    uint32_t nb = bound;
+    uint32_t new_u32 = 0, new_bool = 0, new_bv[5] = { 0 }, new_c1 = 0, new_glsl = 0;
+    if (!t_u32) t_u32 = new_u32 = nb++;
+    if (!t_bool) t_bool = new_bool = nb++;
+    for (int c = 2; c <= 4; c++) if (!bvec[c]) bvec[c] = new_bv[c] = nb++;
+    if (!c_u1) c_u1 = new_c1 = nb++;
+    if (!glsl) glsl = new_glsl = nb++;
+    for (uint32_t t = 0; t < bound; t++) if (needn[t]) nul[t] = nb++;
+    memcpy(o, w, 5 * sizeof *o);
+    k = 5;
+    int cap_done = has_iq || (!n_tx && !n_tw);
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        const uint32_t *x = &w[i];
+        if (k + wc + 64 > nw * 4 + 256) { free(o); o = NULL; goto done; }
+        if (op != 17 && !cap_done) { o[k++] = (2u << 16) | 17; o[k++] = 50; cap_done = 1; } // OpCapability ImageQuery
+        if (i == mm_at && new_glsl) { o[k++] = (6u << 16) | 11; o[k++] = new_glsl; memcpy(&o[k], "GLSL.std.450\0\0\0\0", 16); k += 4; }
+        if (i == fn_start) {
+            if (new_u32) { o[k++] = (4u << 16) | 21; o[k++] = new_u32; o[k++] = 32; o[k++] = 0; }
+            if (new_bool) { o[k++] = (2u << 16) | 20; o[k++] = new_bool; }
+            for (int c = 2; c <= 4; c++) if (new_bv[c]) { o[k++] = (4u << 16) | 23; o[k++] = new_bv[c]; o[k++] = t_bool; o[k++] = (uint32_t) c; }
+            if (new_c1) { o[k++] = (4u << 16) | 43; o[k++] = t_u32; o[k++] = new_c1; o[k++] = 1; }
+            for (uint32_t t = 0; t < bound; t++) if (needn[t]) { o[k++] = (3u << 16) | 46; o[k++] = t; o[k++] = nul[t]; } // OpConstantNull
+        }
+        if (i >= fn_start && (op == 65 || op == 66) && wc >= 6 && x[2] < bound && cand[x[2]] == 1) {
+            uint32_t idx = x[5], idxu = idx;
+            if (idx < bound && rty[idx] && rty[idx] != t_u32) { idxu = nb++; o[k++] = (4u << 16) | 124; o[k++] = t_u32; o[k++] = idxu; o[k++] = idx; }
+            uint32_t len = nb++, l1 = nb++, lm1 = nb++, ci = nb++, b = nb++;
+            o[k++] = (5u << 16) | 68; o[k++] = t_u32; o[k++] = len; o[k++] = x[3]; o[k++] = rtm[x[3]] - 1;   // OpArrayLength
+            o[k++] = (5u << 16) | 176; o[k++] = t_bool; o[k++] = b; o[k++] = idxu; o[k++] = len;            // OpULessThan
+            o[k++] = (7u << 16) | 12; o[k++] = t_u32; o[k++] = l1; o[k++] = glsl; o[k++] = 41; o[k++] = len; o[k++] = c_u1;  // UMax
+            o[k++] = (5u << 16) | 130; o[k++] = t_u32; o[k++] = lm1; o[k++] = l1; o[k++] = c_u1;            // OpISub
+            o[k++] = (7u << 16) | 12; o[k++] = t_u32; o[k++] = ci; o[k++] = glsl; o[k++] = 38; o[k++] = idxu; o[k++] = lm1; // UMin
+            memcpy(o + k, x, wc * sizeof *o);
+            o[k + 5] = ci;
+            k += wc;
+            inb[x[2]] = b;
+            i += wc;
+            continue;
+        }
+        if (i >= fn_start && (op == 65 || op == 66) && wc >= 4 && x[2] < bound && cand[x[2]] == 2 && x[3] < bound) inb[x[2]] = inb[x[3]];
+        if (i >= fn_start && op == 61 && wc >= 4 && x[3] < bound && inb[x[3]] && x[1] < bound && needn[x[1]]) {
+            uint32_t T = x[1], tmp = nb++, cond = inb[x[3]];
+            memcpy(o + k, x, wc * sizeof *o);
+            o[k + 2] = tmp;
+            k += wc;
+            if ((w[tdef[T]] & 0xffff) == 23) {
+                uint32_t nc = w[tdef[T] + 3], bv = nb++;
+                o[k++] = ((3u + nc) << 16) | 80; o[k++] = bvec[nc]; o[k++] = bv;
+                for (uint32_t c = 0; c < nc; c++) o[k++] = cond;
+                cond = bv;
+            }
+            o[k++] = (6u << 16) | 169; o[k++] = T; o[k++] = x[2]; o[k++] = cond; o[k++] = tmp; o[k++] = nul[T]; // OpSelect
+            i += wc;
+            continue;
+        }
+        if (i >= fn_start && (op == 95 || op == 98 || op == 99) && wc >= (op == 99 ? 4u : 5u)) {
+            uint32_t img = op == 99 ? x[1] : x[3], crd = op == 99 ? x[2] : x[4];
+            uint32_t it = img < bound ? rty[img] : 0, ct = crd < bound ? rty[crd] : 0;
+            int texel = it && it < bound && tdef[it] && (w[tdef[it]] & 0xffff) == 25 && w[tdef[it] + 3] == 5;
+            int scal = ct && ct < bound && tdef[ct] && (w[tdef[ct]] & 0xffff) == 21;
+            if (texel && scal) {
+                uint32_t cu = crd, sz = nb++, b = nb++, l1 = nb++, lm1 = nb++, cc = nb++, cc2 = cc;
+                if (ct != t_u32) { cu = nb++; o[k++] = (4u << 16) | 124; o[k++] = t_u32; o[k++] = cu; o[k++] = crd; }
+                o[k++] = (4u << 16) | 104; o[k++] = t_u32; o[k++] = sz; o[k++] = img;                       // OpImageQuerySize
+                o[k++] = (5u << 16) | 176; o[k++] = t_bool; o[k++] = b; o[k++] = cu; o[k++] = sz;           // OpULessThan
+                o[k++] = (7u << 16) | 12; o[k++] = t_u32; o[k++] = l1; o[k++] = glsl; o[k++] = 41; o[k++] = sz; o[k++] = c_u1;
+                o[k++] = (5u << 16) | 130; o[k++] = t_u32; o[k++] = lm1; o[k++] = l1; o[k++] = c_u1;
+                o[k++] = (7u << 16) | 12; o[k++] = t_u32; o[k++] = cc; o[k++] = glsl; o[k++] = 38; o[k++] = cu; o[k++] = lm1;
+                if (ct != t_u32) { cc2 = nb++; o[k++] = (4u << 16) | 124; o[k++] = ct; o[k++] = cc2; o[k++] = cc; }
+                if (op == 99) {
+                    memcpy(o + k, x, wc * sizeof *o);
+                    o[k + 2] = cc2;
+                    k += wc;
+                } else if (x[1] < bound && needn[x[1]]) {
+                    uint32_t T = x[1], tmp = nb++, nc = w[tdef[T] + 3], bv = nb++;
+                    memcpy(o + k, x, wc * sizeof *o);
+                    o[k + 2] = tmp;
+                    o[k + 4] = cc2;
+                    k += wc;
+                    o[k++] = ((3u + nc) << 16) | 80; o[k++] = bvec[nc]; o[k++] = bv;
+                    for (uint32_t c = 0; c < nc; c++) o[k++] = b;
+                    o[k++] = (6u << 16) | 169; o[k++] = T; o[k++] = x[2]; o[k++] = bv; o[k++] = tmp; o[k++] = nul[T];
+                } else {
+                    memcpy(o + k, x, wc * sizeof *o);
+                    o[k + 4] = cc2;
+                    k += wc;
+                }
+                i += wc;
+                continue;
+            }
+        }
+        memcpy(o + k, x, wc * sizeof *o);
+        k += wc;
+        i += wc;
+    }
+    o[3] = nb;
+    *n = k;
+    {
+        static volatile LONG cnt;
+        LONG c = InterlockedIncrement(&cnt);
+        if (c <= 3 || (c & (c - 1)) == 0)
+            say("範囲の外の守り：storage buffer の添字 %d か所（うち読み %d）・texel buffer の読み %d・書き %d を直した（%ld 本目）", n_ac, n_ld, n_tx, n_tw, c);
+    }
+done:
+    free(tdef); free(rty); free(cval); free(ptee); free(psc); free(rtm); free(inb); free(nul);
+    free(deco); free(iscon); free(cand); free(needn);
+    if (o && !*n) { free(o); o = NULL; }
+    return o;
+}
+
 static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreateInfo *ci, const VkAllocationCallbacks *a, VkShaderModule *out) {
     (void) a;
     size_t nfix = 0;
@@ -8337,6 +8544,11 @@ static VkResult VKAPI_CALL create_shader(VkDevice dv, const VkShaderModuleCreate
         size_t n3 = 0;
         uint32_t *fix3 = spv_sparse(fix ? fix : ci->pCode, fix ? nfix : ci->codeSize / 4, &n3);
         if (fix3) { free(fix); fix = fix3; nfix = n3; }
+    }
+    {
+        size_t n4 = 0;
+        uint32_t *fix4 = spv_robust(fix ? fix : ci->pCode, fix ? nfix : ci->codeSize / 4, &n4);
+        if (fix4) { free(fix); fix = fix4; nfix = n4; }
     }
     const uint32_t *code = fix ? fix : ci->pCode;
     size_t size = fix ? nfix * 4 : ci->codeSize;
