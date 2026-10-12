@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import CoreImage
 import CoreMedia
 import CoreMotion
@@ -35,6 +36,12 @@ import VideoToolbox
 //   切り抜きと水平を保つ：エンコーダの前で Core Image が切り出して回し、選んだ解像度に拡大する（iOS 15 でも動く。VTPixelTransferSession は iOS 16 からで、斜めに回せない）。
 //   カメラ 4：背面の仮想カメラ（三つか二つのレンズ）。倍率に合わせて iOS がレンズを切り替える。PC には「背面」（0）と知らせる。
 //   iPhone のレンズの F 値は変えられない（lensAperture は読むだけ）。背景ぼかしは iOS 26 のシネマティックか、コントロールセンターのポートレート
+//
+// camctl2 で足した所（PC から操作する。通信の形は work/camctl/PROTOCOL.md・番号の表は work/camctl2/ctl_ids.md）：
+//   PC が HELLO の flags に WC_HELLO_CTRL（8）を立てたつなぎだけ、CTRL_CAPS（5）と CTRL_STATE（6）を送り、CTRL_SET（18）と CTRL_GET（19）を受ける。
+//   立てない PC（古い webcam_rx）には、今までどおり何も増やさない。
+//   PC の SET は、画面で変えたときと同じ道を通す（画面の糸で UserDefaults に書き、controlsChanged か settingsChanged）。
+//   だから画面にもすぐ出て、次に開いたときも残る。画面と PC の両方で変えたら、あとから変えた方が残る
 final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureMetadataOutputObjectsDelegate {
     static let shared = CameraBridge()
     static let port: UInt16 = 50064
@@ -44,12 +51,16 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private enum Msg {
         static let hello: UInt32 = 1, ack: UInt32 = 2, frame: UInt32 = 3, event: UInt32 = 4
         static let reqKey: UInt32 = 16, setKbps: UInt32 = 17, ping: UInt32 = 20, pong: UInt32 = 21
+        // camctl2：PC から操作する。5・6 は iPhone→PC、18・19 は PC→iPhone
+        static let ctrlCaps: UInt32 = 5, ctrlState: UInt32 = 6, ctrlSet: UInt32 = 18, ctrlGet: UInt32 = 19
     }
     // HELLO と ACK の flags（pc/wcam.h と同じ）
     private enum Flag {
         static let mirror: UInt32 = 1, cameraSet: UInt32 = 2, live: UInt32 = 4
         static let ackAppSettings: UInt32 = 1, ackAppPriority: UInt32 = 2, ackLive: UInt32 = 4, ackChanged: UInt32 = 8
         static let ackThermal: UInt32 = 16 // camctl：熱のためにコマ数を下げた（work/camctl/PROTOCOL.md の案。古い PC は見ない）
+        static let ctrl: UInt32 = 8        // camctl2：HELLO。PC は CTRL のメッセージを受け、送れる
+        static let ackCtrl: UInt32 = 32    // camctl2：ACK。この iPhone は CTRL を受ける（CTRL を名乗った PC にだけ立てる）
     }
 
     // アプリの画面の設定（UserDefaults の鍵）
@@ -106,6 +117,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     @Published private(set) var rotSkipped = false   // PC が古いので 90 度・270 度の回転を使っていない
     @Published private(set) var levelAngle = 0.0     // 水平を保つ：いま直している角度（度）
     @Published private(set) var thermalNote = ""     // 熱でフレームレートを下げているときの文
+    @Published private(set) var pcControl = false    // camctl2：接続中の PC は CTRL を名乗った（PC のアプリからも操作できる）
     // Wi-Fi でつなぐときの合言葉（起動のたびに変わる 6 けた）。PC は webcam_rx --addr iPhoneの住所:50064 --code これ
     let wifiCode = UInt32.random(in: 100_000...999_999)
     static let wifiKey = "webcamWifi"
@@ -181,6 +193,17 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private var focusTargetApplied = -1    // いまのカメラに当てたピントの合わせ方（同じなら合わせ直さない）
     private var torchDev: AVCaptureDevice? // 点けたライトの持ち主（前面カメラのときは背面のカメラ）
     private var baseFps = 0                // 熱で下げる前のコマ数（いまのカメラ）
+    // camctl2：PC から操作する（CTRL）。q の上だけで触る
+    private var ctl = false                    // このつなぎの PC は HELLO で CTRL を名乗った
+    private var ctlNow = CtlCaps()             // PC に送ってある CAPS（SET を範囲に収める・STATE の値を決める）
+    private var ctlSent: [UInt16: Float] = [:] // PC に送った値（変わった物だけ送るため）
+    private var ctlReplies = Set<UInt16>()     // 次の STATE で SET への返事（why 8）にする id
+    private var ctlFlushQueued = false
+    private var ctlPollGen = 0                 // 1 秒ごとの見回りの番号（つなぎ直し・作り直しで前の見回りを止める）
+    private var ctlZoom: CGFloat?              // PC がカメラを決めて画面のカメラと違うときに、PC が選んだ倍率（このつなぎの間だけ）
+    private var dimCopy = false                // 画面を暗くしている（ScreenDimmer から写す）
+    private var lightCopy = false              // 画面のライトを出している（ScreenDimmer から写す）
+    private var screenSubs: [AnyCancellable] = []
 
     // カメラの糸・エンコーダの糸からも触る物（lock で守る）
     private let lock = NSLock()
@@ -238,8 +261,23 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         observers.append(nc.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: nil) { [weak self] _ in self?.q.async { self?.appActive = false } })
         observers.append(nc.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: nil) { [weak self] _ in
             let s = UInt32(ProcessInfo.processInfo.thermalState.rawValue)
-            self?.q.async { self?.sendEvent(3, s); self?.applyThermal() }
+            self?.q.async {
+                self?.sendEvent(3, s)
+                self?.applyThermal()
+                self?.ctlSendState(all: false, readOnly: true, why: CtlWhy.ios) // camctl2：温度の状態（102）をすぐ
+            }
         })
+        // camctl2：画面で操作を変えた（@AppStorage も UserDefaults に書く）。CTRL の PC に今の値を送る
+        observers.append(nc.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: nil) { [weak self] _ in
+            self?.q.async { self?.ctlSchedule() }
+        })
+        // camctl2：画面を暗くした・画面のライトを出した（画面の糸から）
+        ScreenDimmer.shared.changes.sink { [weak self] on in
+            self?.q.async { self?.dimCopy = on; self?.ctlSchedule() }
+        }.store(in: &screenSubs)
+        ScreenDimmer.shared.lightChanges.sink { [weak self] on in
+            self?.q.async { self?.lightCopy = on; self?.ctlSchedule() }
+        }.store(in: &screenSubs)
     }
 
     private func log(_ s: String) { (s + "\n").withCString { rpc_bridge_log_line($0) } }
@@ -258,6 +296,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             pendingNote = false
             rotSkipped = false
             thermalNote = ""
+            pcControl = false
         }
         let active = UIApplication.shared.applicationState == .active
         q.async { [weak self] in
@@ -451,6 +490,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         conn = nil
         lastHello = nil
         stopCapture()
+        ctlReset(false)
         c.cancel()
         log("ウェブカメラ：切れた")
         DispatchQueue.main.async { [weak self] in
@@ -460,6 +500,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             self?.pendingNote = false
             self?.rotSkipped = false
             self?.thermalNote = ""
+            self?.pcControl = false
         }
     }
 
@@ -510,6 +551,12 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             let quality = body.count >= 40 ? Int(Self.u32(body, 36)) : 0
             let hi = Hello(version: f[0], width: Int(f[1]), height: Int(f[2]), fps: Int(f[3]), kbps: Int(f[4]), gop: Int(f[5]), camera: f[6], flags: f[7], quality: quality)
             lastHello = hi
+            // camctl2：CTRL を名乗った PC か（頼み直しの HELLO でも読み直す）
+            let wantCtl = hi.flags & Flag.ctrl != 0
+            if wantCtl != ctl {
+                ctlReset(wantCtl)
+                if wantCtl { log("ウェブカメラ：PC が CTRL を名乗った。PC からカメラを操作できる") }
+            }
             startSession(c, hi, changed: curReq != nil)
         case Msg.reqKey:
             lock.lock(); forceKey = true; lock.unlock()
@@ -520,6 +567,12 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             d.append(contentsOf: body[0..<8])
             Self.appendLE64(&d, Self.nowUs())
             sendMsg(Msg.pong, d)
+        case Msg.ctrlSet where ctl:
+            ctlSet(body)
+        case Msg.ctrlGet where ctl:
+            // CAPS と今の値を送り直す（カメラを動かしていないとき＝作り直しの途中などは、このあとの CAPS で届く）
+            ctlSendCaps()
+            ctlSendState(all: true, readOnly: true, why: CtlWhy.all)
         default:
             break // 知らない型は読み捨てる（先の版が足した物でも壊れない）
         }
@@ -680,9 +733,14 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         liveApply() // 手動のシャッター速度を、新しい 1 コマの長さに収め直す
         if let hi = lastHello, hi.flags & Flag.live != 0 {
             sendAck(status: 0, w: curW, h: curH, fps: target, kbps: curKbps, camera: Self.ackCamera(r.camera),
-                    flags: r.ackFlags | Flag.ackLive | Flag.ackChanged | (down ? Flag.ackThermal : 0))
+                    flags: r.ackFlags | Flag.ackLive | Flag.ackChanged | (down ? Flag.ackThermal : 0) | (ctl ? Flag.ackCtrl : 0))
         }
         sendEvent(5, UInt32(target)) // 5：熱でコマ数を変えた（arg が新しいコマ数）。古い PC は記録に出すだけ
+        // camctl2：シャッター速度の選択肢と送っているコマ数（108）が変わるので、CAPS と今の値を送り直す
+        if ctl {
+            ctlSendCaps()
+            ctlSendState(all: true, readOnly: true, why: CtlWhy.all)
+        }
         let w = curW, h = curH, kb = curKbps
         let name = Self.cameraName(r.camera)
         let note = down ? L("iPhone が熱いため、フレームレートを \(target) fps に下げています。", "The iPhone is hot, so the frame rate is lowered to \(target) fps.") : ""
@@ -793,10 +851,19 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         observeSession(s)
         // ピント・明るさ・色・ズーム・ライト・切り抜きの値を、走らせる前に当てる
         liveApply(initial: true)
-        let ackFlags = r.ackFlags | Flag.ackLive | (changed ? Flag.ackChanged : 0)
+        // camctl2：CTRL の PC には ACK に CTRL を立てる。熱でコマ数を下げて始めたときは THERMAL も立てる
+        let hot = fr < p.baseFps
+        var ackFlags = r.ackFlags | Flag.ackLive | (changed ? Flag.ackChanged : 0)
+        if ctl { ackFlags |= Flag.ackCtrl | (hot ? Flag.ackThermal : 0) }
         sendAck(status: 0, w: aw, h: ah, fps: fr, kbps: kb, camera: Self.ackCamera(r.camera), flags: ackFlags)
         // 温度の状態は変わったときに EVENT 3 で送っている。つないだ直後にも今の状態を 1 回送る（古い PC は記録に出すだけ）
         if !changed { sendEvent(3, UInt32(ProcessInfo.processInfo.thermalState.rawValue)) }
+        // camctl2：CTRL の PC には、熱で下げて始めたことも EVENT 5 で知らせ、操作の一覧（CAPS）と今の値（STATE）を送る
+        if ctl {
+            if hot { sendEvent(5, UInt32(fr)) }
+            ctlStart()
+        }
+        let ctlOn = ctl
         log("ウェブカメラ：\(changed ? "切り替えた" : "始める") \(aw)×\(ah)・\(fr) コマ/秒・\(kb) kbps・カメラ \(r.camera)（\(dev.localizedName)）・回転 \(r.rot)・反転 \(r.connMirror ? 1 : 0)・切り抜き \(pool != nil ? 1 : 0)・手ぶれ補正 \(r.stab)・シネマティック \(cineOn ? 1 : 0)・ACK flags \(ackFlags)")
         // startRunning は返ってくるまでに時間がかかるので、カメラの糸で（前のカメラの stopRunning のあとに並ぶ）
         captureQueue.async { s.startRunning() }
@@ -811,6 +878,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             self?.pendingNote = false
             self?.rotSkipped = skipped
             self?.thermalNote = hotNote
+            self?.pcControl = ctlOn
         }
     }
 
@@ -1377,8 +1445,10 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private func applyZoom(_ dev: AVCaptureDevice, _ d: UserDefaults, _ r: Resolved, extra: CGFloat, initial: Bool) {
         let m = Self.zoomMultiplier(dev)
         // PC がカメラを決めて、画面のカメラと違うときは、そのレンズの 1 枚目の見え方（画面の倍率は別のレンズの物なので使わない）
-        let stored = !r.pcCam || r.camera == UInt32(max(0, d.integer(forKey: Key.camera)))
+        let stored = ctlZoomStored(r)
         var want = stored ? CGFloat(d.double(forKey: Key.zoom)) / m : 1
+        // camctl2：そのときは、PC が CTRL で選んだ倍率を使う（このつなぎの間だけ。画面の倍率は別のレンズの物なので書かない）
+        if !stored, let z = ctlZoom { want = z / m }
         if want <= 0 { want = 1 / m }
         if extra > 1.001 { want = max(Self.lensFloor(dev, for: want), want / extra) }
         let lo = max(1, dev.minAvailableVideoZoomFactor)
@@ -1699,6 +1769,412 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         })
     }
 
+    // ---- camctl2：PC から操作する（CTRL。q の上） ----
+    // CAPS：使える操作と範囲。画面の CameraControlsView に出る物と同じ物を、いま使っているカメラと形で出す。ACK のあと（作り直すたびに）と GET で送る。
+    //   {u32 数}{項目 24 バイト × 数}{u32 倍率のボタンの数}{f32 × 数}{u32 選択肢の表の数}{u16 id・u16 数・f32 × 数 を表の数だけ}
+    // STATE：{u16 id・u16 why・f32 値} × n。why は 0 全部・1 画面で変えた・2 iOS が変えた・8 SET への返事。
+    //   画面の変更は UserDefaults の変更で気づき、0.1 秒まとめて送る。読むだけの値（100 から）は 1 秒ごとに見て、変わった物を送る
+
+    // CAPS の 1 項目
+    private struct CtlItem {
+        var id: UInt16, kind: UInt16, min: Float, max: Float, step: Float, flags: UInt32
+        var choices: [Float]
+    }
+    // PC に送ってある CAPS
+    private struct CtlCaps {
+        var items: [CtlItem] = []
+        var stops: [Float] = []
+        var cam = CameraCaps()
+    }
+    private enum CtlKind { static let toggle: UInt16 = 0, choice: UInt16 = 1, number: UInt16 = 2, readOnly: UInt16 = 3 }
+    private enum CtlFlag { static let rebuild: UInt32 = 1, unavailable: UInt32 = 2, log: UInt32 = 4 }
+    private enum CtlWhy { static let all: UInt16 = 0, app: UInt16 = 1, ios: UInt16 = 2, reply: UInt16 = 8 }
+
+    // つなぎが変わった・CTRL を名乗るかが変わった：送った物の覚えを捨てる
+    private func ctlReset(_ on: Bool) {
+        ctl = on
+        ctlNow = CtlCaps()
+        ctlSent = [:]
+        ctlReplies = []
+        ctlZoom = nil
+        ctlPollGen += 1
+    }
+
+    // ACK のあと：CAPS と全部の値を送り、1 秒ごとの見回りを始める
+    private func ctlStart() {
+        guard ctl else { return }
+        ctlSendCaps()
+        ctlSendState(all: true, readOnly: true, why: CtlWhy.all)
+        ctlPollGen += 1
+        ctlPollLater(ctlPollGen)
+    }
+
+    // 1 秒ごと：ライトの今の明るさ・温度・エフェクトなど、iOS が変える値を見て、変わった物を送る
+    private func ctlPollLater(_ g: Int) {
+        q.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, g == self.ctlPollGen, self.ctl, self.conn != nil else { return }
+            self.ctlSendState(all: false, readOnly: true, why: CtlWhy.ios)
+            self.ctlPollLater(g)
+        }
+    }
+
+    // 画面の変更・SET のあと。0.1 秒まとめてから送る（同じ id は 0.1 秒に 1 回まで）
+    private func ctlSchedule() {
+        guard ctl, !ctlFlushQueued else { return }
+        ctlFlushQueued = true
+        q.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self else { return }
+            self.ctlFlushQueued = false
+            self.ctlSendState(all: false, readOnly: false, why: CtlWhy.app)
+        }
+    }
+
+    // 倍率を画面の値（Key.zoom）で決めるか。PC がカメラを決めて画面のカメラと違うときは、画面の倍率は別のレンズの物なので使わない
+    private func ctlZoomStored(_ r: Resolved) -> Bool {
+        !r.pcCam || r.camera == UInt32(max(0, UserDefaults.standard.integer(forKey: Key.camera)))
+    }
+
+    // いまの倍率（見え方。applyZoom と同じ決まり）
+    private func ctlZoomValue(_ dev: AVCaptureDevice, _ r: Resolved) -> Float {
+        let m = Self.zoomMultiplier(dev)
+        if ctlZoomStored(r) {
+            let z = UserDefaults.standard.double(forKey: Key.zoom)
+            return Float(z > 0 ? z : 1)
+        }
+        return Float(ctlZoom ?? m)
+    }
+
+    // いまのカメラと形で、PC に出す操作を決める（画面の CameraControlsView に出る物と同じ）
+    private func ctlBuild() -> CtlCaps {
+        var n = CtlCaps()
+        guard let input = deviceInput, let r = curReq else { return n }
+        let dev = input.device
+        let c = Self.caps(dev: dev, format: dev.activeFormat, camera: r.camera, height: r.h, fps: curFps)
+        n.cam = c
+        var items: [CtlItem] = []
+        func add(_ id: UInt16, _ kind: UInt16, _ lo: Float, _ hi: Float, _ step: Float, _ flags: UInt32 = 0, _ choices: [Float] = []) {
+            items.append(CtlItem(id: id, kind: kind, min: lo, max: hi, step: step, flags: flags, choices: choices))
+        }
+        func choice(_ id: UInt16, _ values: [Float], _ flags: UInt32 = 0) {
+            add(id, CtlKind.choice, values.min() ?? 0, values.max() ?? 0, 1, flags, values)
+        }
+        func toggle(_ id: UInt16, _ flags: UInt32 = 0) {
+            add(id, CtlKind.toggle, 0, 1, 1, flags)
+        }
+        // ピント。背景をぼかしている間は変えられない（画面も「ピントは自動」と出す）
+        let fl: UInt32 = isCinematicOn(input) ? CtlFlag.unavailable : 0
+        if c.focusAuto || c.focusManual {
+            var fm: [Float] = [0]
+            if c.focusLock { fm.append(1) }
+            if c.focusManual { fm.append(2) }
+            choice(1, fm, fl)
+            if c.focusManual { add(2, CtlKind.number, 0, 1, 0.01, fl) }
+            if c.focusAuto { choice(3, [0, 1], fl) }
+        }
+        // 明るさ
+        var em: [Float] = [0]
+        if c.expLock { em.append(1) }
+        if c.expManual { em.append(2) }
+        choice(4, em)
+        if c.biasMax > c.biasMin { add(5, CtlKind.number, c.biasMin, c.biasMax, 0.1) }
+        if c.expManual {
+            add(6, CtlKind.number, max(c.isoMin, 1), max(c.isoMax, c.isoMin + 1), 1, CtlFlag.log)
+            if !c.shutters.isEmpty { choice(7, c.shutters.map { Float($0) }) }
+        }
+        // 色
+        var wm: [Float] = [0]
+        if c.wbLock { wm.append(1) }
+        if c.wbTemp { wm.append(2) }
+        choice(8, wm)
+        if c.wbTemp { add(9, CtlKind.number, 2500, 8000, 100) }
+        // ズーム（見え方の倍率）と倍率のボタン
+        if c.zoomMax > c.zoomMin + 0.01 {
+            add(10, CtlKind.number, Float(c.zoomMin), Float(c.zoomMax), 0.01, CtlFlag.log)
+            n.stops = c.zoomStops.map { Float($0) }
+        }
+        // ライト。前面カメラで iOS が背面のライトを許さないときは「今は使えない」
+        if c.torch {
+            let ok = Self.torchDevice(for: dev)?.isTorchAvailable ?? false
+            let tf: UInt32 = c.front && !ok ? CtlFlag.unavailable : 0
+            toggle(11, tf)
+            add(12, CtlKind.number, 0.05, 1, 0.05, tf)
+            add(100, CtlKind.readOnly, 0, 1, 1)
+            add(101, CtlKind.readOnly, 0, 1, 0.01)
+        }
+        // 手ぶれ補正・背景ぼかし・センターフレーム（作り直す）
+        choice(13, c.stabModes.map { Float($0) }, CtlFlag.rebuild)
+        if c.cinematic {
+            toggle(14, CtlFlag.rebuild)
+            if c.apertureMax > c.apertureMin { add(15, CtlKind.number, c.apertureMin, c.apertureMax, 0.1) }
+            add(106, CtlKind.readOnly, 0, 1, 1)
+        }
+        if c.centerStage { toggle(16, CtlFlag.rebuild) }
+        // 向き・切り抜き・水平（作り直す。切り抜く位置の横と縦は作り直さない）
+        toggle(17, CtlFlag.rebuild)
+        toggle(18, CtlFlag.rebuild)
+        add(19, CtlKind.choice, 0, 270, 90, CtlFlag.rebuild, [0, 90, 180, 270])
+        toggle(20, CtlFlag.rebuild)
+        choice(21, [0, 1, 2, 3, 4], CtlFlag.rebuild)
+        add(22, CtlKind.number, 0.3, 1, 0.01, CtlFlag.rebuild)
+        add(23, CtlKind.number, 0, 1, 0.01)
+        add(24, CtlKind.number, 0, 1, 0.01)
+        if c.level {
+            toggle(25, CtlFlag.rebuild)
+            add(107, CtlKind.readOnly, Float(-Self.levelMaxDeg), Float(Self.levelMaxDeg), 0.1)
+        }
+        // 画面のライト・暖かい色・熱いときにコマ数を下げる・画面を暗くする
+        toggle(26)
+        toggle(27)
+        toggle(28)
+        toggle(29)
+        // 読むだけ
+        add(102, CtlKind.readOnly, 0, 3, 1)
+        if c.portrait {
+            add(103, CtlKind.readOnly, 0, 1, 1)
+            add(104, CtlKind.readOnly, 0, 1, 1)
+        }
+        if c.studio { add(105, CtlKind.readOnly, 0, 1, 1) }
+        add(108, CtlKind.readOnly, 1, 120, 1)
+        items.sort { $0.id < $1.id }
+        n.items = items
+        return n
+    }
+
+    // いまの値。画面に出ている値と同じにする（選べない値が入っていたら、画面と同じく初めの選択肢）。readOnly が false なら 100 からは入れない
+    private func ctlValues(readOnly: Bool) -> [UInt16: Float] {
+        var v: [UInt16: Float] = [:]
+        guard let input = deviceInput, let r = curReq else { return v }
+        let dev = input.device
+        let d = UserDefaults.standard
+        let c = ctlNow.cam
+        let torch = Self.torchDevice(for: dev)
+        lock.lock(); let deg = levelShown; let cine = cineCopy; lock.unlock()
+        func b(_ k: String) -> Float { d.bool(forKey: k) ? 1 : 0 }
+        func i(_ k: String) -> Float { Float(d.integer(forKey: k)) }
+        func f(_ k: String) -> Float { Float(d.double(forKey: k)) }
+        for it in ctlNow.items {
+            if it.id >= 100 && !readOnly { continue }
+            var x: Float
+            switch it.id {
+            case 1: x = i(Key.focus)
+            case 2: x = f(Key.focusPos)
+            case 3: x = d.integer(forKey: Key.focusTarget) == 1 ? 1 : 0
+            case 4: x = i(Key.exposure)
+            case 5: x = f(Key.bias)
+            case 6: x = f(Key.iso) // 0 は「今の値から」（画面も「今の値」と出す）
+            case 7:
+                let s = d.integer(forKey: Key.shutter)
+                let fb = c.shutters.first(where: { $0 >= max(curFps, 30) * 2 }) ?? c.shutters.first ?? 0
+                x = Float(c.shutters.contains(s) ? s : fb)
+            case 8: x = i(Key.wb)
+            case 9: x = f(Key.wbTemp)
+            case 10: x = ctlZoomValue(dev, r)
+            case 11: x = b(Key.torch)
+            case 12: x = f(Key.torchLevel)
+            case 13: x = i(Key.stab)
+            case 14: x = b(Key.cinematic)
+            case 15:
+                let a = f(Key.aperture)
+                x = a > 0 ? a : c.apertureDefault
+            case 16: x = AVCaptureDevice.isCenterStageEnabled ? 1 : 0
+            case 17: x = b(Key.mirror)
+            case 18: x = b(Key.flipV)
+            case 19: x = i(Key.rotation)
+            case 20: x = b(Key.crop)
+            case 21: x = i(Key.cropPos)
+            case 22: x = f(Key.cropSize)
+            case 23: x = f(Key.cropX)
+            case 24: x = f(Key.cropY)
+            case 25: x = b(Key.level)
+            case 26: x = lightCopy ? 1 : 0
+            case 27: x = b(Key.screenWarm)
+            case 28: x = b(Key.thermalFps)
+            case 29: x = dimCopy ? 1 : 0
+            case 100: x = torch?.isTorchActive == true ? 1 : 0
+            case 101: x = torch?.isTorchActive == true ? (torch?.torchLevel ?? 0) : 0
+            case 102: x = Float(ProcessInfo.processInfo.thermalState.rawValue)
+            case 103: x = AVCaptureDevice.isPortraitEffectEnabled ? 1 : 0
+            case 104: x = dev.isPortraitEffectActive ? 1 : 0
+            case 105:
+                x = 0
+                if #available(iOS 16.0, *) { x = AVCaptureDevice.isStudioLightEnabled ? 1 : 0 }
+            case 106: x = cine ? 1 : 0
+            case 107: x = Float((deg * 10).rounded() / 10)
+            case 108: x = Float(curFps)
+            default: continue
+            }
+            if !x.isFinite { x = 0 }
+            // 範囲の外の値（古い設定など）は、範囲に収めて見せる。ISO の 0 は「今の値から」なのでそのまま
+            if it.kind == CtlKind.number && it.id != 6 { x = min(max(x, it.min), it.max) }
+            if it.kind == CtlKind.choice && !it.choices.isEmpty && !it.choices.contains(x) { x = it.choices[0] }
+            v[it.id] = x
+        }
+        return v
+    }
+
+    private func ctlSendCaps() {
+        guard ctl, conn != nil, curReq != nil else { return }
+        ctlNow = ctlBuild()
+        let vals = ctlValues(readOnly: true)
+        var d = Data()
+        Self.appendLE32(&d, UInt32(ctlNow.items.count))
+        for it in ctlNow.items {
+            Self.appendLE16(&d, it.id)
+            Self.appendLE16(&d, it.kind)
+            Self.appendF32(&d, it.min)
+            Self.appendF32(&d, it.max)
+            Self.appendF32(&d, it.step)
+            Self.appendF32(&d, vals[it.id] ?? 0)
+            Self.appendLE32(&d, it.flags)
+        }
+        Self.appendLE32(&d, UInt32(ctlNow.stops.count))
+        for s in ctlNow.stops { Self.appendF32(&d, s) }
+        // camctl2 で足した：選ぶ項目の選択肢（PROTOCOL.md の案の後ろ。案だけ読む PC は倍率のボタンまでで止める）
+        let lists = ctlNow.items.filter { $0.kind == CtlKind.choice }
+        Self.appendLE32(&d, UInt32(lists.count))
+        for it in lists {
+            Self.appendLE16(&d, it.id)
+            Self.appendLE16(&d, UInt16(it.choices.count))
+            for x in it.choices { Self.appendF32(&d, x) }
+        }
+        sendMsg(Msg.ctrlCaps, d)
+    }
+
+    // STATE を送る。all は全部（CAPS のあと・GET）。それ以外は、前に送った値と違う物と、SET への返事
+    private func ctlSendState(all: Bool, readOnly: Bool, why: UInt16) {
+        guard ctl, conn != nil, curReq != nil, !ctlNow.items.isEmpty else { return }
+        let vals = ctlValues(readOnly: readOnly)
+        var d = Data()
+        for id in vals.keys.sorted() {
+            guard let x = vals[id] else { continue }
+            let reply = ctlReplies.contains(id)
+            let changed = ctlSent[id].map { abs($0 - x) > 0.0001 } ?? true
+            guard all || reply || changed else { continue }
+            var w = why
+            if all { w = CtlWhy.all } else if reply { w = CtlWhy.reply } else if id >= 100 { w = CtlWhy.ios }
+            Self.appendLE16(&d, id)
+            Self.appendLE16(&d, w)
+            Self.appendF32(&d, x)
+            ctlSent[id] = x
+        }
+        ctlReplies.subtract(vals.keys)
+        if !d.isEmpty { sendMsg(Msg.ctrlState, d) }
+    }
+
+    // PC が値を変えた。範囲に収めてから、画面で変えたときと同じ道で当てる。
+    // 使えない操作・範囲の外の値にも、STATE（why 8）で今の値を返す。CAPS に無い id は読み捨てる
+    private func ctlSet(_ body: [UInt8]) {
+        guard let r = curReq else { return } // 作り直しの途中など。このあとの CAPS と STATE で今の値が届く
+        var apply: [(UInt16, Double)] = []
+        var zoomLive = false
+        var at = 0
+        while at + 8 <= body.count {
+            let id = Self.u16(body, at)
+            let raw = Self.f32(body, at + 4)
+            at += 8
+            guard let it = ctlNow.items.first(where: { $0.id == id }) else { continue }
+            guard it.kind != CtlKind.readOnly, it.flags & CtlFlag.unavailable == 0, raw.isFinite else { ctlReplies.insert(id); continue }
+            var v = Double(raw)
+            if it.kind == CtlKind.toggle {
+                v = v != 0 ? 1 : 0
+            } else if it.kind == CtlKind.choice {
+                // いちばん近い選択肢
+                var best = Double(it.choices.first ?? it.min)
+                for x in it.choices where abs(Double(x) - v) < abs(best - v) { best = Double(x) }
+                v = best
+            } else {
+                let st = Double(it.step)
+                if st > 0 { v = (v / st).rounded() * st }
+                v = min(max(v, Double(it.min)), Double(it.max))
+            }
+            if id == 10 && !ctlZoomStored(r) {
+                // PC が決めたカメラの倍率は、このつなぎの間だけ（画面の倍率は別のレンズの物なので書かない）
+                ctlZoom = CGFloat(v)
+                zoomLive = true
+                ctlReplies.insert(id)
+                continue
+            }
+            apply.append((id, v))
+        }
+        if zoomLive { liveApply() }
+        guard !apply.isEmpty else { ctlSchedule(); return }
+        let todo = apply // 糸をまたぐ閉包には let で渡す
+        let ids = todo.map { $0.0 }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.ctlApplyOnMain(todo)
+            // 書いたあとの値を返す（書く前に返すと古い値になる）
+            self.q.async {
+                self.ctlReplies.formUnion(ids)
+                self.ctlSchedule()
+            }
+        }
+    }
+
+    // 画面の糸。画面の操作（CameraControlsView）と同じ鍵に書き、同じ関数を呼ぶ。だから画面にもすぐ出て、次に開いたときも残る
+    private func ctlApplyOnMain(_ items: [(UInt16, Double)]) {
+        let d = UserDefaults.standard
+        var controls = false, rebuild = false, thermal = false
+        for (id, v) in items {
+            let on = v != 0
+            switch id {
+            case 1: d.set(Int(v), forKey: Key.focus); controls = true
+            case 2: d.set(v, forKey: Key.focusPos); controls = true
+            case 3: d.set(Int(v), forKey: Key.focusTarget); controls = true
+            case 4: d.set(Int(v), forKey: Key.exposure); controls = true
+            case 5: d.set(v, forKey: Key.bias); controls = true
+            case 6: d.set(v, forKey: Key.iso); controls = true
+            case 7: d.set(Int(v), forKey: Key.shutter); controls = true
+            case 8: d.set(Int(v), forKey: Key.wb); controls = true
+            case 9: d.set(v, forKey: Key.wbTemp); controls = true
+            case 10: d.set(v, forKey: Key.zoom); controls = true
+            case 11: d.set(on, forKey: Key.torch); controls = true
+            case 12: d.set(v, forKey: Key.torchLevel); controls = true
+            case 13: d.set(Int(v), forKey: Key.stab); rebuild = true
+            case 14: d.set(on, forKey: Key.cinematic); rebuild = true
+            case 15: d.set(v, forKey: Key.aperture); controls = true
+            case 16: setCenterStage(on)
+            case 17: d.set(on, forKey: Key.mirror); rebuild = true
+            case 18: d.set(on, forKey: Key.flipV); rebuild = true
+            case 19: d.set(Int(v), forKey: Key.rotation); rebuild = true
+            case 20: d.set(on, forKey: Key.crop); rebuild = true
+            case 21: d.set(Int(v), forKey: Key.cropPos); rebuild = true
+            case 22: d.set(v, forKey: Key.cropSize); rebuild = true
+            case 23: d.set(v, forKey: Key.cropX); controls = true
+            case 24: d.set(v, forKey: Key.cropY); controls = true
+            case 25: d.set(on, forKey: Key.level); rebuild = true
+            case 26:
+                // 画面のライトは、アプリが前にいるときだけ出す（消すのはいつでも）
+                if !on || UIApplication.shared.applicationState == .active { ScreenDimmer.shared.setLight(on) }
+            case 27: d.set(on, forKey: Key.screenWarm)
+            case 28: d.set(on, forKey: Key.thermalFps); thermal = true
+            case 29: ctlDim(on)
+            default: break
+            }
+        }
+        if controls { controlsChanged() }
+        if rebuild { settingsChanged() }
+        if thermal { thermalSettingChanged() }
+    }
+
+    // 画面の糸。画面を暗くする・戻す。画面のライトを出しているときは、閉じて明るさが戻ってから暗くする
+    private func ctlDim(_ on: Bool) {
+        let dm = ScreenDimmer.shared
+        guard on else { dm.setDim(false); return }
+        guard UIApplication.shared.applicationState == .active else { return }
+        if dm.light {
+            dm.setLight(false)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { dm.setDim(true) }
+        } else {
+            dm.setDim(true)
+        }
+    }
+
+    private static func u16(_ b: [UInt8], _ at: Int) -> UInt16 { UInt16(b[at]) | UInt16(b[at + 1]) << 8 }
+    private static func f32(_ b: [UInt8], _ at: Int) -> Float { Float(bitPattern: u32(b, at)) }
+    private static func appendLE16(_ d: inout Data, _ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+    private static func appendF32(_ d: inout Data, _ v: Float) { appendLE32(&d, v.bitPattern) }
+
     // ---- 送る ----
 
     private func sendMsg(_ type: UInt32, _ body: Data) {
@@ -1751,6 +2227,11 @@ struct CameraBridgeStatusRow: View {
         }
         if model.pendingNote {
             Text(L("変更した設定は、PC を接続し直すと反映されます。", "The new settings apply when the PC reconnects.")).font(.footnote)
+        }
+        // camctl2：PC のアプリからも操作できるつなぎ
+        if model.connected && model.pcControl {
+            Text(L("PC のアプリからもカメラを操作できます。両方で変えたときは、あとから変えた方が使われます。",
+                   "The camera can also be controlled from the PC app. If you change a setting in both places, the later change is used.")).font(.footnote)
         }
         // camctl：カメラを使っている最中の温度（信号の 3 色。危険は点が点滅する）
         HStack {
@@ -1875,11 +2356,20 @@ struct CameraCaps {
 extension CameraBridge {
     // 画面の糸から呼ぶ。画面の設定（カメラ・解像度・フレームレート）で撮る形を選び、そのカメラと形でできることを調べる
     static func caps(camera cam: UInt32, height: Int, fps: Int) -> CameraCaps {
-        var c = CameraCaps()
-        c.lensAuto = device(4) != nil
-        guard let dev = device(cam) else { return c }
+        guard let dev = device(cam) else {
+            var c = CameraCaps()
+            c.lensAuto = device(4) != nil
+            return c
+        }
         let (w, h) = size(forHeight: height)
         let f = pickFormat(dev, w: w, h: h, fps: fps)?.0 ?? dev.activeFormat
+        return caps(dev: dev, format: f, camera: cam, height: height, fps: fps)
+    }
+
+    // camctl2：カメラと形を決めて調べる。接続中の CTRL は、いま使っているカメラ（背景ぼかしのときはそのカメラ）と形で調べる
+    static func caps(dev: AVCaptureDevice, format f: AVCaptureDevice.Format, camera cam: UInt32, height: Int, fps: Int) -> CameraCaps {
+        var c = CameraCaps()
+        c.lensAuto = device(4) != nil
         c.front = dev.position == .front
         c.focusAuto = dev.isFocusModeSupported(.continuousAutoFocus)
         c.focusLock = c.focusAuto && dev.isFocusModeSupported(.locked)
@@ -1979,7 +2469,6 @@ struct CameraControlsView: View {
     @AppStorage(CameraBridge.Key.level) private var level = false
     @AppStorage(CameraBridge.Key.screenWarm) private var screenWarm = false
     @AppStorage(CameraBridge.Key.thermalFps) private var thermalFps = true
-    @State private var screenLight = false
 
     var body: some View {
         let c = CameraBridge.caps(camera: UInt32(clamping: camera), height: height, fps: fps)
@@ -2218,8 +2707,8 @@ struct CameraControlsView: View {
                          "With the front camera, the back light is used. If iOS does not allow it, use the screen light instead.")
                      : L("PC と接続している間だけ点きます。", "The light is on only while the PC is connected.")).font(.footnote)
             }
-            Button(L("画面のライトをつける", "Use the screen as a light")) { screenLight = true }
-                .fullScreenCover(isPresented: $screenLight) { ScreenLightView(warm: screenWarm) }
+            // camctl2：画面のライトは ScreenDimmer が持つ（PC からも点ける）。出すのはアプリのいちばん外（ScreenDimHost）
+            Button(L("画面のライトをつける", "Use the screen as a light")) { ScreenDimmer.shared.setLight(true) }
             Toggle(L("画面のライトを暖かい色にする", "Warm screen light"), isOn: $screenWarm)
             Text(L("画面を白くして明るさを最大にし、前から顔を照らします。画面をタップすると元の明るさに戻ります。",
                    "Turns the screen white at full brightness to light your face. Tap the screen to restore the brightness.")).font(.footnote)
@@ -2367,9 +2856,10 @@ struct CameraControlsView: View {
 }
 
 // 画面のライト：画面を白くして明るさを最大にし、前から顔を照らす。タップか、アプリが前からいなくなると元の明るさに戻す。
-// 出している間は、自動で画面を暗くする働き（ScreenDimmer）を止める
+// 出している間は、自動で画面を暗くする働き（ScreenDimmer）を止める。
+// camctl2：出すのは ScreenDimmer.light（カメラタブのボタンと PC の両方）。暖かい色は出している間に PC から変えても変わるように、設定を直接読む
 struct ScreenLightView: View {
-    let warm: Bool
+    @AppStorage(CameraBridge.Key.screenWarm) private var warm = false
     @Environment(\.dismiss) private var dismiss
     @State private var saved: CGFloat?
 

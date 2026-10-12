@@ -30,8 +30,8 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: PocketGPU
-        CFBundleShortVersionString: "0.7.61"
-        CFBundleVersion: "69"
+        CFBundleShortVersionString: "0.7.62"
+        CFBundleVersion: "70"
         UILaunchScreen: {}
         NSLocalNetworkUsageDescription: PC からの計算の依頼を受け取るために使います
         NSSpeechRecognitionUsageDescription: PC から送られた音声を文字にするために使います

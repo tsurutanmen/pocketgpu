@@ -14,6 +14,10 @@ final class ScreenDimmer: ObservableObject {
     static let shared = ScreenDimmer()
     @Published private(set) var dimmed = false
     let changes = PassthroughSubject<Bool, Never>() // 暗くした（true）・戻した（false）
+    // camctl2：画面のライト（CameraBridge.swift の ScreenLightView）を出しているか。カメラタブのボタンと PC の両方から出す。
+    // 出すのはアプリのいちばん外（本体は ScreenDimHost・PocketCam は LiteContentView）
+    @Published private(set) var light = false
+    let lightChanges = PassthroughSubject<Bool, Never>() // 出した（true）・閉じた（false）
 
     // 自動で暗くする設定（本体のカメラタブで選ぶ）
     static let autoKey = "screenAutoDim", secondsKey = "screenAutoDimSeconds"
@@ -49,6 +53,16 @@ final class ScreenDimmer: ObservableObject {
     func setHold(_ on: Bool) {
         hold = on
         lastActivity = Date()
+    }
+
+    // camctl2：画面のライトを出す・閉じる。出すときは暗いのをやめ、出している間は自動で暗くしない
+    func setLight(_ on: Bool) {
+        guard on != light else { return }
+        if on && dimmed { setDim(false) }
+        light = on
+        hold = on
+        lastActivity = Date()
+        lightChanges.send(on)
     }
 
     // 画面に触れた
@@ -111,6 +125,8 @@ struct ScreenDimHost: ViewModifier {
             .overlay(ScreenDimOverlay(connected: connected()))
             .onReceive(tick) { _ in dimmer.autoTick(connected: connected()) }
             .onReceive(dimmer.changes) { on in onDim(on) }
+            // camctl2：画面のライト。カメラタブのボタンと PC の両方から出す
+            .fullScreenCover(isPresented: Binding(get: { dimmer.light }, set: { dimmer.setLight($0) })) { ScreenLightView() }
     }
 }
 

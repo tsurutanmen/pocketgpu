@@ -96,6 +96,8 @@ struct LiteContentView: View {
             ScreenDimOverlay(connected: (webcamOn && CameraBridge.shared.connected) || (audioOn && AudioBridgeModel.shared.connected))
         }
         .statusBar(hidden: dimmer.dimmed)
+        // camctl2：画面のライト（PC から点けたとき。CameraBridge.swift の ScreenLightView）
+        .fullScreenCover(isPresented: Binding(get: { dimmer.light }, set: { dimmer.setLight($0) })) { ScreenLightView() }
         .onAppear {
             // 前にオンにしたまま閉じたなら、開いたときから待ち受ける
             CameraBridge.shared.setOn(webcamOn)
