@@ -28,8 +28,8 @@ struct LiteContentView: View {
     @AppStorage("liteKeepScreenOn") private var keepScreenOn = true
     // 画面の言葉（自動・日本語・English）。Lang.swift の L が読む
     @AppStorage("lang") private var lang = AppLang.auto.rawValue
-    @State private var dimmed = false
-    @State private var savedBrightness: CGFloat?
+    // 画面を暗くする（ScreenDimmer.swift。本体と同じ部品）
+    @ObservedObject private var dimmer = ScreenDimmer.shared
     @State private var showLog = false
     private let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -71,7 +71,7 @@ struct LiteContentView: View {
                             Text(L("ウェブカメラがオンの間は、画面を自動で消しません。画面が消えると iOS がカメラを止めるためです。",
                                    "While the webcam is on, the screen stays on. iOS stops the camera when the screen turns off.")).font(.footnote)
                         }
-                        Button(L("画面を暗くする", "Dim the screen")) { setDim(true) }
+                        Button(L("画面を暗くする", "Dim the screen")) { dimmer.setDim(true) }
                         Text(L("暗くしている間も、カメラとマイクは動作します。画面をタップすると元の明るさに戻ります。",
                                "The camera and mic keep working while the screen is dim. Tap the screen to restore the brightness.")).font(.footnote)
                         Picker(L("言語", "Language"), selection: $lang) {
@@ -92,11 +92,10 @@ struct LiteContentView: View {
                 .id(lang)
                 .navigationTitle("PocketCam")
             }
-            if dimmed {
-                LiteDimOverlay { setDim(false) }
-            }
+            // 暗くしている間だけ出る。タップか、アプリが前からいなくなると元の明るさに戻す
+            ScreenDimOverlay(connected: (webcamOn && CameraBridge.shared.connected) || (audioOn && AudioBridgeModel.shared.connected))
         }
-        .statusBar(hidden: dimmed)
+        .statusBar(hidden: dimmer.dimmed)
         .onAppear {
             // 前にオンにしたまま閉じたなら、開いたときから待ち受ける
             CameraBridge.shared.setOn(webcamOn)
@@ -115,7 +114,7 @@ struct LiteContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             // アプリが下がるときは明るさを戻す。iOS はアプリが変えた明るさを、画面をロックするまで戻さない
-            setDim(false)
+            dimmer.setDim(false)
         }
     }
 
@@ -135,24 +134,6 @@ struct LiteContentView: View {
     // カメラを使う間は必ず画面を消さない（iOS は、アプリが前面にいない間はカメラを使わせない）
     private func applyIdleTimer() {
         UIApplication.shared.isIdleTimerDisabled = webcamOn || keepScreenOn
-    }
-
-    // 暗くする：明るさを一番下にして、黒い画面で覆う。戻すときは前の明るさに戻す
-    private func setDim(_ on: Bool) {
-        guard on != dimmed else { return }
-        let screen = Self.currentScreen()
-        if on {
-            savedBrightness = screen.brightness
-            screen.brightness = 0
-        } else if let b = savedBrightness {
-            screen.brightness = b
-            savedBrightness = nil
-        }
-        dimmed = on
-    }
-
-    private static func currentScreen() -> UIScreen {
-        UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first?.screen ?? UIScreen.main
     }
 
     private static var versionText: String {
@@ -257,21 +238,5 @@ struct LiteLogView: View {
         Text(log.text.isEmpty ? L("ログはまだありません。", "No log yet.") : log.text)
             .font(.caption2.monospaced())
             .textSelection(.enabled)
-    }
-}
-
-// 暗くしている間の黒い画面。どこをタップしても戻る
-struct LiteDimOverlay: View {
-    let onTap: () -> Void
-
-    var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            Text(L("タップすると元の明るさに戻ります。", "Tap to restore the brightness."))
-                .font(.footnote)
-                .foregroundColor(Color(white: 0.35))
-        }
-        .contentShape(Rectangle())
-        .onTapGesture(perform: onTap)
     }
 }

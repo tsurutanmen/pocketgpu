@@ -195,6 +195,10 @@ struct ContentView: View {
             settingsTab
                 .tabItem { Label(L("設定", "Settings"), systemImage: "slider.horizontal.3") }
         }
+        // 画面を暗くする（ScreenDimmer.swift）。カメラかマイクが接続中に操作が無いまま決めた時間がたつと、黒で覆って明るさを最小にする。
+        // 暗い間は下の画面を描かず、iPhone に出力のプレビューも止める（戻したら元に戻す）
+        .modifier(ScreenDimHost(connected: { CameraBridge.shared.connected || AudioBridgeModel.shared.connected },
+                                onDim: { on in preview.setOn(on ? false : showFrames) }))
         // スイッチとタブの色は案 A の見本に合わせて青にする
         .tint(.blue)
         .onAppear {
@@ -337,6 +341,13 @@ struct ContentView: View {
                 // 切っている間も、先に決めておけるように出す。変えた値は次につないだときに使う
                 Section(L("映像", "Video")) {
                     CameraSettingsView(model: webcam)
+                }
+                // 向き・ズームと切り抜き・ピント・明るさ・色・ライト・手ぶれ補正・背景ぼかし（CameraBridge.swift の CameraControlsView）。
+                // 接続中に変えると、作り直さずにその場で効く物と、カメラを作り直す物がある。どちらも次の接続でも同じ値を使う
+                CameraControlsView(model: webcam)
+                // 画面を暗くする（熱の対策。ScreenDimmer.swift）
+                Section(L("画面", "Screen")) {
+                    ScreenDimSettingsView()
                 }
                 Section("Wi-Fi") {
                     Toggle(L("Wi-Fi でもウェブカメラに接続できるようにする", "Webcam over Wi-Fi too"), isOn: $webcamWifi)

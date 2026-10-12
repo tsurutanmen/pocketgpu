@@ -1,5 +1,7 @@
 import AVFoundation
+import CoreImage
 import CoreMedia
+import CoreMotion
 import CoreVideo
 import Network
 import SwiftUI
@@ -23,7 +25,17 @@ import VideoToolbox
 //   PC は同じつなぎのまま HELLO を送り直してよい（仮想カメラを開いたアプリが形を選んだとき）。
 // iOS 15 でも動く書き方にしてある（あとで作るカメラとマイクだけの軽い版で使うため）。iOS 17 からの API は #available で分けた。
 // 画面に出す文は仮。言葉は鶴田さんが決める
-final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+//
+// camctl で足した所（work/camctl/PROTOCOL.md に PC から操作する案）：
+//   ピント・明るさ・色・ズーム・ライト：接続中に変えたら、カメラを作り直さずに lockForConfiguration でその場で変える（liveApply）。
+//   向き（左右反転・上下反転・90 度ずつの回転）・手ぶれ補正・シネマティック・切り抜きの入り切り：カメラを作り直してキーフレームから流す。
+//     回転は接続（AVCaptureConnection）で回す（ハードウェアで回る。エンコーダの前で回すより CPU を使わない）。上下反転は 180 度＋左右反転。
+//     左右反転は PC の HELLO の mirror と同じ決まり（PC が立てたら PC・「PC からの指定を優先する」を切ると画面）。
+//     90 度と 270 度は幅と高さが入れ替わる。古い webcam_rx（WC_HELLO_LIVE が無い）は縦長を仮想カメラに書かないので、その相手には使わない。
+//   切り抜きと水平を保つ：エンコーダの前で Core Image が切り出して回し、選んだ解像度に拡大する（iOS 15 でも動く。VTPixelTransferSession は iOS 16 からで、斜めに回せない）。
+//   カメラ 4：背面の仮想カメラ（三つか二つのレンズ）。倍率に合わせて iOS がレンズを切り替える。PC には「背面」（0）と知らせる。
+//   iPhone のレンズの F 値は変えられない（lensAperture は読むだけ）。背景ぼかしは iOS 26 のシネマティックか、コントロールセンターのポートレート
+final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureMetadataOutputObjectsDelegate {
     static let shared = CameraBridge()
     static let port: UInt16 = 50064
     static let version: UInt32 = 1
@@ -37,15 +49,43 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private enum Flag {
         static let mirror: UInt32 = 1, cameraSet: UInt32 = 2, live: UInt32 = 4
         static let ackAppSettings: UInt32 = 1, ackAppPriority: UInt32 = 2, ackLive: UInt32 = 4, ackChanged: UInt32 = 8
+        static let ackThermal: UInt32 = 16 // camctl：熱のためにコマ数を下げた（work/camctl/PROTOCOL.md の案。古い PC は見ない）
     }
 
     // アプリの画面の設定（UserDefaults の鍵）
     enum Key {
-        static let camera = "webcamCamera"     // 0 背面の広角・1 前面・2 背面の超広角・3 背面の望遠
+        static let camera = "webcamCamera"     // 0 背面の広角・1 前面・2 背面の超広角・3 背面の望遠・4 背面のレンズ自動切り替え（camctl）
         static let height = "webcamHeight"     // 720・1080・2160（幅は 16:9）
         static let fps = "webcamFps"           // 30・60
         static let quality = "webcamQuality"   // 1 標準・2 高画質・3 最高
         static let preferPC = "webcamPreferPC" // PC が値を決めた項目は PC を使う
+        // camctl で足した。カメラの操作
+        static let mirror = "webcamMirror"           // 左右反転
+        static let flipV = "webcamFlipV"             // 上下反転
+        static let rotation = "webcamRotation"       // 0・90・180・270 度
+        static let focus = "webcamFocus"             // 0 自動・1 固定・2 手動
+        static let focusPos = "webcamFocusPos"       // 手動のレンズの位置。0 が近く・1 が遠く
+        static let focusTarget = "webcamFocusTarget" // 0 顔を優先・1 画面の真ん中
+        static let exposure = "webcamExposure"       // 0 自動・1 固定・2 手動
+        static let bias = "webcamBias"               // 露出補正（EV）
+        static let iso = "webcamISO"                 // 手動の ISO。0 は今の値から
+        static let shutter = "webcamShutter"         // 手動のシャッター速度の分母（100 は 1/100 秒）。0 はコマ数の 2 倍
+        static let wb = "webcamWB"                   // 0 自動・1 固定・2 色温度
+        static let wbTemp = "webcamWBTemp"           // 色温度（K）
+        static let zoom = "webcamZoom"               // 見え方の倍率。1 は背面の広角と同じ・0.5 は超広角
+        static let torch = "webcamTorch"             // ライト（接続している間だけ点ける）
+        static let torchLevel = "webcamTorchLevel"   // 0.25・0.5・0.75・1
+        static let stab = "webcamStab"               // 0 オフ・1 遅れの少ない補正（iOS 26）・2 標準・3 シネマティック
+        static let cinematic = "webcamCinematic"     // 背景をぼかす（iOS 26 のシネマティックビデオ）
+        static let aperture = "webcamAperture"       // シネマティックの F 値。0 はその形の初めの値
+        static let centerStage = "webcamCenterStage" // センターフレーム。触るまでは値が無い（コントロールセンターのまま）
+        static let crop = "webcamCrop"               // 切り抜く
+        static let cropPos = "webcamCropPos"         // 0 中央・1 左寄り・2 右寄り・3 顔に合わせる・4 手動
+        static let cropSize = "webcamCropSize"       // 枠の大きさ（映像の幅に対する割合 0.3〜1）
+        static let cropX = "webcamCropX", cropY = "webcamCropY" // 手動のときの枠の中心（0〜1。左上が 0）
+        static let level = "webcamLevel"             // 水平を保つ（背面のカメラだけ）
+        static let screenWarm = "webcamScreenWarm"   // 画面のライトを暖かい色にする
+        static let thermalFps = "webcamThermalFps"   // iPhone が熱いときはフレームレートを下げる
     }
     // 初めの値（画面の @AppStorage の初めの値と同じにしておく）
     static let defaultCamera = 0, defaultHeight = 1080, defaultFps = 30, defaultQuality = 2, defaultPreferPC = true
@@ -56,6 +96,16 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     @Published private(set) var detail = ""      // 例：1920×1080・30 fps・背面カメラ
     @Published private(set) var pcNote = ""      // PC が指定した項目。画面の設定より優先しているとき
     @Published private(set) var pendingNote = false // 画面の変更が次の接続まで待ちになっている
+    // camctl：画面に出す今の状態（tick で 1 秒ごとに読み直す）
+    @Published private(set) var torchState = ""      // ライトの状態の文
+    @Published private(set) var portraitOn = false   // コントロールセンターのポートレートが入っているか
+    @Published private(set) var portraitActive = false
+    @Published private(set) var studioOn = false
+    @Published private(set) var centerStageOn = false
+    @Published private(set) var cinematicActive = false
+    @Published private(set) var rotSkipped = false   // PC が古いので 90 度・270 度の回転を使っていない
+    @Published private(set) var levelAngle = 0.0     // 水平を保つ：いま直している角度（度）
+    @Published private(set) var thermalNote = ""     // 熱でフレームレートを下げているときの文
     // Wi-Fi でつなぐときの合言葉（起動のたびに変わる 6 けた）。PC は webcam_rx --addr iPhoneの住所:50064 --code これ
     let wifiCode = UInt32.random(in: 100_000...999_999)
     static let wifiKey = "webcamWifi"
@@ -73,6 +123,39 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private struct Resolved: Equatable {
         var camera: UInt32, w: Int, h: Int, fps: Int, quality: Int, kbps: Int, gop: Int, mirror: Bool, ackFlags: UInt32
         var pcSize: Bool, pcFps: Bool, pcCam: Bool
+        // camctl。ここが変わったらカメラを作り直す。ピントや明るさなど、作り直さずに変える物は入れない
+        var pcMirror = false     // 左右反転を PC の指定で決めた
+        var rot = 0              // 接続で回す角度（上下反転を含めた値）
+        var connMirror = false   // 接続で左右反転するか（上下反転を含めた値）
+        var portrait = false     // 90 度か 270 度。幅と高さが入れ替わる
+        var rotSkipped = false   // PC が古いので 90 度・270 度を使わなかった
+        var stab = 0             // 手ぶれ補正（Key.stab の値）
+        var cinematic = false
+        var stage = false        // エンコーダの前で切り抜く（切り抜き・水平を保つ）
+        var capH = 0             // stage のときに撮る高さ（切り抜いても粗くならないように大きめに撮る）
+        var face = false         // 顔の位置を調べる（切り抜きを顔に合わせる）
+        var fx = 0               // コントロールセンターで入っているエフェクト（対応する形とコマ数が変わる）
+    }
+
+    // 作り直すときに決める、カメラと形と送る大きさ
+    private struct Plan {
+        let dev: AVCaptureDevice, fmt: AVCaptureDevice.Format, frameDur: CMTime, fps: Int
+        let baseFps: Int         // 熱で下げる前のコマ数
+        let outW: Int, outH: Int // エンコーダと PC に渡す大きさ（回したあと）
+    }
+
+    // エンコーダの前で切り抜く・水平を保つための値。q で作り、カメラの糸が lock の中で写して読む
+    private struct StageParams {
+        var on = false
+        var scale: CGFloat = 1      // 枠の小ささ。1 は全体・2 は幅が半分
+        var extra: CGFloat = 1      // 水平の余白のために、カメラの倍率から移した分
+        var pos = 0                 // Key.cropPos と同じ
+        var cx: CGFloat = 0.5, cy: CGFloat = 0.5
+        var level = false
+        var levelMax: CGFloat = 0   // 直す角度の上限（ラジアン）
+        var refAngle: CGFloat = 0   // 水平のときの iPhone の傾き（接続で回す角度から決まる）
+        var sign: CGFloat = 1       // 接続で左右反転しているときは -1
+        var outW = 0, outH = 0
     }
 
     // ここから下は q の上だけで触る
@@ -94,6 +177,10 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private var curReq: Resolved?          // いま流している形の元（nil は流していない）
     private var settingsGen = 0
     private var observers: [NSObjectProtocol] = []
+    private var pendingApply = false       // アプリが前にいない間（コントロールセンターなど）に設定が変わった。戻ったら当てる
+    private var focusTargetApplied = -1    // いまのカメラに当てたピントの合わせ方（同じなら合わせ直さない）
+    private var torchDev: AVCaptureDevice? // 点けたライトの持ち主（前面カメラのときは背面のカメラ）
+    private var baseFps = 0                // 熱で下げる前のコマ数（いまのカメラ）
 
     // カメラの糸・エンコーダの糸からも触る物（lock で守る）
     private let lock = NSLock()
@@ -105,20 +192,53 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private var dropped: UInt64 = 0
     private var sessionGen: UInt64 = 0  // カメラを作り直すたびに増やす。前のカメラのコマを、新しい形の後ろに送らないため
     private let maxInflight = 4         // これより溜まったら、カメラの絵を捨てて追いつく（USB が詰まったとき、古いコマを送り続けない）
+    // camctl：lock で守る
+    private var stage = StageParams()
+    private var poolCopy: CVPixelBufferPool?       // 切り抜いた絵を入れる先（送る大きさ）
+    private var devCopy: AVCaptureDevice?          // いまのカメラ（画面の糸が状態を読む）
+    private var videoOutCopy: AVCaptureVideoDataOutput? // 顔の位置を、送る絵の向きに直すため
+    private var faceTarget: CGPoint?               // 顔の真ん中（送る絵の上で 0〜1。左上が 0）
+    private var srcW = 0, srcH = 0                 // カメラが渡す絵の大きさ（回したあと）
+    private var levelShown = 0.0                   // 画面に出す、直している角度（度）
+    private var cineCopy = false                   // シネマティックが入っている
 
     private let captureQueue = DispatchQueue(label: "camera-capture", qos: .userInteractive)
+    private let metaQueue = DispatchQueue(label: "camera-meta", qos: .userInitiated)
+    // camctl：カメラの糸だけで触る
+    private lazy var ciContext = CIContext(options: [.workingColorSpace: NSNull(), .cacheIntermediates: false])
+    private var levelNow: CGFloat = 0              // なめらかにした傾き（ラジアン）
+    private var faceNow = CGPoint(x: 0.5, y: 0.5)  // なめらかにした顔の位置
+    private var lastStagePts = -1.0
+    // 画面の糸だけで触る
+    private var lastFx = CameraBridge.effectsMask()
+    // iPhone の傾き（水平を保つ）。読むのはカメラの糸、始める・止めるのは q
+    static let motion = CMMotionManager()
 
     private override init() {
         super.init()
         UserDefaults.standard.register(defaults: [Key.camera: Self.defaultCamera, Key.height: Self.defaultHeight, Key.fps: Self.defaultFps,
                                                   Key.quality: Self.defaultQuality, Key.preferPC: Self.defaultPreferPC])
+        // camctl の初めの値（画面の @AppStorage の初めの値と同じ）。センターフレームは触るまで値を持たない
+        UserDefaults.standard.register(defaults: [Key.mirror: false, Key.flipV: false, Key.rotation: 0,
+                                                  Key.focus: 0, Key.focusPos: 0.5, Key.focusTarget: 0,
+                                                  Key.exposure: 0, Key.bias: 0.0, Key.iso: 0.0, Key.shutter: 0,
+                                                  Key.wb: 0, Key.wbTemp: 5000.0, Key.zoom: 1.0, Key.torch: false, Key.torchLevel: 0.5,
+                                                  Key.stab: 0, Key.cinematic: false, Key.aperture: 0.0,
+                                                  Key.crop: false, Key.cropPos: 0, Key.cropSize: 0.7, Key.cropX: 0.5, Key.cropY: 0.5,
+                                                  Key.level: false, Key.screenWarm: false, Key.thermalFps: true])
         let nc = NotificationCenter.default
-        // アプリが前にいるか。iOS はカメラを後ろで使わせない
-        observers.append(nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil) { [weak self] _ in self?.q.async { self?.appActive = true } })
+        // アプリが前にいるか。iOS はカメラを後ろで使わせない。前にいない間に変わった設定は、戻ったときに当てる
+        observers.append(nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil) { [weak self] _ in
+            self?.q.async {
+                guard let self else { return }
+                self.appActive = true
+                if self.pendingApply { self.pendingApply = false; self.applySettings() }
+            }
+        })
         observers.append(nc.addObserver(forName: UIApplication.willResignActiveNotification, object: nil, queue: nil) { [weak self] _ in self?.q.async { self?.appActive = false } })
         observers.append(nc.addObserver(forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: nil) { [weak self] _ in
             let s = UInt32(ProcessInfo.processInfo.thermalState.rawValue)
-            self?.q.async { self?.sendEvent(3, s) }
+            self?.q.async { self?.sendEvent(3, s); self?.applyThermal() }
         })
     }
 
@@ -136,6 +256,8 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             detail = ""
             pcNote = ""
             pendingNote = false
+            rotSkipped = false
+            thermalNote = ""
         }
         let active = UIApplication.shared.applicationState == .active
         q.async { [weak self] in
@@ -147,7 +269,9 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
 
     // 1 秒ごとに呼ぶ。送ったコマの数の差で毎秒のコマ数を出す
+    // camctl：画面を暗くしている間は、画面に出す値を変えない（描き直さない。熱の対策）
     func tick() {
+        if ScreenDimmer.shared.dimmed { return }
         let now = Date()
         let dt = now.timeIntervalSince(lastTick)
         guard dt >= 0.5 else { return }
@@ -156,9 +280,11 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         lastShown = s
         lastTick = now
         if f != fps { fps = f }
+        pollState()
     }
 
     // 画面でカメラの設定を変えた。つないでいれば、その場で切り替える。続けて変えたときは、最後の 1 回だけ作り直す
+    // camctl：作り直さなくてよい変更（切り抜きの位置など）なら、作り直さずに今のカメラへ当てる
     func settingsChanged() {
         q.async { [weak self] in
             guard let self else { return }
@@ -168,6 +294,48 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                 guard let self, g == self.settingsGen else { return }
                 self.applySettings()
             }
+        }
+    }
+
+    // camctl：ピント・明るさ・色・ズーム・ライトなど、作り直さずに変える操作。待たずに今のカメラへ当てる
+    func controlsChanged() {
+        q.async { [weak self] in self?.liveApply() }
+    }
+
+    // camctl：センターフレームを画面で切り替えた。アプリとコントロールセンターの両方で切り替えられる形にして当て、
+    // 対応する形とコマ数で作り直す
+    func setCenterStage(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: Key.centerStage)
+        Self.applyCenterStage(on) // 画面の糸のまま当てる（1 秒ごとの見回りが古い値で上書きしないように）
+        centerStageOn = on
+        q.async { [weak self] in self?.applySettings() }
+    }
+
+    // camctl：1 秒ごと（画面の糸）。ライト・エフェクト・水平の状態を画面に出す。
+    // コントロールセンターでエフェクトを入れ替えたら、対応する形で作り直す（前にいないときは戻ってから）
+    private func pollState() {
+        let pe = AVCaptureDevice.isPortraitEffectEnabled
+        var sl = false
+        if #available(iOS 16.0, *) { sl = AVCaptureDevice.isStudioLightEnabled }
+        let cs = AVCaptureDevice.isCenterStageEnabled
+        lock.lock(); let dev = devCopy; let deg = levelShown; let cine = cineCopy; lock.unlock()
+        let pa = dev?.isPortraitEffectActive ?? false
+        let ts = connected ? Self.torchText(dev) : ""
+        if pe != portraitOn { portraitOn = pe }
+        if pa != portraitActive { portraitActive = pa }
+        if sl != studioOn { studioOn = sl }
+        if cs != centerStageOn { centerStageOn = cs }
+        if cine != cinematicActive { cinematicActive = cine }
+        if ts != torchState { torchState = ts }
+        if abs(deg - levelAngle) >= 0.1 { levelAngle = deg }
+        // センターフレームをコントロールセンターで切り替えた：覚えている値も合わせる（アプリが触ったことがあるときだけ）
+        if AVCaptureDevice.centerStageControlMode == .cooperative, let saved = UserDefaults.standard.object(forKey: Key.centerStage) as? Bool, saved != cs {
+            UserDefaults.standard.set(cs, forKey: Key.centerStage)
+        }
+        let fx = Self.effectsMask()
+        if fx != lastFx {
+            lastFx = fx
+            if connected { settingsChanged() }
         }
     }
 
@@ -290,6 +458,8 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             self?.detail = ""
             self?.pcNote = ""
             self?.pendingNote = false
+            self?.rotSkipped = false
+            self?.thermalNote = ""
         }
     }
 
@@ -360,30 +530,67 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private func resolve(_ hi: Hello) -> Resolved? {
         let d = UserDefaults.standard
         let preferPC = d.bool(forKey: Key.preferPC)
-        let appCam = UInt32(max(0, min(3, d.integer(forKey: Key.camera))))
+        let appCam = UInt32(max(0, min(4, d.integer(forKey: Key.camera))))
         let (appW, appH) = Self.size(forHeight: d.integer(forKey: Key.height))
         let appFps = d.integer(forKey: Key.fps) > 0 ? d.integer(forKey: Key.fps) : Self.defaultFps
         let appQ = max(1, min(3, d.integer(forKey: Key.quality)))
+        let appMirror = d.bool(forKey: Key.mirror)
         let pcSize = hi.width > 0 && hi.height > 0, pcFps = hi.fps > 0
         let pcCam = hi.camera != 0 || hi.flags & Flag.cameraSet != 0
         let pcRate = hi.kbps > 0 || hi.quality > 0
+        // 左右反転：PC が mirror を立てたら「PC が決めた」。立っていなければおまかせで、画面の設定を使う
+        let pcMirror = hi.flags & Flag.mirror != 0
         var flags: UInt32 = 0
         if !(pcSize && pcFps && pcCam && pcRate) { flags |= Flag.ackAppSettings }
-        if !preferPC && (pcSize || pcFps || pcCam || pcRate) { flags |= Flag.ackAppPriority | Flag.ackAppSettings }
+        if !preferPC && (pcSize || pcFps || pcCam || pcRate || pcMirror) { flags |= Flag.ackAppPriority | Flag.ackAppSettings }
         let useSize = pcSize && preferPC, useFps = pcFps && preferPC, useCam = pcCam && preferPC, useRate = pcRate && preferPC
+        let useMirror = pcMirror && preferPC
         // 無いカメラを頼まれたら：画面の設定のカメラ → 背面の広角 → 前面の順に代える（ACK の camera で、実際に使ったカメラを知らせる）
-        var cam = useCam ? min(hi.camera, 3) : appCam
+        var cam = useCam ? min(hi.camera, 4) : appCam
         for alt in [cam, appCam, 0, 1] where Self.device(alt) != nil { cam = alt; break }
         guard Self.device(cam) != nil else { return nil }
-        return Resolved(camera: cam, w: useSize ? hi.width : appW, h: useSize ? hi.height : appH, fps: useFps ? hi.fps : appFps,
-                        quality: useRate && hi.quality > 0 ? min(hi.quality, 3) : appQ, kbps: useRate ? hi.kbps : 0, gop: hi.gop,
-                        mirror: hi.flags & Flag.mirror != 0, ackFlags: flags, pcSize: useSize, pcFps: useFps, pcCam: useCam)
+        var r = Resolved(camera: cam, w: useSize ? hi.width : appW, h: useSize ? hi.height : appH, fps: useFps ? hi.fps : appFps,
+                         quality: useRate && hi.quality > 0 ? min(hi.quality, 3) : appQ, kbps: useRate ? hi.kbps : 0, gop: hi.gop,
+                         mirror: useMirror || appMirror, ackFlags: flags, pcSize: useSize, pcFps: useFps, pcCam: useCam)
+        r.pcMirror = useMirror
+        if !useMirror && appMirror { r.ackFlags |= Flag.ackAppSettings }
+        // 形はいつも横長で選ぶ（カメラの形は横長）。縦長にするのは回転
+        if r.h > r.w { (r.w, r.h) = (r.h, r.w) }
+        // 回転と上下反転。上下反転は 180 度回して左右反転するのと同じ
+        let want = d.integer(forKey: Key.rotation)
+        var rot = [0, 90, 180, 270].contains(want) ? want : 0
+        let flipV = d.bool(forKey: Key.flipV)
+        // 古い webcam_rx（WC_HELLO_LIVE が無い）は縦長の絵を仮想カメラに書かないので、90 度と 270 度は使わない
+        if rot % 180 != 0 && hi.flags & Flag.live == 0 { rot = 0; r.rotSkipped = true }
+        r.portrait = rot % 180 != 0
+        r.rot = flipV ? (rot + 180) % 360 : rot
+        r.connMirror = r.mirror != flipV
+        if rot != 0 || flipV { r.ackFlags |= Flag.ackAppSettings }
+        // 縦長の 4K は送らない（Windows の H.264 のデコーダの資料は 4096×2304 まで）。1080 の高さに縮める
+        if r.portrait && r.h > 1080 { r.w = (r.w * 1080 / r.h) & ~1; r.h = 1080 }
+        r.stab = max(0, min(3, d.integer(forKey: Key.stab)))
+        // シネマティックは 30 fps まで（WWDC25 の 319：1080p と 4K の 30 fps）。実際の上限は形の値で plan が決め直す
+        r.cinematic = d.bool(forKey: Key.cinematic) && Self.cinematicDevice(cam) != nil
+        if r.cinematic { r.fps = min(r.fps, 30) }
+        let cropOn = d.bool(forKey: Key.crop)
+        let levelOn = d.bool(forKey: Key.level) && Self.levelAvailable(r.cinematic ? Self.cinematicDevice(cam) : Self.device(cam))
+        r.stage = cropOn || levelOn
+        r.face = cropOn && d.integer(forKey: Key.cropPos) == 3
+        if r.stage {
+            let s = Self.stageScale(crop: cropOn ? d.double(forKey: Key.cropSize) : 1, level: levelOn, w: r.w, h: r.h)
+            r.capH = Self.captureHeight(camera: cam, outH: r.h, fps: r.fps, scale: s)
+        }
+        r.fx = Self.effectsMask()
+        return r
     }
 
     // 画面で設定が変わった：同じつなぎのまま作り直す（できるとき）
     private func applySettings() {
-        guard let c = conn, let hi = lastHello, let cur = curReq, let r = resolve(hi) else { return } // つないでいなければ、次の HELLO のときに使う
-        if r == cur { return }
+        guard let c = conn, let hi = lastHello, let cur = curReq else { return } // つないでいなければ、次の HELLO のときに使う
+        // アプリが前にいない（コントロールセンターを開いているなど）ときは作り直せない（iOS はカメラを止める）。前に戻ってから
+        guard appActive else { pendingApply = true; return }
+        guard let r = resolve(hi) else { return }
+        if r == cur { liveApply(); return } // 作り直さなくてよい変更（切り抜きの位置など）
         // 形が同じで画質だけ違う：作り直さずにビットレートだけ変える（どの PC でもよい）
         var onlyRate = r
         onlyRate.quality = cur.quality
@@ -392,13 +599,13 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             let k = r.kbps > 0 ? r.kbps : Self.qualityKbps(r.quality, w: curW, h: curH, fps: curFps)
             setBitrate(k)
             curReq = r
+            liveApply()
             return
         }
         // 大きさとコマ数が今と同じになるなら、古い PC でも作り直してよい（絵の大きさが変わらない）
         var sameSize = false
-        if let dev = Self.device(r.camera), let p = Self.pickFormat(dev, w: r.w, h: r.h, fps: r.fps) {
-            let d = CMVideoFormatDescriptionGetDimensions(p.0.formatDescription)
-            sameSize = Int(d.width) == curW && Int(d.height) == curH && p.2 == curFps
+        if let p = plan(r) {
+            sameSize = p.outW == curW && p.outH == curH && p.fps == curFps
         }
         if hi.flags & Flag.live != 0 || sameSize {
             log("ウェブカメラ：画面で設定が変わったので、カメラとエンコーダを作り直す")
@@ -406,6 +613,83 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         } else {
             log("ウェブカメラ：画面で設定が変わった。PC が途中の切り替えに対応しないので、次の接続から使う")
             DispatchQueue.main.async { [weak self] in self?.pendingNote = true }
+            liveApply() // 待つ間も、作り直さずに変えられる物は今のカメラへ
+        }
+    }
+
+    // 作り直すときのカメラ・形・コマ数・送る大きさを決める
+    private func plan(_ r: Resolved) -> Plan? {
+        guard let dev = r.cinematic ? Self.cinematicDevice(r.camera) : Self.device(r.camera) else { return nil }
+        // 切り抜くときは大きめに撮って、送る大きさに縮める
+        let (cw, ch) = r.stage ? Self.size(forHeight: r.capH) : (r.w, r.h)
+        guard let picked = Self.pickFormat(dev, w: cw, h: ch, fps: r.fps, only: r.cinematic ? Self.cinematicFormat : nil, prefer: Self.effectScore(r.fx)) else { return nil }
+        let fmt = picked.0
+        var dur = picked.1, fr = picked.2
+        // エフェクトが入っているときは、そのコマ数の範囲に収める（iOS も自分で収めるが、ACK に正しいコマ数を書くため）
+        let cap = Self.effectFpsCap(fmt, fx: r.fx, cinematic: r.cinematic)
+        if cap > 0 && fr > cap, Self.canRun(fmt, cap) {
+            fr = cap
+            dur = CMTime(value: 1, timescale: CMTimeScale(cap))
+        }
+        let base = fr
+        // iPhone が熱いときは、コマ数を下げて始める（設定で切れる）。下げたあとに冷えたら applyThermal が戻す
+        let hot = Self.thermalFps(fr)
+        if hot < fr, Self.canRun(fmt, hot) {
+            fr = hot
+            dur = CMTime(value: 1, timescale: CMTimeScale(hot))
+        }
+        let dims = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
+        var ow = Int(dims.width), oh = Int(dims.height)
+        if r.stage { ow = r.w & ~1; oh = r.h & ~1 }
+        if r.portrait { (ow, oh) = (oh, ow) }
+        return Plan(dev: dev, fmt: fmt, frameDur: dur, fps: fr, baseFps: base, outW: ow, outH: oh)
+    }
+
+    // その形がそのコマ数で撮れるか（範囲の外を activeVideoMinFrameDuration に入れると例外で落ちる）
+    private static func canRun(_ f: AVCaptureDevice.Format, _ fps: Int) -> Bool {
+        fps > 0 && f.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= Double(fps) && Double(fps) <= $0.maxFrameRate }
+    }
+
+    // 熱いときのコマ数。serious は 60 を 30 に・30 を 24 に、critical は 15。設定を切っているときはそのまま
+    private static func thermalFps(_ fps: Int) -> Int {
+        guard UserDefaults.standard.bool(forKey: Key.thermalFps) else { return fps }
+        switch ProcessInfo.processInfo.thermalState {
+        case .critical: return min(fps, 15)
+        case .serious: return min(fps, fps > 30 ? 30 : 24)
+        default: return fps
+        }
+    }
+
+    // 熱の状態が変わった（q の上）。作り直さずに、カメラのコマ数とエンコーダの見込みのコマ数だけ変える。
+    // 大きさは変わらないので、どの PC でもよい。途中の ACK を受けられる PC（LIVE）には、ACK（CHANGED と THERMAL）で知らせる
+    private func applyThermal() {
+        guard let input = deviceInput, let r = curReq, baseFps > 0 else { return }
+        let target = Self.thermalFps(baseFps)
+        guard target != curFps, Self.canRun(input.device.activeFormat, target) else { return }
+        let dev = input.device
+        do { try dev.lockForConfiguration() } catch { return }
+        let dur = CMTime(value: 1, timescale: CMTimeScale(target))
+        dev.activeVideoMinFrameDuration = dur
+        dev.activeVideoMaxFrameDuration = dur
+        dev.unlockForConfiguration()
+        let down = target < curFps
+        curFps = target
+        lock.lock(); fpsCopy = target; lock.unlock()
+        if let e = venc { _ = VTSessionSetProperty(e, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: NSNumber(value: target)) }
+        log("ウェブカメラ：熱の状態 \(ProcessInfo.processInfo.thermalState.rawValue) のため、コマ数を \(target) にした")
+        liveApply() // 手動のシャッター速度を、新しい 1 コマの長さに収め直す
+        if let hi = lastHello, hi.flags & Flag.live != 0 {
+            sendAck(status: 0, w: curW, h: curH, fps: target, kbps: curKbps, camera: Self.ackCamera(r.camera),
+                    flags: r.ackFlags | Flag.ackLive | Flag.ackChanged | (down ? Flag.ackThermal : 0))
+        }
+        sendEvent(5, UInt32(target)) // 5：熱でコマ数を変えた（arg が新しいコマ数）。古い PC は記録に出すだけ
+        let w = curW, h = curH, kb = curKbps
+        let name = Self.cameraName(r.camera)
+        let note = down ? L("iPhone が熱いため、フレームレートを \(target) fps に下げています。", "The iPhone is hot, so the frame rate is lowered to \(target) fps.") : ""
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.connected else { return }
+            self.detail = "\(w)×\(h)・\(target) fps・\(name)・\(String(format: "%.0f", Double(kb) / 1000)) Mbps"
+            self.thermalNote = note
         }
     }
 
@@ -435,17 +719,15 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             return
         default: refuse(1, "カメラの許可が無い"); return
         }
-        guard let r = resolve(hi), let dev = Self.device(r.camera) else { refuse(2, "使えるカメラが無い"); return }
-        guard let picked = Self.pickFormat(dev, w: r.w, h: r.h, fps: r.fps) else { refuse(2, "そのカメラに使える形が無い"); return }
-        let (fmt, frameDur, fr) = picked
-        let dims = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
-        let aw = Int(dims.width), ah = Int(dims.height)
-        let kb = r.kbps > 0 ? r.kbps : Self.qualityKbps(r.quality, w: aw, h: ah, fps: fr)
-        let g = r.gop > 0 ? r.gop : fr * 2
-        guard let enc = makeEncoder(w: aw, h: ah, fps: fr, kbps: kb, gop: g) else { refuse(4, "エンコーダを作れない"); return }
+        guard let r = resolve(hi), Self.device(r.camera) != nil else { refuse(2, "使えるカメラが無い"); return }
+        guard let p = plan(r) else { refuse(2, "そのカメラに使える形が無い"); return }
+        let dev = p.dev, fmt = p.fmt, fr = p.fps
         let s = AVCaptureSession()
         s.beginConfiguration()
         s.sessionPreset = .inputPriority // 形は device.activeFormat で決める（プリセットだと 1080p は 30 コマまでのことがある）
+        let out = AVCaptureVideoDataOutput()
+        var rotated = r.rot == 0
+        var cineOn = false
         do {
             let input = try AVCaptureDeviceInput(device: dev)
             guard s.canAddInput(input) else { throw NSError(domain: "CameraBridge", code: 1) }
@@ -454,60 +736,172 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             try dev.lockForConfiguration()
             dev.activeFormat = fmt
             // frameDur は pickFormat が fmt の videoSupportedFrameRateRanges の中から選んだ物（範囲の外を入れると例外で落ちる）
-            dev.activeVideoMinFrameDuration = frameDur
-            dev.activeVideoMaxFrameDuration = frameDur
+            dev.activeVideoMinFrameDuration = p.frameDur
+            dev.activeVideoMaxFrameDuration = p.frameDur
             // HDR の映像にしない（形式が変わり、色が合わなくなる）
             if fmt.isVideoHDRSupported { dev.automaticallyAdjustsVideoHDREnabled = false; dev.isVideoHDREnabled = false }
             dev.unlockForConfiguration()
-            let out = AVCaptureVideoDataOutput()
             out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange]
             out.alwaysDiscardsLateVideoFrames = true // 遅れたコマは溜めずに捨てる
             out.setSampleBufferDelegate(self, queue: captureQueue)
             guard s.canAddOutput(out) else { throw NSError(domain: "CameraBridge", code: 2) }
             s.addOutput(out)
             if let cn = out.connection(with: .video) {
-                // 向きは iPhone の持ち方に関わらず、横長（センサーの向き）で固定する。ウェブカメラの絵は 16:9 の横長。
-                // iOS 17 からは回す角度 0 を明示する。それより前は、AVCaptureVideoDataOutput の既定（センサーの向きのまま）に任せる
-                if #available(iOS 17.0, *) {
-                    if cn.isVideoRotationAngleSupported(0) { cn.videoRotationAngle = 0 }
-                }
+                // 向き：初めは iPhone の持ち方に関わらず、横長（センサーの向き）で固定する。画面の「回転」で 90 度ずつ回す。
+                // 回すのは接続で（ハードウェアで回る。エンコーダの前で回すより CPU を使わない）。回してから左右反転する
+                rotated = Self.orient(cn, angle: r.rot)
                 if cn.isVideoMirroringSupported {
                     cn.automaticallyAdjustsVideoMirroring = false
-                    cn.isVideoMirrored = r.mirror // ふつうは反転しない。鏡のように見せるのは使う側のアプリ
+                    cn.isVideoMirrored = r.connMirror // ふつうは反転しない。鏡のように見せるのは使う側のアプリ
                 }
+                // 手ぶれ補正。オフ以外は写る範囲が狭くなる。標準とシネマティックは遅れが増える
+                if cn.isVideoStabilizationSupported { cn.preferredVideoStabilizationMode = Self.stabMode(r.stab) }
             }
+            if r.face { addFaceOutput(s) }
+            cineOn = enableCinematic(input, r)
         } catch {
             s.commitConfiguration()
-            VTCompressionSessionInvalidate(enc)
             deviceInput = nil
             refuse(2, "カメラを開けない：\(error)")
             return
         }
         s.commitConfiguration()
+        // 送る大きさ。回せなかったときは、センサーの向きのまま（幅と高さも元のまま）
+        var aw = p.outW, ah = p.outH
+        if !rotated && r.portrait { (aw, ah) = (ah, aw) }
+        let kb = r.kbps > 0 ? r.kbps : Self.qualityKbps(r.quality, w: aw, h: ah, fps: fr)
+        let g = r.gop > 0 ? r.gop : fr * 2
+        guard let enc = makeEncoder(w: aw, h: ah, fps: fr, kbps: kb, gop: g) else {
+            deviceInput = nil
+            captureQueue.async { for i in s.inputs { s.removeInput(i) }; for o in s.outputs { s.removeOutput(o) } }
+            refuse(4, "エンコーダを作れない")
+            return
+        }
+        // 切り抜く・水平を保つときは、送る大きさの入れ物を用意する
+        let pool = r.stage ? Self.makePool(w: aw, h: ah) : nil
+        if r.stage && pool == nil { log("ウェブカメラ：切り抜きの入れ物を作れない。切り抜かずに送る") }
         session = s
         venc = enc
         curFps = fr; curKbps = kb; curW = aw; curH = ah
         curReq = r
-        lock.lock(); sendConn = c; encCopy = enc; fpsCopy = fr; wCopy = aw; hCopy = ah; forceKey = true; inflight = 0; if !changed { seq = 0; sent = 0; dropped = 0 }; lock.unlock()
+        baseFps = p.baseFps
+        focusTargetApplied = -1
+        lock.lock()
+        sendConn = c; encCopy = enc; fpsCopy = fr; wCopy = aw; hCopy = ah; forceKey = true; inflight = 0; if !changed { seq = 0; sent = 0; dropped = 0 }
+        poolCopy = pool; devCopy = dev; videoOutCopy = out; cineCopy = cineOn; faceTarget = nil
+        lock.unlock()
         observeSession(s)
+        // ピント・明るさ・色・ズーム・ライト・切り抜きの値を、走らせる前に当てる
+        liveApply(initial: true)
         let ackFlags = r.ackFlags | Flag.ackLive | (changed ? Flag.ackChanged : 0)
-        sendAck(status: 0, w: aw, h: ah, fps: fr, kbps: kb, camera: r.camera, flags: ackFlags)
-        log("ウェブカメラ：\(changed ? "切り替えた" : "始める") \(aw)×\(ah)・\(fr) コマ/秒・\(kb) kbps・カメラ \(r.camera)（\(dev.localizedName)）・ACK flags \(ackFlags)")
+        sendAck(status: 0, w: aw, h: ah, fps: fr, kbps: kb, camera: Self.ackCamera(r.camera), flags: ackFlags)
+        // 温度の状態は変わったときに EVENT 3 で送っている。つないだ直後にも今の状態を 1 回送る（古い PC は記録に出すだけ）
+        if !changed { sendEvent(3, UInt32(ProcessInfo.processInfo.thermalState.rawValue)) }
+        log("ウェブカメラ：\(changed ? "切り替えた" : "始める") \(aw)×\(ah)・\(fr) コマ/秒・\(kb) kbps・カメラ \(r.camera)（\(dev.localizedName)）・回転 \(r.rot)・反転 \(r.connMirror ? 1 : 0)・切り抜き \(pool != nil ? 1 : 0)・手ぶれ補正 \(r.stab)・シネマティック \(cineOn ? 1 : 0)・ACK flags \(ackFlags)")
         // startRunning は返ってくるまでに時間がかかるので、カメラの糸で（前のカメラの stopRunning のあとに並ぶ）
         captureQueue.async { s.startRunning() }
         let name = Self.cameraName(r.camera)
         let note = Self.pcNoteText(r, w: aw, h: ah, fps: fr)
+        let skipped = r.rotSkipped
+        let hotNote = fr < p.baseFps ? L("iPhone が熱いため、フレームレートを \(fr) fps に下げています。", "The iPhone is hot, so the frame rate is lowered to \(fr) fps.") : ""
         DispatchQueue.main.async { [weak self] in
             self?.connected = true
             self?.detail = "\(aw)×\(ah)・\(fr) fps・\(name)・\(String(format: "%.0f", Double(kb) / 1000)) Mbps"
             self?.pcNote = note
             self?.pendingNote = false
+            self?.rotSkipped = skipped
+            self?.thermalNote = hotNote
         }
     }
 
+    // ---- camctl：向き・顔・シネマティック ----
+
+    // 接続で回す。iOS 17 からは videoRotationAngle（0・90・180・270）。それより前は videoOrientation を、回していない向きから 90 度ずつ進める。
+    // 回せたら true（0 度はいつも true。前と同じく、出力の既定のセンサーの向きのまま）
+    private static func orient(_ cn: AVCaptureConnection, angle: Int) -> Bool {
+        if #available(iOS 17.0, *) {
+            let a = CGFloat(angle)
+            guard cn.isVideoRotationAngleSupported(a) else { return angle == 0 }
+            cn.videoRotationAngle = a
+            return true
+        }
+        if angle == 0 { return true }
+        guard cn.isVideoOrientationSupported else { return false }
+        let order: [AVCaptureVideoOrientation] = [.landscapeRight, .portrait, .landscapeLeft, .portraitUpsideDown]
+        let base = order.firstIndex(of: cn.videoOrientation) ?? 0
+        cn.videoOrientation = order[(base + angle / 90) % 4]
+        return true
+    }
+
+    // 顔の位置を調べる出力（切り抜きを顔に合わせるときだけ）。顔の検出はカメラの中で行われ、重くない
+    private func addFaceOutput(_ s: AVCaptureSession) {
+        let mo = AVCaptureMetadataOutput()
+        guard s.canAddOutput(mo) else { log("ウェブカメラ：顔の位置を調べる出力を足せない"); return }
+        s.addOutput(mo)
+        if mo.availableMetadataObjectTypes.contains(.face) {
+            mo.metadataObjectTypes = [.face]
+            mo.setMetadataObjectsDelegate(self, queue: metaQueue)
+        } else {
+            log("ウェブカメラ：このカメラは顔の位置を出さない")
+        }
+    }
+
+    // 顔が見つかった（metaQueue）。いちばん大きい顔の真ん中を、送る絵の上の位置（回転と反転のあと）に直して覚える
+    func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
+        lock.lock(); let outCopy = videoOutCopy; lock.unlock()
+        guard let vo = outCopy, let vc = vo.connection(with: .video) else { return }
+        var best: CGRect?
+        for o in metadataObjects where o.type == .face {
+            guard let b = vo.transformedMetadataObject(for: o, connection: vc)?.bounds else { continue }
+            if let cur = best, cur.width * cur.height >= b.width * b.height { continue }
+            best = b
+        }
+        guard let b = best else { return }
+        var pt = CGPoint(x: b.midX, y: b.midY)
+        lock.lock()
+        // 0〜1 で来るはず。画素の数で来たときは、絵の大きさで割る
+        if (pt.x > 1.5 || pt.y > 1.5) && srcW > 0 && srcH > 0 { pt.x /= CGFloat(srcW); pt.y /= CGFloat(srcH) }
+        faceTarget = CGPoint(x: min(max(pt.x, 0), 1), y: min(max(pt.y, 0), 1))
+        lock.unlock()
+    }
+
+    // シネマティック（iOS 26）を入れる。入れられたら true。beginConfiguration の中で呼ぶ（入れると作り直しに時間がかかる）
+    private func enableCinematic(_ input: AVCaptureDeviceInput, _ r: Resolved) -> Bool {
+        guard r.cinematic else { return false }
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            guard input.isCinematicVideoCaptureSupported else { log("ウェブカメラ：この形ではシネマティックを使えない"); return false }
+            input.isCinematicVideoCaptureEnabled = true
+            setAperture(input)
+            return true
+        }
+        #endif
+        return false
+    }
+
+    // シネマティックの F 値（ぼかしの強さ）。形の範囲の中に収める。範囲の外や、変えられない形で入れると例外で落ちる
+    private func setAperture(_ input: AVCaptureDeviceInput) {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            guard input.isCinematicVideoCaptureEnabled else { return }
+            let f = input.device.activeFormat
+            guard f.minSimulatedAperture > 0, f.maxSimulatedAperture >= f.minSimulatedAperture else { return }
+            var a = Float(UserDefaults.standard.double(forKey: Key.aperture))
+            if a <= 0 { a = f.defaultSimulatedAperture }
+            a = min(max(a, f.minSimulatedAperture), f.maxSimulatedAperture)
+            if abs(input.simulatedAperture - a) > 0.01 { input.simulatedAperture = a }
+        }
+        #endif
+    }
+
+    // ACK の camera。古い PC は 0〜3 しか知らないので、レンズ自動切り替え（4）は背面（0）と知らせる
+    private static func ackCamera(_ cam: UInt32) -> UInt32 { cam == 4 ? 0 : cam }
+
     // ---- カメラと形 ----
 
-    // カメラ（0 背面の広角・1 前面・2 背面の超広角・3 背面の望遠）。無い機種では入れない
+    // カメラ（0 背面の広角・1 前面・2 背面の超広角・3 背面の望遠・4 背面のレンズ自動切り替え）。無い機種では入れない
+    // 4 は iOS の仮想カメラ（三つのレンズ → 超広角と広角 → 広角と望遠の順に探す）。倍率に合わせて iOS がレンズを切り替える。
+    // 仮想カメラは手動のピント・手動の露出・色温度の固定ができない（Apple の資料）。その操作は画面に出さない
     private static let deviceTable: [UInt32: AVCaptureDevice] = {
         func find(_ type: AVCaptureDevice.DeviceType, _ pos: AVCaptureDevice.Position) -> AVCaptureDevice? {
             AVCaptureDevice.DiscoverySession(deviceTypes: [type], mediaType: .video, position: pos).devices.first
@@ -517,6 +911,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         t[1] = find(.builtInWideAngleCamera, .front)
         t[2] = find(.builtInUltraWideCamera, .back)
         t[3] = find(.builtInTelephotoCamera, .back)
+        t[4] = find(.builtInTripleCamera, .back) ?? find(.builtInDualWideCamera, .back) ?? find(.builtInDualCamera, .back)
         return t
     }()
     static func device(_ id: UInt32) -> AVCaptureDevice? { deviceTable[id] }
@@ -525,8 +920,203 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         case 1: return L("前面カメラ", "Front camera")
         case 2: return L("超広角", "Ultra wide")
         case 3: return L("望遠", "Telephoto")
+        case 4: return L("背面・レンズ自動切り替え", "Back, auto lens switching")
         default: return L("背面カメラ", "Back camera")
         }
+    }
+
+    // シネマティック（iOS 26）に使うカメラ。背面はデュアル広角・前面は TrueDepth（WWDC25 の 319）。望遠では使えない
+    private static let cineTable: [UInt32: AVCaptureDevice] = {
+        var t: [UInt32: AVCaptureDevice] = [:]
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            func find(_ type: AVCaptureDevice.DeviceType, _ pos: AVCaptureDevice.Position) -> AVCaptureDevice? {
+                guard let d = AVCaptureDevice.DiscoverySession(deviceTypes: [type], mediaType: .video, position: pos).devices.first else { return nil }
+                return d.formats.contains { $0.isCinematicVideoCaptureSupported && CameraBridge.is420v($0) } ? d : nil
+            }
+            let back = find(.builtInDualWideCamera, .back)
+            t[0] = back; t[2] = back; t[4] = back
+            t[1] = find(.builtInTrueDepthCamera, .front)
+        }
+        #endif
+        return t
+    }()
+    static func cinematicDevice(_ id: UInt32) -> AVCaptureDevice? { cineTable[id] }
+    private static func is420v(_ f: AVCaptureDevice.Format) -> Bool {
+        CMFormatDescriptionGetMediaSubType(f.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    }
+    // シネマティックに使える形だけを選ぶ
+    private static func cinematicFormat(_ f: AVCaptureDevice.Format) -> Bool {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) { return f.isCinematicVideoCaptureSupported }
+        #endif
+        return false
+    }
+
+    // コントロールセンターで入っているエフェクト（1 ポートレート・2 スタジオ照明・4 センターフレーム・8 背景の置き換え）
+    static func effectsMask() -> Int {
+        var m = 0
+        if AVCaptureDevice.isPortraitEffectEnabled { m |= 1 }
+        if #available(iOS 16.0, *), AVCaptureDevice.isStudioLightEnabled { m |= 2 }
+        if AVCaptureDevice.isCenterStageEnabled { m |= 4 }
+        if #available(iOS 18.0, *), AVCaptureDevice.isBackgroundReplacementEnabled { m |= 8 }
+        return m
+    }
+    // 入っているエフェクトに対応する形を先に選ぶための点数
+    private static func effectScore(_ fx: Int) -> (AVCaptureDevice.Format) -> Int {
+        { f in
+            var n = 0
+            if fx & 1 != 0 && f.isPortraitEffectSupported { n += 1 }
+            if #available(iOS 16.0, *), fx & 2 != 0 && f.isStudioLightSupported { n += 1 }
+            if fx & 4 != 0 && f.isCenterStageSupported { n += 1 }
+            if #available(iOS 18.0, *), fx & 8 != 0 && f.isBackgroundReplacementSupported { n += 1 }
+            return n
+        }
+    }
+    // エフェクトが入っているときの、コマ数の上限（0 は上限なし）
+    private static func effectFpsCap(_ f: AVCaptureDevice.Format, fx: Int, cinematic: Bool) -> Int {
+        var cap = 0
+        func take(_ r: AVFrameRateRange?) {
+            guard let r else { return }
+            let m = Int(r.maxFrameRate.rounded(.down))
+            if m > 0 { cap = cap == 0 ? m : min(cap, m) }
+        }
+        if fx & 1 != 0 && f.isPortraitEffectSupported { take(f.videoFrameRateRangeForPortraitEffect) }
+        if #available(iOS 16.0, *), fx & 2 != 0 && f.isStudioLightSupported { take(f.videoFrameRateRangeForStudioLight) }
+        if fx & 4 != 0 && f.isCenterStageSupported { take(f.videoFrameRateRangeForCenterStage) }
+        if #available(iOS 18.0, *), fx & 8 != 0 && f.isBackgroundReplacementSupported { take(f.videoFrameRateRangeForBackgroundReplacement) }
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *), cinematic { take(f.videoFrameRateRangeForCinematicVideo) }
+        #endif
+        return cap
+    }
+
+    // センターフレーム：アプリとコントロールセンターの両方で切り替えられる形にしてから入れる（user の形のまま入れると例外で落ちる）
+    static func applyCenterStage(_ on: Bool) {
+        if AVCaptureDevice.centerStageControlMode != .cooperative { AVCaptureDevice.centerStageControlMode = .cooperative }
+        if AVCaptureDevice.isCenterStageEnabled != on { AVCaptureDevice.isCenterStageEnabled = on }
+    }
+
+    // 水平を保てるか：背面のカメラで、傾きを読めるとき（前面はセンサーの向きが機種で違うので、本物で確かめるまで出さない）
+    static func levelAvailable(_ dev: AVCaptureDevice?) -> Bool {
+        dev?.position == .back && motion.isDeviceMotionAvailable
+    }
+    // 水平を保つときに直す角度の上限（度）。この角度まで直せるだけの余白を取る
+    static let levelMaxDeg: CGFloat = 6
+    // 水平の余白に要る拡大：枠を θ 回して、同じ縦横比の元の絵に収めるには cos θ ＋ 長辺/短辺 × sin θ 倍
+    static func levelScale(w: Int, h: Int) -> CGFloat {
+        let a = levelMaxDeg * .pi / 180
+        let r = CGFloat(max(w, h)) / CGFloat(max(1, min(w, h)))
+        return cos(a) + r * sin(a)
+    }
+    // 切り抜きと水平を合わせた、エンコーダの前で拡大する倍率
+    static func stageScale(crop size: Double, level: Bool, w: Int, h: Int) -> CGFloat {
+        let c = 1 / CGFloat(min(max(size, 0.3), 1))
+        return max(c, level ? levelScale(w: w, h: h) : 1)
+    }
+    // 切り抜くときに撮る高さ：拡大が 1.25 倍までに収まる、いちばん小さい高さ（撮れなければ送る高さのまま）
+    static func captureHeight(camera: UInt32, outH: Int, fps: Int, scale: CGFloat) -> Int {
+        let need = Double(outH) * Double(scale) / 1.25
+        let ok = heightChoices.filter { $0 >= outH && supports(camera: camera, height: $0, fps: fps) }
+        return ok.first(where: { Double($0) >= need }) ?? ok.last ?? outH
+    }
+
+    // 手ぶれ補正の値（Key.stab）と、その形で選べる物
+    static func stabMode(_ v: Int) -> AVCaptureVideoStabilizationMode {
+        switch v {
+        case 1:
+            #if compiler(>=6.2)
+            if #available(iOS 26.0, *) { return .lowLatency }
+            #endif
+            return .off
+        case 2: return .standard
+        case 3: return .cinematic
+        default: return .off
+        }
+    }
+    static func stabChoices(_ f: AVCaptureDevice.Format) -> [Int] {
+        var s = [0]
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *), f.isVideoStabilizationModeSupported(.lowLatency) { s.append(1) }
+        #endif
+        if f.isVideoStabilizationModeSupported(.standard) { s.append(2) }
+        if f.isVideoStabilizationModeSupported(.cinematic) { s.append(3) }
+        return s
+    }
+
+    // 見え方の倍率（背面の広角を 1 とする）とカメラの倍率（videoZoomFactor）の比。iOS 18 からは iOS が教える値
+    static func zoomMultiplier(_ dev: AVCaptureDevice) -> CGFloat {
+        // 仮想カメラは、最初のレンズが超広角なら、切り替わる倍率の最初（広角に替わる所）を 1 にする（iOS の版によらず同じ見え方）
+        if dev.isVirtualDevice, dev.constituentDevices.first?.deviceType == .builtInUltraWideCamera,
+           let f = dev.virtualDeviceSwitchOverVideoZoomFactors.first?.doubleValue, f > 1 {
+            return CGFloat(1 / f)
+        }
+        if #available(iOS 18.0, *) {
+            let m = dev.displayVideoZoomFactorMultiplier
+            if m > 0 && m != 1 { return m }
+        }
+        // iOS 17 まで、または iOS が 1 と言うとき：超広角は 0.5
+        if dev.deviceType == .builtInUltraWideCamera { return 0.5 }
+        // 望遠は画角の比から（0.5 刻みに丸める）
+        if dev.deviceType == .builtInTelephotoCamera, let wide = device(0) {
+            let a = tan(Double(wide.activeFormat.videoFieldOfView) * .pi / 360), b = tan(Double(dev.activeFormat.videoFieldOfView) * .pi / 360)
+            if b > 0 { return CGFloat(max(1, (a / b * 2).rounded() / 2)) }
+        }
+        return 1
+    }
+    // カメラを替えたときの倍率：そのカメラをそのまま使う見え方（超広角は 0.5・レンズ自動切り替えは広角の 1）
+    static func baseZoom(_ cam: UInt32) -> CGFloat {
+        guard cam != 4, let d = device(cam) else { return 1 }
+        return zoomMultiplier(d)
+    }
+    // 倍率のボタン：各レンズの 1 枚目と、その 2 倍（48MP のセンサーの真ん中を使う倍率）。見え方の倍率で返す
+    static func zoomStops(_ dev: AVCaptureDevice, m: CGFloat) -> [CGFloat] {
+        var base: [CGFloat] = [m]
+        for f in dev.virtualDeviceSwitchOverVideoZoomFactors { base.append(CGFloat(f.doubleValue) * m) }
+        var s = Set<CGFloat>()
+        for b in base {
+            s.insert(roundZoom(b))
+            if b >= 0.99 { s.insert(roundZoom(b * 2)) }
+        }
+        return s.sorted()
+    }
+    // 0.1 刻みに丸め、整数に近ければ整数にする
+    static func roundZoom(_ z: CGFloat) -> CGFloat {
+        let n = z.rounded()
+        if n >= 1 && abs(z - n) < 0.15 { return n }
+        return (z * 10).rounded() / 10
+    }
+    // レンズが替わる倍率のうち、z 以下でいちばん大きい物（水平の余白で倍率を下げるとき、ここより下げるとレンズが替わる）
+    private static func lensFloor(_ dev: AVCaptureDevice, for z: CGFloat) -> CGFloat {
+        var f: CGFloat = 1
+        for n in dev.virtualDeviceSwitchOverVideoZoomFactors {
+            let v = CGFloat(n.doubleValue)
+            if v <= z + 0.001 { f = max(f, v) }
+        }
+        return f
+    }
+
+    // ライトの持ち主：そのカメラにライトがあればそのカメラ。前面カメラのときは背面のカメラ（使えるかは isTorchAvailable で決まる）
+    static func torchDevice(for cur: AVCaptureDevice) -> AVCaptureDevice? {
+        if cur.hasTorch { return cur }
+        if cur.position == .front, let b = device(0), b.hasTorch { return b }
+        return nil
+    }
+    // ライトの状態の文（画面の糸）。熱いときは iOS が弱めたり消したりする
+    static func torchText(_ cur: AVCaptureDevice?) -> String {
+        guard UserDefaults.standard.bool(forKey: Key.torch), let cur, let t = torchDevice(for: cur) else { return "" }
+        if !t.isTorchAvailable {
+            return L("今は使えません。iPhone が熱いときや、前面カメラを使っているときは、使えないことがあります。",
+                     "Not available now. It may be unavailable when the iPhone is hot or the front camera is in use.")
+        }
+        guard t.isTorchActive else { return L("点いていません。", "The light is off.") }
+        let now = Double(t.torchLevel)
+        let want = min(max(UserDefaults.standard.double(forKey: Key.torchLevel), 0.05), 1)
+        let pct = Int((now * 100).rounded())
+        if now + 0.05 < want {
+            return L("熱を下げるため、iOS が明るさを \(pct)% に下げています。", "iOS has lowered the brightness to \(pct)% to reduce heat.")
+        }
+        return L("点いています。明るさは \(pct)% です。", "The light is on at \(pct)%.")
     }
     static func size(forHeight h: Int) -> (Int, Int) {
         switch h {
@@ -539,7 +1129,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     // 画面に出す選び肢。4K は 30 fps まで（Windows の H.264 のデコーダの資料は level 5.1 まで。4K の 60 fps は level 5.2 が要る）
     static let heightChoices = [720, 1080, 2160]
     static let fpsChoices = [30, 60]
-    static func availableCameras() -> [UInt32] { [UInt32(0), 1, 2, 3].filter { device($0) != nil } }
+    static func availableCameras() -> [UInt32] { [UInt32(0), 4, 1, 2, 3].filter { device($0) != nil } }
     static func heights(for cam: UInt32) -> [Int] { heightChoices.filter { !rates(for: cam, height: $0).isEmpty } }
     static func rates(for cam: UInt32, height: Int) -> [Int] {
         fpsChoices.filter { f in !(height >= 2160 && f > 30) && supports(camera: cam, height: height, fps: f) }
@@ -562,8 +1152,11 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     //   2. そのコマ数を撮れる中で、面積がいちばん近い形
     //   3. どの形もそのコマ数を撮れない：大きさがぴったりの形（無ければ面積がいちばん近い形）を、その形の最高のコマ数で
     // activeVideoMinFrameDuration に範囲の外の値を入れると例外で落ちるので、1 コマの長さは必ず範囲の中の値にする
-    private static func pickFormat(_ dev: AVCaptureDevice, w: Int, h: Int, fps: Int) -> (AVCaptureDevice.Format, CMTime, Int)? {
-        let nv = dev.formats.filter { CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange }
+    // camctl：only は使える形を絞る（シネマティック）。prefer は同じ大きさの中で先に選ぶ形の点数（エフェクトに対応する形）
+    private static func pickFormat(_ dev: AVCaptureDevice, w: Int, h: Int, fps: Int,
+                                   only: ((AVCaptureDevice.Format) -> Bool)? = nil, prefer: ((AVCaptureDevice.Format) -> Int)? = nil) -> (AVCaptureDevice.Format, CMTime, Int)? {
+        let nv = dev.formats.filter { CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && (only?($0) ?? true) }
+        let score = prefer ?? { _ in 0 }
         let want = Double(fps)
         func area(_ f: AVCaptureDevice.Format) -> Int {
             let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
@@ -574,7 +1167,12 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             return Int(d.width) == w && Int(d.height) == h
         }
         func canDo(_ f: AVCaptureDevice.Format) -> Bool { fps > 0 && f.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= want && want <= $0.maxFrameRate } }
-        func widest(_ list: [AVCaptureDevice.Format]) -> AVCaptureDevice.Format? { list.max { $0.videoFieldOfView < $1.videoFieldOfView } }
+        func widest(_ list: [AVCaptureDevice.Format]) -> AVCaptureDevice.Format? {
+            list.max { a, b in
+                let sa = score(a), sb = score(b)
+                return sa != sb ? sa < sb : a.videoFieldOfView < b.videoFieldOfView
+            }
+        }
         func nearest(_ list: [AVCaptureDevice.Format]) -> AVCaptureDevice.Format? { list.min { abs(area($0) - w * h) < abs(area($1) - w * h) } }
         if let f = widest(nv.filter { exact($0) && canDo($0) }) ?? nearest(nv.filter(canDo)) {
             return (f, CMTime(value: 1, timescale: CMTimeScale(fps)), fps)
@@ -659,19 +1257,233 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         }
     }
 
+    // ---- camctl：作り直さずに、今のカメラへ当てる（q の上） ----
+
+    // ピント・明るさ・色・ズーム・ライト・切り抜き・水平を、lockForConfiguration でその場で変える。
+    // 作り直したあと（initial：ズームを ramp せずに一度で）と、画面で操作を変えたときに呼ぶ
+    private func liveApply(initial: Bool = false) {
+        guard let input = deviceInput, let r = curReq else { return }
+        let dev = input.device
+        let d = UserDefaults.standard
+        var st = stageParams(r)
+        lock.lock()
+        st.on = st.on && poolCopy != nil // 入れ物を作れなかったときは切り抜かない（倍率も移さない）
+        stage = st
+        lock.unlock()
+        if st.on && st.level { startMotion() } else { stopMotion() }
+        let cine = isCinematicOn(input)
+        do {
+            try dev.lockForConfiguration()
+            // シネマティックの間はピントの形を変えられない（変えると例外で落ちる）
+            if !cine { applyFocus(dev, d) }
+            Self.applyExposure(dev, d, fps: curFps)
+            Self.applyWhiteBalance(dev, d)
+            applyZoom(dev, d, r, extra: st.on ? st.extra : 1, initial: initial)
+            dev.unlockForConfiguration()
+        } catch {
+            log("ウェブカメラ：カメラの設定を変えられない：\(error)")
+        }
+        if cine { setAperture(input) }
+        applyTorch(dev)
+        // センターフレームは、画面で触ったことがあるときだけアプリが決める（触っていなければコントロールセンターのまま）
+        if let cs = d.object(forKey: Key.centerStage) as? Bool, dev.formats.contains(where: { $0.isCenterStageSupported }) {
+            Self.applyCenterStage(cs)
+        }
+    }
+
+    private func isCinematicOn(_ input: AVCaptureDeviceInput) -> Bool {
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) { return input.isCinematicVideoCaptureEnabled }
+        #endif
+        return false
+    }
+
+    // ピント：0 自動（連続）・1 固定（今の位置）・2 手動（レンズの位置）。合わせる所は 0 顔を優先・1 画面の真ん中
+    private func applyFocus(_ dev: AVCaptureDevice, _ d: UserDefaults) {
+        let mode = d.integer(forKey: Key.focus)
+        let target = d.integer(forKey: Key.focusTarget) == 1 ? 1 : 0
+        let canAF = dev.isFocusModeSupported(.continuousAutoFocus)
+        if #available(iOS 15.4, *), canAF {
+            if target == 1 {
+                // 顔ではなく真ん中に合わせる：顔に合わせる働きを切る（先に automaticallyAdjusts を切らないと例外で落ちる）
+                dev.automaticallyAdjustsFaceDrivenAutoFocusEnabled = false
+                dev.isFaceDrivenAutoFocusEnabled = false
+            } else if !dev.automaticallyAdjustsFaceDrivenAutoFocusEnabled {
+                dev.automaticallyAdjustsFaceDrivenAutoFocusEnabled = true // iOS の初めの形（顔を優先）に戻す
+            }
+        }
+        if mode == 2 && dev.isLockingFocusWithCustomLensPositionSupported {
+            let p = Float(min(max(d.double(forKey: Key.focusPos), 0), 1))
+            if dev.focusMode != .locked || abs(dev.lensPosition - p) > 0.002 { dev.setFocusModeLocked(lensPosition: p, completionHandler: nil) }
+        } else if mode == 1 && dev.isFocusModeSupported(.locked) {
+            if dev.focusMode != .locked { dev.focusMode = .locked }
+        } else if canAF {
+            // 合わせる所を変えたときと、自動に戻したときだけ合わせ直す（ズームを変えるたびに合わせ直さない）
+            if dev.focusMode != .continuousAutoFocus || focusTargetApplied != target {
+                if dev.isFocusPointOfInterestSupported { dev.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5) }
+                dev.focusMode = .continuousAutoFocus
+            }
+        }
+        focusTargetApplied = target
+    }
+
+    // 明るさ：0 自動・1 固定（今の明るさ）・2 手動（ISO とシャッター速度）。露出補正は自動と固定で効く
+    private static func applyExposure(_ dev: AVCaptureDevice, _ d: UserDefaults, fps: Int) {
+        let mode = d.integer(forKey: Key.exposure)
+        let f = dev.activeFormat
+        if mode == 2 && dev.isExposureModeSupported(.custom) {
+            // シャッター速度は 1 コマの長さより短くする（長いとコマ数が落ちる）。範囲の外は例外で落ちるので収める
+            var den = d.double(forKey: Key.shutter)
+            if den <= 0 { den = Double(max(fps, 30) * 2) }
+            let frame = CMTime(value: 1, timescale: CMTimeScale(max(1, fps)))
+            let hiDur = CMTimeMinimum(f.maxExposureDuration, frame)
+            var dur = CMTimeMakeWithSeconds(1 / den, preferredTimescale: 1_000_000)
+            dur = CMTimeMaximum(f.minExposureDuration, CMTimeMinimum(dur, hiDur))
+            var iso = Float(d.double(forKey: Key.iso))
+            if iso <= 0 { iso = dev.iso } // 初めは今の値から
+            iso = min(max(iso, f.minISO), f.maxISO)
+            dev.setExposureModeCustom(duration: dur, iso: iso, completionHandler: nil)
+            return
+        }
+        if mode == 1 && dev.isExposureModeSupported(.locked) {
+            if dev.exposureMode != .locked { dev.exposureMode = .locked }
+        } else if dev.isExposureModeSupported(.continuousAutoExposure) {
+            if dev.exposureMode != .continuousAutoExposure { dev.exposureMode = .continuousAutoExposure }
+        }
+        let b = min(max(Float(d.double(forKey: Key.bias)), dev.minExposureTargetBias), dev.maxExposureTargetBias)
+        if abs(dev.exposureTargetBias - b) > 0.01 { dev.setExposureTargetBias(b, completionHandler: nil) }
+    }
+
+    // 色：0 自動・1 固定（今の色）・2 色温度。色温度は iOS 8 からの変換で RGB の倍率にして、1〜上限に収めてから固定する
+    private static func applyWhiteBalance(_ dev: AVCaptureDevice, _ d: UserDefaults) {
+        let mode = d.integer(forKey: Key.wb)
+        if mode == 2 && dev.isLockingWhiteBalanceWithCustomDeviceGainsSupported {
+            let t = Float(min(max(d.double(forKey: Key.wbTemp), 2000), 10000))
+            var g = dev.deviceWhiteBalanceGains(for: AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: t, tint: 0))
+            let mx = dev.maxWhiteBalanceGain
+            g.redGain = min(max(g.redGain, 1), mx)
+            g.greenGain = min(max(g.greenGain, 1), mx)
+            g.blueGain = min(max(g.blueGain, 1), mx)
+            dev.setWhiteBalanceModeLocked(with: g, completionHandler: nil)
+        } else if mode == 1 && dev.isWhiteBalanceModeSupported(.locked) {
+            if dev.whiteBalanceMode != .locked { dev.whiteBalanceMode = .locked }
+        } else if dev.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+            if dev.whiteBalanceMode != .continuousAutoWhiteBalance { dev.whiteBalanceMode = .continuousAutoWhiteBalance }
+        }
+    }
+
+    // ズーム：見え方の倍率をカメラの倍率に直す。仮想カメラなら、倍率に合わせて iOS がレンズを切り替える。
+    // extra は水平の余白のぶん。カメラの倍率を下げて、エンコーダの前で拡大する（レンズが替わる倍率より下には下げない）
+    private func applyZoom(_ dev: AVCaptureDevice, _ d: UserDefaults, _ r: Resolved, extra: CGFloat, initial: Bool) {
+        let m = Self.zoomMultiplier(dev)
+        // PC がカメラを決めて、画面のカメラと違うときは、そのレンズの 1 枚目の見え方（画面の倍率は別のレンズの物なので使わない）
+        let stored = !r.pcCam || r.camera == UInt32(max(0, d.integer(forKey: Key.camera)))
+        var want = stored ? CGFloat(d.double(forKey: Key.zoom)) / m : 1
+        if want <= 0 { want = 1 / m }
+        if extra > 1.001 { want = max(Self.lensFloor(dev, for: want), want / extra) }
+        let lo = max(1, dev.minAvailableVideoZoomFactor)
+        let hi = max(lo, min(dev.maxAvailableVideoZoomFactor, dev.activeFormat.videoMaxZoomFactor))
+        let z = min(max(want, lo), hi)
+        if abs(dev.videoZoomFactor - z) < 0.001 { return }
+        if initial { dev.videoZoomFactor = z } else { dev.ramp(toVideoZoomFactor: z, withRate: 8) }
+    }
+
+    // ライト。前面カメラのときは背面のライトを点ける（iOS が許すときだけ）。熱いときは、今出せるいちばん明るい段にする
+    private func applyTorch(_ cur: AVCaptureDevice) {
+        let d = UserDefaults.standard
+        guard let t = Self.torchDevice(for: cur) else { return }
+        do { try t.lockForConfiguration() } catch { return }
+        defer { t.unlockForConfiguration() }
+        if d.bool(forKey: Key.torch) && t.isTorchAvailable && t.isTorchModeSupported(.on) {
+            let lv = Float(min(max(d.double(forKey: Key.torchLevel), 0.05), 1))
+            do {
+                try t.setTorchModeOn(level: lv)
+            } catch {
+                try? t.setTorchModeOn(level: AVCaptureDevice.maxAvailableTorchLevel)
+            }
+            torchDev = t
+        } else if t.torchMode != .off && t.isTorchModeSupported(.off) {
+            t.torchMode = .off
+        }
+    }
+
+    private func torchOff() {
+        guard let t = torchDev else { return }
+        torchDev = nil
+        do { try t.lockForConfiguration() } catch { return }
+        if t.torchMode != .off && t.isTorchModeSupported(.off) { t.torchMode = .off }
+        t.unlockForConfiguration()
+    }
+
+    // 切り抜きと水平の値を作る
+    private func stageParams(_ r: Resolved) -> StageParams {
+        var p = StageParams()
+        guard r.stage, let input = deviceInput else { return p }
+        let d = UserDefaults.standard
+        let cropOn = d.bool(forKey: Key.crop)
+        let c: CGFloat = cropOn ? 1 / CGFloat(min(max(d.double(forKey: Key.cropSize), 0.3), 1)) : 1
+        p.on = true
+        p.outW = curW; p.outH = curH
+        p.level = d.bool(forKey: Key.level) && Self.levelAvailable(input.device)
+        p.scale = max(c, p.level ? Self.levelScale(w: curW, h: curH) : 1)
+        p.extra = p.scale / c
+        p.pos = cropOn ? max(0, min(4, d.integer(forKey: Key.cropPos))) : 0
+        p.cx = CGFloat(min(max(d.double(forKey: Key.cropX), 0), 1))
+        p.cy = CGFloat(min(max(d.double(forKey: Key.cropY), 0), 1))
+        p.levelMax = Self.levelMaxDeg * .pi / 180
+        // 水平のときの傾き。背面のカメラで回す角度 0 は、上を左にした横向き（傾き -90 度）。回す角度ぶん進む
+        p.refAngle = CGFloat(r.rot) * .pi / 180 - .pi / 2
+        p.sign = r.connMirror ? -1 : 1
+        return p
+    }
+
+    private func startMotion() {
+        let m = Self.motion
+        guard m.isDeviceMotionAvailable, !m.isDeviceMotionActive else { return }
+        m.deviceMotionUpdateInterval = 1.0 / 60
+        m.startDeviceMotionUpdates() // 読むのはカメラの糸から deviceMotion を見るだけ（受け取りの関数は使わない）
+    }
+
+    private func stopMotion() {
+        if Self.motion.isDeviceMotionActive { Self.motion.stopDeviceMotionUpdates() }
+    }
+
+    // 切り抜いた絵の入れ物（送る大きさの NV12。エンコーダと Core Image の両方が使える IOSurface）
+    private static func makePool(w: Int, h: Int) -> CVPixelBufferPool? {
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferWidthKey as String: w,
+            kCVPixelBufferHeightKey as String: h,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+        ]
+        var pool: CVPixelBufferPool?
+        guard CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pool) == kCVReturnSuccess else { return nil }
+        return pool
+    }
+
     // カメラとエンコーダを止める（つなぎ自体は切らない）
     private func stopCapture() {
-        lock.lock(); sendConn = nil; encCopy = nil; sessionGen &+= 1; lock.unlock()
+        lock.lock()
+        sendConn = nil; encCopy = nil; sessionGen &+= 1
+        stage = StageParams(); poolCopy = nil; devCopy = nil; videoOutCopy = nil; faceTarget = nil; cineCopy = false; levelShown = 0
+        lock.unlock()
         curReq = nil
+        baseFps = 0
+        stopMotion()
+        torchOff()
         for o in sessionObservers { NotificationCenter.default.removeObserver(o) }
         sessionObservers.removeAll()
         if let s = session {
             session = nil
             deviceInput = nil
-            captureQueue.async { // 走っている最中のコマの扱いが終わってから止める
+            captureQueue.async { [weak self] in // 走っている最中のコマの扱いが終わってから止める
                 s.stopRunning()
                 for i in s.inputs { s.removeInput(i) }
                 for o in s.outputs { s.removeOutput(o) }
+                self?.levelNow = 0
+                self?.faceNow = CGPoint(x: 0.5, y: 0.5)
+                self?.lastStagePts = -1
             }
         }
         if let e = venc {
@@ -718,9 +1530,17 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let n = seq
         if !busy && live { seq &+= 1 }
         let gen = sessionGen
+        let stg = stage
+        let pool = poolCopy
         lock.unlock()
-        guard live, !busy, let enc = encoderForCallback(), let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        guard live, !busy, let enc = encoderForCallback(), let src = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        // camctl：切り抜く・水平を保つときは、エンコーダの前で切り出して送る大きさにする
+        var pb = src
+        if stg.on {
+            guard let pool, let cut = renderStage(src, stg, pool, pts: pts) else { lock.lock(); forceKey = true; lock.unlock(); return }
+            pb = cut
+        }
         let capUs = UInt64(max(0, CMTimeGetSeconds(pts)) * 1_000_000) // ホストの時計（単調）。PING の PONG と同じ時計
         let props = key ? ([kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary) : nil
         var info = VTEncodeInfoFlags()
@@ -728,6 +1548,76 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             self?.encoded(status, flags, sb, capUs, n, gen)
         }
         if st != noErr { lock.lock(); forceKey = true; lock.unlock() }
+    }
+
+    // ---- camctl：カメラの糸。切り抜き・拡大・水平の回転を Core Image で 1 回で ----
+    // 枠は「送る大きさと同じ縦横比で元の絵に入るいちばん大きい枠」を scale で縮めた物。水平を保つときは、iPhone の傾きと同じだけ枠を回し、
+    // 回した枠の中を真っすぐにして送る。傾きはなめらかにして（0.5 秒でなじむ・0.3 度より小さい揺れは見ない）、細かく揺れないようにする。
+    // 重さの見込み：GPU で 1080p を 1 枚描くのに数ミリ秒。CPU は命令を作るだけ。遅れはその描く時間だけ増える（本物では測っていない）
+    private func renderStage(_ src: CVPixelBuffer, _ st: StageParams, _ pool: CVPixelBufferPool, pts: CMTime) -> CVPixelBuffer? {
+        let sw = CGFloat(CVPixelBufferGetWidth(src)), sh = CGFloat(CVPixelBufferGetHeight(src))
+        let ow = CGFloat(st.outW), oh = CGFloat(st.outH)
+        guard sw > 0, sh > 0, ow > 0, oh > 0, st.scale > 0 else { return nil }
+        let t = CMTimeGetSeconds(pts)
+        let dt = lastStagePts < 0 ? 0 : min(max(t - lastStagePts, 0), 0.1)
+        lastStagePts = t
+        // 傾き：重さの向き（gravity）から iPhone の傾きを出し、水平のときの傾きとの差を直す
+        var target: CGFloat = 0
+        if st.level, let g = Self.motion.deviceMotion?.gravity, hypot(g.x, g.y) > 0.5 { // 平らに置いているときは直さない
+            var e = CGFloat(atan2(g.x, -g.y)) - st.refAngle
+            while e > .pi { e -= 2 * .pi }
+            while e < -.pi { e += 2 * .pi }
+            // 大きく傾いている（別の向きに置いた）ときは直さない。直すのは上限まで
+            if abs(e) < .pi / 4 { target = min(max(e, -st.levelMax), st.levelMax) * st.sign }
+        }
+        levelNow = Self.smooth(levelNow, target, dt: dt, tau: 0.5, dead: 0.3 * .pi / 180)
+        // 顔に合わせるときは、顔の真ん中をなめらかに追う（0.4 秒でなじむ・枠の 2% より小さい動きは見ない）
+        var center = CGPoint(x: st.cx, y: st.cy)
+        if st.pos == 3 {
+            lock.lock(); let f = faceTarget; lock.unlock()
+            if let f {
+                faceNow.x = Self.smooth(faceNow.x, f.x, dt: dt, tau: 0.4, dead: 0.02)
+                faceNow.y = Self.smooth(faceNow.y, f.y, dt: dt, tau: 0.4, dead: 0.02)
+            }
+            center = faceNow
+        }
+        var bw = sw, bh = sw * oh / ow
+        if bh > sh { bh = sh; bw = sh * ow / oh }
+        let rw = bw / st.scale, rh = bh / st.scale
+        let a = levelNow
+        // 回した枠が元の絵からはみ出さないように、真ん中の位置を収める
+        let hx = (rw * abs(cos(a)) + rh * abs(sin(a))) / 2, hy = (rw * abs(sin(a)) + rh * abs(cos(a))) / 2
+        var cx: CGFloat, cy: CGFloat
+        switch st.pos {
+        case 1: cx = hx; cy = sh / 2
+        case 2: cx = sw - hx; cy = sh / 2
+        case 3, 4: cx = center.x * sw; cy = center.y * sh
+        default: cx = sw / 2; cy = sh / 2
+        }
+        cx = hx * 2 >= sw ? sw / 2 : min(max(cx, hx), sw - hx)
+        cy = hy * 2 >= sh ? sh / 2 : min(max(cy, hy), sh - hy)
+        // Core Image は左下が原点。枠の真ん中を原点へ → 傾きの分だけ戻す → 送る大きさへ → 送る絵の真ん中へ
+        let s = ow / rw
+        let tr = CGAffineTransform(translationX: -cx, y: -(sh - cy))
+            .concatenating(CGAffineTransform(rotationAngle: -a))
+            .concatenating(CGAffineTransform(scaleX: s, y: s))
+            .concatenating(CGAffineTransform(translationX: ow / 2, y: oh / 2))
+        var made: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &made) == kCVReturnSuccess, let out = made else { return nil }
+        CVBufferPropagateAttachments(src, out) // 色の決まり（BT.709 など）を写す。Core Image はこれを見て YCbCr に戻す
+        let img = CIImage(cvPixelBuffer: src).clampedToExtent().transformed(by: tr)
+        ciContext.render(img, to: out, bounds: CGRect(x: 0, y: 0, width: ow, height: oh), colorSpace: nil)
+        lock.lock(); srcW = Int(sw); srcH = Int(sh); levelShown = Double(a * 180 / .pi); lock.unlock()
+        return out
+    }
+
+    // なめらかにする：dead より小さい差は動かさない。それより大きい差は、tau 秒でなじむように少しずつ寄せる
+    private static func smooth(_ cur: CGFloat, _ target: CGFloat, dt: Double, tau: Double, dead: CGFloat) -> CGFloat {
+        let diff = target - cur
+        if abs(diff) <= dead { return cur }
+        if dt <= 0 { return target } // 初めのコマ
+        let k = CGFloat(1 - exp(-dt / tau))
+        return cur + (diff - (diff > 0 ? dead : -dead)) * k
     }
 
     // エンコーダと設定の値を、q の外（カメラの糸）から読む。q を待たない（待つと遅れる）ので、壊れても困らない値だけを lock の中の写しから読む
@@ -862,6 +1752,15 @@ struct CameraBridgeStatusRow: View {
         if model.pendingNote {
             Text(L("変更した設定は、PC を接続し直すと反映されます。", "The new settings apply when the PC reconnects.")).font(.footnote)
         }
+        // camctl：カメラを使っている最中の温度（信号の 3 色。危険は点が点滅する）
+        HStack {
+            Text(L("温度", "Temperature"))
+            Spacer()
+            ThermalBadge()
+        }
+        if !model.thermalNote.isEmpty {
+            Text(model.thermalNote).font(.footnote)
+        }
     }
 
     private var text: String {
@@ -886,7 +1785,7 @@ struct CameraSettingsView: View {
         if cams.isEmpty {
             Text(L("この iPhone ではカメラが見つかりません。", "No camera was found on this iPhone.")).font(.footnote)
         } else {
-            Picker(L("カメラ", "Camera"), selection: bind($camera)) {
+            Picker(L("カメラ", "Camera"), selection: cameraBinding) {
                 ForEach(cams, id: \.self) { c in Text(CameraBridge.cameraName(c)).tag(Int(c)) }
             }
             .pickerStyle(.menu)
@@ -910,6 +1809,16 @@ struct CameraSettingsView: View {
                 Text(L("4K は 30 fps までです。カメラを使うアプリには、PC で 1920×1080 に縮めて渡します。", "4K is up to 30 fps. Apps on the PC get it scaled to 1920×1080.")).font(.footnote)
             }
         }
+    }
+
+    // camctl：カメラを替えたら、倍率はそのカメラをそのまま使う見え方に戻す（超広角は 0.5 倍・望遠はその倍率・レンズ自動切り替えは 1 倍）
+    private var cameraBinding: Binding<Int> {
+        Binding(get: { camera }, set: { v in
+            camera = v
+            normalize()
+            UserDefaults.standard.set(Double(CameraBridge.baseZoom(UInt32(clamping: camera))), forKey: CameraBridge.Key.zoom)
+            model.settingsChanged()
+        })
     }
 
     // 選んだら：組み合わせを撮れる物に直してから、接続中なら切り替える
@@ -938,5 +1847,551 @@ struct CameraSettingsView: View {
         let s = String(format: "%.0f", mbps)
         if q >= 3 { return L("約 \(s) Mbps です。USB で接続しているときに向いています。Wi-Fi では映像が止まることがあります。", "About \(s) Mbps. Best over USB. Over Wi-Fi the video may stall.") }
         return L("約 \(s) Mbps です。", "About \(s) Mbps.")
+    }
+}
+
+// ---- camctl：画面 ----
+
+// そのカメラでできること。画面に出す操作を決める（できない操作は出さない）
+struct CameraCaps {
+    var front = false
+    var focusAuto = false, focusLock = false, focusManual = false
+    var expLock = false, expManual = false
+    var biasMin: Float = 0, biasMax: Float = 0
+    var isoMin: Float = 0, isoMax: Float = 0
+    var shutters: [Int] = []
+    var wbLock = false, wbTemp = false
+    var zoomMin: CGFloat = 1, zoomMax: CGFloat = 1, zoomOptical: CGFloat = 1
+    var zoomStops: [CGFloat] = []
+    var torch = false
+    var stabModes: [Int] = [0]
+    var cinematic = false
+    var apertureMin: Float = 0, apertureMax: Float = 0, apertureDefault: Float = 0
+    var portrait = false, studio = false, centerStage = false
+    var level = false
+    var lensAuto = false // 背面のレンズ自動切り替え（仮想カメラ）がある
+}
+
+extension CameraBridge {
+    // 画面の糸から呼ぶ。画面の設定（カメラ・解像度・フレームレート）で撮る形を選び、そのカメラと形でできることを調べる
+    static func caps(camera cam: UInt32, height: Int, fps: Int) -> CameraCaps {
+        var c = CameraCaps()
+        c.lensAuto = device(4) != nil
+        guard let dev = device(cam) else { return c }
+        let (w, h) = size(forHeight: height)
+        let f = pickFormat(dev, w: w, h: h, fps: fps)?.0 ?? dev.activeFormat
+        c.front = dev.position == .front
+        c.focusAuto = dev.isFocusModeSupported(.continuousAutoFocus)
+        c.focusLock = c.focusAuto && dev.isFocusModeSupported(.locked)
+        c.focusManual = dev.isLockingFocusWithCustomLensPositionSupported
+        c.expLock = dev.isExposureModeSupported(.locked)
+        c.expManual = dev.isExposureModeSupported(.custom)
+        var bmin = dev.minExposureTargetBias, bmax = dev.maxExposureTargetBias
+        if #available(iOS 18.0, *), let r = f.systemRecommendedExposureBiasRange {
+            bmin = max(bmin, r.lowerBound)
+            bmax = min(bmax, r.upperBound)
+        }
+        c.biasMin = max(bmin, -3)
+        c.biasMax = min(bmax, 3)
+        c.isoMin = f.minISO
+        c.isoMax = f.maxISO
+        // シャッター速度は 1 コマの長さより短い物だけ（長いとコマ数が落ちる）
+        let minS = CMTimeGetSeconds(f.minExposureDuration), maxS = CMTimeGetSeconds(f.maxExposureDuration)
+        c.shutters = [30, 50, 60, 100, 120, 250, 500, 1000, 2000, 4000].filter { s in
+            let t = 1 / Double(s)
+            return s >= fps && t >= minS && t <= maxS
+        }
+        c.wbLock = dev.isWhiteBalanceModeSupported(.locked)
+        c.wbTemp = dev.isLockingWhiteBalanceWithCustomDeviceGainsSupported
+        let m = zoomMultiplier(dev)
+        c.zoomMin = max(1, dev.minAvailableVideoZoomFactor) * m
+        var hi = min(f.videoMaxZoomFactor, 10 / m) // 見え方で 10 倍まで。iOS 18 からは iOS の勧める範囲
+        if #available(iOS 18.0, *), let r = f.systemRecommendedVideoZoomRange { hi = min(f.videoMaxZoomFactor, r.upperBound) }
+        c.zoomMax = max(c.zoomMin, hi * m)
+        c.zoomStops = zoomStops(dev, m: m).filter { $0 >= c.zoomMin - 0.01 && $0 <= c.zoomMax + 0.01 }
+        c.zoomOptical = max(c.zoomStops.max() ?? c.zoomMin, f.videoZoomFactorUpscaleThreshold * m)
+        c.torch = torchDevice(for: dev) != nil
+        c.stabModes = stabChoices(f)
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *), let cd = cinematicDevice(cam) {
+            let cf = cd.formats.filter { $0.isCinematicVideoCaptureSupported && is420v($0) }
+            let want = Int32(min(height, 2160))
+            if let p = cf.first(where: { CMVideoFormatDescriptionGetDimensions($0.formatDescription).height == want }) ?? cf.first {
+                c.cinematic = true
+                if p.minSimulatedAperture > 0 && p.maxSimulatedAperture > p.minSimulatedAperture {
+                    c.apertureMin = p.minSimulatedAperture
+                    c.apertureMax = p.maxSimulatedAperture
+                    c.apertureDefault = p.defaultSimulatedAperture
+                }
+            }
+        }
+        #endif
+        c.portrait = dev.formats.contains { $0.isPortraitEffectSupported }
+        if #available(iOS 16.0, *) { c.studio = dev.formats.contains { $0.isStudioLightSupported } }
+        c.centerStage = dev.formats.contains { $0.isCenterStageSupported }
+        c.level = levelAvailable(dev)
+        return c
+    }
+
+    // 倍率の文字（0.5×・1×・2.5× など）
+    static func zoomLabel(_ z: CGFloat) -> String {
+        let r = (Double(z) * 10).rounded() / 10
+        return (abs(r - r.rounded()) < 0.001 ? String(format: "%.0f", r) : String(format: "%.1f", r)) + "×"
+    }
+
+    // 熱いときにフレームレートを下げる設定を変えた。今の温度で当て直す
+    func thermalSettingChanged() {
+        q.async { [weak self] in self?.applyThermal() }
+    }
+}
+
+// カメラの操作（camctl）。「映像」の下に並べる、いくつかの Section。Form の中に直接置く。
+// 変えたら、接続中ならすぐ効く（ピント・明るさ・色・ズーム・ライト）か、0.3 秒まとめてカメラを作り直す（向き・手ぶれ補正・背景ぼかし・切り抜きの入り切り）。
+// 値は UserDefaults に残り、次に開いたときも同じ。iOS 15 でも使えるように、onChange（iOS 17 の形）と LabeledContent（iOS 16）は使わない
+struct CameraControlsView: View {
+    @ObservedObject var model: CameraBridge
+    @AppStorage(CameraBridge.Key.camera) private var camera = CameraBridge.defaultCamera
+    @AppStorage(CameraBridge.Key.height) private var height = CameraBridge.defaultHeight
+    @AppStorage(CameraBridge.Key.fps) private var fps = CameraBridge.defaultFps
+    @AppStorage(CameraBridge.Key.mirror) private var mirror = false
+    @AppStorage(CameraBridge.Key.flipV) private var flipV = false
+    @AppStorage(CameraBridge.Key.rotation) private var rotation = 0
+    @AppStorage(CameraBridge.Key.focus) private var focus = 0
+    @AppStorage(CameraBridge.Key.focusPos) private var focusPos = 0.5
+    @AppStorage(CameraBridge.Key.focusTarget) private var focusTarget = 0
+    @AppStorage(CameraBridge.Key.exposure) private var exposure = 0
+    @AppStorage(CameraBridge.Key.bias) private var bias = 0.0
+    @AppStorage(CameraBridge.Key.iso) private var iso = 0.0
+    @AppStorage(CameraBridge.Key.shutter) private var shutter = 0
+    @AppStorage(CameraBridge.Key.wb) private var wb = 0
+    @AppStorage(CameraBridge.Key.wbTemp) private var wbTemp = 5000.0
+    @AppStorage(CameraBridge.Key.zoom) private var zoom = 1.0
+    @AppStorage(CameraBridge.Key.torch) private var torch = false
+    @AppStorage(CameraBridge.Key.torchLevel) private var torchLevel = 0.5
+    @AppStorage(CameraBridge.Key.stab) private var stab = 0
+    @AppStorage(CameraBridge.Key.cinematic) private var cinematic = false
+    @AppStorage(CameraBridge.Key.aperture) private var aperture = 0.0
+    @AppStorage(CameraBridge.Key.crop) private var crop = false
+    @AppStorage(CameraBridge.Key.cropPos) private var cropPos = 0
+    @AppStorage(CameraBridge.Key.cropSize) private var cropSize = 0.7
+    @AppStorage(CameraBridge.Key.cropX) private var cropX = 0.5
+    @AppStorage(CameraBridge.Key.cropY) private var cropY = 0.5
+    @AppStorage(CameraBridge.Key.level) private var level = false
+    @AppStorage(CameraBridge.Key.screenWarm) private var screenWarm = false
+    @AppStorage(CameraBridge.Key.thermalFps) private var thermalFps = true
+    @State private var screenLight = false
+
+    var body: some View {
+        let c = CameraBridge.caps(camera: UInt32(clamping: camera), height: height, fps: fps)
+        orientationSection
+        zoomSection(c)
+        focusSection(c)
+        exposureSection(c)
+        colorSection(c)
+        lightSection(c)
+        stabSection(c)
+        effectsSection(c)
+        heatSection
+    }
+
+    // ---- 向き ----
+
+    private var orientationSection: some View {
+        Section(L("向き", "Orientation")) {
+            Toggle(L("左右反転", "Flip horizontally"), isOn: rebuild($mirror))
+            Toggle(L("上下反転", "Flip vertically"), isOn: rebuild($flipV))
+            Picker(L("回転", "Rotation"), selection: rebuild($rotation)) {
+                Text("0°").tag(0)
+                Text("90°").tag(90)
+                Text("180°").tag(180)
+                Text("270°").tag(270)
+            }
+            .pickerStyle(.segmented)
+            if rotation == 90 || rotation == 270 {
+                Text(L("90 度と 270 度では縦長の映像になります。4K は 1080p で送ります。", "At 90° and 270° the video is portrait. 4K is sent as 1080p.")).font(.footnote)
+            }
+            if model.rotSkipped {
+                Text(L("PC のソフトが古いため、90 度と 270 度の回転は使っていません。PC のソフトを新しくしてください。",
+                       "The PC software is old, so 90° and 270° rotation is not used. Please update the PC software.")).font(.footnote)
+            }
+        }
+    }
+
+    // ---- ズームと切り抜き・水平 ----
+
+    private func zoomSection(_ c: CameraCaps) -> some View {
+        Section(L("ズームと切り抜き", "Zoom and crop")) {
+            if c.zoomMax > c.zoomMin + 0.01 {
+                HStack(spacing: 8) {
+                    ForEach(c.zoomStops, id: \.self) { z in
+                        Button(CameraBridge.zoomLabel(z)) {
+                            zoom = Double(z)
+                            model.controlsChanged()
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(abs(zoom - Double(z)) < 0.05 ? Color.blue : Color.gray)
+                    }
+                }
+                HStack {
+                    Text(L("デジタルズーム", "Digital zoom"))
+                    Spacer()
+                    Text(CameraBridge.zoomLabel(CGFloat(zoom))).monospacedDigit().foregroundColor(.secondary)
+                }
+                Slider(value: zoomSlider(c), in: 0...1)
+                Text(L("\(CameraBridge.zoomLabel(c.zoomOptical)) より大きくすると、拡大した分だけ画質が落ちます。",
+                       "Beyond \(CameraBridge.zoomLabel(c.zoomOptical)), the picture gets softer as you zoom in.")).font(.footnote)
+            }
+            if camera == 4 {
+                Text(L("倍率に合わせて、iOS が超広角・広角・望遠のレンズを切り替えます。手動のピントと色温度は使えません。",
+                       "iOS switches between the ultra wide, wide, and telephoto lenses to match the zoom. Manual focus and color temperature are not available.")).font(.footnote)
+            } else if c.lensAuto && !c.front {
+                Text(L("0.5 倍や望遠も倍率のボタンで選ぶには、カメラで「背面・レンズ自動切り替え」を選びます。",
+                       "To pick 0.5× and telephoto with the zoom buttons, choose Back, auto lens switching as the camera.")).font(.footnote)
+            }
+            Toggle(L("切り抜く", "Crop"), isOn: rebuild($crop))
+            if crop {
+                Picker(L("位置", "Position"), selection: rebuild($cropPos)) {
+                    Text(L("中央", "Center")).tag(0)
+                    Text(L("左寄り", "Left")).tag(1)
+                    Text(L("右寄り", "Right")).tag(2)
+                    Text(L("顔に合わせる", "Follow the face")).tag(3)
+                    Text(L("手動", "Manual")).tag(4)
+                }
+                .pickerStyle(.menu)
+                HStack {
+                    Text(L("大きさ", "Size"))
+                    Slider(value: rebuild($cropSize), in: 0.3...1)
+                    Text("\(Int((cropSize * 100).rounded()))%").monospacedDigit().foregroundColor(.secondary)
+                }
+                if cropPos == 4 {
+                    HStack {
+                        Text(L("横の位置", "Horizontal"))
+                        Slider(value: live($cropX), in: 0...1)
+                    }
+                    HStack {
+                        Text(L("縦の位置", "Vertical"))
+                        Slider(value: live($cropY), in: 0...1)
+                    }
+                }
+                if cropPos == 3 {
+                    Text(L("顔が見つかるまでは、真ん中を切り抜きます。", "Until a face is found, the center is cropped.")).font(.footnote)
+                }
+            }
+            Text(L("ズームは映像の真ん中を拡大します。切り抜きは好きな位置を切り出して、選んだ解像度に拡大して送ります。",
+                   "Zoom enlarges the center of the picture. Crop cuts out any part you choose and scales it to the selected resolution.")).font(.footnote)
+            if c.level {
+                Toggle(L("水平を保つ", "Keep level"), isOn: rebuild($level))
+                if level {
+                    Text(L("iPhone が少し傾いていても、映像の水平を保ちます。6 度まで直せます。傾きを直す余白のため、映像を少し拡大します。",
+                           "Keeps the picture level even if the iPhone is slightly tilted, up to 6°. The picture is zoomed in a little to leave room for the correction.")).font(.footnote)
+                    if model.connected {
+                        Text(L("いま \(String(format: "%.1f", model.levelAngle)) 度直しています。", "Correcting \(String(format: "%.1f", model.levelAngle))° now.")).font(.footnote)
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- ピント ----
+
+    private func focusSection(_ c: CameraCaps) -> some View {
+        Section(L("ピント", "Focus")) {
+            if cinematic && c.cinematic {
+                Text(L("背景をぼかしている間は、ピントは自動で合わせます。", "While the background is blurred, focus is automatic.")).font(.footnote)
+            } else if c.focusAuto || c.focusManual {
+                let modes = [0] + (c.focusLock ? [1] : []) + (c.focusManual ? [2] : [])
+                let mode = modes.contains(focus) ? focus : 0
+                Picker(L("ピント", "Focus"), selection: pick($focus, modes)) {
+                    Text(L("自動", "Auto")).tag(0)
+                    if c.focusLock { Text(L("固定", "Lock")).tag(1) }
+                    if c.focusManual { Text(L("手動", "Manual")).tag(2) }
+                }
+                .pickerStyle(.segmented)
+                if mode == 2 {
+                    HStack {
+                        Text(L("近く", "Near")).font(.footnote)
+                        Slider(value: live($focusPos), in: 0...1)
+                        Text(L("遠く", "Far")).font(.footnote)
+                    }
+                } else if mode == 1 {
+                    Text(L("今のピントのまま固定します。", "Keeps the current focus.")).font(.footnote)
+                } else if c.focusAuto {
+                    Picker(L("合わせる所", "Focus on"), selection: live($focusTarget)) {
+                        Text(L("顔を優先", "Faces first")).tag(0)
+                        Text(L("画面の真ん中", "Center of the picture")).tag(1)
+                    }
+                    .pickerStyle(.menu)
+                }
+            } else {
+                Text(L("このカメラはピントを変えられません。", "This camera has a fixed focus.")).font(.footnote)
+            }
+        }
+    }
+
+    // ---- 明るさ ----
+
+    private func exposureSection(_ c: CameraCaps) -> some View {
+        Section(L("明るさ", "Brightness")) {
+            let modes = [0] + (c.expLock ? [1] : []) + (c.expManual ? [2] : [])
+            let mode = modes.contains(exposure) ? exposure : 0
+            Picker(L("明るさ", "Brightness"), selection: pick($exposure, modes)) {
+                Text(L("自動", "Auto")).tag(0)
+                if c.expLock { Text(L("固定", "Lock")).tag(1) }
+                if c.expManual { Text(L("手動", "Manual")).tag(2) }
+            }
+            .pickerStyle(.segmented)
+            if mode == 2 {
+                HStack {
+                    Text("ISO")
+                    Spacer()
+                    Text(iso > 0 ? "\(Int(iso))" : L("今の値", "Current")).monospacedDigit().foregroundColor(.secondary)
+                }
+                Slider(value: isoSlider(c), in: 0...1)
+                if !c.shutters.isEmpty {
+                    Picker(L("シャッター速度", "Shutter speed"), selection: shutterBinding(c)) {
+                        ForEach(c.shutters, id: \.self) { s in Text("1/\(s)").tag(s) }
+                    }
+                    .pickerStyle(.menu)
+                }
+                Text(L("照明のちらつきを抑えるには、東日本では 1/50 か 1/100、西日本では 1/60 か 1/120 にします。",
+                       "To reduce flicker from lights, use 1/50 or 1/100 where the power is 50 Hz, and 1/60 or 1/120 where it is 60 Hz.")).font(.footnote)
+            } else if c.biasMax > c.biasMin {
+                HStack {
+                    Text(L("露出補正", "Exposure compensation"))
+                    Spacer()
+                    Text(String(format: "%+.1f", bias)).monospacedDigit().foregroundColor(.secondary)
+                }
+                Slider(value: live($bias), in: Double(c.biasMin)...Double(c.biasMax), step: 0.1)
+                if mode == 1 {
+                    Text(L("今の明るさのまま固定します。", "Keeps the current brightness.")).font(.footnote)
+                }
+            }
+        }
+    }
+
+    // ---- 色 ----
+
+    private func colorSection(_ c: CameraCaps) -> some View {
+        Section(L("色", "Color")) {
+            let modes = [0] + (c.wbLock ? [1] : []) + (c.wbTemp ? [2] : [])
+            let mode = modes.contains(wb) ? wb : 0
+            Picker(L("ホワイトバランス", "White balance"), selection: pick($wb, modes)) {
+                Text(L("自動", "Auto")).tag(0)
+                if c.wbLock { Text(L("固定", "Lock")).tag(1) }
+                if c.wbTemp { Text(L("色温度", "Temperature")).tag(2) }
+            }
+            .pickerStyle(.segmented)
+            if mode == 2 {
+                HStack {
+                    Text(L("色温度", "Color temperature"))
+                    Spacer()
+                    Text("\(Int(wbTemp)) K").monospacedDigit().foregroundColor(.secondary)
+                }
+                Slider(value: live($wbTemp), in: 2500...8000, step: 100)
+                Text(L("値を小さくすると青みが、大きくすると黄みが強くなります。", "Lower values look bluer and higher values look warmer.")).font(.footnote)
+            } else if mode == 1 {
+                Text(L("今の色のまま固定します。", "Keeps the current color.")).font(.footnote)
+            }
+        }
+    }
+
+    // ---- ライト ----
+
+    private func lightSection(_ c: CameraCaps) -> some View {
+        Section(L("ライト", "Light")) {
+            if c.torch {
+                Toggle(L("ライトをつける", "Turn on the light"), isOn: live($torch))
+                if torch {
+                    Picker(L("ライトの明るさ", "Light brightness"), selection: torchStep) {
+                        Text("25%").tag(25)
+                        Text("50%").tag(50)
+                        Text("75%").tag(75)
+                        Text("100%").tag(100)
+                    }
+                    .pickerStyle(.segmented)
+                    if !model.torchState.isEmpty {
+                        Text(model.torchState).font(.footnote)
+                    }
+                }
+                Text(c.front
+                     ? L("前面カメラのときは背面のライトを使います。iOS が許さないときは点きません。そのときは画面のライトを使ってください。",
+                         "With the front camera, the back light is used. If iOS does not allow it, use the screen light instead.")
+                     : L("PC と接続している間だけ点きます。", "The light is on only while the PC is connected.")).font(.footnote)
+            }
+            Button(L("画面のライトをつける", "Use the screen as a light")) { screenLight = true }
+                .fullScreenCover(isPresented: $screenLight) { ScreenLightView(warm: screenWarm) }
+            Toggle(L("画面のライトを暖かい色にする", "Warm screen light"), isOn: $screenWarm)
+            Text(L("画面を白くして明るさを最大にし、前から顔を照らします。画面をタップすると元の明るさに戻ります。",
+                   "Turns the screen white at full brightness to light your face. Tap the screen to restore the brightness.")).font(.footnote)
+        }
+    }
+
+    // ---- 手ぶれ補正 ----
+
+    private func stabSection(_ c: CameraCaps) -> some View {
+        Section(L("手ぶれ補正", "Stabilization")) {
+            Picker(L("手ぶれ補正", "Stabilization"), selection: pick($stab, c.stabModes, remake: true)) {
+                Text(L("オフ", "Off")).tag(0)
+                if c.stabModes.contains(1) { Text(L("遅れの少ない補正", "Low latency")).tag(1) }
+                if c.stabModes.contains(2) { Text(L("標準", "Standard")).tag(2) }
+                if c.stabModes.contains(3) { Text(L("シネマティック", "Cinematic")).tag(3) }
+            }
+            .pickerStyle(.menu)
+            Text(Self.stabNote(c.stabModes.contains(stab) ? stab : 0)).font(.footnote)
+        }
+    }
+
+    private static func stabNote(_ v: Int) -> String {
+        switch v {
+        case 1: return L("映像の遅れを増やさずに揺れを抑えます。写る範囲は少し狭くなります。", "Reduces shake without adding delay. The picture is slightly narrower.")
+        case 2: return L("揺れを抑えます。写る範囲が少し狭くなり、映像が少し遅れることがあります。", "Reduces shake. The picture is slightly narrower and may be slightly delayed.")
+        case 3: return L("揺れを強く抑えます。写る範囲が狭くなり、映像の遅れがはっきり増えます。", "Strongly reduces shake. The picture is narrower and the delay clearly increases.")
+        default: return L("揺れを抑えません。映像の遅れがいちばん少なくなります。", "No stabilization. The delay is the shortest.")
+        }
+    }
+
+    // ---- 背景ぼかしとエフェクト ----
+
+    private func effectsSection(_ c: CameraCaps) -> some View {
+        Section(L("背景ぼかしとエフェクト", "Background blur and effects")) {
+            Text(L("iPhone のレンズの F 値は変えられないため、背景のぼかしは iPhone の処理で作ります。",
+                   "The aperture of the iPhone lens cannot be changed, so the background blur is made by processing on the iPhone.")).font(.footnote)
+            if c.cinematic {
+                Toggle(L("背景をぼかす", "Blur the background"), isOn: rebuild($cinematic))
+                if cinematic {
+                    if c.apertureMax > c.apertureMin {
+                        HStack {
+                            Text(L("ぼかしの強さ", "Blur strength"))
+                            Spacer()
+                            Text(String(format: "f/%.1f", apertureValue(c))).monospacedDigit().foregroundColor(.secondary)
+                        }
+                        Slider(value: apertureBinding(c), in: Double(c.apertureMin)...Double(c.apertureMax), step: 0.1)
+                    }
+                    Text(L("F 値を小さくすると、背景が強くぼけます。iPhone のシネマティックモードと同じ処理です。30 fps までになり、映像が少し遅れることがあります。ピントは自動です。",
+                           "A smaller f-number blurs the background more. This is the same processing as Cinematic mode on the iPhone. The video is limited to 30 fps and may be slightly delayed. Focus is automatic.")).font(.footnote)
+                    if model.connected && !model.cinematicActive {
+                        Text(L("今の設定では使えません。解像度かフレームレートを変えてください。", "Not available with the current settings. Change the resolution or frame rate.")).font(.footnote)
+                    }
+                }
+            }
+            if c.portrait || c.studio {
+                if c.portrait { stateRow(L("ポートレート", "Portrait"), on: model.portraitOn, active: model.portraitActive) }
+                if c.studio { stateRow(L("スタジオ照明", "Studio Light"), on: model.studioOn, active: false) }
+                Button(L("ビデオエフェクトを開く", "Open Video Effects")) { AVCaptureDevice.showSystemUserInterface(.videoEffects) }
+                Text(L("ポートレートとスタジオ照明は、コントロールセンターのビデオエフェクトで入れます。入れると 30 fps までになることがあります。",
+                       "Turn on Portrait and Studio Light in Video Effects in Control Center. They may limit the video to 30 fps.")).font(.footnote)
+            }
+            if c.centerStage {
+                Toggle(L("センターフレーム", "Center Stage"), isOn: Binding(get: { model.centerStageOn }, set: { model.setCenterStage($0) }))
+                Text(L("人が動いても画面の中に収まるように、写す範囲を自動で動かします。", "Automatically moves the framing to keep people in the picture.")).font(.footnote)
+            }
+            if !c.cinematic && !c.portrait && !c.centerStage {
+                Text(L("このカメラでは背景ぼかしを使えません。", "Background blur is not available with this camera.")).font(.footnote)
+            }
+        }
+    }
+
+    private func stateRow(_ name: String, on: Bool, active: Bool) -> some View {
+        HStack {
+            Text(name)
+            Spacer()
+            Text(on ? (active ? L("使用中", "In use") : L("オン", "On")) : L("オフ", "Off")).foregroundColor(.secondary)
+        }
+    }
+
+    // ---- 熱の対策 ----
+
+    private var heatSection: some View {
+        Section(L("熱の対策", "Heat")) {
+            Toggle(L("iPhone が熱いときはフレームレートを下げる", "Lower the frame rate when the iPhone is hot"),
+                   isOn: Binding(get: { thermalFps }, set: { v in thermalFps = v; model.thermalSettingChanged() }))
+            Text(L("温度が高いときは 60 fps を 30 fps に、30 fps を 24 fps にします。危険のときは 15 fps にします。温度が下がると元に戻ります。",
+                   "When hot, 60 fps becomes 30 fps and 30 fps becomes 24 fps. When critical, 15 fps. It returns when the iPhone cools down.")).font(.footnote)
+        }
+    }
+
+    // ---- 値のつなぎ ----
+
+    // 今のカメラにすぐ効く操作（作り直さない）
+    private func live<T>(_ b: Binding<T>) -> Binding<T> {
+        Binding(get: { b.wrappedValue }, set: { v in b.wrappedValue = v; model.controlsChanged() })
+    }
+    // 作り直すかもしれない操作。0.3 秒まとめてから、要るときだけ作り直す
+    private func rebuild<T>(_ b: Binding<T>) -> Binding<T> {
+        Binding(get: { b.wrappedValue }, set: { v in b.wrappedValue = v; model.settingsChanged() })
+    }
+    // 選べない値が入っていたら（カメラを替えたときなど）、初めの値として見せる
+    private func pick(_ b: Binding<Int>, _ allowed: [Int], remake: Bool = false) -> Binding<Int> {
+        Binding(get: { allowed.contains(b.wrappedValue) ? b.wrappedValue : (allowed.first ?? 0) },
+                set: { v in
+                    b.wrappedValue = v
+                    if remake { model.settingsChanged() } else { model.controlsChanged() }
+                })
+    }
+    // ズームのスライダーは倍率の対数（1 倍から 2 倍と、5 倍から 10 倍が同じ長さ）
+    private func zoomSlider(_ c: CameraCaps) -> Binding<Double> {
+        let lo = Double(c.zoomMin), hi = Double(max(c.zoomMax, c.zoomMin + 0.01))
+        return Binding(get: { min(max(log(max(zoom, lo) / lo) / log(hi / lo), 0), 1) },
+                       set: { t in
+                           zoom = (lo * pow(hi / lo, t) * 100).rounded() / 100
+                           model.controlsChanged()
+                       })
+    }
+    // ISO のスライダーも対数
+    private func isoSlider(_ c: CameraCaps) -> Binding<Double> {
+        let lo = Double(max(c.isoMin, 1)), hi = Double(max(c.isoMax, c.isoMin + 1))
+        return Binding(get: {
+                           let v = iso > 0 ? iso : (lo * hi).squareRoot()
+                           return min(max(log(v / lo) / log(hi / lo), 0), 1)
+                       },
+                       set: { t in
+                           iso = (lo * pow(hi / lo, t)).rounded()
+                           model.controlsChanged()
+                       })
+    }
+    private func shutterBinding(_ c: CameraCaps) -> Binding<Int> {
+        let fallback = c.shutters.first(where: { $0 >= max(fps, 30) * 2 }) ?? c.shutters.first ?? 0
+        return Binding(get: { c.shutters.contains(shutter) ? shutter : fallback },
+                       set: { v in shutter = v; model.controlsChanged() })
+    }
+    private var torchStep: Binding<Int> {
+        Binding(get: { min(max(Int((torchLevel * 4).rounded()), 1), 4) * 25 },
+                set: { v in torchLevel = Double(v) / 100; model.controlsChanged() })
+    }
+    private func apertureValue(_ c: CameraCaps) -> Double {
+        aperture > 0 ? min(max(aperture, Double(c.apertureMin)), Double(c.apertureMax)) : Double(c.apertureDefault)
+    }
+    private func apertureBinding(_ c: CameraCaps) -> Binding<Double> {
+        Binding(get: { apertureValue(c) }, set: { v in aperture = (v * 10).rounded() / 10; model.controlsChanged() })
+    }
+}
+
+// 画面のライト：画面を白くして明るさを最大にし、前から顔を照らす。タップか、アプリが前からいなくなると元の明るさに戻す。
+// 出している間は、自動で画面を暗くする働き（ScreenDimmer）を止める
+struct ScreenLightView: View {
+    let warm: Bool
+    @Environment(\.dismiss) private var dismiss
+    @State private var saved: CGFloat?
+
+    var body: some View {
+        ZStack {
+            (warm ? Color(red: 1.0, green: 0.87, blue: 0.70) : Color.white).ignoresSafeArea()
+            Text(L("タップすると元の明るさに戻ります。", "Tap to restore the brightness.")).font(.footnote).foregroundColor(Color(white: 0.6))
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { dismiss() }
+        .statusBar(hidden: true)
+        .onAppear {
+            ScreenDimmer.shared.setHold(true)
+            if let s = ScreenDimmer.currentScreen() {
+                saved = s.brightness
+                s.brightness = 1
+            }
+        }
+        .onDisappear {
+            if let s = ScreenDimmer.currentScreen(), let b = saved { s.brightness = b }
+            ScreenDimmer.shared.setHold(false)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in dismiss() }
     }
 }

@@ -30,13 +30,17 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: PocketGPU
-        CFBundleShortVersionString: "0.7.60"
-        CFBundleVersion: "68"
+        CFBundleShortVersionString: "0.7.61"
+        CFBundleVersion: "69"
         UILaunchScreen: {}
         NSLocalNetworkUsageDescription: PC からの計算の依頼を受け取るために使います
         NSSpeechRecognitionUsageDescription: PC から送られた音声を文字にするために使います
         NSMicrophoneUsageDescription: PC の通話や録音で、この iPhone のマイクの音を使うために使用します
         NSCameraUsageDescription: この iPhone のカメラを PC のウェブカメラとして使うために使用します
+        # コントロールセンターのビデオエフェクトのポートレートとスタジオ照明を、このアプリのカメラでも使えるようにする。
+        # iOS は VoIP のアプリ（UIBackgroundModes に voip）にだけ初めから効かせる。それ以外のアプリはこの鍵で入れる（AVCaptureDevice.h の説明）
+        NSCameraPortraitEffectEnabled: true
+        NSCameraStudioLightEnabled: true
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UIRequiredDeviceCapabilities: [metal]
@@ -87,7 +91,7 @@ targets:
       - sdk: CoreMedia.framework
       - sdk: CoreVideo.framework
   # 古い iPhone（iOS 15・16。iPhone 8 など）用の軽いアプリ。iPhone を PC のウェブカメラとマイクとしてだけ使う。
-  # 入れるのは CameraBridge.swift・AudioBridge.swift・Lang.swift と Sources/Lite だけ。GPU の機能・llama.cpp・MoltenVK・AI のパッケージは入れない。
+  # 入れるのは CameraBridge.swift・AudioBridge.swift・Lang.swift・ScreenDimmer.swift（画面を暗くする・温度の色）と Sources/Lite だけ。GPU の機能・llama.cpp・MoltenVK・AI のパッケージは入れない。
   # PC 側は本体と同じ（USB の 50064 番と 50063 番）。組み方は ci/build_lite.sh（Codemagic の ios-lite）
   PocketCam:
     type: application
@@ -95,7 +99,7 @@ targets:
     deploymentTarget: "15.0"
     sources:
       - path: Sources
-        includes: ["CameraBridge.swift", "AudioBridge.swift", "Lang.swift"]
+        includes: ["CameraBridge.swift", "AudioBridge.swift", "Lang.swift", "ScreenDimmer.swift"]
       # C の関数の代わり・画面・権限の文の日英（ja.lproj・en.lproj の InfoPlist.strings）
       - path: Sources/Lite
     info:
@@ -106,6 +110,9 @@ targets:
         CFBundleVersion: "2"
         UILaunchScreen: {}
         NSCameraUsageDescription: この iPhone のカメラを PC のウェブカメラとして使うために使用します
+        # 本体と同じ：ビデオエフェクトのポートレートとスタジオ照明をこのアプリでも使えるようにする
+        NSCameraPortraitEffectEnabled: true
+        NSCameraStudioLightEnabled: true
         NSMicrophoneUsageDescription: PC の通話や録音で、この iPhone のマイクの音を使うために使用します
         NSLocalNetworkUsageDescription: Wi-Fi で PC からウェブカメラに接続できるようにするために使用します
         # 接続中は、画面を消してもほかのアプリに切り替えても、マイクとスピーカーを続ける（カメラは iOS が止める）

@@ -37,24 +37,11 @@ final class LiteDeviceStatus: ObservableObject {
         if md != micDenied { micDenied = md }
     }
 
-    var thermalText: String {
-        switch thermal {
-        case .nominal: return L("正常", "Normal")
-        case .fair: return L("やや高い", "Warm")
-        case .serious: return L("高い", "Hot")
-        case .critical: return L("非常に高い", "Very hot")
-        @unknown default: return "?"
-        }
-    }
+    // 温度の文と色は、カメラタブと暗くした画面と同じ（ScreenDimmer.swift の ThermalSignal）。
+    // 信号の 3 色：正常は緑・やや高いは黄・高いと危険は赤。危険は文字で分かるようにする
+    var thermalText: String { ThermalSignal.text(thermal) }
 
-    var thermalColor: Color {
-        switch thermal {
-        case .nominal: return .green
-        case .fair: return .yellow
-        case .serious: return .orange
-        default: return .red
-        }
-    }
+    var thermalColor: Color { ThermalSignal.color(thermal) }
 
     var batteryText: String {
         let level = battery < 0 ? "?" : "\(Int((battery * 100).rounded()))%"
