@@ -44,6 +44,7 @@ enum MicKey {
     static let input = "audioMicInput"
     static let stereo = "audioMicStereo"
     static let orientation = "audioMicOrientation"
+    static let gainDb = "audioMicGainDb"   // マイクの音量（dB）。送る前に掛ける。0 で今までと同じ
     // 前の版の「イヤホンのマイクを使う」（Bluetooth のマイクにする）。入力をまだ選んでいなければ、これがオンなら「Bluetooth」と同じ。
     // 書き換えて移すことはしない（Lite の PocketCamApp はこのスイッチのまま使っている）
     static let oldHeadset = "audioHeadsetMic"
@@ -326,6 +327,26 @@ private final class Scratch {
 // ---- マイクの側の輪（音の実時間の糸が書き、送りの糸が読む）----
 // Float（-1〜1）のまま、ch の交互で持つ。送るときに PC の頼んだ形（s16・s24・float）にする
 
+// マイクの音量と、画面に出す入力レベル。音の実時間の糸（MicRing.write）と画面の両方から触るので、鍵で守る
+final class MicGain {
+    static let shared = MicGain()
+    private let lock = UnfairLock()
+    private var factor: Float
+    private var peak: Float = 0
+    init() {
+        let db = UserDefaults.standard.double(forKey: MicKey.gainDb)
+        factor = Float(pow(10.0, db / 20.0))
+    }
+    func set(db: Double) {
+        let f = Float(pow(10.0, db / 20.0))
+        lock.lock(); factor = f; lock.unlock()
+    }
+    var current: Float { lock.lock(); defer { lock.unlock() }; return factor }
+    func note(_ p: Float) { lock.lock(); if p > peak { peak = p }; lock.unlock() }
+    // 前に読んでからの一番大きい値（音量を掛けた後）を返して 0 に戻す
+    func takePeak() -> Float { lock.lock(); defer { lock.unlock() }; let p = peak; peak = 0; return p }
+}
+
 final class MicRing {
     let channels: Int
     private let cap: Int
@@ -345,14 +366,24 @@ final class MicRing {
     func write(_ list: UnsafeMutableAudioBufferListPointer, frames: Int) {
         guard list.count > 0, let p0 = list[0].mData?.assumingMemoryBound(to: Float.self) else { return }
         let p1 = list.count > 1 ? list[1].mData?.assumingMemoryBound(to: Float.self) : nil
+        let g = MicGain.shared.current
+        var top: Float = 0
         lock.lock(); defer { lock.unlock() }
         let ch = channels
         for i in 0..<frames {
             let at = Int(wr % UInt64(cap)) * ch
-            buf[at] = p0[i]
-            if ch == 2 { buf[at + 1] = p1?[i] ?? p0[i] }
+            // 音量を掛けて、-1〜1 に収める（16・24 ビットで送るときに桁あふれしないように）
+            let l = max(-1, min(1, p0[i] * g))
+            buf[at] = l
+            top = max(top, abs(l))
+            if ch == 2 {
+                let r = max(-1, min(1, (p1?[i] ?? p0[i]) * g))
+                buf[at + 1] = r
+                top = max(top, abs(r))
+            }
             wr += 1
         }
+        MicGain.shared.note(top)
         let over = Int(wr - rd) - cap
         if over > 0 { rd += UInt64(over) }
     }
@@ -1185,6 +1216,7 @@ struct MicSettingsView: View {
     @AppStorage(MicKey.mode) private var mode = MicMode.standard.rawValue
     @AppStorage(MicKey.stereo) private var stereo = false
     @AppStorage(MicKey.orientation) private var orientation = MicOrientation.portrait.rawValue
+    @AppStorage(MicKey.gainDb) private var gainDb = 0.0
 
     var body: some View {
         Picker(L("入力", "Input"), selection: inputBinding) {
@@ -1197,6 +1229,19 @@ struct MicSettingsView: View {
         }
         .pickerStyle(.menu)
         Text((MicMode(rawValue: mode) ?? .standard).note).font(.footnote)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(L("マイクの音量", "Mic volume"))
+                Spacer()
+                Text(gainDb == 0 ? "0 dB" : String(format: "%+.0f dB", gainDb)).font(.body.monospacedDigit()).foregroundStyle(.secondary)
+            }
+            Slider(value: Binding(get: { gainDb }, set: { v in
+                gainDb = v
+                MicGain.shared.set(db: v)
+            }), in: -20...30, step: 1)
+        }
+        MicLevelRow()
+        Text(L("話しながら、入力レベルが -20〜-6 dBFS くらいになるように合わせてください。0 dBFS に近いと音が割れます。", "While talking, set the input level to about -20 to -6 dBFS. Near 0 dBFS the sound clips.")).font(.footnote)
         if !model.pcMicNote.isEmpty {
             Text(model.pcMicNote).font(.footnote)
         }
@@ -1232,5 +1277,21 @@ struct MicSettingsView: View {
             b.wrappedValue = v
             model.settingsChanged()
         })
+    }
+}
+
+// 入力レベル。0.25 秒ごとに、その間の一番大きい値（音量を掛けた後）を dBFS で出す。マイクが止まっている間は「無音」
+struct MicLevelRow: View {
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.25)) { _ in
+            let p = MicGain.shared.takePeak()
+            HStack {
+                Text(L("入力レベル", "Input level"))
+                Spacer()
+                Text(p <= 0.00001 ? L("無音", "Silent") : String(format: "%.0f dBFS", 20 * log10(Double(p))))
+                    .font(.body.monospacedDigit())
+                    .foregroundStyle(p >= 0.89 ? Color.red : Color.secondary)
+            }
+        }
     }
 }
