@@ -15,12 +15,17 @@
 # 古い iPhone（iOS 15・16）用の PocketCam-*.ipa も、RpcServer の IPA と同じ印を足して入れる（カメラとマイクだけのアプリ。PC 側は Start-Mic-Camera.cmd）
 # 新しく足した物（extras\ の道具・PocketGPU.exe・PocketCam の IPA）は、キットのフォルダを作る前に揃っているか見る
 # （途中で止まると同じ人のフォルダが残って、作り直せなくなるため）。入れないときは --no-media・--no-app
+# 更新（10/12）：tools\update.ini に、更新を聞く先（url=）と、その人の更新用の合言葉（token=）を書く。合言葉は乱数で、
+# 最後に UPDATE_TOKEN= の行で出す（kit_pool.py が KV の upd:<合言葉> に印と一緒に置く）。kit.ini は全員同じ中身なので、
+# 更新でそのまま差し替えられるよう、人ごとの物は update.ini に分けた。入口は Update-PocketGPU.cmd（中身は tools\update.ps1）
+#   --template フォルダ   印を入れない「ひな形」を作る（publish_update.py が使う）。IPA・update.ini・zip・台帳は作らない。
+#                         dll は印の場所（PGKIT-MARK:###…）を残したまま。更新は、このひな形との違いで配る
 import argparse, csv, datetime, hashlib, os, re, secrets, shutil, zipfile
 
 KITBUILD = os.environ.get('PGKIT_KITBUILD', r'D:\iphone-rpc\kitbuild')        # vk/build_win.sh D:/iphone-rpc/kitbuild icd icd32 tools で組んだ物
 DXVK = r'D:\iphone-rpc\dl\dxvk-macos-1103\x\dxvk-macOS-async-v1.10.3-20230507'
 DXVK_LICENSE = r'D:\iphone-rpc\vkbuild\dxvk3\LICENSE'
-IPA_DIR = r'D:\iphone-rpc\ipa\serve'
+IPA_DIR = os.environ.get('PGKIT_IPA_DIR', r'D:\iphone-rpc\ipa\serve')
 OUT = os.environ.get('PGKIT_OUT', r'D:\iphone-rpc\tester_kit')
 ANDROID_DIR = r'D:\iphone-rpc\androidbuild'   # app\vk\build_android.sh で組んだ受け手（server_aarch64 と server_x86_64）
 PLACE = b'PGKIT-MARK:' + b'#' * 32
@@ -30,6 +35,8 @@ PROTO_H = os.environ.get('PGKIT_PROTO_H', os.path.join(os.path.dirname(os.path.a
 MEDIA = ('webcam_rx.exe', 'ipaudio.exe', 'livecap.exe', 'camera_setup.exe', 'dshow_cam64.dll', 'dshow_cam32.dll')
 # PC アプリ。work/pcapp2 の build.cmd で組んだ out\PocketGPU.exe を KITBUILD の一番上に置く → キットの一番上
 APP_EXE = 'PocketGPU.exe'
+# 更新を聞く先（Cloudflare の kit-worker）。試すときは PGKIT_UPDATE_URL で PC の中の wrangler dev に向ける
+UPDATE_URL = os.environ.get('PGKIT_UPDATE_URL', 'https://pocketgpu-kit.YOUR-SUBDOMAIN.workers.dev')
 
 # 窓から使う人と、Steam の起動オプション（"...\pocketgpu.cmd" %command%）用。引数が無ければ Run-on-iPhone-GPU.cmd に回す
 LAUNCH = r'''@echo off
@@ -98,6 +105,13 @@ Steps
    RpcServer-*.ipa needs iOS 17 or later. On an older iPhone with iOS 15 or 16, install PocketCam-*.ipa instead. It has only the webcam and the microphone.
 7. PocketGPU.exe in this folder does all of this in one window: checking, running games, the camera, the microphone, and captions.
 
+Updates
+- PC: double-click Update-PocketGPU.cmd. It checks for a new version and downloads only the files that changed.
+  PocketGPU.exe can do the same from Settings > Updates.
+  The old files are kept in the update-backup folder. If an update fails, the old files are put back.
+- iPhone app: in AltStore, open Sources, tap +, and add your own source URL. Type /kit in #get-kit on Discord to see it.
+  When a new version is out, AltStore shows Update. Update-PocketGPU.cmd also saves the new RpcServer-*.ipa in this folder.
+
 Good to know
 - Only programs started this way see the iPhone GPU. Nothing is written to the registry.
 - Start-Mic-Camera.cmd and PocketGPU.exe write to the registry only when you add the camera, and only for your Windows user.
@@ -153,6 +167,13 @@ iPhone ではなく Android のスマートフォンを使う場合は、以下�
    マイクとして使うには VB-CABLE が必要です。このキットには含まれていません。インストールの方法は FAQ.txt に書いてあります。
    RpcServer-*.ipa には iOS 17 以降が必要です。iOS 15 または 16 の古い iPhone には、代わりに PocketCam-*.ipa をインストールしてください。ウェブカメラとマイクの機能だけがあります
 7. このフォルダの PocketGPU.exe を開くと、チェック・ゲームの起動・カメラ・マイク・字幕を 1 つのウィンドウで操作できます
+
+更新
+- PC：Update-PocketGPU.cmd をダブルクリックしてください。新しいバージョンがあるかをチェックして、変更されたファイルだけをダウンロードします。
+  PocketGPU.exe の「設定」の「アップデート」からも同じ操作ができます。
+  古いファイルは update-backup フォルダに残します。更新に失敗したときは、元のファイルに戻します
+- iPhone のアプリ：AltStore の「Sources」で「+」をタップして、あなた専用のソースの URL を追加してください。URL は、Discord の #get-kit で /kit と入力すると表示されます。
+  新しいバージョンが出ると、AltStore に「Update」が表示されます。Update-PocketGPU.cmd も、新しい RpcServer-*.ipa をこのフォルダに保存します
 
 知っておくこと
 - この方法で起動したアプリだけが、iPhone の GPU を認識できます。レジストリには何も書き込みません
@@ -535,11 +556,12 @@ def sha256(path):
 
 
 def stamp(src, dst, mark):
+    # mark が None のときは印を入れない（ひな形。印の場所はそのまま残す）
     data = open(src, 'rb').read()
     if data.count(PLACE) != 1:
         raise SystemExit(f'{src} の印の場所が 1 つではない（{data.count(PLACE)} 個）。kitbuild を組み直す')
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    open(dst, 'wb').write(data.replace(PLACE, b'PGKIT-MARK:' + mark))
+    open(dst, 'wb').write(data if mark is None else data.replace(PLACE, b'PGKIT-MARK:' + mark))
 
 
 def proto_version():
@@ -590,7 +612,7 @@ def missing_inputs(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('who', help='渡す人の名前（Reddit の名前など・英数字）')
+    ap.add_argument('who', nargs='?', default='', help='渡す人の名前（Reddit の名前など・英数字）。--template のときは要らない')
     ap.add_argument('--discord-id', default='', help='Discord の bot から作るときの、その人の番号。同じ番号には 2 つめを作らない')
     ap.add_argument('--android-dir', default=ANDROID_DIR, help='Android の受け手（server_aarch64）がある所')
     ap.add_argument('--with-x86_64', action='store_true', help='エミュレーター用の server_x86_64 も入れる（試験用・配るキットには入れない）')
@@ -599,19 +621,34 @@ def main():
     ap.add_argument('--no-media', action='store_true', help='カメラ・マイク・字幕の物（extras\\・Start-Mic-Camera.cmd・PocketCam の IPA）を入れない')
     ap.add_argument('--no-app', action='store_true', help='PC アプリ（PocketGPU.exe）を入れない')
     ap.add_argument('--extras', action='store_true', help='前の呼び方。今は extras\\ の道具は既定で入るので、付けても何も変わらない')
+    ap.add_argument('--template', metavar='DIR', help='印を入れないひな形をこのフォルダに作る（publish_update.py 用）。IPA・update.ini・zip・台帳は作らない')
+    ap.add_argument('--update-token', default='', help='tools\\update.ini に書く更新用の合言葉。無ければ乱数で作る')
     a = ap.parse_args()
     ledger = os.path.join(OUT, 'ledger.csv')
-    if a.discord_id and os.path.exists(ledger):
-        with open(ledger, encoding='utf-8') as f:
-            if any(row and row[-1] == a.discord_id for row in csv.reader(f)):
-                print('ALREADY')
-                raise SystemExit(3)
-    who = re.sub(r'[^A-Za-z0-9_-]', '_', a.who)[:15]
-    mark = (who.ljust(15, '_') + '-' + secrets.token_hex(8)).encode()
-    assert len(mark) == 32
-    kit = os.path.join(OUT, f'PocketGPU-{who}' + (f'-{a.discord_id[-6:]}' if a.discord_id else ''))
-    if os.path.exists(kit):
-        raise SystemExit(f'{kit} はもうある。同じ人に作り直すなら、先にそのフォルダと zip を片づける')
+    if a.template:
+        # ひな形：印は入れず、IPA と人ごとの物は入れない。中身のフォルダを残す
+        a.no_ipa = True
+        mark = None
+        kit = os.path.abspath(a.template)
+        if os.path.exists(kit) and os.listdir(kit):
+            raise SystemExit(f'{kit} が空ではない。ひな形は空のフォルダに作る')
+    else:
+        if not a.who:
+            raise SystemExit('渡す人の名前が要る。ひな形を作るなら --template フォルダ')
+        if a.discord_id and os.path.exists(ledger):
+            with open(ledger, encoding='utf-8') as f:
+                if any(row and row[-1] == a.discord_id for row in csv.reader(f)):
+                    print('ALREADY')
+                    raise SystemExit(3)
+        who = re.sub(r'[^A-Za-z0-9_-]', '_', a.who)[:15]
+        mark = (who.ljust(15, '_') + '-' + secrets.token_hex(8)).encode()
+        assert len(mark) == 32
+        kit = os.path.join(OUT, f'PocketGPU-{who}' + (f'-{a.discord_id[-6:]}' if a.discord_id else ''))
+        if os.path.exists(kit):
+            raise SystemExit(f'{kit} はもうある。同じ人に作り直すなら、先にそのフォルダと zip を片づける')
+    update_token = a.update_token or secrets.token_urlsafe(24)
+    if not re.fullmatch(r'[A-Za-z0-9_-]{16,64}', update_token):
+        raise SystemExit('--update-token は英数字と - _ の 16〜64 文字')
     miss = missing_inputs(a)
     if miss:
         raise SystemExit('次の物が無い。extras\\ の道具は work/camset/out と work/livecap で、PocketGPU.exe は work/pcapp2 の build.cmd で組んだ物を '
@@ -630,11 +667,16 @@ def main():
     for name, text in (('pocketgpu.cmd', LAUNCH), ('report.cmd', REPORT)):
         open(os.path.join(kit, name), 'w', encoding='ascii', newline='\r\n').write(text)
     # 入口 2 つと、その中身（PowerShell）。前の check.cmd は Start-PocketGPU.cmd の 7 番目が代わる
-    for name in ('Start-PocketGPU.cmd', 'Run-on-iPhone-GPU.cmd'):
+    # Update-PocketGPU.cmd と tools\update.ps1 は更新の入口（10/12）
+    for name in ('Start-PocketGPU.cmd', 'Run-on-iPhone-GPU.cmd', 'Update-PocketGPU.cmd'):
         shutil.copy2(os.path.join(HERE, 'kit', name), os.path.join(kit, name))
     os.makedirs(os.path.join(kit, 'tools'), exist_ok=True)
-    for name in ('pgpu_common.ps1', 'start.ps1', 'run.ps1'):
+    for name in ('pgpu_common.ps1', 'start.ps1', 'run.ps1', 'update.ps1'):
         shutil.copy2(os.path.join(HERE, 'kit', 'tools', name), os.path.join(kit, 'tools', name))
+    # 更新を聞く先と、その人の合言葉。人ごとの物なので更新では差し替えない。ひな形には入れない
+    if not a.template:
+        open(os.path.join(kit, 'tools', 'update.ini'), 'w', encoding='ascii', newline='\r\n').write(
+            f'url={UPDATE_URL}\ntoken={update_token}\n')
     try:
         app_ver = re.match(r'RpcServer-(.+)\.ipa$', os.path.basename(newest_ipa())).group(1)
     except (OSError, ValueError):
@@ -687,6 +729,10 @@ def main():
             cam_ipa = newest_ipa('PocketCam')
             mark_ipa(cam_ipa, os.path.join(kit, os.path.basename(cam_ipa)), mark)
 
+    if a.template:
+        print(f'TEMPLATE={kit}')
+        return
+
     zpath = kit + '.zip'
     with zipfile.ZipFile(zpath, 'w', zipfile.ZIP_DEFLATED) as z:
         for root, _, files in os.walk(kit):
@@ -705,6 +751,7 @@ def main():
     shutil.rmtree(kit)  # 配るのは zip。中身のフォルダは残さない
     print(f'ZIP={zpath}')
     print(f'MARK={mark.decode()}')
+    print(f'UPDATE_TOKEN={update_token}')
     if android_sha:
         print(f'ANDROID_SERVER_SHA256={android_sha}')
     if cam_ipa:
