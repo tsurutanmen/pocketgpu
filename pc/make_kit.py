@@ -50,6 +50,7 @@ set "VK_ADD_DRIVER_FILES=%~dp0iphone_icd.json;%~dp0x86\iphone_icd.json"
 if "%IPHONE_VK%"=="" set IPHONE_VK=usb
 if "%IPHONE_VK_ONLY%"=="" set IPHONE_VK_ONLY=1
 if "%IPHONE_VK_ONLY%"=="1" set "VK_LOADER_DRIVERS_SELECT=*iphone_icd*"
+if "%IPHONE_VK_ONLY%"=="1" set "VK_ICD_FILENAMES=%VK_ADD_DRIVER_FILES%"
 set DISABLE_TWITCH_VULKAN_OVERLAY=1
 set DISABLE_VULKAN_OBS_CAPTURE=1
 set DISABLE_VULKAN_OW_OBS_CAPTURE=1
@@ -401,6 +402,7 @@ if "%PGPU_PORT%"=="" set PGPU_PORT=50300
 set IPHONE_VK=127.0.0.1:%PGPU_PORT%
 if "%IPHONE_VK_ONLY%"=="" set IPHONE_VK_ONLY=1
 if "%IPHONE_VK_ONLY%"=="1" set "VK_LOADER_DRIVERS_SELECT=*iphone_icd*"
+if "%IPHONE_VK_ONLY%"=="1" set "VK_ICD_FILENAMES=%VK_ADD_DRIVER_FILES%"
 set DISABLE_TWITCH_VULKAN_OVERLAY=1
 set DISABLE_VULKAN_OBS_CAPTURE=1
 set DISABLE_VULKAN_OW_OBS_CAPTURE=1
@@ -413,6 +415,7 @@ setlocal
 set "VK_ADD_DRIVER_FILES=%~dp0iphone_icd.json;%~dp0x86\iphone_icd.json"
 if "%PGPU_PORT%"=="" set PGPU_PORT=50300
 set IPHONE_VK=127.0.0.1:%PGPU_PORT%
+set "VK_ICD_FILENAMES=%VK_ADD_DRIVER_FILES%"
 "%~dp0vklist.exe"
 echo.
 echo If you see a GPU named PocketGPU phone in the list above, it works.

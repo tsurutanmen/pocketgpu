@@ -353,6 +353,8 @@ function Get-PgpuEnv {
     $e['IPHONE_VK'] = $(if ($env:IPHONE_VK) { $env:IPHONE_VK } else { 'usb' })
     $only = $(if ($env:IPHONE_VK_ONLY) { $env:IPHONE_VK_ONLY } else { '1' })
     if ($only -eq '1') { $e['VK_LOADER_DRIVERS_SELECT'] = '*iphone_icd*' }
+    # VK_ADD_DRIVER_FILES と VK_LOADER_DRIVERS_SELECT は Vulkan ローダー 1.3.234 から。古いローダー（10/13 にテスターの 1.3.204）でも効くように、iPhone だけを見せるときは VK_ICD_FILENAMES も付ける
+    if ($only -eq '1') { $e['VK_ICD_FILENAMES'] = $e['VK_ADD_DRIVER_FILES'] }
     $e['DISABLE_TWITCH_VULKAN_OVERLAY'] = '1'
     $e['DISABLE_VULKAN_OBS_CAPTURE'] = '1'
     $e['DISABLE_VULKAN_OW_OBS_CAPTURE'] = '1'
@@ -381,6 +383,8 @@ function Invoke-VkList {
     if (-not $p.WaitForExit(30000)) { try { $p.Kill() } catch { }; return @{ Ok = $false; Why = 'timeout' } }
     $out = $o.Result + $er.Result
     $gpus = @($out -split "`r?`n" | Where-Object { $_ -match '^GPU\d+: ' })
+    # PC の GPU（Intel・NVIDIA・AMD・Microsoft・Mesa の CPU）しか見えないときは、iPhone の GPU が見えていない
+    $gpus = @($gpus | Where-Object { $_ -notmatch '\(vendor 0x(8086|10de|1002|1414|10005|10004)' })
     return @{ Ok = ($gpus.Count -gt 0); Gpus = $gpus; Output = $out; Exit = $p.ExitCode }
 }
 
