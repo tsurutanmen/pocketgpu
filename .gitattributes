@@ -6,3 +6,6 @@
 *.yml text eol=lf
 *.py  text eol=lf
 *.cs  text eol=lf
+# The Linux files must keep LF. A CRLF in a shell script or in a fake tool stops it with "bad interpreter".
+*.sh text eol=lf
+linux/tests/fakes/* text eol=lf

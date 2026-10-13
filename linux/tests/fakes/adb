@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# 試験用の偽の adb。本物のスマホは使わない。状態は $FAKE_DIR/adb/ の中のファイル：
+#   devices      端末の一覧。1 行に「シリアル<TAB>状態」（無ければ、つながっていない）
+#   noperm_fix   あれば、kill-server のあとに「no permissions」が「device」になる（udev を直したあとのふり）
+#   forwards     adb forward の一覧。1 行に「シリアル tcp:ポート 向け先」
+#   listen.ポート  そのポートで待つプロセス（adb_listen.py）の PID
+#   pids         スマホで動いている受け手の PID（空白で区切る）
+#   hash         スマホの受け手の sha256
+#   app          入っている PocketGPU アプリの版（無ければ入っていない。空ならあるが版を出さない）
+#   unix・tcp    スマホの /proc/net/unix と /proc/net/tcp の行（キットの check-android.sh が口を調べる。本物と同じ形で書く）
+# 呼ばれた引数は calls.log に書く。
+set -u
+D=${FAKE_DIR:?}/adb
+mkdir -p "$D"
+HERE=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")
+printf '%s\n' "$*" >> "$D/calls.log"
+serial=
+while [ "${1:-}" = -s ]; do serial=$2; shift 2; done
+[ -z "$serial" ] && serial=${ANDROID_SERIAL:-}
+cmd=${1:-}
+shift || true
+alive() { [ -d "/proc/$1" ] && ! grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2> /dev/null; }
+listening() {
+    local hex
+    hex=$(printf '%04X' "$1")
+    awk -v p="$hex" '$4 == "0A" && toupper(substr($2, length($2) - 3)) == p {f = 1} END {exit !f}' /proc/net/tcp /proc/net/tcp6 2> /dev/null
+}
+stop_listener() {
+    local f="$D/listen.$1" p
+    [ -f "$f" ] || return 0
+    p=$(cat "$f")
+    alive "$p" && kill "$p" 2> /dev/null
+    for _ in $(seq 1 30); do alive "$p" || break; sleep 0.05; done
+    rm -f "$f"
+}
+ready_serial() { awk -F'\t' '$2 == "device" {print $1; exit}' "$D/devices" 2> /dev/null; }
+need_device() {
+    local n
+    n=$(awk -F'\t' '$2 == "device"' "$D/devices" 2> /dev/null | wc -l)
+    if [ -n "$serial" ]; then
+        awk -F'\t' -v s="$serial" '$1 == s && $2 == "device" {f = 1} END {exit !f}' "$D/devices" 2> /dev/null || { echo "adb: device '$serial' not found" >&2; exit 1; }
+    elif [ "$n" -eq 0 ]; then echo "adb: no devices/emulators found" >&2; exit 1
+    elif [ "$n" -gt 1 ]; then echo "adb: more than one device/emulator" >&2; exit 1
+    else serial=$(ready_serial); fi
+}
+case "$cmd" in
+version) echo "Android Debug Bridge version 1.0.41 (fake)" ;;
+start-server) ;;
+kill-server)
+    for f in "$D"/listen.*; do [ -f "$f" ] && stop_listener "${f##*.}"; done
+    : > "$D/forwards"
+    if [ -f "$D/noperm_fix" ] && [ -f "$D/devices" ]; then
+        sed -i 's/\tno permissions.*$/\tdevice/' "$D/devices"
+    fi
+    ;;
+devices)
+    echo "List of devices attached"
+    [ -f "$D/devices" ] && cat "$D/devices"
+    echo
+    ;;
+forward)
+    case "${1:-}" in
+    --list) [ -f "$D/forwards" ] && cat "$D/forwards" ;;
+    --remove)
+        p=${2#tcp:}
+        stop_listener "$p"
+        [ -f "$D/forwards" ] && { grep -v " tcp:$p " "$D/forwards" > "$D/forwards.tmp"; mv "$D/forwards.tmp" "$D/forwards"; }
+        ;;
+    --remove-all)
+        for f in "$D"/listen.*; do [ -f "$f" ] && stop_listener "${f##*.}"; done
+        : > "$D/forwards"
+        ;;
+    tcp:*)
+        need_device
+        p=${1#tcp:}
+        dest=${2:-}
+        if [ ! -f "$D/listen.$p" ]; then
+            if listening "$p"; then echo "adb: error: cannot bind listener: Address already in use" >&2; exit 1; fi
+            setsid python3 "$HERE/adb_listen.py" "$p" < /dev/null > /dev/null 2>&1 &
+            lp=$!
+            echo "$lp" > "$D/listen.$p"
+            for _ in $(seq 1 60); do listening "$p" && break; alive "$lp" || break; sleep 0.05; done
+            listening "$p" || { rm -f "$D/listen.$p"; echo "adb: error: cannot bind listener" >&2; exit 1; }
+        fi
+        [ -f "$D/forwards" ] && { grep -v " tcp:$p " "$D/forwards" > "$D/forwards.tmp"; mv "$D/forwards.tmp" "$D/forwards"; }
+        echo "$serial tcp:$p $dest" >> "$D/forwards"
+        ;;
+    esac
+    ;;
+push)
+    need_device
+    sha256sum -- "$1" | awk '{print $1}' > "$D/hash"
+    echo "$1: 1 file pushed."
+    ;;
+install) need_device; echo "Success" ;;
+shell)
+    need_device
+    s="$*"
+    case "$s" in
+    *kill*) : > "$D/pids" ;;
+    *nohup*) echo "$((RANDOM + 1000))" > "$D/pids" ;;
+    "pidof pgpu_server") [ -s "$D/pids" ] && cat "$D/pids" ;;
+    "sha256sum /data/local/tmp/pgpu_server") [ -s "$D/hash" ] && echo "$(cat "$D/hash")  /data/local/tmp/pgpu_server" ;;
+    "echo ==unix"*)
+        # android_snapshot が読む /proc/net/unix と /proc/net/tcp の写し。unix・tcp のファイルに本物と同じ形の行を書いておく
+        echo "==unix"; [ -f "$D/unix" ] && cat "$D/unix"
+        echo "==tcp"; [ -f "$D/tcp" ] && cat "$D/tcp"
+        ;;
+    "pm path "*) [ -f "$D/app" ] && echo "package:/data/app/com.tsurutanmen.pocketgpu/base.apk" ;;
+    "dumpsys package"*) [ -f "$D/app" ] && [ -s "$D/app" ] && echo "    versionName=$(cat "$D/app")" ;;
+    "getprop ro.product.model") echo "Pixel 9 (fake)" ;;
+    "getprop ro.build.version.release") echo "16" ;;
+    "getprop ro.build.version.sdk") echo "36" ;;
+    "getprop ro.product.cpu.abi") echo "arm64-v8a" ;;
+    "cat /data/local/tmp/pgpu_server.log") echo "fake log" ;;
+    *) ;;
+    esac
+    ;;
+*) echo "adb: unknown command $cmd" >&2; exit 1 ;;
+esac
+exit 0
