@@ -6416,8 +6416,219 @@ int vkr_hotspot_tick(int on, char *out, int cap) {
     return r;
 }
 
+// ---- 待つ口（0.1.4 で足した） ----
+// テスターの 1 台（Redmagic 9S Pro）で、Android のアプリの中の受け手だけが 127.0.0.1:50060 で待てず、すぐ終わっていた（端末の再起動でも同じ）。
+// どの機種でも起動するように：
+//   1. PGPU_FD_SOCK=抽象名：アプリ（Java）が開けた口を、その抽象名の UNIX ソケットから SCM_RIGHTS で受け取る。受け手は bind しない。
+//      受け取れないときは 4 で終わる（アプリは次から 2 と 3 の形で起動し直す）
+//   2. PGPU_PORT_TRY=50061,50062,…：引数の番号で待てなければ、この番号を順に試す
+//   3. PGPU_UNIX=抽象名（Android だけ）：USB 用に抽象名の UNIX ソケットでも待つ。PC は adb forward tcp:50300 localabstract:抽象名。
+//      つないでよいのは adb（uid 2000、エミュレーターなどは 0）と自分の uid だけ（同じ端末のほかのアプリは断る。アプリの Link.java と同じ考え）
+// TCP と UNIX のどちらか 1 つでも待てれば動く。どれも無いときだけ 1 で終わる。キットの受け手（環境変数なし）は今までと同じ
+#ifdef _WIN32
+#define vr_close_sock(s) closesocket(s)
+#else
+#define vr_close_sock(s) close(s)
+#endif
+
+// host:port で待つ口を開ける。だめなら理由を記録に書いて VR_BAD_SOCK
+static vr_sock tcp_listen(const char *host, int port) {
+    char et[160];
+    vr_sock ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls == VR_BAD_SOCK) {
+        sock_err_text(sock_errno(), et, sizeof et);
+        vlog(JE("%s:%d で待てない：%s（socket）", "Cannot listen on %s:%d: %s (socket)"), host, port, et);
+        return VR_BAD_SOCK;
+    }
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, sizeof one);
+    struct sockaddr_in a = { 0 };
+    a.sin_family = AF_INET;
+    a.sin_port = htons((uint16_t) port);
+    if (inet_pton(AF_INET, host, &a.sin_addr) != 1) {
+        vlog(JE("%s:%d で待てない：アドレスが読めない", "Cannot listen on %s:%d: the address cannot be read"), host, port);
+        vr_close_sock(ls);
+        return VR_BAD_SOCK;
+    }
+    if (bind(ls, (struct sockaddr *) &a, sizeof a) != 0 || listen(ls, 4) != 0) {
+        sock_err_text(sock_errno(), et, sizeof et);
+        vlog(JE("%s:%d で待てない：%s", "Cannot listen on %s:%d: %s"), host, port, et);
+        vr_close_sock(ls);
+        return VR_BAD_SOCK;
+    }
+    return ls;
+}
+
+#ifdef __ANDROID__
+#include <sys/un.h>
+static int g_given_tcp = -1, g_given_unix = -1; // アプリから受け取った口（-1 は無し）
+static int g_given_port;                        // 受け取った TCP の口の番号
+static char g_unix_name[100];                   // UNIX の口の抽象名（記録用）
+
+// 抽象名の住所。先頭の 0 が抽象名のしるし。長さは Java の LocalServerSocket と adb の localabstract に合わせる
+static int unix_addr(const char *name, struct sockaddr_un *u, socklen_t *len) {
+    size_t n = strlen(name);
+    if (!n || n + 1 > sizeof u->sun_path) return 0;
+    memset(u, 0, sizeof *u);
+    u->sun_family = AF_UNIX;
+    memcpy(u->sun_path + 1, name, n);
+    *len = (socklen_t) (offsetof(struct sockaddr_un, sun_path) + 1 + n);
+    return 1;
+}
+
+static int unix_listen(const char *name) {
+    struct sockaddr_un u;
+    socklen_t ul;
+    char et[160];
+    if (!unix_addr(name, &u, &ul)) {
+        vlog(JE("USB の口 localabstract:%s で待てない：名前が長すぎる", "Cannot listen on the USB socket localabstract:%s: the name is too long"), name);
+        return -1;
+    }
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0 || bind(s, (struct sockaddr *) &u, ul) != 0 || listen(s, 4) != 0) {
+        sock_err_text(errno, et, sizeof et);
+        vlog(JE("USB の口 localabstract:%s で待てない：%s", "Cannot listen on the USB socket localabstract:%s: %s"), name, et);
+        if (s >= 0) close(s);
+        return -1;
+    }
+    snprintf(g_unix_name, sizeof g_unix_name, "%s", name);
+    return s;
+}
+
+// fd が待っている口（listen 済み）で、種類が dom なら 1
+static int is_listening_fd(int fd, int dom) {
+    int v = 0;
+    socklen_t l = sizeof v;
+    if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &v, &l) != 0 || !v) return 0;
+    v = -1;
+    l = sizeof v;
+    if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &v, &l) != 0) return 0;
+    return v == dom;
+}
+
+// アプリから口を受け取る。アプリは「PGPU-FDS tcp=番号 unix=名前\n」（無い方は tcp=0・unix=-）と、
+// 同じ順の fd（TCP・UNIX）を 1 回の書き込みで送ってくる。受け取ったら「OK\n」を返す。1 つでも受け取れたら 1
+static int recv_given(const char *name) {
+    struct sockaddr_un u;
+    socklen_t ul;
+    char et[160];
+    if (!unix_addr(name, &u, &ul)) return 0;
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0) {
+        sock_err_text(errno, et, sizeof et);
+        vlog(JE("アプリから口を受け取れない：%s（socket）", "Cannot receive the sockets from the app: %s (socket)"), et);
+        return 0;
+    }
+    struct timeval to = { 5, 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof to);
+    if (connect(s, (struct sockaddr *) &u, ul) != 0) {
+        sock_err_text(errno, et, sizeof et);
+        vlog(JE("アプリから口を受け取れない：%s（connect）", "Cannot receive the sockets from the app: %s (connect)"), et);
+        close(s);
+        return 0;
+    }
+    char msg[256];
+    size_t got = 0;
+    int fds[4], nfd = 0;
+    while (got < sizeof msg - 1 && !memchr(msg, '\n', got)) {
+        union { char b[CMSG_SPACE(sizeof(int) * 4)]; struct cmsghdr align; } cb;
+        struct iovec iov = { msg + got, sizeof msg - 1 - got };
+        struct msghdr mh;
+        memset(&mh, 0, sizeof mh);
+        mh.msg_iov = &iov;
+        mh.msg_iovlen = 1;
+        mh.msg_control = cb.b;
+        mh.msg_controllen = sizeof cb.b;
+        ssize_t k = recvmsg(s, &mh, MSG_CMSG_CLOEXEC);
+        if (k < 0 && errno == EINTR) continue;
+        if (k <= 0) break;
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(&mh); c; c = CMSG_NXTHDR(&mh, c)) {
+            if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
+            int n = (int) ((c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+            for (int i = 0; i < n; i++) {
+                int fd;
+                memcpy(&fd, CMSG_DATA(c) + i * sizeof(int), sizeof fd);
+                if (nfd < 4) fds[nfd++] = fd;
+                else close(fd);
+            }
+        }
+        got += (size_t) k;
+    }
+    msg[got] = 0;
+    int tport = 0, at = 0;
+    char uname[100] = "-";
+    const char *p = strstr(msg, "tcp=");
+    if (p) tport = atoi(p + 4);
+    p = strstr(msg, "unix=");
+    if (p) sscanf(p + 5, "%99[^ \r\n]", uname);
+    if (strncmp(msg, "PGPU-FDS ", 9) != 0) {
+        vlog(JE("アプリから口を受け取れない：知らない形（%.40s）", "Cannot receive the sockets from the app: unknown message (%.40s)"), msg);
+        for (int i = 0; i < nfd; i++) close(fds[i]);
+        close(s);
+        return 0;
+    }
+    if (tport > 0 && at < nfd) {
+        int fd = fds[at++];
+        if (is_listening_fd(fd, AF_INET) || is_listening_fd(fd, AF_INET6)) {
+            g_given_tcp = fd;
+            g_given_port = tport;
+        } else {
+            close(fd);
+        }
+    }
+    if (strcmp(uname, "-") && at < nfd) {
+        int fd = fds[at++];
+        if (is_listening_fd(fd, AF_UNIX)) {
+            g_given_unix = fd;
+            snprintf(g_unix_name, sizeof g_unix_name, "%s", uname);
+        } else {
+            close(fd);
+        }
+    }
+    while (at < nfd) close(fds[at++]);
+    int ok = g_given_tcp >= 0 || g_given_unix >= 0;
+    if (ok) {
+        static const char reply[] = "OK\n";
+        send(s, reply, sizeof reply - 1, MSG_NOSIGNAL);
+    } else {
+        vlog(JE("アプリから口を受け取れない：届いた fd が待っている口ではない（%d 個）", "Cannot receive the sockets from the app: the received fds are not listening sockets (%d)"), nfd);
+    }
+    close(s);
+    return ok;
+}
+
+// UNIX の口で待つ。adb（2000・0）と自分の uid だけ相手をする
+static void unix_accept_loop(int ls) {
+    for (;;) {
+        int c = accept4(ls, NULL, NULL, SOCK_CLOEXEC);
+        if (c < 0) {
+            if (errno != EINTR) sleep_ms(100);
+            continue;
+        }
+        struct ucred cr;
+        socklen_t l = sizeof cr;
+        int uid = getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &l) == 0 ? (int) cr.uid : -1;
+        if (uid != 2000 && uid != 0 && uid != (int) getuid()) {
+            vlog(JE("USB の口：adb ではない接続（uid %d）を断った。この端末のほかのアプリが接続しようとした", "USB socket: refused a connection that is not from adb (uid %d). Another app on this phone tried to connect"), uid);
+            close(c);
+            continue;
+        }
+        serve_one(c, 0);
+    }
+}
+
+static void *unix_thread(void *p) {
+    qos_hi();
+    unix_accept_loop((int) (intptr_t) p);
+    return 0;
+}
+#endif
+
 int vkr_serve(const char *host, int port) {
     qos_hi();
+#ifdef __ANDROID__
+    if (g_given_tcp >= 0) port = g_given_port;
+#endif
     g_main_port = port; // 共有の網の口も同じ番号で待つ。Vulkan が起きるとすぐ vkr_hotspot_tick が開けるので、先に決める
     if (!vk_init()) { vlog(JE("Vulkan を起動できない", "Cannot start Vulkan")); return 1; }
     if (g_extra_env) vkr_listen_extra(g_extra_env);
@@ -6425,20 +6636,56 @@ int vkr_serve(const char *host, int port) {
     WSADATA w;
     WSAStartup(MAKEWORD(2, 2), &w);
 #endif
-    vr_sock ls = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
-    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, sizeof one);
-    struct sockaddr_in a = { 0 };
-    a.sin_family = AF_INET;
-    a.sin_port = htons((uint16_t) port);
-    inet_pton(AF_INET, host, &a.sin_addr);
-    if (bind(ls, (struct sockaddr *) &a, sizeof a) != 0 || listen(ls, 4) != 0) {
-        char et[160];
-        sock_err_text(sock_errno(), et, sizeof et);
-        vlog(JE("%s:%d で待てない：%s", "Cannot listen on %s:%d: %s"), host, port, et);
-        return 1;
+    vr_sock ls = VR_BAD_SOCK;
+    int uls = -1, given = 0;
+#ifdef __ANDROID__
+    if (g_given_tcp >= 0 || g_given_unix >= 0) {
+        // アプリが開けた口を使う
+        given = 1;
+        ls = g_given_tcp >= 0 ? g_given_tcp : VR_BAD_SOCK;
+        uls = g_given_unix;
     }
-    vlog(JE("Vulkan の受け手：%s:%d で待っている", "Vulkan receiver: listening on %s:%d"), host, port);
+#endif
+    if (!given) {
+        ls = tcp_listen(host, port);
+        const char *tr = getenv("PGPU_PORT_TRY");
+        for (const char *p = tr; ls == VR_BAD_SOCK && p && *p;) {
+            char *e;
+            long v = strtol(p, &e, 10);
+            if (e == p) { p++; continue; }
+            p = e;
+            if (v <= 0 || v > 65535 || v == port) continue;
+            ls = tcp_listen(host, (int) v);
+            if (ls != VR_BAD_SOCK) {
+                vlog(JE("%d で待てないので、%ld で待つ", "Cannot listen on %d, so using %ld instead"), port, v);
+                port = (int) v;
+                g_main_port = port;
+            }
+        }
+#ifdef __ANDROID__
+        const char *un = getenv("PGPU_UNIX");
+        if (un && *un) uls = unix_listen(un);
+#endif
+    }
+    if (ls == VR_BAD_SOCK && uls < 0) return 1;
+    if (ls != VR_BAD_SOCK)
+        vlog(given ? JE("Vulkan の受け手：%s:%d で待っている（口はアプリが開けた）", "Vulkan receiver: listening on %s:%d (socket opened by the app)")
+                   : JE("Vulkan の受け手：%s:%d で待っている", "Vulkan receiver: listening on %s:%d"),
+             host, port);
+#ifdef __ANDROID__
+    if (uls >= 0) {
+        if (ls == VR_BAD_SOCK) vlog(JE("Vulkan の受け手：USB（localabstract:%s）だけで待っている", "Vulkan receiver: listening on USB only (localabstract:%s)"), g_unix_name);
+        else vlog(JE("Vulkan の受け手：USB（localabstract:%s）でも待っている", "Vulkan receiver: also listening on USB (localabstract:%s)"), g_unix_name);
+        if (ls == VR_BAD_SOCK) {
+            unix_accept_loop(uls); // 戻ってこない
+            return 1;
+        }
+        pthread_t t;
+        if (pthread_create(&t, NULL, unix_thread, (void *) (intptr_t) uls) == 0) pthread_detach(t);
+        else vlog(JE("USB の口の糸を作れない", "Cannot start the USB socket thread"));
+    }
+#endif
     for (;;) {
         vr_sock c = accept(ls, NULL, NULL);
         if (c == VR_BAD_SOCK) continue;
@@ -6574,6 +6821,11 @@ int main(int argc, char **argv) {
 #endif
         vlog(JE("試験用：1 秒ごとに共有の網の口を探す（VKR_HOTSPOT）", "Test: looking for the sharing network port every second (VKR_HOTSPOT)"));
     }
+#ifdef __ANDROID__
+    // アプリが開けた口を受け取る（0.1.4）。Vulkan より先に（アプリは数秒しか待たない）
+    const char *fds = getenv("PGPU_FD_SOCK");
+    if (fds && *fds && !recv_given(fds)) return 4;
+#endif
     return vkr_serve(argc > 1 ? argv[1] : "127.0.0.1", argc > 2 ? atoi(argv[2]) : VR_DEFAULT_PORT);
 }
 #endif
