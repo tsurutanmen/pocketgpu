@@ -6,7 +6,8 @@
 //   hash=…          スマートフォンに置いた pgpu_server の SHA-256
 //   file=1
 //   app=0.1.2       スマートフォンに入っている PocketGPU アプリの版（空なら入っていない）
-//   apprecv=1       アプリの中の GPU の受け手（端末の 50060）が動いている
+//   apprecv=1       アプリの中の GPU の受け手が動いている（TCP は端末の 50060。0.1.4 以上は localabstract:pocketgpu-gpu でも待つ）
+//   appport=50061   アプリの受け手の TCP の番号（既定 50060）。50060 が使えず次の番号で待った形（0.1.4。tcp:50060 は答えない）
 //   legacy=1        アプリの設定「古い PC のツールも受け付ける」がオン
 //   refuse_abstract=1   localabstract: への adb forward を断る（古い adb のふり）
 //   crlf=1          shell の出力の行末を CR CR LF にする（古い adb のふり）
@@ -14,7 +15,8 @@
 //   next=7001       次に使う pid
 // 環境変数 FAKE_ADB_LOG に書くと、呼ばれた adb の引数を 1 行ずつそのファイルに足す。
 // adb forward のふり：口を開けて待つ「adb.exe __serve 口 状態ファイル」を別に起こす。つながると、先と状態に応じて答える：
-//   tcp:番号（GPU）             キットの受け手が動いていれば GPU のあいさつに答える。先が 50060 なら、アプリの受け手が動いていれば答える
+//   tcp:番号（GPU）             キットの受け手が動いていれば GPU のあいさつに答える。先が 50060 なら、アプリの受け手が 50060 で動いていれば答える
+//   localabstract:pocketgpu-gpu  アプリの版が 0.1.4 以上で、アプリの受け手が動いていれば GPU のあいさつに答える
 //   tcp:50064・tcp:50063        アプリの版が 0.1.1 以前か、legacy=1 のときだけ、アプリの口として答える（0.1.2 は既定で断る）
 //   localabstract:pocketgpu-…   アプリの版が 0.1.2 以上のときだけ、アプリの口として答える
 // アプリの口の答えは「PGFAKE-APP webcam」「PGFAKE-APP audio」の 1 行。断るときは、つないですぐ切る
@@ -236,12 +238,15 @@ public static class FakeAdb
         }
     }
 
-    static bool NewApp(string v)
+    static bool NewApp(string v) { return AppAtLeast(v, new Version(0, 1, 2)); }
+    // GPU の受け手が USB 用の口（localabstract:pocketgpu-gpu）でも待つ版
+    static bool GpuUsbApp(string v) { return AppAtLeast(v, new Version(0, 1, 4)); }
+    static bool AppAtLeast(string v, Version min)
     {
         var m = System.Text.RegularExpressions.Regex.Match(v ?? "", @"^(\d+)\.(\d+)(?:\.(\d+))?");
         if (!m.Success) return false;
         var ver = new Version(int.Parse(m.Groups[1].Value), int.Parse(m.Groups[2].Value), m.Groups[3].Success ? int.Parse(m.Groups[3].Value) : 0);
-        return ver >= new Version(0, 1, 2);
+        return ver >= min;
     }
 
     static void Handle(TcpClient c, string st, int port)
@@ -267,8 +272,11 @@ public static class FakeAdb
                 while (c.GetStream().Read(hold, 0, 1) > 0) { }
                 return;
             }
-            // GPU：先が 50060 ならアプリの受け手、それ以外はキットの受け手。動いていなければ、本物の adb と同じように、つないですぐ切る
-            if (target == "tcp:50060") { if (Get(s, "apprecv") != "1") { c.Close(); return; } }
+            // GPU：先が 50060 か localabstract:pocketgpu-gpu ならアプリの受け手、それ以外はキットの受け手。動いていなければ、本物の adb と同じように、つないですぐ切る
+            string appPort = Get(s, "appport") == "" ? "50060" : Get(s, "appport");
+            if (target == "tcp:50060") { if (Get(s, "apprecv") != "1" || appPort != "50060") { c.Close(); return; } }
+            else if (target == "localabstract:pocketgpu-gpu") { if (Get(s, "apprecv") != "1" || !GpuUsbApp(app)) { c.Close(); return; } }
+            else if (target.StartsWith("localabstract:")) { c.Close(); return; }
             else if (Get(s, "pids") == "") { c.Close(); return; }
             var ns = c.GetStream();
             var req = new byte[12];

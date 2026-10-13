@@ -14,8 +14,13 @@ rem   If the version cannot be read it uses the new form. If adb refuses the new
 rem   To choose the form yourself:   set PGPU_APP_FORWARD=new   or   set PGPU_APP_FORWARD=old
 rem   The 0.1.2 app also takes the old form when "Also accept old PC tools" is on in the app settings. It is off by default.
 rem Other ports:   set PGPU_CAM_PORT=50064   set PGPU_AUDIO_PORT=50063   set PGPU_PORT=50300
-rem GPU: nothing changed. If the kit receiver from android\start_android.cmd is running on the phone, the app does not
-rem   start its own receiver and the kit receiver is used. Otherwise port %PGPU_PORT% goes to the receiver inside the app (port 50060).
+rem GPU: if the kit receiver from android\start_android.cmd is running on the phone, the app does not start its own
+rem   receiver and port %PGPU_PORT% goes to the kit receiver (tcp:%PGPU_PORT%). Otherwise it goes to the receiver inside the app:
+rem   app 0.1.4 and newer:   adb forward tcp:50300 localabstract:pocketgpu-gpu   (no port number on the phone, so nothing else can be in the way)
+rem   app 0.1.3 and older:   adb forward tcp:50300 tcp:50060
+rem   If the version cannot be read it uses tcp:50060 (the 0.1.4 app also listens there when 50060 is free on the phone).
+rem   If adb refuses the localabstract form it uses tcp:50060.
+rem   To choose the GPU form yourself:   set PGPU_APP_GPU=usb   or   set PGPU_APP_GPU=tcp
 setlocal
 call "%~dp0_common.cmd"
 if errorlevel 1 goto nodev
@@ -33,6 +38,8 @@ set "APPVER="
 for /f "tokens=1,2 delims== " %%U in ('"%ADB%" shell dumpsys package %PKG%') do if "%%U"=="versionName" if not defined APPVER set "APPVER=%%V"
 set "FORM=new"
 set "FORMBY=the app version could not be read"
+set "GPUFORM=tcp"
+set "GPUOLD="
 set "V1="
 set "V2="
 set "V3="
@@ -45,6 +52,8 @@ if errorlevel 1 goto ver_done
 set /a VN=1000000*%V1%+1000*%V2%+%V3%
 set "FORMBY=app version %APPVER%"
 if %VN% LSS 1002 set "FORM=old"
+if %VN% GEQ 1004 set "GPUFORM=usb"
+if %VN% LSS 1004 set "GPUOLD=1"
 :ver_done
 set "FORCED="
 if /i "%PGPU_APP_FORWARD%"=="new" set "FORM=new"
@@ -70,14 +79,32 @@ set "FORMBY=adb refused the new form"
 "%ADB%" forward tcp:%PGPU_AUDIO_PORT% tcp:50063 >nul || goto forward_failed
 :fwd_done
 
+rem ---- GPU: the kit receiver if it runs, else the receiver inside the app in the form for this app version ----
+set "GPU_FORCED="
+if /i "%PGPU_APP_GPU%"=="usb" set "GPUFORM=usb"
+if /i "%PGPU_APP_GPU%"=="usb" set "GPU_FORCED=1"
+if /i "%PGPU_APP_GPU%"=="tcp" set "GPUFORM=tcp"
+if /i "%PGPU_APP_GPU%"=="tcp" set "GPU_FORCED=1"
 set "GPU_TARGET=tcp:50060"
-set "GPU_WHO=the app receiver"
+set "GPU_WHO=the app receiver, port 50060 on the phone"
+if "%GPUFORM%"=="usb" set "GPU_TARGET=localabstract:pocketgpu-gpu"
+if "%GPUFORM%"=="usb" set "GPU_WHO=the app receiver, USB port pocketgpu-gpu"
 "%ADB%" shell pidof pgpu_server | findstr /r "[0-9]" >nul
 if errorlevel 1 goto gpu_forward
 set "GPU_TARGET=tcp:%PGPU_PORT%"
 set "GPU_WHO=the kit receiver started by android\start_android.cmd"
+set "GPU_FORCED=1"
+set "GPUOLD="
 :gpu_forward
-"%ADB%" forward tcp:%PGPU_PORT% %GPU_TARGET% >nul || goto forward_failed
+"%ADB%" forward tcp:%PGPU_PORT% %GPU_TARGET% >nul 2>&1
+if not errorlevel 1 goto gpu_done
+if defined GPU_FORCED goto forward_failed
+if not "%GPU_TARGET%"=="localabstract:pocketgpu-gpu" goto forward_failed
+echo adb did not accept the USB port form for the GPU. Using port 50060 on the phone ...
+set "GPU_TARGET=tcp:50060"
+set "GPU_WHO=the app receiver, port 50060 on the phone"
+"%ADB%" forward tcp:%PGPU_PORT% tcp:50060 >nul || goto forward_failed
+:gpu_done
 "%ADB%" shell am start -n %APP% --ez webcam true --ez audio true --ez gpu true >nul
 echo.
 echo Done. If the phone asks for camera or microphone access, tap Allow.
@@ -85,6 +112,8 @@ echo Port form: %FORM% (%FORMBY%)
 echo   Webcam:          webcam_rx.exe --addr 127.0.0.1:%PGPU_CAM_PORT%
 echo   Speaker and mic: ipaudio.exe --connect 127.0.0.1:%PGPU_AUDIO_PORT% --speaker --mic
 echo   GPU:             pocketgpu_android.cmd "C:\path\to\app.exe"   (uses %GPU_WHO%)
+echo   GPU port form:   adb forward tcp:%PGPU_PORT% %GPU_TARGET%
+if defined GPUOLD echo The app is older than 0.1.4. If the GPU does not answer, update the app:   "%ADB%" install -r "%~dp0pocketgpu.apk"
 if "%FORM%"=="old" echo The app on the phone is old. The new app is android\pocketgpu.apk. To update:   "%ADB%" install -r "%~dp0pocketgpu.apk"
 if "%FORM%"=="old" if not defined FORCED echo The new app takes the camera and the mic only from adb, so other apps on the phone cannot read them.
 echo When you are finished: android\android_app.cmd stop

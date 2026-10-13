@@ -522,6 +522,8 @@ function Test-AppAnswer([int]$port) {
 }
 $script:AppNew = @{ Cam = 'localabstract:pocketgpu-webcam'; Aud = 'localabstract:pocketgpu-audio' }
 $script:AppOld = @{ Cam = 'tcp:50064'; Aud = 'tcp:50063' }
+# アプリの中の GPU の受け手：0.1.4 以上は USB 用の口でも待つ
+$script:AppGpuUsb = 'localabstract:pocketgpu-gpu'
 # アプリが入っていて、アプリの中の受け手（50060）だけが動く形の端末の状態
 function New-AppState([string]$ver) { return @{ serial = 'EMU1'; dstate = 'device'; pids = ''; hash = ''; file = '0'; next = '7001'; app = $ver; apprecv = '1' } }
 
@@ -643,17 +645,51 @@ function Scn-AndroidAppLeft([string]$mode) {
     Check 'アプリが無いのに残っていたカメラとマイクの adb forward が外れ、口も閉じる' (($m.ContainsKey([string]$k.CamPort) -eq $false) -and ($m.ContainsKey([string]$k.AudioPort) -eq $false) -and (Wait-Until { -not (Test-Port $k.CamPort) -and -not (Test-Port $k.AudioPort) } 4))
     Check 'GPU の口（キットの受け手）は残り、応答する' (($m.ContainsKey([string]$k.Port)) -and (Test-Hello $k.Port)) 'safety'
 }
-# 何も壊れていない：アプリ 0.1.2 の新しい向け方・アプリ 0.1.1 の古い向け方・版が読めない（どちらの向け方も触らない）
+# アプリ 0.1.4：端末の 50060 が使えず、アプリの受け手が 50061 で待っている（10/14 テスターの Redmagic 9S Pro の形）。
+# GPU の口は古い向け方の tcp:50060 のままで答えない -> USB 用の口（localabstract:pocketgpu-gpu）につなぎ直す。キットの受け手は起こさない
+function Scn-AndroidAppGpuTaken([string]$mode) {
+    $s = New-AppState '0.1.4'; $s.appport = '50061'
+    $k = New-AndroidKit "android-app-gputaken-$mode" $s $false @(
+        @{ Port = '@gpu'; Target = 'tcp:50060' }, @{ Port = '@cam'; Target = $script:AppNew.Cam }, @{ Port = '@aud'; Target = $script:AppNew.Aud })
+    Check '準備：tcp:50060 では、50061 で待つアプリの受け手に届かない' (-not (Test-Hello $k.Port)) 'safety'
+    Use-Mode $mode $k.Kit
+    $r = Invoke-AndroidFix $k (Get-Mode $mode 'y')
+    $m = Get-FwdMap $k.State
+    foreach ($id in (Get-FwdPids $k.State)) { $script:Spawned.Add($id) }
+    Check 'GPU の口が localabstract:pocketgpu-gpu になり、アプリの受け手が応答する（実際につないで確認）' (($m[[string]$k.Port] -eq $script:AppGpuUsb) -and (Test-Hello $k.Port))
+    $st = Get-AdbState $k.State
+    Check 'キットの受け手は起こさず、スマートフォンに置かない' (($st.pids -eq '') -and ($st.file -eq '0')) 'safety'
+    Check 'カメラとマイクの口は、そのまま応答する' (((Test-AppAnswer $k.CamPort) -eq 'webcam') -and ((Test-AppAnswer $k.AudioPort) -eq 'audio')) 'safety'
+    if ($mode -eq 'fix') { Check 'まとめに「直った」・終わりのコード 0' (($r.Summary -match '\[直った\] Android') -and $r.Exit -eq 0) 'safety' }
+    else { Check '直していないので、終わりのコード 1・GPU の口は tcp:50060 のまま' (($r.Exit -eq 1) -and ($m[[string]$k.Port] -eq 'tcp:50060')) 'safety' }
+}
+# アプリ 0.1.3：GPU の口が USB 用の口（0.1.3 は待たない）に向いている -> tcp:50060 につなぎ直す
+function Scn-AndroidAppGpuUsbOnOld([string]$mode) {
+    $k = New-AndroidKit "android-app-gpuusb-old-$mode" (New-AppState '0.1.3') $false @(
+        @{ Port = '@gpu'; Target = $script:AppGpuUsb }, @{ Port = '@cam'; Target = $script:AppNew.Cam }, @{ Port = '@aud'; Target = $script:AppNew.Aud })
+    Check '準備：0.1.3 のアプリは、USB 用の GPU の口では答えない' (-not (Test-Hello $k.Port)) 'safety'
+    Use-Mode $mode $k.Kit
+    $r = Invoke-AndroidFix $k (Get-Mode $mode 'y')
+    $m = Get-FwdMap $k.State
+    foreach ($id in (Get-FwdPids $k.State)) { $script:Spawned.Add($id) }
+    Check 'GPU の口が tcp:50060 になり、アプリ 0.1.3 の受け手が応答する' (($m[[string]$k.Port] -eq 'tcp:50060') -and (Test-Hello $k.Port))
+    Check 'キットの受け手は起こさない' ((Get-AdbState $k.State).pids -eq '') 'safety'
+    if ($mode -ne 'fix') { Check '直していないので、終わりのコード 1' ($r.Exit -eq 1) 'safety' }
+}
+# 何も壊れていない：アプリ 0.1.2 の新しい向け方・アプリ 0.1.1 の古い向け方・版が読めない（どちらの向け方も触らない）・
+# アプリ 0.1.4 の GPU の USB 用の口・アプリ 0.1.4 で 50060 が空いていて tcp:50060 でも答える（古いキットの android_app.cmd の形。答えるなら触らない）
 function Scn-PristineApp([string]$mode) {
     if ($mode -ne 'fix') { return }
     $cases = @(
-        @{ Name = 'new'; Ver = '0.1.2'; Cam = $script:AppNew.Cam; Aud = $script:AppNew.Aud },
-        @{ Name = 'old'; Ver = '0.1.1'; Cam = $script:AppOld.Cam; Aud = $script:AppOld.Aud },
-        @{ Name = 'unknown-old-form'; Ver = 'dev'; Cam = $script:AppOld.Cam; Aud = $script:AppOld.Aud },
-        @{ Name = 'unknown-new-form'; Ver = 'dev'; Cam = $script:AppNew.Cam; Aud = $script:AppNew.Aud })
+        @{ Name = 'new'; Ver = '0.1.2'; Cam = $script:AppNew.Cam; Aud = $script:AppNew.Aud; Gpu = 'tcp:50060' },
+        @{ Name = 'old'; Ver = '0.1.1'; Cam = $script:AppOld.Cam; Aud = $script:AppOld.Aud; Gpu = 'tcp:50060' },
+        @{ Name = 'unknown-old-form'; Ver = 'dev'; Cam = $script:AppOld.Cam; Aud = $script:AppOld.Aud; Gpu = 'tcp:50060' },
+        @{ Name = 'unknown-new-form'; Ver = 'dev'; Cam = $script:AppNew.Cam; Aud = $script:AppNew.Aud; Gpu = 'tcp:50060' },
+        @{ Name = 'gpu-usb'; Ver = '0.1.4'; Cam = $script:AppNew.Cam; Aud = $script:AppNew.Aud; Gpu = $script:AppGpuUsb },
+        @{ Name = 'gpu-tcp-free'; Ver = '0.1.4'; Cam = $script:AppNew.Cam; Aud = $script:AppNew.Aud; Gpu = 'tcp:50060' })
     foreach ($c in $cases) {
         $k = New-AndroidKit ('pristine-app-' + $c.Name) (New-AppState $c.Ver) $false @(
-            @{ Port = '@gpu'; Target = 'tcp:50060' }, @{ Port = '@cam'; Target = $c.Cam }, @{ Port = '@aud'; Target = $c.Aud })
+            @{ Port = '@gpu'; Target = $c.Gpu }, @{ Port = '@cam'; Target = $c.Cam }, @{ Port = '@aud'; Target = $c.Aud })
         $before = Get-FwdMap $k.State
         $r = Invoke-AndroidFix $k 'n,n,n'
         $after = Get-FwdMap $k.State
@@ -705,16 +741,58 @@ function Scn-AndroidAppCmd([string]$mode) {
     Check 'android_app.cmd・アプリ 0.1.1：tcp:50064・tcp:50063 の向け方でつなぎ、PC の口でアプリが応答する（行末 CR CR LF の adb でも）' (($r.Exit -eq 0) -and ($m[[string]$k.CamPort] -eq $script:AppOld.Cam) -and ($m[[string]$k.AudioPort] -eq $script:AppOld.Aud) -and ((Test-AppAnswer $k.CamPort) -eq 'webcam') -and ((Test-AppAnswer $k.AudioPort) -eq 'audio')) 'safety'
     Check 'android_app.cmd・アプリ 0.1.1：古いアプリだと知らせ、更新のしかたを出す' ($r.Out -match 'The app on the phone is old') 'safety'
     Stop-Spawned
-    # 3) 版の読めない形（0.1.10・0.2.0・1.0・0.1.2-debug は新、0.0.9・0.1 は古い）
-    foreach ($v in @(@('0.1.10', 'new'), @('0.2.0', 'new'), @('1.0', 'new'), @('0.1.2-debug', 'new'), @('0.0.9', 'old'), @('0.1', 'old'))) {
+    # 3) 版の読めない形（0.1.10・0.2.0・1.0・0.1.2-debug は新、0.0.9・0.1 は古い）。GPU は 0.1.4 以上だけ USB 用の口
+    foreach ($v in @(@('0.1.10', 'new', 'usb'), @('0.2.0', 'new', 'usb'), @('1.0', 'new', 'usb'), @('0.1.2-debug', 'new', 'tcp'), @('0.1.4-debug', 'new', 'usb'), @('0.0.9', 'old', 'tcp'), @('0.1', 'old', 'tcp'))) {
         $s = $idle.Clone(); $s.app = $v[0]
         $k = New-AndroidKit ('appcmd-ver-' + $v[0]) $s $false
         $r = Invoke-AppCmd $k
         $m = Get-FwdMap $k.State
         $want = $(if ($v[1] -eq 'new') { $script:AppNew.Cam } else { $script:AppOld.Cam })
-        Check ('android_app.cmd・アプリ ' + $v[0] + ' は ' + $v[1] + ' の向け方を選ぶ') (($r.Exit -eq 0) -and ($m[[string]$k.CamPort] -eq $want)) 'safety'
+        $wantGpu = $(if ($v[2] -eq 'usb') { $script:AppGpuUsb } else { 'tcp:50060' })
+        Check ('android_app.cmd・アプリ ' + $v[0] + ' は ' + $v[1] + ' の向け方・GPU は ' + $wantGpu + ' を選ぶ') (($r.Exit -eq 0) -and ($m[[string]$k.CamPort] -eq $want) -and ($m[[string]$k.Port] -eq $wantGpu)) 'safety'
         Stop-Spawned
     }
+    # 3b) アプリ 0.1.4：GPU の口は USB 用の口。端末の 50060 が使えず、受け手が 50061 で待っていても届く（10/14 の Redmagic 9S Pro の形）
+    $s = $idle.Clone(); $s.app = '0.1.4'; $s.appport = '50061'
+    $k = New-AndroidKit 'appcmd-014' $s $false
+    $r = Invoke-AppCmd $k
+    $m = Get-FwdMap $k.State
+    Check 'android_app.cmd・アプリ 0.1.4：GPU の口を localabstract:pocketgpu-gpu へ向け、端末の 50060 が使えなくてもアプリの受け手が応答する' (($r.Exit -eq 0) -and ($m[[string]$k.Port] -eq $script:AppGpuUsb) -and (Test-Hello $k.Port) -and ($r.Out -match 'localabstract:pocketgpu-gpu')) 'safety'
+    Check 'android_app.cmd・アプリ 0.1.4：GPU の tcp:50060 への forward は 1 回も打たない・更新の案内は出さない' (($r.Calls -notmatch ('forward tcp:' + $k.Port + ' tcp:50060')) -and ($r.Out -notmatch 'older than 0.1.4')) 'safety'
+    Stop-Spawned
+    # 3c) アプリ 0.1.3：GPU の口は tcp:50060。更新の案内を出す
+    $s = $idle.Clone(); $s.app = '0.1.3'
+    $k = New-AndroidKit 'appcmd-013' $s $false
+    $r = Invoke-AppCmd $k
+    $m = Get-FwdMap $k.State
+    Check 'android_app.cmd・アプリ 0.1.3：GPU の口は tcp:50060・応答する・0.1.4 への更新の案内を出す' (($r.Exit -eq 0) -and ($m[[string]$k.Port] -eq 'tcp:50060') -and (Test-Hello $k.Port) -and ($r.Out -match 'older than 0.1.4')) 'safety'
+    Check 'android_app.cmd・アプリ 0.1.3：USB 用の GPU の口は打たない' ($r.Calls -notmatch 'pocketgpu-gpu') 'safety'
+    Stop-Spawned
+    # 3d) アプリ 0.1.4 で、adb が localabstract を断る（古い adb）：GPU は tcp:50060 に切り替える
+    $s = $idle.Clone(); $s.app = '0.1.4'; $s.refuse_abstract = '1'
+    $k = New-AndroidKit 'appcmd-014-refuse' $s $false
+    $r = Invoke-AppCmd $k
+    $m = Get-FwdMap $k.State
+    Check 'android_app.cmd・アプリ 0.1.4 で adb が localabstract を断ったら、GPU は tcp:50060 にして応答する' (($r.Exit -eq 0) -and ($m[[string]$k.Port] -eq 'tcp:50060') -and (Test-Hello $k.Port) -and ($r.Calls -match 'pocketgpu-gpu')) 'safety'
+    Stop-Spawned
+    # 3e) PGPU_APP_GPU=tcp：0.1.4 でも tcp:50060。PGPU_APP_GPU=usb で断られたら、切り替えずに失敗する
+    $s = $idle.Clone(); $s.app = '0.1.4'
+    $k = New-AndroidKit 'appcmd-014-forced-tcp' $s $false
+    $r = Invoke-AppCmd $k '' @{ PGPU_APP_GPU = 'tcp' }
+    Check 'android_app.cmd・PGPU_APP_GPU=tcp：アプリ 0.1.4 でも GPU は tcp:50060' (($r.Exit -eq 0) -and ((Get-FwdMap $k.State)[[string]$k.Port] -eq 'tcp:50060') -and (Test-Hello $k.Port)) 'safety'
+    Stop-Spawned
+    $s = $idle.Clone(); $s.app = '0.1.4'; $s.refuse_abstract = '1'
+    $k = New-AndroidKit 'appcmd-014-forced-usb' $s $false
+    $r = Invoke-AppCmd $k '' @{ PGPU_APP_GPU = 'usb'; PGPU_APP_FORWARD = 'old' }
+    Check 'android_app.cmd・PGPU_APP_GPU=usb で断られたら、tcp:50060 に切り替えずに失敗する' (($r.Exit -eq 1) -and (-not (Get-FwdMap $k.State).ContainsKey([string]$k.Port))) 'safety'
+    Stop-Spawned
+    # 3f) アプリ 0.1.4 でも、キットの受け手が動いていれば、GPU の口はキットの受け手へ
+    $s = $idle.Clone(); $s.app = '0.1.4'; $s.pids = '1111'; $s.file = '1'; $s.hash = 'ab' * 32
+    $k = New-AndroidKit 'appcmd-014-kitrecv' $s $false
+    $r = Invoke-AppCmd $k
+    $m = Get-FwdMap $k.State
+    Check 'android_app.cmd・アプリ 0.1.4 でもキットの受け手が動いていれば、GPU の口は tcp:口（キットの受け手）' (($m[[string]$k.Port] -eq ('tcp:' + $k.Port)) -and (Test-Hello $k.Port) -and ((Get-AdbState $k.State).apprecv -eq '0')) 'safety'
+    Stop-Spawned
     # 4) 版が読めない（dumpsys が何も返さない）：新しい向け方。adb が新しい向け方を断ったら、古い向け方
     $s = $idle.Clone(); $s.app = 'dev'
     $k = New-AndroidKit 'appcmd-unknown' $s $false
@@ -884,6 +962,8 @@ $scenarios = [ordered]@{
     'android-app-stale'   = { param($m) Scn-AndroidAppStale $m }
     'android-app-conflict' = { param($m) Scn-AndroidAppConflict $m }
     'android-app-left'    = { param($m) Scn-AndroidAppLeft $m }
+    'android-app-gputaken' = { param($m) Scn-AndroidAppGpuTaken $m }
+    'android-app-gpuusb-old' = { param($m) Scn-AndroidAppGpuUsbOnOld $m }
     'android-app-cmd'     = { param($m) Scn-AndroidAppCmd $m }
     'pristine-app'        = { param($m) Scn-PristineApp $m }
     'gpu-av'        = { param($m) Scn-GpuAv $m }

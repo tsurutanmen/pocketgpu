@@ -430,14 +430,32 @@ function Get-AppForm([string]$ver) {
     }
     return 'unknown'
 }
+# アプリの中の GPU の受け手の口。アプリ 0.1.4 から、USB 用の localabstract:pocketgpu-gpu でも待つ（端末の 50060 が使えなくても動く。
+# 10/14 テスターの Redmagic 9S Pro では、0.1.3 の受け手が 50060 で待てずにすぐ終わった）。キットの android\android_app.cmd と同じ：
+#   0.1.4 以上：adb forward tcp:50300 localabstract:pocketgpu-gpu
+#   0.1.3 以前：adb forward tcp:50300 tcp:50060
+#   版が読めない：どちらも認める（android_app.cmd は tcp:50060 を使う。0.1.4 も 50060 が空いていればそこで待つ）
+$script:AppGpuUsb = 'localabstract:pocketgpu-gpu'
+$script:AppGpuTcp = 'tcp:50060'
+function Get-AppGpuForm([string]$ver) {
+    if ($ver -match '^(\d+)\.(\d+)(?:\.(\d+))?') {
+        $third = $(if ($Matches[3]) { $Matches[3] } else { '0' })
+        $v = [Version]('{0}.{1}.{2}' -f $Matches[1], $Matches[2], $third)
+        if ($v -ge [Version]'0.1.4') { return 'usb' } else { return 'tcp' }
+    }
+    return 'unknown'
+}
 function Get-AndroidApp($adb, [string]$serial) {
     $sa = $(if ($serial) { '-s ' + $serial + ' ' } else { '' })
-    $a = @{ Installed = $false; Version = ''; Form = 'unknown' }
+    $a = @{ Installed = $false; Version = ''; Form = 'unknown'; GpuForm = 'unknown'; GpuDest = $script:AppGpuTcp }
     $r = Invoke-Adb $adb ($sa + 'shell pm path ' + $script:AppPkg)
     if ($r.Out -notmatch 'package:') { return $a }
     $a.Installed = $true
     $r = Invoke-Adb $adb ($sa + 'shell dumpsys package ' + $script:AppPkg)
-    if ($r.Out -match '(?m)^\s*versionName=(\S+)') { $a.Version = $Matches[1]; $a.Form = Get-AppForm $a.Version }
+    if ($r.Out -match '(?m)^\s*versionName=(\S+)') {
+        $a.Version = $Matches[1]; $a.Form = Get-AppForm $a.Version; $a.GpuForm = Get-AppGpuForm $a.Version
+        if ($a.GpuForm -eq 'usb') { $a.GpuDest = $script:AppGpuUsb }
+    }
     return $a
 }
 # アプリの口の adb forward のうち、このキットの形（新旧どちらか）をしている物の PC の口の番号
@@ -451,6 +469,7 @@ function Get-AppLeftoverPorts($fw) {
 }
 # 今の状態の問題を数える。Quiet でなければ、画面にも出す。Problems の名前：
 #   GPU の口   norecv dup oldrecv portconflict fwdmissing fwdwrong fwdstale busy nohello
+#              appgpufwd（アプリの中の受け手へ、版に合わない向け方でつないでいる。0.1.4 以上に tcp:50060、0.1.3 以前に localabstract）
 #   アプリの口 appleft（アプリが無いのに残っている）・appfwdwrong（版に合わない向け方、または別の物を指す）・appfwdhalf（片方しか無い）・appfwdstale（口が開いていない）・appportconflict
 function Get-AndroidProblems($adb, [string]$serial, [int]$port, [string]$localHash, [bool]$Quiet) {
     $r = @{ Problems = @(); Conflict = @(); AppFix = @(); AppLeft = @(); AppConflict = @(); AppRecv = $false; Hello = $null; Note = ''; App = $null }
@@ -459,11 +478,12 @@ function Get-AndroidProblems($adb, [string]$serial, [int]$port, [string]$localHa
     $s = Get-AndroidState $adb $serial $port
     $app = Get-AndroidApp $adb $serial
     $r.App = $app
-    # アプリの中の受け手（端末の 50060）だけが動いている形：android\android_app.cmd が作る。キットの受け手は動いていない
-    $appRecv = ($s.Pids.Count -eq 0) -and $app.Installed -and ($s.Forward -eq 'tcp:50060')
+    # アプリの中の受け手だけが動いている形：android\android_app.cmd が作る。キットの受け手は動いていない。
+    # GPU の口の向け先は、端末の 50060（tcp:50060）か、0.1.4 からの USB 用の口（localabstract:pocketgpu-gpu）
+    $appRecv = ($s.Pids.Count -eq 0) -and $app.Installed -and ($s.Forward -eq $script:AppGpuTcp -or $s.Forward -eq $script:AppGpuUsb)
     $r.AppRecv = $appRecv
     if ($s.Pids.Count -eq 0) {
-        if ($appRecv) { & $out 'ok' (M 'スマートフォンでは、PocketGPU アプリの中の受け手（端末の 50060）を使っています。' 'The phone uses the receiver inside the PocketGPU app (port 50060 on the phone).') }
+        if ($appRecv) { & $out 'ok' ((M 'スマートフォンでは、PocketGPU アプリの中の受け手（{0}）を使っています。' 'The phone uses the receiver inside the PocketGPU app ({0}).') -f $s.Forward) }
         else { $pr.Add('norecv'); & $out 'ng' (M 'スマートフォンで受け手（pgpu_server）が動いていません。' 'The receiver (pgpu_server) is not running on the phone.') }
     }
     elseif ($s.Pids.Count -gt 1) { $pr.Add('dup'); & $out 'ng' ((M 'スマートフォンで受け手（pgpu_server）が {0} 個、二重に動いています。PID：{1}' 'The receiver (pgpu_server) runs {0} times on the phone. PIDs: {1}') -f $s.Pids.Count, ($s.Pids -join ' ')) }
@@ -479,6 +499,11 @@ function Get-AndroidProblems($adb, [string]$serial, [int]$port, [string]$localHa
         foreach ($o in $conflict) { & $out 'info' (Get-ProcLabel $o.Name $o.Pid $o.Exe) }
     } elseif (-not $s.Forward) { $pr.Add('fwdmissing'); & $out 'ng' ((M '口 {0} の adb forward がありません。' 'There is no adb forward for port {0}.') -f $port) }
     elseif ($s.Forward -ne ('tcp:' + $port) -and -not $appRecv) { $pr.Add('fwdwrong'); & $out 'ng' ((M '口 {0} の adb forward が、別の口 {1} を指しています。' 'The adb forward for port {0} points at another port, {1}.') -f $port, $s.Forward) }
+    elseif ($appRecv -and $app.GpuForm -eq 'tcp' -and $s.Forward -eq $script:AppGpuUsb) {
+        # 0.1.3 以前は USB 用の口で待たない。0.1.4 以上に tcp:50060 は、答えるなら問題にしない（答えないときは下のあいさつで見る）
+        $pr.Add('appgpufwd')
+        & $out 'ng' ((M 'GPU の口 {0} の adb forward が、アプリ {1} に合わない向け方 {2} です。アプリ 0.1.4 以上は localabstract:pocketgpu-gpu、0.1.3 以前は tcp:50060 です。' 'The adb forward for the GPU port {0} uses {2}, which does not fit app {1}. App 0.1.4 and newer use localabstract:pocketgpu-gpu, 0.1.3 and older use tcp:50060.') -f $port, $app.Version, $s.Forward)
+    }
     elseif ($s.Owners.Count -eq 0) { $pr.Add('fwdstale'); & $out 'ng' ((M 'adb forward は残っていますが、PC の口 {0} が開いていません（adb が再起動したあと）。' 'The adb forward is listed but port {0} on this PC is not open (after an adb restart).') -f $port) }
     else { & $out 'ok' ((M 'PC の口 {0} は adb の forward でスマートフォンにつながっています。' 'Port {0} on this PC is connected to the phone by adb forward.') -f $port) }
 
@@ -488,9 +513,15 @@ function Get-AndroidProblems($adb, [string]$serial, [int]$port, [string]$localHa
         if ($c) { try { $hello = Invoke-Hello $c 3000 } finally { $c.Close() } } else { $hello = @{ Ok = $false; Why = 'closed' } }
         if ($hello.Ok) { & $out 'ok' ((M '受け手が応答しました：' 'The receiver answered: ') + $hello.Name) }
         elseif ($hello.Why -eq 'timeout') { $pr.Add('busy'); & $out 'ng' (M '受け手が応答しません。PC のほかのプログラムが使っているか、前の接続が残っています。' 'The receiver does not answer. Another program on this PC is using it, or an old connection remains.') }
+        elseif ($appRecv -and $app.GpuForm -eq 'usb' -and $s.Forward -eq $script:AppGpuTcp) {
+            # 0.1.4 以上のアプリは、端末の 50060 が使えないと 50061 などで待つ。USB 用の口なら番号に関係なく届く
+            $pr.Add('appgpufwd')
+            & $out 'ng' ((M 'GPU の口 {0} は端末の 50060 につながっていますが、アプリ {1} の受け手が答えません。50060 が使えず、別の番号で待っているのかもしれません。アプリ 0.1.4 以上は localabstract:pocketgpu-gpu でつなぎます。' 'The GPU port {0} goes to port 50060 on the phone, but the receiver of app {1} does not answer. It may listen on another port because 50060 is taken. App 0.1.4 and newer are reached with localabstract:pocketgpu-gpu.') -f $port, $app.Version)
+        }
         else {
             $pr.Add('nohello'); & $out 'ng' (M '口はつながっていますが、受け手が答えません。' 'The port is connected but the receiver does not answer.')
             if ($appRecv) { & $out 'info' (M 'アプリの中の受け手です。PocketGPU アプリを開いて、GPU がオンになっているか確かめてください。キットの受け手に切り替えることもできます。' 'This is the receiver inside the app. Open the PocketGPU app and check that GPU is on. You can also switch to the kit receiver.') }
+            if ($appRecv -and $app.GpuForm -eq 'tcp') { & $out 'info' (M 'アプリが 0.1.3 以前です。スマートフォンの 50060 を別の物が使っていると、アプリの受け手は動きません。キットの android\pocketgpu.apk（0.1.4 以上）に更新すると、USB 用の口で待つので、ぶつかりません。' 'The app is 0.1.3 or older. If something else on the phone uses port 50060, the app receiver cannot run. Update to android\pocketgpu.apk from the kit (0.1.4 or newer): it also listens on a USB-only port, so nothing is in the way.') }
         }
     }
     $r.Hello = $hello
@@ -1064,9 +1095,14 @@ if (Want 'android') {
                         if ($r.Exit -ne 0) { Say-NG (M 'start_android.cmd が失敗しました。上の表示を見てください。' 'start_android.cmd failed. See the lines above.'); $okAll = $false }
                         else { $acts += 'restarted the receiver' }
                     } else { $okAll = $false }
-                } elseif ($problems | Where-Object { $_ -in 'fwdmissing', 'fwdwrong', 'fwdstale', 'busy', 'portconflict' }) {
-                    # 3) adb forward だけやり直す
-                    Say-Info (M '直し方：adb forward を外して、つなぎ直します。つながっていた接続は一度切れます。' 'Fix: remove the adb forward and connect it again. Existing connections are dropped once.')
+                } elseif ($problems | Where-Object { $_ -in 'fwdmissing', 'fwdwrong', 'fwdstale', 'busy', 'portconflict', 'appgpufwd' }) {
+                    # 3) adb forward だけやり直す。アプリの中の受け手なら、アプリの版に合う向け方（版が読めなければ今の向け方）で
+                    $gpuDest = 'tcp:' + $port
+                    if ($a1.AppRecv) {
+                        $gpuDest = $(if ($a1.App.GpuForm -ne 'unknown') { $a1.App.GpuDest } else { (Get-AdbForwards $adb)[[string]$port] })
+                        if (-not $gpuDest) { $gpuDest = $script:AppGpuTcp }
+                    }
+                    Say-Info ((M '直し方：adb forward を外して、{0} へつなぎ直します。つながっていた接続は一度切れます。' 'Fix: remove the adb forward and connect it again to {0}. Existing connections are dropped once.') -f $gpuDest)
                     if ($problems -contains 'busy') {
                         $holdersA = @(Get-TcpOwners $port 'Established' -Remote | Where-Object { $_.Name -notmatch '^adb' })
                         foreach ($o in $holdersA) {
@@ -1076,8 +1112,12 @@ if (Want 'android') {
                     }
                     if (Offer (M 'adb forward をやり直しますか？' 'Redo the adb forward?')) {
                         [void](Invoke-Adb $adb ($sa + 'forward --remove tcp:' + $port))
-                        $gpuDest = $(if ($a1.AppRecv) { 'tcp:50060' } else { 'tcp:' + $port })
                         $r = Invoke-Adb $adb ($sa + 'forward tcp:' + $port + ' ' + $gpuDest)
+                        # 古い adb は localabstract: を断る。そのときは端末の 50060 へ（android_app.cmd と同じ）
+                        if ($r.Exit -ne 0 -and $gpuDest -eq $script:AppGpuUsb) {
+                            Say-Info (M 'adb が USB 用の口の向け方を断ったので、端末の 50060 へつなぎます。' 'adb refused the USB-only port form, so the GPU port goes to port 50060 on the phone.')
+                            $r = Invoke-Adb $adb ($sa + 'forward tcp:' + $port + ' ' + $script:AppGpuTcp)
+                        }
                         if ($r.Exit -ne 0) { Say-NG ((M 'adb forward に失敗しました：{0}' 'adb forward failed: {0}') -f $r.Err.Trim()); $okAll = $false } else { $acts += 'redid adb forward' }
                     } else { $okAll = $false }
                 }
