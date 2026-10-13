@@ -90,7 +90,7 @@ Android phone
   - A 64-bit ARM Android phone, Android 11 or later, with a Vulkan GPU, and a USB cable that carries data.
   - adb, the Android command line tool:
         Arch, CachyOS:   sudo pacman -S android-tools
-        Ubuntu, Debian:  sudo apt install android-tools-adb
+        Ubuntu, Linux Mint, Debian:  sudo apt install adb
         Fedora:          sudo dnf install android-tools
     Without a package, download SDK Platform-Tools for Linux from
     https://developer.android.com/tools/releases/platform-tools, unzip it, and put the platform-tools folder inside this kit folder.
@@ -137,6 +137,8 @@ Android phone
     If it cannot read the version, it tries the new form first and then the old one. You do not need to do anything.
   - The receiver of this kit and the app can run together. If the receiver of this kit is running on the phone at 127.0.0.1:50300, the app does not start its own.
     ./start-android.sh --app uses the receiver inside the app instead, so nothing is copied to the phone.
+    With app 0.1.4 or later it connects port 50300 to the USB socket of the app (adb forward tcp:50300 localabstract:pocketgpu-gpu). The app waits there for USB,
+    and on TCP it uses port 50060, or 50061 and up if 50060 is taken. With app 0.1.3 or earlier it connects to tcp:50060 as before.
 - If something fails:
   - adb says "unauthorized": unlock the phone and tap Allow on "Allow USB debugging?". Unplug and plug the cable in again if it does not appear.
   - adb says "no permissions": plug the cable in again and run adb kill-server. If it stays, install the udev rules:
@@ -277,7 +279,7 @@ Android のスマートフォン
   - 64 ビット ARM の Android のスマートフォン。Android 11 以上で、Vulkan に対応した GPU を搭載しているもの。データを転送できる USB ケーブル
   - adb（Android のコマンドラインツール）：
         Arch・CachyOS：   sudo pacman -S android-tools
-        Ubuntu・Debian：  sudo apt install android-tools-adb
+        Ubuntu・Linux Mint・Debian：  sudo apt install adb
         Fedora：          sudo dnf install android-tools
     パッケージを使わない場合は、https://developer.android.com/tools/releases/platform-tools から SDK Platform-Tools for Linux をダウンロードして展開し、
     platform-tools フォルダをこのキットのフォルダの中に置いてください。
@@ -323,6 +325,8 @@ Android のスマートフォン
     版が読めないときは、新しい形を先に試して、だめなら古い形にします。操作は必要ありません
   - このキットの受け手とアプリは、同時に動かせます。スマートフォンの 127.0.0.1:50300 でこのキットの受け手が動いているときは、アプリは自分の受け手を起動しません。
     ./start-android.sh --app を使うと、アプリの中の受け手を使うので、スマートフォンにファイルをコピーしません
+    アプリ 0.1.4 以降では、この PC の 50300 番をアプリの USB 用の口につなぎます（adb forward tcp:50300 localabstract:pocketgpu-gpu）。アプリは USB ではそこで待ち、
+    TCP では 50060 番を使い、使えなければ 50061 番から順に試します。アプリ 0.1.3 以前では、これまでどおり tcp:50060 につなぎます
 - うまくいかないとき：
   - adb が「unauthorized」と表示する：スマートフォンのロックを解除して、「USB デバッグを許可しますか？」で「許可」をタップしてください。表示されないときは、ケーブルを抜いて接続し直してください
   - adb が「no permissions」と表示する：ケーブルを接続し直して、adb kill-server を実行してください。直らないときは、udev のルールを入れてください：

@@ -2,7 +2,7 @@
 # PocketGPU for Android（Linux）：スマホに受け手を入れて起動し、USB でこの PC につなぐ。Windows のキットの android\start_android.cmd と同じ流れ。
 # 管理者の権限は要らない。スマホには何もインストールせず、root も要らない。受け手は /data/local/tmp の中のファイル。
 #   ./start-android.sh                 受け手（android/server_aarch64）をスマホに置いて起動し、adb forward でこの PC の 50300 番につなぐ
-#   ./start-android.sh --app           PocketGPU のアプリの中の受け手を使う（アプリの GPU をオンにして、50300 番を端末の 50060 番につなぐ）
+#   ./start-android.sh --app           PocketGPU のアプリの中の受け手を使う（アプリの GPU をオンにして、50300 番を端末のアプリの口につなぐ。アプリ 0.1.4 以上は localabstract:pocketgpu-gpu・0.1.3 以下は tcp:50060）
 #   ./start-android.sh --serial 番号    スマホが何台かあるとき、adb devices のシリアルで選ぶ（環境変数 ANDROID_SERIAL でも選べる）
 #   PGPU_PORT=50301 ./start-android.sh  50300 番が使えないときの別の番号
 # そのあと：./check-android.sh でチェック・./run-on-android-gpu.sh vkcube で起動・終わったら ./stop-android.sh
@@ -20,7 +20,7 @@ USE_APP=0
 usage() {
     say '使い方：./start-android.sh [--app] [--serial シリアル]' 'Usage: ./start-android.sh [--app] [--serial SERIAL]'
     say '  引数なし   受け手をスマホに入れて起動し、この PC の 50300 番につなぎます' '  no option  put the receiver on the phone, start it, and connect port 50300 on this PC to it'
-    say '  --app      PocketGPU のアプリの中の受け手を使います。50300 番をスマホの 50060 番につなぎます' '  --app      use the receiver inside the PocketGPU app. Port 50300 is connected to port 50060 on the phone'
+    say '  --app      PocketGPU のアプリの中の受け手を使います。50300 番をスマホのアプリにつなぎます（アプリ 0.1.4 以上は USB 用の口 pocketgpu-gpu・0.1.3 以下は 50060 番）' '  --app      use the receiver inside the PocketGPU app. Port 50300 is connected to the app on the phone (the USB socket pocketgpu-gpu for app 0.1.4 or newer, port 50060 for 0.1.3 or older)'
     say '  --serial   スマホが何台かあるとき、adb devices のシリアルで選びます。環境変数 ANDROID_SERIAL でも選べます' '  --serial   choose a phone by its serial from adb devices when more than one is connected. ANDROID_SERIAL works too'
     say '  PGPU_PORT=50301 ./start-android.sh   50300 番を使えないときの別の番号' '  PGPU_PORT=50301 ./start-android.sh   another port, when 50300 is used by another program'
     say 'そのあとは ./check-android.sh でチェックして、./run-on-android-gpu.sh vkcube で起動します。終わったら ./stop-android.sh を実行します。' 'Then check with ./check-android.sh, run with ./run-on-android-gpu.sh vkcube, and finish with ./stop-android.sh.'
@@ -102,7 +102,10 @@ if [ "$USE_APP" = 1 ]; then
     done
     # キットの受け手が動いていると、アプリは自分の受け手を起こさない。先に止める
     ash "kill \$(pidof $DEV_NAME) 2>/dev/null; true" > /dev/null 2>&1
-    FW=$("$ADB" forward "tcp:$PGPU_PORT" "tcp:$APP_GPU_PORT" 2>&1 < /dev/null)
+    # 0.1.4 以上のアプリは USB 用に localabstract で待つ。0.1.3 以下は TCP の 50060 番
+    if version_ge "${ver:-}" "$APP_MIN_GPU_USB"; then APP_FWD="localabstract:$APP_GPU_USB"; else APP_FWD="tcp:$APP_GPU_PORT"; fi
+    LOG+=("      app GPU forward target: $APP_FWD")
+    FW=$("$ADB" forward "tcp:$PGPU_PORT" "$APP_FWD" 2>&1 < /dev/null)
     if [ $? -ne 0 ]; then
         ng "$(M "この PC の $PGPU_PORT 番を使えません。ほかのプログラムが使っているかもしれません。" "Cannot use port $PGPU_PORT on this PC. Another program may be using it.")"
         info "$(M "./stop-android.sh を実行するか、別の番号を使ってください：PGPU_PORT=$((PGPU_PORT + 1)) $SELF --app" "Run ./stop-android.sh, or use another port: PGPU_PORT=$((PGPU_PORT + 1)) $SELF --app")"
@@ -110,7 +113,11 @@ if [ "$USE_APP" = 1 ]; then
         stop_here
     fi
     ash "am start -n $APP_ACT --ez gpu true" > /dev/null 2>&1
-    ok "$(M "アプリの GPU をオンにして、この PC の $PGPU_PORT 番をスマホの $APP_GPU_PORT 番につなぎました。" "Turned on the GPU in the app and connected port $PGPU_PORT on this PC to port $APP_GPU_PORT on the phone.")"
+    if [ "${APP_FWD#tcp:}" = "$APP_FWD" ]; then
+        ok "$(M "アプリの GPU をオンにして、この PC の $PGPU_PORT 番をスマホのアプリの USB 用の口（$APP_GPU_USB）につなぎました。" "Turned on the GPU in the app and connected port $PGPU_PORT on this PC to the USB socket of the app on the phone ($APP_GPU_USB).")"
+    else
+        ok "$(M "アプリの GPU をオンにして、この PC の $PGPU_PORT 番をスマホの $APP_GPU_PORT 番につなぎました。" "Turned on the GPU in the app and connected port $PGPU_PORT on this PC to port $APP_GPU_PORT on the phone.")"
+    fi
     info "$(M 'スマホにカメラやマイクの許可を求められたら「許可」をタップしてください。' 'If the phone asks for camera or microphone access, tap Allow.')"
 else
     step 4 "$(M 'スマホに受け手を入れて起動' 'Put the receiver on the phone and start it')"

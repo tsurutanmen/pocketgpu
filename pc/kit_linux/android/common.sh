@@ -16,7 +16,9 @@ APP_ACT=$APP_PKG/.MainActivity
 APP_MIN_NEW=0.1.2        # カメラとマイクの口が localabstract になった版
 CAM_PORT=50064
 AUD_PORT=50063
-APP_GPU_PORT=50060       # アプリの中の GPU の受け手が端末で待つ口
+APP_GPU_PORT=50060       # アプリの中の GPU の受け手が端末で待つ TCP の口（0.1.3 以下。0.1.4 以上は 50060 が使えなければ 50061 から順に待つ）
+APP_GPU_USB=pocketgpu-gpu # アプリの中の GPU の受け手が USB 用に待つ localabstract の名前（0.1.4 から）
+APP_MIN_GPU_USB=0.1.4    # GPU の USB 用の口（localabstract）が付いた版
 CAM_ABSTRACT=pocketgpu-webcam
 AUD_ABSTRACT=pocketgpu-audio
 DEV_DIR=/data/local/tmp  # キットの受け手を置く所
@@ -127,7 +129,7 @@ adb_install_hint() {
         cmdline "sudo steamos-readonly enable"
         ;;
     arch) cmdline "sudo pacman -S android-tools" ;;
-    debian) cmdline "sudo apt install android-tools-adb" ;;
+    debian) cmdline "sudo apt install adb" ;;
     fedora) cmdline "sudo dnf install android-tools" ;;
     ostree)
         cmdline "rpm-ostree install android-tools"

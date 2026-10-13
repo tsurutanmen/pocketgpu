@@ -94,11 +94,16 @@ done
 while :; do
     step 4 "$(M 'スマホの受け手と、この PC の口' 'The receiver on the phone, and the port on this PC')"
     KITPID=$(ashr "pidof $DEV_NAME")
+    APPV=
+    android_app_installed && APPV=$(android_app_version)
     android_snapshot
     EXPECT=
     if [ -n "$KITPID" ]; then
         ok "$(M "キットの受け手がスマホで動いています。口：127.0.0.1:$PGPU_PORT" "The kit receiver is running on the phone. Port: 127.0.0.1:$PGPU_PORT")"
         EXPECT="tcp:$PGPU_PORT"
+    elif { [ -z "$APPV" ] || version_ge "$APPV" "$APP_MIN_GPU_USB"; } && snap_unix "$APP_GPU_USB"; then
+        ok "$(M "PocketGPU のアプリの中の受け手が動いています。USB 用の口：localabstract:$APP_GPU_USB" "The receiver in the PocketGPU app is running. USB socket: localabstract:$APP_GPU_USB")"
+        EXPECT="localabstract:$APP_GPU_USB"
     elif snap_tcp "$APP_GPU_PORT"; then
         ok "$(M "PocketGPU のアプリの中の受け手が動いています。口：127.0.0.1:$APP_GPU_PORT" "The receiver in the PocketGPU app is running. Port: 127.0.0.1:$APP_GPU_PORT")"
         EXPECT="tcp:$APP_GPU_PORT"
@@ -118,7 +123,7 @@ while :; do
         continue
     fi
     if [ "$FWD" != "$EXPECT" ]; then
-        warn "$(M "この PC の $PGPU_PORT 番は、スマホの ${FWD#tcp:} 番につながっていますが、動いている受け手は ${EXPECT#tcp:} 番です。" "Port $PGPU_PORT on this PC is connected to port ${FWD#tcp:} on the phone, but the receiver that is running uses port ${EXPECT#tcp:}.")"
+        warn "$(M "この PC の $PGPU_PORT 番は、スマホの ${FWD} につながっていますが、動いている受け手は ${EXPECT} です。" "Port $PGPU_PORT on this PC is connected to ${FWD} on the phone, but the receiver that is running uses ${EXPECT}.")"
         info "$(M 'もう一度 ./start-android.sh を実行してください。アプリの受け手を使うときは --app を付けます。' 'Run ./start-android.sh again. To use the receiver in the app, add --app.')"
     else
         ok "$(M "この PC の $PGPU_PORT 番がスマホの受け手につながっています。" "Port $PGPU_PORT on this PC is connected to the receiver on the phone.")"
