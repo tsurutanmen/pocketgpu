@@ -97,11 +97,19 @@ fi
 family() {
     case " $OS_ID $OS_LIKE " in
     *" steamos "*) echo steamos ;;
-    *" arch "*) echo arch ;;
+    *" arch "* | *" cachyos "*) echo arch ;;
     *" fedora "* | *" rhel "*) echo fedora ;;
     *" debian "* | *" ubuntu "*) echo debian ;;
     *" suse "* | *" opensuse "*) echo suse ;;
-    *) echo other ;;
+    *)
+        # ID_LIKE を書いていないディストリビューション（CachyOS など）は、パッケージマネージャで見分ける。PGPU_OS_RELEASE の試験では見ない
+        if [ -n "${PGPU_OS_RELEASE:-}" ]; then echo other
+        elif command -v pacman > /dev/null 2>&1; then echo arch
+        elif command -v apt-get > /dev/null 2>&1; then echo debian
+        elif command -v dnf > /dev/null 2>&1; then echo fedora
+        elif command -v zypper > /dev/null 2>&1; then echo suse
+        else echo other; fi
+        ;;
     esac
 }
 FAMILY=$(family)

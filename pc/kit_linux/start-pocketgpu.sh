@@ -107,11 +107,19 @@ fi
 family() {
     case " $OS_ID $OS_LIKE " in
     *" steamos "*) echo steamos ;;
-    *" arch "*) echo arch ;;
+    *" arch "* | *" cachyos "*) echo arch ;;
     *" fedora "* | *" rhel "*) echo fedora ;;
     *" debian "* | *" ubuntu "*) echo debian ;;
     *" suse "* | *" opensuse "*) echo suse ;;
-    *) echo other ;;
+    *)
+        # ID_LIKE を書いていないディストリビューション（CachyOS など）は、パッケージマネージャで見分ける。PGPU_OS_RELEASE の試験では見ない
+        if [ -n "${PGPU_OS_RELEASE:-}" ]; then echo other
+        elif command -v pacman > /dev/null 2>&1; then echo arch
+        elif command -v apt-get > /dev/null 2>&1; then echo debian
+        elif command -v dnf > /dev/null 2>&1; then echo fedora
+        elif command -v zypper > /dev/null 2>&1; then echo suse
+        else echo other; fi
+        ;;
     esac
 }
 FAMILY=$(family)
@@ -414,6 +422,9 @@ if command -v flatpak > /dev/null 2>&1 && flatpak info com.valvesoftware.Steam >
     out "    flatpak override --user --filesystem=\"$KIT\":ro com.valvesoftware.Steam"
     out "$(M '  さらに、ゲームを起動する前に別のターミナルで次を実行して、開いたままにしてください：' '  Also, before starting the game, run this in another terminal and keep it open:')"
     out "    \"$RUN\" --broker"
+fi
+if [ -e /snap/steam/current ]; then
+    out "$(M '・Snap 版の Steam がインストールされています。Snap 版では、ゲームから iPhone の USB に接続できない可能性が高く、まだ確認していません。Valve の .deb か、ディストリビューションのパッケージの Steam を使ってください。' '- The Snap Steam is installed. From the Snap Steam, games can most likely not reach the iPhone over USB. This has not been checked yet. Use the .deb from Valve or the Steam package of your distribution.')"
 fi
 [ "$FAMILY" = steamos ] && out "$(M '・ゲームモードでも動作する見込みですが、まだ確認していません。まずデスクトップモードで試してください。' '- Game Mode is expected to work but has not been checked yet. Try Desktop Mode first.')"
 out "$(M '・アンチチートを導入しているゲームでは使用しないでください。アカウントが停止されることがあります。' '- Do not use games with anti-cheat. Your account may be banned.')"

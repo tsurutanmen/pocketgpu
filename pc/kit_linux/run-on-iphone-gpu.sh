@@ -12,6 +12,7 @@
 #   IPHONE_VK=host:port   connect over the network instead of USB. The default is usb.
 #   IPHONE_VK_LOG=1       print what the driver does. With Proton, add PROTON_LOG=1 to get it in ~/steam-<appid>.log.
 #   IPHONE_VK_VIDEO=1     receive the window picture as H.264 instead of JPEG. Needs FFmpeg's libavcodec on this PC.
+#   IPHONE_VK_KEEP_WAYLAND=1  keep WAYLAND_DISPLAY. By default it is removed when X11 or Xwayland is there, so programs open X11 windows.
 #
 # USB の補助プログラム（受け渡し役）：Steam の入れ物の中のゲームは /run/usbmuxd が見えないので、外で動く pgpu-probe broker が
 # usbmuxd につないだ口を渡す。起動のたびに、名前（PGPU_BROKER）と合言葉（PGPU_BROKER_TOKEN）を新しく作り、
@@ -55,6 +56,8 @@ pgpu_env() {
     if [ -n "${DISPLAY:-}" ]; then
         export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-x11}"
         export SDL_VIDEO_DRIVER="${SDL_VIDEO_DRIVER:-x11}"
+        # GLFW 3.4, winit, Qt, GTK and others open Wayland windows when WAYLAND_DISPLAY is set, and the driver cannot draw those. Make them use X11 or Xwayland
+        [ "${IPHONE_VK_KEEP_WAYLAND:-0}" = 1 ] || unset WAYLAND_DISPLAY
     fi
 }
 

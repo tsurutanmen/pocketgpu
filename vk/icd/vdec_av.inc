@@ -3,10 +3,11 @@
 // 形は Windows の Media Foundation の物（icd.c の struct vdec）と同じ：vdec_open・vdec_push・vdec_map・vdec_unmap・vdec_close。
 // ほどけた絵は NV12（Y の面のすぐ後ろに UV の面・1 行の長さは同じ）で返す（vid_nv12_to_bgra にそのまま渡せる）。
 //
-// 読む libavcodec：IPHONE_VK_AVCODEC=パス があればそれ、無ければ libavcodec.so.62・61・60・59・58（FFmpeg 8・7・6・5・4）の順。
+// 読む libavcodec：IPHONE_VK_AVCODEC=パス があればそれ、無ければ libavcodec.so.63・62・61・60・59・58（FFmpeg 9・8・7・6・5・4）の順。
+// 63（FFmpeg 9。Arch は 2026 年 10 月に 9.0）も、下の AVPacket・AVFrame の並びは同じ（n9.0 の packet.h・frame.h で確かめた）
 // FFmpeg の版で中の並びが変わる所は使わない：
 //   AVCodecContext の中は触らない。設定は avcodec_open2 の AVDictionary で渡す（threads・flags=+low_delay・thread_type）
-//   AVPacket は data（24 バイト目）と size（32 バイト目）だけ。FFmpeg 4 から 8 まで同じ
+//   AVPacket は data（24 バイト目）と size（32 バイト目）だけ。FFmpeg 4 から 9 まで同じ
 //   AVFrame は data[8]・linesize[8]・width・height・format（0・64・104・108・116 バイト目）だけ。FFmpeg 1 から同じ
 //   絵の形は番号でなく名前（av_get_pix_fmt_name）で見る（yuv420p・yuvj420p・nv12）
 //   札（何回目の present の物か）は、AVFrame の pts を読まずに、入れた順の待ち行列で付ける（遅れの少ない設定では入れた順に出る）
@@ -59,7 +60,7 @@ static struct {
 } g_av = { PTHREAD_ONCE_INIT, 0, 0, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
 static void vdec_av_load(void) {
-    static const char *const names[] = { "libavcodec.so.62", "libavcodec.so.61", "libavcodec.so.60", "libavcodec.so.59", "libavcodec.so.58" };
+    static const char *const names[] = { "libavcodec.so.63", "libavcodec.so.62", "libavcodec.so.61", "libavcodec.so.60", "libavcodec.so.59", "libavcodec.so.58" };
     const char *alt = getenv("IPHONE_VK_AVCODEC");
     void *h = NULL;
     if (alt && *alt) {

@@ -19,9 +19,9 @@ What you need
 - A tool to install the iPhone app with your own Apple ID. Impactor and iloader both work on Linux.
 
 Install the packages
-- Arch Linux:     sudo pacman -S --needed usbmuxd libimobiledevice vulkan-icd-loader
-- Ubuntu, Debian: sudo apt install usbmuxd libimobiledevice-utils libvulkan1
-- Fedora:         sudo dnf install usbmuxd libimobiledevice-utils vulkan-loader
+- Arch Linux, CachyOS:         sudo pacman -S --needed usbmuxd libimobiledevice vulkan-icd-loader
+- Ubuntu, Linux Mint, Debian:  sudo apt install usbmuxd libimobiledevice-utils libvulkan1
+- Fedora:                      sudo dnf install usbmuxd libimobiledevice-utils vulkan-loader
 - Bazzite and other rpm-ostree systems: rpm-ostree install usbmuxd libimobiledevice-utils, then restart.
 - SteamOS on a Steam Deck: the system is read-only. In Desktop Mode, open Konsole and run:
       passwd                                      only if you have not set a password yet
@@ -159,6 +159,8 @@ Steam and Proton
   2. Every time, before you start the game, run this in a terminal and keep it open:
          ./run-on-iphone-gpu.sh --broker
   If you can, use Steam from your distribution instead of Flatpak.
+- Steam from Snap has not been tested. Games in it can most likely not reach the iPhone over USB.
+  Use the .deb from Valve or the Steam package of your distribution.
 - Steam Deck: try it in Desktop Mode first. Game Mode has not been tested yet.
 - Each start gets its own USB helper with a new secret, given only to that game. The helper gives the connection
   only to programs of the same user that know the secret. With --broker, the secret is kept in tools/broker-token,
@@ -205,9 +207,9 @@ iPhone ではなく Android のスマートフォンを使う場合は、iPhone 
 - 自分の Apple ID で iPhone にアプリをインストールするためのツール。Impactor と iloader が Linux で使えます
 
 パッケージのインストール
-- Arch Linux：      sudo pacman -S --needed usbmuxd libimobiledevice vulkan-icd-loader
-- Ubuntu・Debian：  sudo apt install usbmuxd libimobiledevice-utils libvulkan1
-- Fedora：          sudo dnf install usbmuxd libimobiledevice-utils vulkan-loader
+- Arch Linux・CachyOS：         sudo pacman -S --needed usbmuxd libimobiledevice vulkan-icd-loader
+- Ubuntu・Linux Mint・Debian：  sudo apt install usbmuxd libimobiledevice-utils libvulkan1
+- Fedora：                      sudo dnf install usbmuxd libimobiledevice-utils vulkan-loader
 - Bazzite など rpm-ostree のシステム：rpm-ostree install usbmuxd libimobiledevice-utils を実行してから、再起動してください
 - Steam Deck の SteamOS：システムが読み取り専用です。デスクトップモードで Konsole を開いて、次を実行してください。
       passwd                                      パスワードをまだ設定していない場合だけ
@@ -344,6 +346,8 @@ Steam と Proton
   2. ゲームを起動する前に毎回、ターミナルで次を実行して、開いたままにしてください：
          ./run-on-iphone-gpu.sh --broker
   できれば、Flatpak 版ではなく、ディストリビューションの Steam を使ってください
+- Snap 版の Steam はまだテストしていません。Snap 版では、ゲームから iPhone の USB に接続できない可能性が高いです。
+  Valve の .deb か、ディストリビューションのパッケージの Steam を使ってください
 - Steam Deck：まずデスクトップモードで試してください。ゲームモードはまだテストしていません
 - USB の補助プログラムは、起動のたびに新しい合言葉で起動し、合言葉はそのゲームにだけ渡します。
   補助プログラムは、同じユーザーで合言葉を知っているプログラムにだけ接続を渡します。

@@ -126,11 +126,19 @@ OS_LIKE=
 [ -r "$OSR" ] && OS_ID=$(. "$OSR" && printf '%s' "${ID:-}") && OS_LIKE=$(. "$OSR" && printf '%s' "${ID_LIKE:-}")
 case " $OS_ID $OS_LIKE " in
 *" steamos "*) FAMILY=steamos ;;
-*" arch "*) FAMILY=arch ;;
+*" arch "* | *" cachyos "*) FAMILY=arch ;;
 *" fedora "* | *" rhel "*) FAMILY=fedora ;;
 *" debian "* | *" ubuntu "*) FAMILY=debian ;;
 *" suse "* | *" opensuse "*) FAMILY=suse ;;
-*) FAMILY=other ;;
+*) # ID_LIKE を書いていないディストリビューション（CachyOS など）は、パッケージマネージャで見分ける。PGPU_OS_RELEASE の試験では見ない
+    FAMILY=other
+    if [ -z "${PGPU_OS_RELEASE:-}" ]; then
+        if command -v pacman > /dev/null 2>&1; then FAMILY=arch
+        elif command -v apt-get > /dev/null 2>&1; then FAMILY=debian
+        elif command -v dnf > /dev/null 2>&1; then FAMILY=fedora
+        elif command -v zypper > /dev/null 2>&1; then FAMILY=suse; fi
+    fi
+    ;;
 esac
 hint_ffmpeg() {
     case "$FAMILY" in
@@ -146,12 +154,18 @@ hint_v4l2() {
     case "$FAMILY" in
     debian) cmdline "sudo apt install v4l2loopback-dkms" ;;
     fedora) cmdline "sudo dnf install v4l2loopback   # RPM Fusion" ;;
-    arch) cmdline "sudo pacman -S --needed v4l2loopback-dkms linux-headers" ;;
+    arch)
+        # headers は動いているカーネルに合わせる（CachyOS は linux-cachyos-headers・LTS は linux-lts-headers）。わからなければ linux-headers
+        local kpkg
+        kpkg=$(pacman -Qqo "/usr/lib/modules/$(uname -r)/vmlinuz" 2> /dev/null | head -1)
+        cmdline "sudo pacman -S --needed v4l2loopback-dkms ${kpkg:-linux}-headers"
+        ;;
     steamos) info "$(M 'SteamOS では v4l2loopback を使えません。PipeWire のカメラを使います。' 'SteamOS cannot use v4l2loopback. The PipeWire camera is used.')"; return ;;
     *) info "$(M 'パッケージマネージャで v4l2loopback をインストールしてください。' 'Install v4l2loopback with your package manager.')" ;;
     esac
     cmdline "sudo modprobe v4l2loopback exclusive_caps=1 card_label=\"PocketGPU iPhone Camera\""
     info "$(M 'PC を再起動すると消えます。そのときは modprobe の行をもう一度実行してください。' 'It is gone after a restart. Then run the modprobe line again.')"
+    case "$FAMILY" in debian | fedora) info "$(M 'セキュアブートが有効な PC では、インストールの途中で MOK のパスワードを決めて、再起動の画面で登録してください。登録しないと modprobe が「Key was rejected by service」で失敗します。' 'With Secure Boot on, set a MOK password during the install and enroll it on the screen after a restart. Without it, modprobe fails with "Key was rejected by service".')" ;; esac
 }
 
 out "$(M 'iPhone をマイクとカメラとして使います' 'Use the iPhone as a microphone and a camera')"
