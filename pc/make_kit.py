@@ -236,6 +236,8 @@ if defined ADB goto adb_given
 for /f "delims=" %%A in ('where adb.exe 2^>nul') do if not defined ADB set "ADB=%%A"
 if defined ADB goto adb_ok
 for %%D in ("%LOCALAPPDATA%\Android\Sdk\platform-tools" "%USERPROFILE%\platform-tools" "%USERPROFILE%\Downloads\platform-tools" "%USERPROFILE%\Desktop\platform-tools" "C:\platform-tools" "C:\adb" "%ProgramFiles%\platform-tools" "%~dp0..\platform-tools" "%~dp0..\..\platform-tools") do if not defined ADB if exist "%%~D\adb.exe" set "ADB=%%~D\adb.exe"
+rem "Extract All" in Windows puts the zip in a folder named after it: platform-tools-latest-windows\platform-tools
+for %%D in ("%USERPROFILE%\Downloads\platform-tools-latest-windows\platform-tools" "%USERPROFILE%\Desktop\platform-tools-latest-windows\platform-tools" "%OneDrive%\Desktop\platform-tools" "%OneDrive%\Desktop\platform-tools-latest-windows\platform-tools" "%OneDrive%\Downloads\platform-tools" "%~dp0..\platform-tools-latest-windows\platform-tools" "%~dp0..\..\platform-tools-latest-windows\platform-tools") do if not defined ADB if exist "%%~D\adb.exe" set "ADB=%%~D\adb.exe"
 if defined ADB goto adb_ok
 echo.
 echo ERROR: adb.exe was not found.
@@ -318,15 +320,25 @@ echo Phone:
 "%ADB%" shell getprop ro.product.model
 echo Receiver: %SRV%  Port: %PGPU_PORT%
 echo Stopping an old receiver, if any ...
-"%ADB%" shell "kill $(pidof pgpu_server) 2>/dev/null; rm -f /data/local/tmp/pgpu_server; true" >nul 2>&1
+"%ADB%" shell "kill $(pidof pgpu_server) 2>/dev/null; for i in 1 2 3 4 5 6 7 8 9 10; do pidof pgpu_server >/dev/null || break; sleep 0.3; done; kill -9 $(pidof pgpu_server) 2>/dev/null; rm -f /data/local/tmp/pgpu_server /data/local/tmp/pgpu_server.log; true" >nul 2>&1
 echo Copying the receiver to the phone ...
-"%ADB%" push "%~dp0%SRV%" /data/local/tmp/pgpu_server >nul
+"%ADB%" push "%~dp0%SRV%" /data/local/tmp/pgpu_server > "%TEMP%\pocketgpu_push.txt" 2>&1
 if errorlevel 1 goto push_failed
 echo Starting the receiver ...
-"%ADB%" shell "cd /data/local/tmp && chmod 755 pgpu_server && (nohup ./pgpu_server 127.0.0.1 %PGPU_PORT% > pgpu_server.log 2>&1 &)"
-ping -n 3 127.0.0.1 >nul
+"%ADB%" shell "cd /data/local/tmp && chmod 755 pgpu_server && (PGPU_LANG=en nohup ./pgpu_server 127.0.0.1 %PGPU_PORT% > pgpu_server.log 2>&1 &)"
+rem Wait until the receiver says it is listening. Starting Vulkan on the phone can take a few seconds.
+rem The line is "Vulkan receiver: listening on 127.0.0.1:PORT" (older receivers write it in Japanese, with the same start and address).
+set /a TRIES=0
+:wait_listen
+ping -n 2 127.0.0.1 >nul
+set /a TRIES+=1
+"%ADB%" shell cat /data/local/tmp/pgpu_server.log 2>nul | findstr /r /c:"^Vulkan .*127\.0\.0\.1:%PGPU_PORT%" >nul
+if not errorlevel 1 goto listening
 "%ADB%" shell pidof pgpu_server | findstr /r "[0-9]" >nul
 if errorlevel 1 goto server_failed
+if %TRIES% LSS 30 goto wait_listen
+goto server_slow
+:listening
 "%ADB%" forward tcp:%PGPU_PORT% tcp:%PGPU_PORT% >nul
 if errorlevel 1 goto forward_failed
 
@@ -349,13 +361,20 @@ echo ERROR: %~dp0%SRV% is missing. Unzip the whole kit again.
 goto fail
 :push_failed
 echo.
-echo ERROR: could not copy the receiver to the phone (see the message above).
+echo ERROR: could not copy the receiver to the phone. adb said:
+type "%TEMP%\pocketgpu_push.txt"
 goto fail
 :server_failed
 echo.
 echo ERROR: the receiver did not stay running on the phone. Its log:
 "%ADB%" shell cat /data/local/tmp/pgpu_server.log
 echo Please send us this log together with the phone model and the Android version.
+goto fail
+:server_slow
+echo.
+echo ERROR: the receiver is running on the phone, but it did not start listening within 30 seconds. Its log:
+"%ADB%" shell cat /data/local/tmp/pgpu_server.log
+echo Unlock the phone and run this file again. If it happens again, send us this log.
 goto fail
 :forward_failed
 echo.
@@ -556,6 +575,79 @@ if "%PGPU_NOPAUSE%"=="" pause
 '''
 
 # 手順だけの下書き。言い回しは鶴田さんが直す
+ANDROID_EASY = r'''@echo off
+rem PocketGPU for Android: the easy way. Double-click this file.
+rem It copies the receiver to the phone, starts it, connects it to this PC and checks that Windows sees the phone GPU.
+rem Then drag a game's .exe onto this window (or onto this file) to start it on the phone GPU.
+rem The "Use as a GPU" switch in the phone app is not needed for this. Needs adb.exe, see android\README_android.txt.
+rem Only English here on purpose: a Japanese Windows reads .cmd files as Shift_JIS.
+setlocal
+set "GAME=%~1"
+echo PocketGPU for Android
+echo.
+echo [1/2] Setting up the phone ...
+set PGPU_NOPAUSE=1
+rem "<nul" keeps adb from reading this window's input, so a game dragged in early is not lost.
+call "%~dp0android\start_android.cmd" <nul
+if errorlevel 1 goto failed
+echo.
+echo [2/2] Checking that Windows sees the phone GPU ...
+set "VK_ADD_DRIVER_FILES=%~dp0iphone_icd.json;%~dp0x86\iphone_icd.json"
+if "%PGPU_PORT%"=="" set PGPU_PORT=50300
+set IPHONE_VK=127.0.0.1:%PGPU_PORT%
+set "VK_ICD_FILENAMES=%VK_ADD_DRIVER_FILES%"
+"%~dp0vklist.exe" > "%TEMP%\pocketgpu_vklist.txt" 2>&1 <nul
+type "%TEMP%\pocketgpu_vklist.txt"
+findstr /c:"PocketGPU phone" "%TEMP%\pocketgpu_vklist.txt" >nul
+if errorlevel 1 goto not_seen
+echo.
+echo OK. Windows sees the phone GPU.
+echo Keep the phone unlocked with the screen on while a game is running.
+set "VK_ICD_FILENAMES="
+if not "%GAME%"=="" goto run
+:ask
+echo.
+echo Drag a game's .exe into this window and press Enter.
+echo You can also drop a game's .exe onto pocketgpu_android.cmd later.
+set "GAME="
+set /p GAME=Game:
+if not defined GAME goto end
+set "GAME=%GAME:"=%"
+if "%GAME%"=="" goto end
+:run
+if not exist "%GAME%" goto no_game
+rem Start the game in its own folder, as Steam and Explorer do. Some games look for their files there.
+for %%G in ("%GAME%") do cd /d "%%~dpG"
+echo Starting "%GAME%" on the phone GPU ...
+call "%~dp0pocketgpu_android.cmd" "%GAME%"
+echo.
+echo The game (or its launcher) has exited. The receiver keeps running on the phone until you run android\stop_android.cmd or restart the phone.
+goto end
+
+:no_game
+echo.
+echo ERROR: this file was not found:
+echo   "%GAME%"
+echo Drag the game's .exe file itself into this window.
+goto ask
+
+:not_seen
+echo.
+echo The phone GPU is not in the list above.
+echo Please send a screenshot of this window, and the receiver log:
+call "%~dp0android\_common.cmd" >nul 2>&1 <nul
+if defined ADB "%ADB%" shell cat /data/local/tmp/pgpu_server.log 2>nul <nul
+goto failed
+:failed
+echo.
+echo Something did not work. Please send a screenshot of this window in Discord.
+pause
+exit /b 1
+:end
+pause
+exit /b 0
+'''
+
 ANDROID_README = r'''PocketGPU for Android (draft)
 =============================
 
@@ -911,7 +1003,7 @@ def main():
             shutil.copy2(a.android_apk, os.path.join(adir, 'pocketgpu.apk'))
             android_apk_sha = sha256(a.android_apk)
         open(os.path.join(adir, 'README_android.txt'), 'w', encoding='utf-8-sig', newline='\r\n').write(ANDROID_README)
-        for name, text in (('pocketgpu_android.cmd', ANDROID_LAUNCH), ('check_android.cmd', ANDROID_CHECK)):
+        for name, text in (('pocketgpu_android.cmd', ANDROID_LAUNCH), ('check_android.cmd', ANDROID_CHECK), ('Start-Android-GPU.cmd', ANDROID_EASY)):
             open(os.path.join(kit, name), 'w', encoding='ascii', newline='\r\n').write(text)
 
     # カメラ・マイク・字幕：extras\ に道具と仮想カメラ、一番上に Start-Mic-Camera.cmd、tools\ に miccam.ps1。印は入れない
