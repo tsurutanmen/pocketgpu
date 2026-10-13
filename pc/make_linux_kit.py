@@ -18,9 +18,13 @@
 #   start-mic-camera.sh       iPhone をマイクとカメラにする（GPU は使わない）。Windows の Start-Mic-Camera.cmd
 #   bin/webcam_rx・bin/ipaudio  カメラ（PipeWire か v4l2loopback へ）とマイク・スピーカー（PipeWire か PulseAudio へ）（--no-media で入れない）
 #   tools/kit.ini             受け手との約束の版（proto=）とアプリの版（app=）
+#   start-android.sh・stop-android.sh・check-android.sh・run-on-android-gpu.sh・start-android-mic-camera.sh と android/common.sh
+#                             Android のスマホ用（--no-android で入れない）。Windows のキットの android\ と同じ流れ
+#   android/server_aarch64    スマホで動く受け手（PGKIT_ANDROID_DIR にある物。--with-x86_64 で server_x86_64 も。印は入れない）
+#   android/pocketgpu.apk     Android のアプリ（PGKIT_ANDROID_APK の物。adb install -r で入れる）
 #   THIRD-PARTY.txt           ドライバに入っている他の人のコード（lz4・bcdec・stb_image）のライセンス
 #   RpcServer-*.ipa           iPhone のアプリ（印入り）
-# 置き場は環境変数で変えられる：PGKIT_OUT（出す所）・PGKIT_LINUX_BUILD（組んだ物）・PGKIT_IPA_DIR・PGKIT_VK_SRC（app\vk）・ZIG・VK_HEADERS
+# 置き場は環境変数で変えられる：PGKIT_OUT（出す所）・PGKIT_LINUX_BUILD（組んだ物）・PGKIT_IPA_DIR・PGKIT_ANDROID_DIR・PGKIT_ANDROID_APK・PGKIT_VK_SRC（app\vk）・ZIG・VK_HEADERS
 # 台本の横に kit_linux\ があればそれを、無ければ app\pc\kit_linux\ を使う。app\vk は横の src\vk（work\linuxkit の作業コピー）か ..\vk
 import argparse, csv, datetime, hashlib, io, json, os, re, secrets, shutil, struct, subprocess, sys, tarfile, zipfile
 
@@ -30,6 +34,8 @@ VK_SRC = os.environ.get('PGKIT_VK_SRC') or next(
     (p for p in (os.path.join(HERE, 'src', 'vk'), os.path.join(HERE, '..', 'vk')) if os.path.exists(os.path.join(p, 'icd', 'icd.c'))), '')
 BUILD = os.environ.get('PGKIT_LINUX_BUILD', r'D:\iphone-rpc\kitbuild_linux')
 IPA_DIR = os.environ.get('PGKIT_IPA_DIR', r'D:\iphone-rpc\ipa\serve')
+ANDROID_DIR = os.environ.get('PGKIT_ANDROID_DIR', r'D:\iphone-rpc\androidbuild')  # app\vk\build_android.sh で組んだ受け手（server_aarch64 と server_x86_64）
+ANDROID_APK = os.environ.get('PGKIT_ANDROID_APK', r'D:\iphone-rpc\work\android_app\out\pocketgpu.apk')  # work\android_app\build_apk.sh で組んだアプリ
 OUT = os.environ.get('PGKIT_OUT', r'D:\iphone-rpc\tester_kit')
 ZIG = os.environ.get('ZIG') or shutil.which('zig') or r'D:\tools\zig-x86_64-windows-0.17.0\zig.exe'
 VK_HEADERS = os.environ.get('VK_HEADERS') or next(
@@ -250,6 +256,8 @@ def main():
     ap.add_argument('--no-ipa', action='store_true', help='iPhone のアプリ（IPA）を入れない（試験用）')
     ap.add_argument('--no-32', action='store_true', help='32 ビットのゲーム用のドライバ（lib/i386）を入れない')
     ap.add_argument('--no-media', action='store_true', help='カメラとマイクの道具（webcam_rx・ipaudio・start-mic-camera.sh）を入れない')
+    ap.add_argument('--no-android', action='store_true', help='Android の物（受け手・アプリ・start-android*.sh など）を入れない')
+    ap.add_argument('--with-x86_64', action='store_true', help='Android の受け手の x86_64 版（エミュレーター用）も android/ に入れる')
     a = ap.parse_args()
     ledger = os.path.join(OUT, 'ledger_linux.csv')
     if a.template:
@@ -280,6 +288,12 @@ def main():
             src_ipa = newest_ipa()
         except (OSError, ValueError):
             raise SystemExit(f'{IPA_DIR} に RpcServer-*.ipa が無い。入れないなら --no-ipa')
+
+    android_srv = os.path.join(ANDROID_DIR, 'server_aarch64')
+    if not a.no_android:
+        for p in [android_srv, ANDROID_APK] + ([os.path.join(ANDROID_DIR, 'server_x86_64')] if a.with_x86_64 else []):
+            if not os.path.exists(p):
+                raise SystemExit(f'{p} が無い。置き場は PGKIT_ANDROID_DIR・PGKIT_ANDROID_APK で決める。Android の物を入れないなら --no-android')
 
     if not a.no_build:
         build(BUILD, not a.no_32, not a.no_media)
@@ -312,6 +326,16 @@ def main():
         for m in media:
             shutil.copyfile(m, os.path.join(kit, 'bin', os.path.basename(m)))
         names.append('start-mic-camera.sh')
+    if not a.no_android:
+        # 受け手とアプリには印を入れない（Windows のキットの android\ と同じ。人ごとの印はドライバにある）
+        os.makedirs(os.path.join(kit, 'android'), exist_ok=True)
+        shutil.copyfile(android_srv, os.path.join(kit, 'android', 'server_aarch64'))
+        if a.with_x86_64:
+            shutil.copyfile(os.path.join(ANDROID_DIR, 'server_x86_64'), os.path.join(kit, 'android', 'server_x86_64'))
+        shutil.copyfile(ANDROID_APK, os.path.join(kit, 'android', 'pocketgpu.apk'))
+        names += ['android/common.sh', 'start-android.sh', 'stop-android.sh', 'check-android.sh', 'run-on-android-gpu.sh']
+        if not a.no_media:
+            names.append('start-android-mic-camera.sh')
     for n in names:
         lf_copy(os.path.join(KIT_SRC, n), os.path.join(kit, n))
     try:
@@ -347,6 +371,9 @@ def main():
                     sha256(dst_ipa) if dst_ipa else '', os.path.basename(src_ipa) if src_ipa else '', sha256(tpath), a.discord_id])
     shutil.rmtree(kit)  # 配るのは tar.gz。中身のフォルダは残さない
     print(f'ZIP={tpath}')  # Windows の make_kit.py と同じ鍵の名前（bot が読む）。中身は tar.gz
+    if not a.no_android:
+        print(f'ANDROID_SERVER_SHA256={sha256(android_srv)}')
+        print(f'ANDROID_APK_SHA256={sha256(ANDROID_APK)}')
     print(f'MARK={mark.decode()}')
 
 

@@ -147,6 +147,7 @@ probe() { "$PROBE" "$@" 2> /dev/null; }
 
 out "$(M 'PocketGPU を開始します' 'Start PocketGPU')"
 out "$(M 'iPhone の GPU を使うために必要な項目を、順にチェックします。管理者権限は必要ありません。' 'This checks, one by one, what is needed to use the iPhone GPU. No administrator rights are needed.')"
+[ -f "$KIT/start-android.sh" ] && out "$(M 'Android のスマホを使う場合は、この台本ではなく ./start-android.sh を実行してください。' 'To use an Android phone, run ./start-android.sh instead of this script.')"
 
 # ==== 1. この PC ====
 step 1 "$(M 'この PC' 'This PC')"
@@ -251,6 +252,7 @@ while :; do
         break
     fi
     ng "$(M 'iPhone が USB で認識されていません。' 'The iPhone is not seen over USB.')"
+    [ -f "$KIT/start-android.sh" ] && info "$(M 'Android のスマホを使うときは、./start-android.sh を実行してください。' 'For an Android phone, run ./start-android.sh.')"
     printf '%s\n' "$DEVS" | grep -q ' Network ' && info "$(M 'Wi-Fi 経由でのみ認識されています。USB ケーブルで接続してください。' 'It is only seen over Wi-Fi. Connect it with a USB cable.')"
     if [ "$(probe usb | tail -1)" != "USB 0" ]; then
         info "$(M 'Linux は iPhone を認識していますが、usbmuxd はまだ認識していません。' 'Linux sees the iPhone, but usbmuxd does not see it yet.')"

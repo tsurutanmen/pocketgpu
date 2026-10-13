@@ -6,6 +6,8 @@ Each kit is marked for one person.
 The Linux version is new. It has been tested only with a stand-in for the iPhone, not with a real iPhone yet.
 Please tell us what works and what does not.
 
+Have an Android phone instead of an iPhone? Skip the iPhone parts and read the section "Android phone" below.
+
 What you need
 - A 64-bit x86_64 Linux PC: Arch Linux, Ubuntu 22.04 or later, Fedora, or a Steam Deck with SteamOS 3.
   An X11 desktop, or a Wayland desktop with Xwayland. Windows from the iPhone GPU are shown through X11.
@@ -80,6 +82,71 @@ Microphone and webcam
   such as OBS (Video Capture Device, PipeWire). SteamOS cannot use v4l2loopback.
 - The microphone and webcam on Linux have not been tested with a real iPhone yet.
 
+Android phone
+- This kit also works with an Android phone instead of an iPhone. It is an experiment.
+  The Android scripts have been tested here only with a stand-in for adb, not on a real phone from Linux yet.
+  Please tell us what works and what does not.
+- You do not need usbmuxd, libimobiledevice, or the iPhone app. You need:
+  - A 64-bit ARM Android phone, Android 11 or later, with a Vulkan GPU, and a USB cable that carries data.
+  - adb, the Android command line tool:
+        Arch, CachyOS:   sudo pacman -S android-tools
+        Ubuntu, Debian:  sudo apt install android-tools-adb
+        Fedora:          sudo dnf install android-tools
+    Without a package, download SDK Platform-Tools for Linux from
+    https://developer.android.com/tools/releases/platform-tools, unzip it, and put the platform-tools folder inside this kit folder.
+  - The Vulkan loader, libvulkan.so.1, as above.
+- Steps for the GPU. Extract the kit as in step 1 above, then:
+  1. On the phone, turn on USB debugging. Open Settings > About phone and tap Build number 7 times.
+     Then open Settings > System > Developer options and turn on USB debugging.
+  2. Plug the phone into the PC with USB. When the phone asks "Allow USB debugging?", tap Allow.
+     If more than one phone or emulator is connected, choose one with its serial from "adb devices":
+         ./start-android.sh --serial SERIAL        or        export ANDROID_SERIAL=SERIAL
+  3. Run:   ./start-android.sh
+     It copies the receiver, android/server_aarch64, to /data/local/tmp on the phone and starts it. Nothing is installed on the phone and root is not needed.
+     Then it connects port 50300 on the PC to the receiver with adb forward.
+  4. Run:   ./check-android.sh
+     It checks each part in order. At the end you should see a GPU named "PocketGPU phone".
+  5. To run a program on the phone GPU:
+         ./run-on-android-gpu.sh vkcube
+         ./run-on-android-gpu.sh /path/to/program arguments
+     Steam games, native and Proton: put this line in the game's Properties > Launch Options:
+         "/home/you/PocketGPU-linux-.../run-on-android-gpu.sh" %command%
+     It sets the same things as run-on-iphone-gpu.sh, with DXVK_FILTER_DEVICE_NAME=PocketGPU. It does not need the USB helper.
+     Everything in "Steam and Proton" below applies to it, except --broker.
+     Flatpak Steam needs only the flatpak override line from that section, not --broker.
+  6. While you use it, keep the phone unlocked with the screen on.
+  7. When you are finished, run:   ./stop-android.sh
+     It stops the receiver and removes it from the phone. Its log stays at /data/local/tmp/pgpu_server.log on the phone.
+- Another port: if port 50300 is used by another program, run PGPU_PORT=50301 ./start-android.sh, and put PGPU_PORT=50301 in front of the other scripts too.
+- Steps for the microphone and webcam, with or without the GPU:
+  1. Run:   ./start-android-mic-camera.sh
+  2. If the PocketGPU app is not on the phone yet, the script offers to install android/pocketgpu.apk with adb install -r.
+     If the phone asks about Google Play Protect, tap Install anyway.
+  3. The script opens the app on the phone, turns on the webcam and the speaker and mic, and connects the ports with adb forward.
+     When the phone asks for camera and microphone access, tap Allow.
+  4. Pick "PocketGPU Android Mic" as the microphone in your call app. With --speaker, pick "PocketGPU Android Speaker" as the output.
+     The camera is shown on v4l2loopback or on a PipeWire camera named "PocketGPU Android Camera".
+  5. Press q in the terminal to stop. The script closes the ports and turns the app features off. With --keep-app-on it leaves them on.
+  - FFmpeg, PipeWire, PulseAudio and v4l2loopback are the same as in "Microphone and webcam" above.
+  - Keep the phone unlocked and do not close the PocketGPU app while you use it.
+  - The ports. App 0.1.2 and later wait on an abstract socket that only adb can reach, so other apps on the phone cannot read your camera or microphone.
+    The script runs these two commands, and then webcam_rx --addr 127.0.0.1:50064 and ipaudio --connect 127.0.0.1:50063:
+        adb forward tcp:50064 localabstract:pocketgpu-webcam
+        adb forward tcp:50063 localabstract:pocketgpu-audio
+    App 0.1.1 uses the old form, adb forward tcp:50064 tcp:50064 and adb forward tcp:50063 tcp:50063. The script reads the app version and picks the right form.
+    If it cannot read the version, it tries the new form first and then the old one. You do not need to do anything.
+  - The receiver of this kit and the app can run together. If the receiver of this kit is running on the phone at 127.0.0.1:50300, the app does not start its own.
+    ./start-android.sh --app uses the receiver inside the app instead, so nothing is copied to the phone.
+- If something fails:
+  - adb says "unauthorized": unlock the phone and tap Allow on "Allow USB debugging?". Unplug and plug the cable in again if it does not appear.
+  - adb says "no permissions": plug the cable in again and run adb kill-server. If it stays, install the udev rules:
+    sudo pacman -S android-udev on Arch and CachyOS, or sudo apt install android-sdk-platform-tools-common on Ubuntu and Debian.
+  - No phone is found: try another cable or USB port. Set the USB mode of the phone to File transfer. Check step 1.
+  - The picture stops or the connection drops: run ./stop-android.sh and then ./start-android.sh again.
+- Reporting for Android: send pocketgpu-android-start-log.txt, pocketgpu-android-check-log.txt, or pocketgpu-android-miccam-log.txt, whichever you ran.
+  They have no user name, PC name, home folder, or phone serial. Please also tell us the phone model, the Android version, and the chip, for example Pixel 10 Pro XL, Android 16, Tensor G5.
+  If the receiver did not start, also send the output of:   adb shell cat /data/local/tmp/pgpu_server.log
+
 Steam and Proton
 - The launch option line sets these for the game only: the iPhone driver as the only Vulkan driver,
   DXVK_FILTER_DEVICE_NAME=iPhone, and a small USB helper. The helper lets the game reach usbmuxd from inside
@@ -124,6 +191,8 @@ PocketGPU 試験用キット Linux 版。この説明は下書きです
 試していただき、ありがとうございます。このキットは、他の人に渡さないでください。1 人ずつ識別用の印が含まれています。
 Linux 版は新しく作ったものです。iPhone の代わりのプログラムでテストしただけで、実際の iPhone ではまだテストしていません。
 動作したこと、動作しなかったことを教えてください。
+
+iPhone ではなく Android のスマートフォンを使う場合は、iPhone の説明は読まずに、下の「Android のスマートフォン」を読んでください。
 
 必要なもの
 - 64 ビットの x86_64 の Linux の PC。Arch Linux、Ubuntu 22.04 以降、Fedora、または SteamOS 3 の Steam Deck
@@ -197,6 +266,70 @@ Linux 版は新しく作ったものです。iPhone の代わりのプログラ�
   v4l2loopback が無いときは PipeWire のカメラになります。選べるのは、OBS（PipeWire のビデオキャプチャデバイス）など、
   PipeWire のカメラに対応したアプリだけです。SteamOS では v4l2loopback を使えません
 - Linux のマイクとウェブカメラは、まだ実際の iPhone ではテストしていません
+
+Android のスマートフォン
+- このキットは、iPhone の代わりに Android のスマートフォンでも使えます。実験段階です。
+  Android 用の台本は、adb の代わりのプログラムでテストしただけで、Linux から実際のスマートフォンではまだテストしていません。
+  動作したこと、動作しなかったことを教えてください。
+- usbmuxd、libimobiledevice、iPhone のアプリは必要ありません。必要なものは次のとおりです。
+  - 64 ビット ARM の Android のスマートフォン。Android 11 以上で、Vulkan に対応した GPU を搭載しているもの。データを転送できる USB ケーブル
+  - adb（Android のコマンドラインツール）：
+        Arch・CachyOS：   sudo pacman -S android-tools
+        Ubuntu・Debian：  sudo apt install android-tools-adb
+        Fedora：          sudo dnf install android-tools
+    パッケージを使わない場合は、https://developer.android.com/tools/releases/platform-tools から SDK Platform-Tools for Linux をダウンロードして展開し、
+    platform-tools フォルダをこのキットのフォルダの中に置いてください。
+  - Vulkan のローダー libvulkan.so.1。上の説明のとおりです
+- GPU を使う手順。上の手順 1 のとおりにキットを展開してから、次のように進めてください。
+  1. スマートフォンで USB デバッグをオンにします。「設定」>「デバイス情報」を開いて、「ビルド番号」を 7 回タップします。
+     次に「設定」>「システム」>「開発者向けオプション」を開いて、「USB デバッグ」をオンにします。
+  2. スマートフォンを USB で PC に接続します。スマートフォンに「USB デバッグを許可しますか？」と表示されたら「許可」をタップしてください。
+     スマートフォンやエミュレーターが 2 台以上つながっている場合は、adb devices のシリアルで 1 台を選んでください：
+         ./start-android.sh --serial シリアル        または        export ANDROID_SERIAL=シリアル
+  3. 次を実行してください：   ./start-android.sh
+     受け手の android/server_aarch64 をスマートフォンの /data/local/tmp にコピーして、起動します。スマートフォンには何もインストールせず、root も必要ありません。
+     そのあと adb forward で、この PC の 50300 番を受け手につなぎます。
+  4. 次を実行してください：   ./check-android.sh
+     必要な項目を順にチェックします。最後に「PocketGPU phone」という名前の GPU が表示されれば成功です
+  5. プログラムをスマートフォンの GPU で動かすには、次のように実行してください：
+         ./run-on-android-gpu.sh vkcube
+         ./run-on-android-gpu.sh /プログラムの場所 引数
+     Steam のゲーム（ネイティブも Proton も）は、ゲームのプロパティの「起動オプション」に次の 1 行を入力してください：
+         "/home/ユーザー名/PocketGPU-linux-…/run-on-android-gpu.sh" %command%
+     run-on-iphone-gpu.sh と同じ設定をして、DXVK_FILTER_DEVICE_NAME=PocketGPU を使います。USB の補助プログラムは必要ありません。
+     下の「Steam と Proton」の説明は、--broker を除いて、これにも当てはまります。Flatpak 版の Steam に必要なのは、そこにある flatpak override の行だけです。--broker は要りません
+  6. 使用中は、スマートフォンのロックを解除したまま、画面をオンにしておいてください
+  7. 終わったら、次を実行してください：   ./stop-android.sh
+     受け手を停止して、スマートフォンから削除します。受け手の記録は、スマートフォンの /data/local/tmp/pgpu_server.log に残ります
+- 別の番号：50300 番をほかのプログラムが使っているときは、PGPU_PORT=50301 ./start-android.sh を実行してください。ほかの台本の先頭にも PGPU_PORT=50301 を付けてください
+- マイクとウェブカメラの手順。GPU を使っていても、使っていなくても使えます。
+  1. 次を実行してください：   ./start-android-mic-camera.sh
+  2. スマートフォンに PocketGPU のアプリが入っていない場合は、android/pocketgpu.apk を adb install -r で入れるかどうかを聞かれます。
+     スマートフォンに Google Play プロテクトの確認が表示されたら、「インストールする」をタップしてください。
+  3. 台本がスマートフォンのアプリを開き、ウェブカメラとスピーカー・マイクをオンにして、adb forward で口をつなぎます。
+     スマートフォンにカメラとマイクの許可を求められたら、「許可」をタップしてください
+  4. 通話アプリのマイクで「PocketGPU Android Mic」を選んでください。--speaker を付けたときは、出力で「PocketGPU Android Speaker」を選んでください。
+     カメラは、v4l2loopback か、「PocketGPU Android Camera」という名前の PipeWire のカメラに表示されます
+  5. 止めるには、ターミナルで q キーを押します。台本は口を閉じて、アプリの機能をオフにします。--keep-app-on を付けると、オンのままにします
+  - FFmpeg・PipeWire・PulseAudio・v4l2loopback は、上の「マイクとウェブカメラ」と同じです
+  - 使用中は、スマートフォンのロックを解除したままにして、PocketGPU のアプリを閉じないでください
+  - 口について。アプリ 0.1.2 以降は、adb からしか届かない抽象名のソケットで待ちます。スマートフォンのほかのアプリは、カメラとマイクの内容を読めません。
+    台本は次の 2 つのコマンドを実行してから、webcam_rx --addr 127.0.0.1:50064 と ipaudio --connect 127.0.0.1:50063 を起動します：
+        adb forward tcp:50064 localabstract:pocketgpu-webcam
+        adb forward tcp:50063 localabstract:pocketgpu-audio
+    アプリ 0.1.1 は古い形の adb forward tcp:50064 tcp:50064 と adb forward tcp:50063 tcp:50063 を使います。台本はアプリの版を読んで、合う形を選びます。
+    版が読めないときは、新しい形を先に試して、だめなら古い形にします。操作は必要ありません
+  - このキットの受け手とアプリは、同時に動かせます。スマートフォンの 127.0.0.1:50300 でこのキットの受け手が動いているときは、アプリは自分の受け手を起動しません。
+    ./start-android.sh --app を使うと、アプリの中の受け手を使うので、スマートフォンにファイルをコピーしません
+- うまくいかないとき：
+  - adb が「unauthorized」と表示する：スマートフォンのロックを解除して、「USB デバッグを許可しますか？」で「許可」をタップしてください。表示されないときは、ケーブルを抜いて接続し直してください
+  - adb が「no permissions」と表示する：ケーブルを接続し直して、adb kill-server を実行してください。直らないときは、udev のルールを入れてください：
+    Arch・CachyOS は sudo pacman -S android-udev、Ubuntu・Debian は sudo apt install android-sdk-platform-tools-common
+  - スマートフォンが見つからない：別のケーブルや USB ポートを試してください。スマートフォンの USB の用途を「ファイル転送」にして、手順 1 をチェックしてください
+  - 映像が止まる、または接続が切れる：./stop-android.sh を実行してから、もう一度 ./start-android.sh を実行してください
+- Android の報告：実行した台本に合わせて、pocketgpu-android-start-log.txt、pocketgpu-android-check-log.txt、pocketgpu-android-miccam-log.txt のどれかを送ってください。
+  ユーザー名・PC 名・ホームフォルダの場所・スマートフォンのシリアルは含まれません。スマートフォンの機種、Android のバージョン、チップも書いてください。例：Pixel 10 Pro XL、Android 16、Tensor G5
+  受け手が起動しなかったときは、次の出力も送ってください：   adb shell cat /data/local/tmp/pgpu_server.log
 
 Steam と Proton
 - 起動オプションの 1 行は、そのゲームだけに次の設定をします：iPhone のドライバだけを Vulkan のドライバにする、

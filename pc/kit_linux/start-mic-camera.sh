@@ -156,6 +156,7 @@ hint_v4l2() {
 
 out "$(M 'iPhone をマイクとカメラとして使います' 'Use the iPhone as a microphone and a camera')"
 out "$(M 'iPhone の GPU は使いません。管理者権限は必要ありません。' 'The iPhone GPU is not used. No administrator rights are needed.')"
+[ -f "$KIT/start-android-mic-camera.sh" ] && out "$(M 'Android のスマホを使う場合は、この台本ではなく ./start-android-mic-camera.sh を実行してください。' 'To use an Android phone, run ./start-android-mic-camera.sh instead of this script.')"
 if [ "$WANT_CAMERA" = 0 ] && [ "$WANT_MIC" = 0 ] && [ "$SPEAKER" = 0 ]; then
     ng "$(M 'カメラもマイクもスピーカーも使わない設定になっています。' 'Camera, microphone, and speaker are all turned off.')"
     finish 2
