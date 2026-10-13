@@ -3,7 +3,7 @@
 # ドライバ 2 つ（64・32 ビット）の「#」32 文字を、その人の印（名前＋乱数）に書き換える。長さは変えない。
 # iPhone のアプリの IPA にも同じ印のファイルを足す（試す人が自分の Apple ID で署名し直すので、中を足しても入る）。
 # 誰に何を渡したかは tester_kit\ledger.csv に足す。配った物が外に出たら、印とハッシュで誰の分かを見分ける
-# Android の機種を持っている人用に、android\（受け手・start_android.cmd・stop_android.cmd・README_android.txt）と
+# Android の機種を持っている人用に、android\（受け手・start_android.cmd・stop_android.cmd・android_app.cmd・pocketgpu.apk・README_android.txt）と
 # pocketgpu_android.cmd・check_android.cmd も入れる。Android の受け手には印を入れない（Android 側は人ごとの印が dll にあれば足りる）。
 # 試すとき：PGKIT_OUT・PGKIT_KITBUILD・--android-dir で置き場を変えられる（台帳は PGKIT_OUT の下に作る）
 # 入口は 3 つ：Start-PocketGPU.cmd（順に確かめて足りない物を案内する）と Run-on-iPhone-GPU.cmd（1 つのアプリを iPhone の GPU で起動する）と
@@ -20,7 +20,7 @@
 # 更新でそのまま差し替えられるよう、人ごとの物は update.ini に分けた。入口は Update-PocketGPU.cmd（中身は tools\update.ps1）
 #   --template フォルダ   印を入れない「ひな形」を作る（publish_update.py が使う）。IPA・update.ini・zip・台帳は作らない。
 #                         dll は印の場所（PGKIT-MARK:###…）を残したまま。更新は、このひな形との違いで配る
-import argparse, csv, datetime, hashlib, os, re, secrets, shutil, zipfile
+import argparse, csv, datetime, hashlib, os, re, secrets, shutil, subprocess, zipfile
 
 KITBUILD = os.environ.get('PGKIT_KITBUILD', r'D:\iphone-rpc\kitbuild')        # vk/build_win.sh D:/iphone-rpc/kitbuild icd icd32 tools で組んだ物
 DXVK = r'D:\iphone-rpc\dl\dxvk-macos-1103\x\dxvk-macOS-async-v1.10.3-20230507'
@@ -28,6 +28,9 @@ DXVK_LICENSE = r'D:\iphone-rpc\vkbuild\dxvk3\LICENSE'
 IPA_DIR = os.environ.get('PGKIT_IPA_DIR', r'D:\iphone-rpc\ipa\serve')
 OUT = os.environ.get('PGKIT_OUT', r'D:\iphone-rpc\tester_kit')
 ANDROID_DIR = r'D:\iphone-rpc\androidbuild'   # app\vk\build_android.sh で組んだ受け手（server_aarch64 と server_x86_64）
+ANDROID_APK = r'D:\iphone-rpc\work\android_app\out\pocketgpu.apk'   # work\android_app\build_apk.sh で組んだ PocketGPU アプリ（Android）
+ANDROID_APK_MIN = (0, 1, 2)   # これより古い版のアプリはキットに入れない。0.1.2 からカメラとマイクの口が localabstract に変わった（android_app.cmd が版を見て向け方を選ぶ）
+AAPT2 = r'D:\android-sdk\build-tools\35.0.0\aapt2.exe'   # APK の版を読む。無ければ版の確認だけ飛ばす
 PLACE = b'PGKIT-MARK:' + b'#' * 32
 PROTO_H = os.environ.get('PGKIT_PROTO_H', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'vk', 'remote', 'proto.h'))
 # カメラ・マイク・字幕の道具と仮想カメラ（C で組んだ物。UCRT だけを使うので VC の部品は要らない）。KITBUILD\extras\ に置く → キットの extras\
@@ -368,6 +371,135 @@ if "%PGPU_NOPAUSE%"=="" pause
 exit /b 0
 '''
 
+ANDROID_APP = r'''@echo off
+rem PocketGPU for Android (app version): open the USB ports to the PocketGPU app and turn its features on.
+rem   android\android_app.cmd          start: forward the ports and turn on webcam, speaker and mic, and GPU
+rem   android\android_app.cmd stop     close the ports and turn the features off
+rem Needs adb.exe and USB debugging. Install the app first:  adb install android\pocketgpu.apk
+rem Only English here on purpose: a Japanese Windows reads .cmd files as Shift_JIS.
+rem
+rem Port form for the webcam (50064) and the audio (50063). It depends on the app version:
+rem   app 0.1.2 and newer:   adb forward tcp:50064 localabstract:pocketgpu-webcam   and   adb forward tcp:50063 localabstract:pocketgpu-audio
+rem                          The app accepts these only from adb, so other apps on the phone cannot read the camera or the mic.
+rem   app 0.1.1 and older:   adb forward tcp:50064 tcp:50064   and   adb forward tcp:50063 tcp:50063
+rem This file reads the app version from the phone and uses the matching form.
+rem   If the version cannot be read it uses the new form. If adb refuses the new form it uses the old one.
+rem   To choose the form yourself:   set PGPU_APP_FORWARD=new   or   set PGPU_APP_FORWARD=old
+rem   The 0.1.2 app also takes the old form when "Also accept old PC tools" is on in the app settings. It is off by default.
+rem Other ports:   set PGPU_CAM_PORT=50064   set PGPU_AUDIO_PORT=50063   set PGPU_PORT=50300
+rem GPU: nothing changed. If the kit receiver from android\start_android.cmd is running on the phone, the app does not
+rem   start its own receiver and the kit receiver is used. Otherwise port %PGPU_PORT% goes to the receiver inside the app (port 50060).
+setlocal
+call "%~dp0_common.cmd"
+if errorlevel 1 goto nodev
+set "PKG=com.tsurutanmen.pocketgpu"
+set "APP=%PKG%/.MainActivity"
+if "%PGPU_CAM_PORT%"=="" set PGPU_CAM_PORT=50064
+if "%PGPU_AUDIO_PORT%"=="" set PGPU_AUDIO_PORT=50063
+if /i "%~1"=="stop" goto stop
+
+"%ADB%" shell pm path %PKG% | findstr /b /c:"package:" >nul
+if errorlevel 1 goto no_app
+
+rem ---- which form of the ports does this app version take? ----
+set "APPVER="
+for /f "tokens=1,2 delims== " %%U in ('"%ADB%" shell dumpsys package %PKG%') do if "%%U"=="versionName" if not defined APPVER set "APPVER=%%V"
+set "FORM=new"
+set "FORMBY=the app version could not be read"
+set "V1="
+set "V2="
+set "V3="
+if defined APPVER for /f "tokens=1-3 delims=.-+_ " %%A in ("%APPVER%") do set "V1=%%A" & set "V2=%%B" & set "V3=%%C"
+if not defined V1 goto ver_done
+if not defined V2 set "V2=0"
+if not defined V3 set "V3=0"
+echo %V1%.%V2%.%V3%| findstr /r /x "[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*" >nul
+if errorlevel 1 goto ver_done
+set /a VN=1000000*%V1%+1000*%V2%+%V3%
+set "FORMBY=app version %APPVER%"
+if %VN% LSS 1002 set "FORM=old"
+:ver_done
+set "FORCED="
+if /i "%PGPU_APP_FORWARD%"=="new" set "FORM=new"
+if /i "%PGPU_APP_FORWARD%"=="new" set "FORCED=1"
+if /i "%PGPU_APP_FORWARD%"=="old" set "FORM=old"
+if /i "%PGPU_APP_FORWARD%"=="old" set "FORCED=1"
+if defined FORCED set "FORMBY=PGPU_APP_FORWARD=%PGPU_APP_FORWARD%"
+
+if "%FORM%"=="old" goto fwd_old
+"%ADB%" forward tcp:%PGPU_CAM_PORT% localabstract:pocketgpu-webcam >nul 2>&1
+if errorlevel 1 goto fwd_new_failed
+"%ADB%" forward tcp:%PGPU_AUDIO_PORT% localabstract:pocketgpu-audio >nul 2>&1
+if errorlevel 1 goto fwd_new_failed
+goto fwd_done
+:fwd_new_failed
+if defined FORCED goto forward_failed
+echo adb did not accept the new port form. Trying the old form ...
+echo The 0.1.2 app takes the old form only when "Also accept old PC tools" is on in the app settings.
+set "FORM=old"
+set "FORMBY=adb refused the new form"
+:fwd_old
+"%ADB%" forward tcp:%PGPU_CAM_PORT% tcp:50064 >nul || goto forward_failed
+"%ADB%" forward tcp:%PGPU_AUDIO_PORT% tcp:50063 >nul || goto forward_failed
+:fwd_done
+
+set "GPU_TARGET=tcp:50060"
+set "GPU_WHO=the app receiver"
+"%ADB%" shell pidof pgpu_server | findstr /r "[0-9]" >nul
+if errorlevel 1 goto gpu_forward
+set "GPU_TARGET=tcp:%PGPU_PORT%"
+set "GPU_WHO=the kit receiver started by android\start_android.cmd"
+:gpu_forward
+"%ADB%" forward tcp:%PGPU_PORT% %GPU_TARGET% >nul || goto forward_failed
+"%ADB%" shell am start -n %APP% --ez webcam true --ez audio true --ez gpu true >nul
+echo.
+echo Done. If the phone asks for camera or microphone access, tap Allow.
+echo Port form: %FORM% (%FORMBY%)
+echo   Webcam:          webcam_rx.exe --addr 127.0.0.1:%PGPU_CAM_PORT%
+echo   Speaker and mic: ipaudio.exe --connect 127.0.0.1:%PGPU_AUDIO_PORT% --speaker --mic
+echo   GPU:             pocketgpu_android.cmd "C:\path\to\app.exe"   (uses %GPU_WHO%)
+if "%FORM%"=="old" echo The app on the phone is old. The new app is android\pocketgpu.apk. To update:   "%ADB%" install -r "%~dp0pocketgpu.apk"
+if "%FORM%"=="old" if not defined FORCED echo The new app takes the camera and the mic only from adb, so other apps on the phone cannot read them.
+echo When you are finished: android\android_app.cmd stop
+goto end
+
+:stop
+"%ADB%" shell am start -n %APP% --ez webcam false --ez audio false --ez gpu false >nul 2>&1
+"%ADB%" forward --remove tcp:%PGPU_CAM_PORT% >nul 2>&1
+"%ADB%" forward --remove tcp:%PGPU_AUDIO_PORT% >nul 2>&1
+"%ADB%" forward --remove tcp:%PGPU_PORT% >nul 2>&1
+echo Stopped.
+goto end
+
+:nodev
+if /i not "%~1"=="stop" goto fail
+if not defined ADB_OK goto fail
+if "%PGPU_CAM_PORT%"=="" set PGPU_CAM_PORT=50064
+if "%PGPU_AUDIO_PORT%"=="" set PGPU_AUDIO_PORT=50063
+"%ADB%" forward --remove tcp:%PGPU_CAM_PORT% >nul 2>&1
+"%ADB%" forward --remove tcp:%PGPU_AUDIO_PORT% >nul 2>&1
+"%ADB%" forward --remove tcp:%PGPU_PORT% >nul 2>&1
+echo The phone was not found. The ports on this PC were closed, but the app on the phone was not told to stop.
+goto fail
+
+:no_app
+echo.
+echo ERROR: the PocketGPU app is not installed on the phone. Install it with:   "%ADB%" install "%~dp0pocketgpu.apk"
+goto fail
+:forward_failed
+echo.
+echo ERROR: could not open a port on this PC. Another program may be using %PGPU_CAM_PORT%, %PGPU_AUDIO_PORT% or %PGPU_PORT%.
+echo Run android\android_app.cmd stop, or use other ports (see the top of this file).
+goto fail
+
+:fail
+if "%PGPU_NOPAUSE%"=="" pause
+exit /b 1
+:end
+if "%PGPU_NOPAUSE%"=="" pause
+exit /b 0
+'''
+
 ANDROID_STOP = r'''@echo off
 rem PocketGPU for Android: stop the receiver on the phone and close the USB port.
 rem   android\stop_android.cmd
@@ -459,6 +591,25 @@ Steps
 7. When you are finished, double-click android\stop_android.cmd. It stops the receiver and removes it from the phone.
    (Restarting the phone also stops it.)
 
+Using the PocketGPU app (optional): camera, microphone, speaker and GPU
+This is another way, not part of steps 4 to 7. The PocketGPU app (android\pocketgpu.apk) runs the receiver itself and also lends the camera, the microphone and the speaker.
+A. Install the app once. In a Command Prompt run:   "C:\path\to\adb.exe" install android\pocketgpu.apk
+   To update an old app, run it with   install -r   instead.
+B. Double-click android\android_app.cmd. It reads the app version from the phone and connects the USB ports in the matching form:
+   - App 0.1.2 and newer:  adb forward tcp:50064 localabstract:pocketgpu-webcam   and   adb forward tcp:50063 localabstract:pocketgpu-audio
+     Only adb can reach these, so other apps on the phone cannot read the camera or the mic.
+   - App 0.1.1 and older:  adb forward tcp:50064 tcp:50064   and   adb forward tcp:50063 tcp:50063
+   If the version cannot be read, it tries the new form first and the old form when adb refuses it.
+   To choose the form yourself:   set PGPU_APP_FORWARD=new   or   set PGPU_APP_FORWARD=old
+   The 0.1.2 app takes the old form only when "Also accept old PC tools" is on in the app settings. It is off by default. Leave it off.
+   If you turn it on for an old PC tool, turn it off again afterwards: other apps on the phone can then reach the camera and the mic.
+C. If the phone asks for camera or microphone access, tap Allow. Then start the tools from extras\ :
+       webcam_rx.exe --addr 127.0.0.1:50064
+       ipaudio.exe --connect 127.0.0.1:50063 --speaker --mic
+D. GPU: if android\start_android.cmd has started the receiver, the app uses that one. If not, the app uses its own receiver. pocketgpu_android.cmd and check_android.cmd work the same either way.
+E. When you are finished, run   android\android_app.cmd stop
+If the camera or the mic does not connect, run Fix-PocketGPU.cmd. It checks these ports against the app version and connects them again in the right form.
+
 Notes
 - Only the app started from pocketgpu_android.cmd sees the phone GPU. Nothing is written to the registry.
 - The receiver listens only inside the phone (127.0.0.1). It is reachable only through the USB cable.
@@ -523,6 +674,25 @@ Windows の PC から、Android のスマートフォンの GPU を Vulkan の G
 7. 終わったら、android\stop_android.cmd をダブルクリックしてください。受信アプリを停止して、スマートフォンから削除します
    スマートフォンを再起動しても、受信アプリは停止します
 
+PocketGPU アプリを使う場合：カメラ、マイク、スピーカー、GPU
+手順 4〜7 とは別の方法です。PocketGPU アプリ（android\pocketgpu.apk）が受信アプリの役目をして、カメラ、マイク、スピーカーも PC に貸します。
+A. アプリを 1 回だけインストールします。コマンドプロンプトで次を入力してください：   "C:\置いた場所\adb.exe" install android\pocketgpu.apk
+   古いアプリを更新するときは、install の代わりに install -r を使ってください。
+B. android\android_app.cmd をダブルクリックしてください。スマートフォンからアプリの版を読んで、合う向け方で USB の口をつなぎます。
+   - アプリ 0.1.2 以上：adb forward tcp:50064 localabstract:pocketgpu-webcam と adb forward tcp:50063 localabstract:pocketgpu-audio
+     adb からしか届かないので、スマートフォンの他のアプリは、カメラとマイクを読めません。
+   - アプリ 0.1.1 以前：adb forward tcp:50064 tcp:50064 と adb forward tcp:50063 tcp:50063
+   版が読めないときは、新しい向け方を先に使い、adb が断ったら古い向け方にします。
+   向け方を自分で決めるときは、set PGPU_APP_FORWARD=new か set PGPU_APP_FORWARD=old を入力してください。
+   0.1.2 のアプリは、アプリの設定で「古い PC のツールも受け付ける」をオンにしたときだけ、古い向け方も受けます。既定はオフです。オフのままにしてください。
+   古い PC のツールのためにオンにしたら、使い終わったらオフに戻してください。オンの間は、スマートフォンの他のアプリからもカメラとマイクに届いてしまいます。
+C. スマートフォンがカメラやマイクの許可を求めたら、「許可」をタップしてください。そのあと、extras\ のツールを起動してください：
+       webcam_rx.exe --addr 127.0.0.1:50064
+       ipaudio.exe --connect 127.0.0.1:50063 --speaker --mic
+D. GPU：android\start_android.cmd で受信アプリを起動してあれば、アプリはそれを使います。起動していなければ、アプリの中の受信アプリを使います。pocketgpu_android.cmd と check_android.cmd は、どちらでも同じように使えます。
+E. 終わったら、android\android_app.cmd stop を実行してください。
+カメラやマイクがつながらないときは、Fix-PocketGPU.cmd を実行してください。これらの口をアプリの版と照らして、合う向け方でつなぎ直します。
+
 メモ
 - pocketgpu_android.cmd から起動したアプリだけが、スマートフォンの GPU を認識できます。レジストリには何も書き込みません
 - 受信アプリは、スマートフォンの中の 127.0.0.1 だけで待ち受けています。USB ケーブルを通してしか接続できません
@@ -575,6 +745,30 @@ def proto_version():
     return int(m.group(1))
 
 
+def apk_version(path):
+    # PocketGPU アプリ（APK）の versionName。aapt2 dump badging で読む。aapt2 が無い・読めないときは None
+    if not os.path.exists(AAPT2):
+        return None
+    try:
+        out = subprocess.run([AAPT2, 'dump', 'badging', path], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"versionName='([^']+)'", out)
+    return m.group(1) if m else None
+
+
+def check_apk(path):
+    # キットに入れる APK が ANDROID_APK_MIN 以上の版か。版を読めたときだけ止める。版を返す。読めなければ ''
+    ver = apk_version(path)
+    if ver is None:
+        print(f'注意：{path} の版を読めなかった（aapt2 が無い）。0.1.2 以上かを自分で確かめる')
+        return ''
+    m = re.match(r'(\d+)\.(\d+)(?:\.(\d+))?', ver)
+    if not m or tuple(int(x or 0) for x in m.groups()) < ANDROID_APK_MIN:
+        raise SystemExit(f'{path} の版は {ver}。{".".join(map(str, ANDROID_APK_MIN))} 以上の APK でないと入れない（0.1.1 以前はカメラとマイクの口の向け方が違う）。work/android_app/build_apk.sh で組み直す')
+    return ver
+
+
 def newest_ipa(name='RpcServer'):
     # IPA_DIR の 名前-x.y.z.ipa のうち一番新しい物。無ければ ValueError
     def ver(n):
@@ -610,6 +804,8 @@ def missing_inputs(a):
                 miss.append(os.path.join(IPA_DIR, 'PocketCam-*.ipa'))
     if not a.no_app and not os.path.exists(os.path.join(KITBUILD, APP_EXE)):
         miss.append(os.path.join(KITBUILD, APP_EXE))
+    if not a.no_android and not a.no_android_apk and not os.path.exists(a.android_apk):
+        miss.append(a.android_apk)
     return miss
 
 
@@ -618,6 +814,8 @@ def main():
     ap.add_argument('who', nargs='?', default='', help='渡す人の名前（Reddit の名前など・英数字）。--template のときは要らない')
     ap.add_argument('--discord-id', default='', help='Discord の bot から作るときの、その人の番号。同じ番号には 2 つめを作らない')
     ap.add_argument('--android-dir', default=ANDROID_DIR, help='Android の受け手（server_aarch64）がある所')
+    ap.add_argument('--android-apk', default=ANDROID_APK, help='Android の PocketGPU アプリ（pocketgpu.apk）。0.1.2 以上でないと入れない')
+    ap.add_argument('--no-android-apk', action='store_true', help='Android のアプリ（android\pocketgpu.apk）を入れない')
     ap.add_argument('--with-x86_64', action='store_true', help='エミュレーター用の server_x86_64 も入れる（試験用・配るキットには入れない）')
     ap.add_argument('--no-android', action='store_true', help='Android の物を入れない（今までと同じ中身）')
     ap.add_argument('--no-ipa', action='store_true', help='iPhone のアプリ（IPA）を入れない（試験用）')
@@ -655,7 +853,11 @@ def main():
     miss = missing_inputs(a)
     if miss:
         raise SystemExit('次の物が無い。extras\\ の道具は work/camset/out と work/livecap で、PocketGPU.exe は work/pcapp2 の build.cmd で組んだ物を '
-                         'KITBUILD に置く。入れないなら --no-media・--no-app\n  ' + '\n  '.join(miss))
+                         'KITBUILD に置く。入れないなら --no-media・--no-app・--no-android-apk\n  ' + '\n  '.join(miss))
+
+    apk_ver = ''
+    if not a.no_android and not a.no_android_apk:
+        apk_ver = check_apk(a.android_apk)   # 古い版なら、キットのフォルダを作る前に止める
 
     stamp(os.path.join(KITBUILD, 'iphone_icd.dll'), os.path.join(kit, 'iphone_icd.dll'), mark)
     stamp(os.path.join(KITBUILD, 'x86', 'iphone_icd.dll'), os.path.join(kit, 'x86', 'iphone_icd.dll'), mark)
@@ -692,6 +894,7 @@ def main():
 
     # Android の受け手と、android\ の中の cmd・手順書。受け手には印を入れない（人ごとの印は dll にある）
     android_sha = ''
+    android_apk_sha = ''
     if not a.no_android:
         adir = os.path.join(kit, 'android')
         os.makedirs(adir, exist_ok=True)
@@ -702,8 +905,11 @@ def main():
         android_sha = sha256(srv)
         if a.with_x86_64:
             shutil.copy2(os.path.join(a.android_dir, 'server_x86_64'), os.path.join(adir, 'server_x86_64'))
-        for name, text in (('_common.cmd', ANDROID_COMMON), ('start_android.cmd', ANDROID_START), ('stop_android.cmd', ANDROID_STOP)):
+        for name, text in (('_common.cmd', ANDROID_COMMON), ('start_android.cmd', ANDROID_START), ('stop_android.cmd', ANDROID_STOP), ('android_app.cmd', ANDROID_APP)):
             open(os.path.join(adir, name), 'w', encoding='ascii', newline='\r\n').write(text)
+        if not a.no_android_apk:
+            shutil.copy2(a.android_apk, os.path.join(adir, 'pocketgpu.apk'))
+            android_apk_sha = sha256(a.android_apk)
         open(os.path.join(adir, 'README_android.txt'), 'w', encoding='utf-8-sig', newline='\r\n').write(ANDROID_README)
         for name, text in (('pocketgpu_android.cmd', ANDROID_LAUNCH), ('check_android.cmd', ANDROID_CHECK)):
             open(os.path.join(kit, name), 'w', encoding='ascii', newline='\r\n').write(text)
@@ -757,6 +963,9 @@ def main():
     print(f'UPDATE_TOKEN={update_token}')
     if android_sha:
         print(f'ANDROID_SERVER_SHA256={android_sha}')
+    if android_apk_sha:
+        print(f'ANDROID_APK_SHA256={android_apk_sha}')
+        print(f'ANDROID_APK_VERSION={apk_ver}')
     if cam_ipa:
         print(f'POCKETCAM_IPA={os.path.basename(cam_ipa)}')
 
