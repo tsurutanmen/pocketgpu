@@ -107,11 +107,14 @@ if ($pe) {
         Say-Info ((M 'Unreal のゲームのようです。描画を行うのはこちらです：' 'This looks like an Unreal game. The drawing is done by: ') + $dxTarget)
     }
     $imp = @($dxPe.Imports)
+    # Unity のゲームは .exe が UnityPlayer.dll を読むだけで、d3d11.dll は後から読む（取り込みの表に出ない）。Windows の Unity の既定は DirectX 11 なので、DirectX 11 のゲームとして扱う
+    $isUnity = ($dxTarget -eq $target) -and ($imp -contains 'unityplayer.dll')
+    if ($isUnity) { Say-Info (M 'Unity のゲームのようです。DirectX 11 のゲームとして扱います。' 'This looks like a Unity game. It is treated as a DirectX 11 game.') }
     if ($imp -contains 'd3d12.dll') {
         Warn (M 'DirectX 12 のゲームのようです。このキットは、まだ DirectX 12 を iPhone の GPU で描画できません。' 'This looks like a DirectX 12 game. This kit cannot draw DirectX 12 on the iPhone GPU yet.')
     } elseif ($imp -contains 'd3d9.dll') {
         Warn (M 'DirectX 9 のゲームのようです。このキットは、まだ DirectX 9 を iPhone の GPU で描画できません。' 'This looks like a DirectX 9 game. This kit cannot draw DirectX 9 on the iPhone GPU yet.')
-    } elseif (($imp -contains 'd3d11.dll' -or $imp -contains 'dxgi.dll') -and $imp -notcontains 'vulkan-1.dll') {
+    } elseif ((($imp -contains 'd3d11.dll' -or $imp -contains 'dxgi.dll') -and $imp -notcontains 'vulkan-1.dll') -or $isUnity) {
         $arch = $(if ($dxPe.Machine -eq 0x8664) { 'x64' } elseif ($dxPe.Machine -eq 0x14c) { 'x32' } else { '' })
         $dir = Split-Path -Parent $dxTarget
         $here = Join-Path $dir 'd3d11.dll'
