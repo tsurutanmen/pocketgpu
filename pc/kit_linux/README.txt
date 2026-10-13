@@ -59,6 +59,26 @@ Steps
    start-pocketgpu.sh shows this line with the real path.
    Proton already contains DXVK and vkd3d-proton, so you do not copy any files next to the game.
    vkcube is a small test program in the vulkan-tools package of most distributions.
+7. To use the iPhone as a microphone and a webcam, with or without the GPU, run:
+       ./start-mic-camera.sh
+   In the iPhone app, turn on "Use this iPhone as a webcam" and "Use as PC speaker and mic".
+   Add --speaker to also play the PC sound on the iPhone. Run ./start-mic-camera.sh --help for more.
+
+Microphone and webcam
+- The microphone shows up as "PocketGPU iPhone Mic". Pick it as the microphone in your call app.
+  It needs PipeWire, which most desktops use now, or PulseAudio with the pactl command.
+- With --speaker, an output called "PocketGPU iPhone Speaker" is added. Pick it to play sound on the iPhone.
+- The webcam needs FFmpeg's libavcodec to show the picture:
+      Ubuntu, Debian: sudo apt install libavcodec-extra
+      Fedora:         sudo dnf install libavcodec-free
+      Arch, SteamOS:  sudo pacman -S --needed ffmpeg
+- So that Zoom, Discord, browsers and others can pick the webcam like a normal camera, v4l2loopback is needed.
+  This needs administrator rights once:
+      sudo apt install v4l2loopback-dkms      (Ubuntu, Debian. Fedora: RPM Fusion. Arch: v4l2loopback-dkms)
+      sudo modprobe v4l2loopback exclusive_caps=1 card_label="PocketGPU iPhone Camera"
+  Without it, the webcam is a PipeWire camera. Only apps that support PipeWire cameras can pick it,
+  such as OBS (Video Capture Device, PipeWire). SteamOS cannot use v4l2loopback.
+- The microphone and webcam on Linux have not been tested with a real iPhone yet.
 
 Steam and Proton
 - The launch option line sets these for the game only: the iPhone driver as the only Vulkan driver,
@@ -73,13 +93,19 @@ Steam and Proton
          ./run-on-iphone-gpu.sh --broker
   If you can, use Steam from your distribution instead of Flatpak.
 - Steam Deck: try it in Desktop Mode first. Game Mode has not been tested yet.
+- Each start gets its own USB helper with a new secret, given only to that game. The helper gives the connection
+  only to programs of the same user that know the secret. With --broker, the secret is kept in tools/broker-token,
+  which only you can read, and it is deleted when you stop --broker.
 
 Good to know
 - Only programs started this way see the iPhone GPU. Nothing is installed and nothing is written outside this folder.
 - Only one program at a time can use the iPhone GPU.
 - Do not use games with anti-cheat such as Easy Anti-Cheat, BattlEye, VAC or Vanguard. Your account may be banned.
-- Not supported yet on Linux: 32-bit games, programs that use Wayland only, the webcam and microphone, captions,
-  and the PocketGPU PC app. The window picture is sent as JPEG.
+- 32-bit games use lib/i386. This has not been tested yet.
+- Not supported yet on Linux: programs that use Wayland only, captions, and the PocketGPU PC app.
+- The window picture is sent as JPEG. To try H.264, which sends less data, put IPHONE_VK_VIDEO=1 in front.
+  It needs FFmpeg's libavcodec on the PC. If it is missing, or the game runs in Steam's container without it,
+  the picture stays JPEG.
 - Kernel 6.7 or later uses less CPU. Older kernels work but are slower.
 
 Reporting
@@ -89,7 +115,8 @@ Reporting
 - Please also tell us the distribution, the desktop, the program or game, the resolution, and what happened.
 
 Third-party software
-- lib/x86_64/libiphone_icd.so contains LZ4, bcdec and stb_image. See THIRD-PARTY.txt.
+- lib/x86_64/libiphone_icd.so and lib/i386/libiphone_icd.so contain LZ4, bcdec and stb_image. See THIRD-PARTY.txt.
+- FFmpeg, PipeWire and PulseAudio are not included. The programs use the ones installed on the PC.
 
 --------------------------------------------
 PocketGPU 試験用キット Linux 版。この説明は下書きです
@@ -150,6 +177,26 @@ Linux 版は新しく作ったものです。iPhone の代わりのプログラ�
    start-pocketgpu.sh は、実際のパスに置き換えたこの 1 行を表示します。
    Proton には DXVK と vkd3d-proton が含まれているので、ゲームのフォルダにファイルをコピーする必要はありません。
    vkcube は、多くのディストリビューションの vulkan-tools パッケージに含まれている、小さなテスト用のプログラムです
+7. iPhone をマイクとウェブカメラとして使うには、次を実行してください。GPU を使っていても、使っていなくても使えます。
+       ./start-mic-camera.sh
+   iPhone のアプリで「ウェブカメラとして使う」と「PC のスピーカーとマイクとして使う」をオンにしてください。
+   PC の音も iPhone から出すには --speaker を付けてください。ほかの設定は ./start-mic-camera.sh --help で確認できます
+
+マイクとウェブカメラ
+- マイクは「PocketGPU iPhone Mic」という名前で表示されます。通話アプリのマイクで選んでください。
+  PipeWire（今の多くのデスクトップ）か、pactl コマンドが使える PulseAudio が必要です
+- --speaker を付けると「PocketGPU iPhone Speaker」という出力が追加されます。音を iPhone から出すには、これを選んでください
+- ウェブカメラの映像を表示するには、FFmpeg の libavcodec が必要です：
+      Ubuntu・Debian：sudo apt install libavcodec-extra
+      Fedora：        sudo dnf install libavcodec-free
+      Arch・SteamOS： sudo pacman -S --needed ffmpeg
+- Zoom・Discord・ブラウザなどで、ふつうのカメラとして選べるようにするには v4l2loopback が必要です。
+  最初に 1 回だけ、管理者権限で次を実行してください：
+      sudo apt install v4l2loopback-dkms      （Ubuntu・Debian。Fedora は RPM Fusion・Arch は v4l2loopback-dkms）
+      sudo modprobe v4l2loopback exclusive_caps=1 card_label="PocketGPU iPhone Camera"
+  v4l2loopback が無いときは PipeWire のカメラになります。選べるのは、OBS（PipeWire のビデオキャプチャデバイス）など、
+  PipeWire のカメラに対応したアプリだけです。SteamOS では v4l2loopback を使えません
+- Linux のマイクとウェブカメラは、まだ実際の iPhone ではテストしていません
 
 Steam と Proton
 - 起動オプションの 1 行は、そのゲームだけに次の設定をします：iPhone のドライバだけを Vulkan のドライバにする、
@@ -165,13 +212,18 @@ Steam と Proton
          ./run-on-iphone-gpu.sh --broker
   できれば、Flatpak 版ではなく、ディストリビューションの Steam を使ってください
 - Steam Deck：まずデスクトップモードで試してください。ゲームモードはまだテストしていません
+- USB の補助プログラムは、起動のたびに新しい合言葉で起動し、合言葉はそのゲームにだけ渡します。
+  補助プログラムは、同じユーザーで合言葉を知っているプログラムにだけ接続を渡します。
+  --broker のときは、合言葉を自分だけが読める tools/broker-token に保存し、--broker を終了すると削除します
 
 知っておくこと
 - この方法で起動したプログラムだけが、iPhone の GPU を認識できます。何もインストールせず、このフォルダの外には何も書き込みません
 - iPhone の GPU を一度に使用できるプログラムは 1 つだけです
 - Easy Anti-Cheat、BattlEye、VAC、Vanguard などのアンチチートを導入しているゲームでは使用しないでください。アカウントが停止されることがあります
-- Linux 版では、まだ次のものは使えません：32 ビットのゲーム、Wayland だけで動作するプログラム、ウェブカメラとマイク、字幕、
-  PocketGPU の PC アプリ。ウィンドウの映像は JPEG で送ります
+- 32 ビットのゲームは lib/i386 のドライバを使います。まだテストしていません
+- Linux 版では、まだ次のものは使えません：Wayland だけで動作するプログラム、字幕、PocketGPU の PC アプリ
+- ウィンドウの映像は JPEG で送ります。データ量の少ない H.264 を試すには、先頭に IPHONE_VK_VIDEO=1 を付けてください。
+  PC に FFmpeg の libavcodec が必要です。無いときや、それが無い Steam のコンテナの中でゲームが動くときは、JPEG のままです
 - カーネル 6.7 以降では CPU の負荷が下がります。古いカーネルでも動作しますが、遅くなります
 
 報告
@@ -181,4 +233,5 @@ Steam と Proton
 - ディストリビューション、デスクトップ、プログラムやゲームの名前、解像度、何が起きたかも書いてください
 
 他の人が作ったソフトウェア
-- lib/x86_64/libiphone_icd.so には、LZ4・bcdec・stb_image が含まれています。THIRD-PARTY.txt を参照してください
+- lib/x86_64/libiphone_icd.so と lib/i386/libiphone_icd.so には、LZ4・bcdec・stb_image が含まれています。THIRD-PARTY.txt を参照してください
+- FFmpeg・PipeWire・PulseAudio は含まれていません。PC にインストールされている物を使います

@@ -373,7 +373,15 @@ VK=$(
     timeout 30 "$PROBE" vklist 2>&1
 )
 RC=$?
-GPUS=$(printf '%s\n' "$VK" | grep -E '^GPU[0-9]+: ' || true)
+# PC の GPU の vendor（Intel 0x8086・NVIDIA 0x10de・AMD 0x1002・Microsoft 0x1414・Mesa の CPU 0x10005）は数えない。
+# 古いローダーで環境変数が効かず、PC の GPU だけが見えたときに「見えた」としないため
+GPUS=$(printf '%s\n' "$VK" | grep -E '^GPU[0-9]+: ' | grep -v -E 'vendor 0x(8086|10de|1002|1414|10005),' || true)
+PCONLY=$(printf '%s\n' "$VK" | grep -E '^GPU[0-9]+: ' | grep -E 'vendor 0x(8086|10de|1002|1414|10005),' || true)
+if [ -z "$GPUS" ] && [ -n "$PCONLY" ]; then
+    ng "$(M 'PC の GPU だけが見えて、iPhone の GPU が見えません。' 'Only the PC GPU is seen, not the iPhone GPU.')"
+    while IFS= read -r l; do info "${l#GPU*: }"; done <<< "$PCONLY"
+    stop_here
+fi
 if [ -n "$GPUS" ]; then
     while IFS= read -r g; do
         g=${g#GPU*: }
@@ -408,6 +416,9 @@ fi
 [ "$FAMILY" = steamos ] && out "$(M '・ゲームモードでも動作する見込みですが、まだ確認していません。まずデスクトップモードで試してください。' '- Game Mode is expected to work but has not been checked yet. Try Desktop Mode first.')"
 out "$(M '・アンチチートを導入しているゲームでは使用しないでください。アカウントが停止されることがあります。' '- Do not use games with anti-cheat. Your account may be banned.')"
 out "$(M '・使用中は、iPhone のアプリを前面に表示したまま、画面をオンにしておいてください。' '- While you use it, keep the iPhone app in front with the screen on.')"
+if [ -x "$KIT/start-mic-camera.sh" ] || [ -f "$KIT/start-mic-camera.sh" ]; then
+    out "$(M '・iPhone をマイクとカメラとして使うには、./start-mic-camera.sh を実行します。GPU を使っていても、使っていなくても使えます。' '- To use the iPhone as a microphone and a camera, run ./start-mic-camera.sh. It works with or without the GPU.')"
+fi
 out ""
 CLIP=
 command -v wl-copy > /dev/null 2>&1 && [ -n "${WAYLAND_DISPLAY:-}" ] && CLIP="wl-copy"

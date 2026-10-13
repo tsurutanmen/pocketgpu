@@ -13,7 +13,7 @@
 //                読み戻しの遅延（VirtualProtect・PAGE_NOACCESS・例外で読む。約 530 行）は外す
 //  窓と絵を出す  Win32 の surface・GDI・WIC の JPEG → X11（VK_KHR_xcb_surface・VK_KHR_xlib_surface）と libturbojpeg か stb_image（wsi_x11.inc）。
 //                窓のバナー・モニターへ動かす・広げた絵の別窓は Windows だけ
-//  動画          Media Foundation の H.264 とそれを GPU でほどく D3D11（約 330 行）・video.h の Windows の部分 → 外す（窓の絵は JPEG）
+//  動画          Media Foundation の H.264 とそれを GPU でほどく D3D11（約 330 行）・video.h の Windows の部分 → FFmpeg の libavcodec を dlopen（vdec_av.inc・ソフトでほどく）
 //  ファイル      シェーダーを書き出す調べ用（IPHONE_VK_SPV_DUMP）と録画の持ち帰りの区切りの文字（PATH_SEP）。MAX_PATH・DeleteFileA・GetFileAttributesA は調べ用の制御ファイルを使う所のため
 //  環境変数      getenv はそのまま。VKD3D_FEATURE_LEVEL の取得と設定だけ Windows の API → getenv・setenv
 //  dll の読み込み  __declspec(dllexport) → visibility("default")（組むとき -fvisibility=hidden）。
@@ -48,7 +48,8 @@
 #define PATH_SEP "/"
 
 typedef int32_t LONG;
-typedef int64_t LONG64;
+// 32 ビット（i386）では int64_t が 4 バイト揃えになり、不可分の足し算がキャッシュの行をまたぐ（split lock）ことがあるので 8 に揃える
+typedef int64_t LONG64 __attribute__((aligned(8)));
 typedef uint32_t DWORD;
 typedef void *HWND;
 

@@ -19,7 +19,8 @@
 //   持ち帰る物があるときは、MEM_READ の返事が終わりの知らせを兼ねる（受け手は読む前に drain する）。
 //   往復は「GPU の答えを持ち帰る」ときだけになる
 //
-// Linux 版（#ifdef _WIN32 で分けている）は、窓を X11（VK_KHR_xcb_surface・VK_KHR_xlib_surface）に出す。窓の絵は JPEG だけ（H.264 は Windows だけ）。
+// Linux 版（#ifdef _WIN32 で分けている）は、窓を X11（VK_KHR_xcb_surface・VK_KHR_xlib_surface）に出す。窓の絵は JPEG。
+// IPHONE_VK_VIDEO=1 で H.264（Windows と同じ VR_READ_H264）。ほどくのは FFmpeg の libavcodec を dlopen して（vdec_av.inc。無ければ JPEG）。
 // 書き込み監視は userfaultfd の非同期の書き込み禁止と PAGEMAP_SCAN（核 6.7 以降）。読み戻しの遅延は無い。
 // つなぎ先は IPHONE_VK=host:port か usb（usbmuxd の Unix socket）
 #ifndef _WIN32
@@ -383,7 +384,7 @@ static struct {
     double lat_sum, lat_max;       // present から窓に出るまで
     uint64_t lat_n;
     int heat_max;                  // いちばん熱かったときの iPhone の熱の状態
-    uint64_t wr_bytes[6], wr_n[6]; // GPU が書くかもしれない CPU から見える範囲（読み戻す元）を理由別に
+    LONG64 wr_bytes[6], wr_n[6]; // GPU が書くかもしれない CPU から見える範囲（読み戻す元）を理由別に
     double cpu0;                   // 最初の present のときのプロセスの CPU 時間（ms）
     uint64_t rp_begin, rp_load, rp_store, rp_clear, rp_dload, rp_dstore, rp_same; // render pass を始めた回数と、画面を読み込む・書き戻す・消す attachment の数
     double rp_px;                  // 読み込みと書き戻しの画素の合計（タイルで描く GPU ではここが重い）
@@ -1318,9 +1319,12 @@ static vr_sock unix_connect(const char *path) {
 
 // usbmuxd の受け渡し役（キットの pgpu-probe broker）から、usbmuxd につないだ口をもらう。
 // Steam の入れ物（pressure-vessel）や Flatpak の中では /run が別なので /var/run/usbmuxd が見えない。
-// 受け渡し役は外で動き、名前だけの Unix socket（@pocketgpu-usbmuxd-<uid>。網の名前空間が同じなら入れ物の中からも見える）で待つ。
-// 頼まれると、同じ利用者か（SO_PEERCRED）を見てから usbmuxd につなぎ、その口を SCM_RIGHTS で渡す。
+// 受け渡し役は外で動き、名前だけの Unix socket（網の名前空間が同じなら入れ物の中からも見える）で待つ。
+// 名前だけの socket はファイルの権限で守れないので、あいさつ（../tools/pgpu_broker.h）で両方の側から確かめる：
+// 相手の uid が自分と同じか（SO_PEERCRED）・run-on-iphone-gpu.sh がこのゲームにだけ渡した合言葉（PGPU_BROKER_TOKEN）を
+// 相手も知っているか（合言葉そのものは送らない）・もらった fd が socket か（fstat）。どれかが違えば口を使わない。
 // そのあとの通り道は usbmuxd に直接つながるので、受け渡し役はデータを中継しない（遅くならない）
+#include "../tools/pgpu_broker.h"
 // 受け渡し役の名前に使う uid。入れ物が利用者の名前空間を分けて uid を写していても（unshare -Ur では 0 に見える）、
 // /proc/self/uid_map で外の uid に戻す。分けていなければそのまま（0 0 4294967295）
 static unsigned mux_outer_uid(void) {
@@ -1336,34 +1340,23 @@ static unsigned mux_outer_uid(void) {
 }
 
 static vr_sock broker_get(const char *name) {
-    struct sockaddr_un a;
-    memset(&a, 0, sizeof a);
-    a.sun_family = AF_UNIX;
-    size_t n = strlen(name);
-    if (n + 1 > sizeof a.sun_path) return INVALID_SOCKET;
-    memcpy(a.sun_path + 1, name, n); // 先頭の 0 で、ファイルの無い名前だけの socket
-    vr_sock s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    uint8_t key[16];
+    if (!pgb_key_from_env(key)) {
+        say("受け渡し役 @%s を使うための合言葉（PGPU_BROKER_TOKEN）が無い。run-on-iphone-gpu.sh から起動する", name);
+        return INVALID_SOCKET;
+    }
+    vr_sock s = pgb_connect(name);
     if (s == INVALID_SOCKET) return s;
-    if (connect(s, (struct sockaddr *) &a, (socklen_t) (offsetof(struct sockaddr_un, sun_path) + 1 + n)) != 0) { closesocket(s); return INVALID_SOCKET; }
     sock_rcvtimeo(s, 5000);
-    char b = 0;
-    struct iovec iov = { &b, 1 };
-    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
-    memset(&u, 0, sizeof u);
-    struct msghdr m;
-    memset(&m, 0, sizeof m);
-    m.msg_iov = &iov;
-    m.msg_iovlen = 1;
-    m.msg_control = u.buf;
-    m.msg_controllen = sizeof u.buf;
-    ssize_t r = recvmsg(s, &m, MSG_CMSG_CLOEXEC);
-    closesocket(s);
     int fd = -1;
-    if (r == 1)
-        for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c))
-            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) memcpy(&fd, CMSG_DATA(c), sizeof fd);
-    if (r != 1 || b != 'K') { if (fd >= 0) close(fd); return INVALID_SOCKET; } // 'K' 以外は「usbmuxd につながらない」
-    if (fd < 0) return INVALID_SOCKET;
+    const char *why = "";
+    char r = pgb_ask(s, key, 'G', &fd, &why);
+    closesocket(s);
+    if (r != 'K') {
+        // 'E' は「usbmuxd につながらない」。ほかは確かめられなかった（別の利用者・合言葉が違う・socket でない）
+        if (r != 'E') say("受け渡し役 @%s の口は使わない（%s）", name, why);
+        return INVALID_SOCKET;
+    }
     sock_rcvtimeo(fd, 5000);
     return fd;
 }
@@ -1375,7 +1368,8 @@ static vr_sock broker_get(const char *name) {
 //   IPHONE_VK_MUX が無ければ USBMUXD_SOCKET_ADDRESS（libusbmuxd と同じ書き方：UNIX:パス か 住所:番号）
 //   それも無ければ Windows は 127.0.0.1:27015（Apple Mobile Device Service）、Linux は /var/run/usbmuxd
 //   Linux：IPHONE_VK_MUX=@名前 は受け渡し役（broker_get）。何も決めずに /var/run/usbmuxd につながらないときは、
-//   受け渡し役 @pocketgpu-usbmuxd-<uid> を試す（Steam の入れ物の中など。IPHONE_VK_MUX_BROKER=0 で試さない）
+//   受け渡し役 @$PGPU_BROKER（無ければ @pocketgpu-usbmuxd-<uid>）を試す（Steam の入れ物の中など。IPHONE_VK_MUX_BROKER=0 で試さない）。
+//   受け渡し役には合言葉 PGPU_BROKER_TOKEN が要る（run-on-iphone-gpu.sh が渡す）
 static vr_sock mux_open(char *where, size_t nw) {
     const char *mp = getenv("IPHONE_VK_MUX");
     const char *env = mp && *mp ? mp : getenv("USBMUXD_SOCKET_ADDRESS");
@@ -1394,8 +1388,11 @@ static vr_sock mux_open(char *where, size_t nw) {
         vr_sock s = unix_connect(path);
         const char *bk = getenv("IPHONE_VK_MUX_BROKER");
         if (s == INVALID_SOCKET && dflt && !(bk && *bk == '0')) {
-            char name[64];
-            snprintf(name, sizeof name, "pocketgpu-usbmuxd-%u", mux_outer_uid());
+            // run-on-iphone-gpu.sh が起動ごとに作った受け渡し役（PGPU_BROKER）。無ければ手で動かす物の名前
+            char name[108];
+            const char *bn = getenv(PGB_NAME_ENV);
+            if (bn && *bn && strlen(bn) < sizeof name) snprintf(name, sizeof name, "%s", bn[0] == '@' ? bn + 1 : bn);
+            else snprintf(name, sizeof name, "pocketgpu-usbmuxd-%u", mux_outer_uid());
             s = broker_get(name);
             snprintf(where, nw, s == INVALID_SOCKET ? "usbmuxd の口 %s（受け渡し役 @%s も無い）" : "usbmuxd の受け渡し役 @%s", s == INVALID_SOCKET ? path : name, name);
             if (s != INVALID_SOCKET) say("%s が見えないので、%s から usbmuxd の口をもらった", path, where);
@@ -6681,8 +6678,9 @@ static int vdec_available(void) {
     return v > 0;
 }
 #else
-// Linux は窓の絵を JPEG で受け取る（H.264 をほどく道はまだ無い）
-static int vdec_available(void) { return 0; }
+// Linux：FFmpeg の libavcodec を dlopen してほどく（vdec_av.inc）。無ければ vdec_available が 0 で、窓の絵は JPEG
+#define VDEC_SAY(...) say(__VA_ARGS__)
+#include "vdec_av.inc"
 #endif
 
 static volatile LONG64 g_vstream; // 流れの番号（swapchain ごとに新しくする）
@@ -6945,8 +6943,13 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
         sc->vw = sc->w, sc->vh = sc->h;
         {
             const char *u = getenv("IPHONE_VK_UPSCALE");
+#ifdef _WIN32
             sc->upscale = sc->use_video && u && *u == '1' && (g_hw.caps & VR_CAP_UPSCALE);
             if (u && *u == '1' && !sc->upscale) say("MetalFX で広げられない（H.264 でない・受け手が名乗らない）");
+#else
+            sc->upscale = 0; // 広げた絵を出す別の窓は Windows だけ
+            if (u && *u == '1') say("MetalFX で広げるのは、Linux ではまだ使えない");
+#endif
             if (sc->upscale) {
                 sc->vw = (sc->w * 3 / 2 + 1) & ~1u, sc->vh = (sc->h * 3 / 2 + 1) & ~1u;
                 say("iPhone の MetalFX で %u x %u を %u x %u に広げ、別の窓に出す", sc->w, sc->h, sc->vw, sc->vh);
@@ -7290,9 +7293,9 @@ static void disp_give(struct swapchain *sc, vr_buf *out, uint64_t serial) {
     ReleaseSRWLockExclusive(&sc->disp.lk);
 }
 
-#ifdef _WIN32
-// ---- 窓の絵を H.264 で受け取る ----
+// ---- 窓の絵を H.264 で受け取る（Windows は Media Foundation、Linux は libavcodec でほどく） ----
 // H.264 は前のコマを元にするので、JPEG と違って間のコマを飛ばせない。表示の糸は届いた順に全部ほどき、最後の 1 枚だけを描く
+#ifdef _WIN32
 // 広げた絵を出す窓。表示の糸が作り、その糸で知らせを回す。窓の文は仮（言葉は鶴田さんが決める）
 // 閉じる知らせは、この窓では壊さずにゲームの窓へ回す（ゲームが閉じれば表示の糸が終わって、この窓も壊す）
 static LRESULT CALLBACK up_wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
@@ -7328,17 +7331,24 @@ static HWND up_window(uint32_t w, uint32_t h, HWND game) {
     }
     return wnd;
 }
+#endif
 
 // 窓に描く糸（H.264）：渡されたコマを順にほどいて、最後の 1 枚を描く
 static DWORD WINAPI vdisp_thread(LPVOID arg) {
     struct swapchain *sc = (struct swapchain *) arg;
+#ifdef _WIN32
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
+#endif
     struct vdec d;
     if (!vdec_open(&d, 1)) {
         say("H.264 のデコーダを作れない。窓の絵は JPEG に戻す");
         InterlockedExchange(&sc->v_broken, 1);
     } else {
+#ifdef _WIN32
         say("H.264 を%sでほどく", d.hw ? " GPU（D3D11）" : "ソフト");
+#else
+        say("H.264 をソフト（libavcodec）でほどく");
+#endif
         sc->v_hwdec = d.hw;
     }
     uint8_t *px = malloc((size_t) sc->vw * sc->vh * 4);
@@ -7357,7 +7367,11 @@ static DWORD WINAPI vdisp_thread(LPVOID arg) {
         sc->disp.has = 0;
         if (sc->disp.skip) wait_key = 1, sc->disp.skip = 0;
         ReleaseSRWLockExclusive(&sc->disp.lk);
+#ifdef _WIN32
         if (!d.t || !px) continue;
+#else
+        if (!d.ctx || !px) continue;
+#endif
         int shown = 0;
         for (size_t at = 0; at + 4 <= mine.n;) {
             uint32_t n;
@@ -7406,12 +7420,15 @@ static DWORD WINAPI vdisp_thread(LPVOID arg) {
         vdec_unmap(&d);
         if (!got) continue;
         double t2 = now_ms();
+#ifdef _WIN32
         if (sc->upscale) {
             if (!sc->vwin && (sc->vwin = up_window(sc->vw, sc->vh, sc->hwnd))) SetWindowLongPtrW(sc->vwin, GWLP_USERDATA, (LONG_PTR) sc->hwnd);
             if (sc->vwin) win_draw(sc->vwin, px, sc->vw, sc->vh);
             MSG m;
             while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
-        } else {
+        } else
+#endif
+        {
             win_draw(sc->hwnd, px, sc->w, sc->h);
         }
         sc->v_cvt_ms += t2 - t1;
@@ -7428,11 +7445,15 @@ static DWORD WINAPI vdisp_thread(LPVOID arg) {
         }
         sc_tick(sc);
     }
+#ifdef _WIN32
     if (sc->vwin) { DestroyWindow(sc->vwin); sc->vwin = NULL; }
+#endif
     free(px);
     free(mine.p);
     vdec_close(&d);
+#ifdef _WIN32
     CoUninitialize();
+#endif
     return 0;
 }
 
@@ -7536,13 +7557,6 @@ static int video_blit(struct swapchain *sc, uint32_t j, uint64_t serial, int now
     video_fallback(sc);
     return 0;
 }
-#else
-// Linux は窓の絵を JPEG だけで受け取る（use_video はいつも 0）
-static int video_blit(struct swapchain *sc, uint32_t j, uint64_t serial, int now, VkResult *r) {
-    (void) sc; (void) j; (void) serial; (void) now; (void) r;
-    return 0;
-}
-#endif
 
 // 今のコマの JPEG をその場で受け取って、表示の糸に渡す（区切りの待ちがあるときの、遅れの少ないやり方）
 static VkResult blit_now(struct swapchain *sc, uint32_t j, uint64_t serial) {

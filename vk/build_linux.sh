@@ -1,8 +1,8 @@
 #!/bin/bash
-# Linux 用（WSL・Steam Deck を含む）を gcc で組む。窓は X11（xcb・Xlib）に JPEG の絵で出す。動画（H.264）と読み戻しの遅延は無い版。
-# X・libturbojpeg は動くときに dlopen するので、組むときに要るのは gcc と Vulkan のヘッダだけ。
+# Linux 用（WSL・Steam Deck を含む）を gcc で組む。窓は X11（xcb・Xlib）に JPEG の絵で出す（IPHONE_VK_VIDEO=1 で H.264。FFmpeg の libavcodec でほどく）。読み戻しの遅延は無い版。
+# X・libturbojpeg・libavcodec は動くときに dlopen するので、組むときに要るのは gcc と Vulkan のヘッダだけ。
 #   vk/build_linux.sh [出す所]                  既定は vk/build_linux
-#   vk/build_linux.sh [出す所] icd tests        icd・tests・server・probe から選ぶ（server は Linux で受け手を組む。lavapipe などが受け手になる）
+#   vk/build_linux.sh [出す所] icd tests        icd・icd32・tests・server・probe から選ぶ（icd32 は 32 ビットのゲーム用。gcc なら -m32 の libc が要る）（server は Linux で受け手を組む。lavapipe などが受け手になる）
 #                                               probe はキットの道具 pgpu-probe（start-pocketgpu.sh と run-on-iphone-gpu.sh が使う）
 # 配るキット用に古い glibc に合わせて組むときは LINUX_CC で組む物を替える（pc/make_linux_kit.py は Windows でもこれと同じ zig cc で組む）：
 #   LINUX_CC="zig cc -target x86_64-linux-gnu.2.31 -mcpu=baseline" vk/build_linux.sh 出す所 icd probe
@@ -27,6 +27,13 @@ for w in $WHAT; do
         $CC -fPIC -shared -fvisibility=hidden -rdynamic $VKH icd/icd.c -o "$OUT/libiphone_icd.so" -lpthread -ldl
         cp -f icd/iphone_icd_linux.json "$OUT/" # library_path は横の libiphone_icd.so
         echo "ドライバ：$OUT/libiphone_icd.so（VK_ICD_FILENAMES=$OUT/iphone_icd_linux.json）"
+        ;;
+    icd32)
+        # 32 ビットのゲーム用（出す所/i386）。zig なら LINUX_CC="zig cc -target x86-linux-gnu.2.31 -mcpu=baseline"
+        mkdir -p "$OUT/i386"
+        if [ -n "$LINUX_CC" ]; then C32="$CC"; else C32="$CC -m32"; fi
+        $C32 -fPIC -shared -fvisibility=hidden -rdynamic $VKH icd/icd.c -o "$OUT/i386/libiphone_icd.so" -lpthread -ldl
+        echo "32 ビットのドライバ：$OUT/i386/libiphone_icd.so"
         ;;
     tests)
         # 試験は Windows 用のままの .c を使う。#include <windows.h> は tests/linux_shim/windows.h（薄い置き換え）に当たる

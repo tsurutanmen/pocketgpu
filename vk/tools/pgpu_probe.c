@@ -8,14 +8,19 @@
 //   pgpu-probe devices                 usbmuxd に見えている機器            DEV <番号> <USB|Network> speed=<bps> product=<番号> の行と DEVICES <数>
 //   pgpu-probe pair <番号>             usbmuxd にペアリングの記録があるか  PAIR OK / PAIR NONE <返事の番号> / PAIR NG <理由>
 //   pgpu-probe hello <番号> [proto] [ms] [port]   受け手（iPhone のアプリ）にあいさつ   HELLO OK mem_mb=<数> name=<名前> / HELLO NG <理由> [<返事>]
+//   pgpu-probe port <番号> <port>      iPhone のアプリがその番号で待っているか   PORT OK <port> / PORT NG <理由> <返事の番号>
 //   pgpu-probe bw <番号> [MB]          USB の太さ（iPhone の 50058 番）    BW OK down=<MB/s> up=<MB/s> rtt_ms=<ms> / BW NG <理由>
 //   pgpu-probe loader                  Vulkan のローダーの版               LOADER OK <版> <ファイル> / LOADER NG <理由>
 //   pgpu-probe vklist                  Vulkan の装置の一覧（vklist.exe と同じ形）  GPU0: 名前  (vendor 0x…, type …, Vulkan 1.x, … MiB)
 //   pgpu-probe ww                      ドライバの書き込み監視（userfaultfd の非同期の書き込み禁止と PAGEMAP_SCAN）が使えるか  WW OK / WW NG <理由>
 //   pgpu-probe usb                     この PC の USB に Apple の iPhone・iPad（05ac:12xx）が見えるか（/sys を読む）  USB <数> と USBDEV <番号> <速さ Mbps> の行
 //   pgpu-probe broker [--quiet]        usbmuxd の受け渡し役。Steam の入れ物（pressure-vessel）・Flatpak の中のドライバに、
-//                                      usbmuxd につないだ口を渡す。親（起こしたシェル）が終わると一緒に終わる
-//   pgpu-probe broker-check            受け渡し役が動いているか            BROKER OK / BROKER NONE
+//                                      usbmuxd につないだ口を渡す。親（起こしたシェル）が終わると一緒に終わる。
+//                                      合言葉 PGPU_BROKER_TOKEN（16 進 32 けた）が要る。名前は PGPU_BROKER か pocketgpu-usbmuxd-<uid>。
+//                                      渡すのは、同じ利用者で、同じ合言葉を知っている相手だけ（pgpu_broker.h）
+//                                      BROKER READY @名前 / BROKER BUSY @名前（名前が使われている・終わりの番号 3）/ BROKER NG <理由>
+//   pgpu-probe broker-check            受け渡し役が動いていて、合言葉が通るか   BROKER OK / BROKER NONE / BROKER NG @名前 <理由>
+//   pgpu-probe token                   新しい合言葉（16 進 32 けた）を出す（run-on-iphone-gpu.sh が使う）
 // usbmuxd の口はドライバ（icd.c の mux_open）と同じ順に決める：IPHONE_VK_MUX → USBMUXD_SOCKET_ADDRESS → /var/run/usbmuxd → 受け渡し役
 // 終わりの番号：0 は OK、1 は NG、2 は使い方の誤り
 #define _GNU_SOURCE
@@ -45,6 +50,7 @@
 #include <unistd.h>
 #include <linux/userfaultfd.h>
 #include <vulkan/vulkan.h>
+#include "pgpu_broker.h"
 
 #define RECV_PORT 50060 // Vulkan の受け手（vk/remote/proto.h の VR_DEFAULT_PORT）
 #define BW_PORT 50058   // USB の太さを測る受け口（vk/remote/bw.c）
@@ -133,29 +139,31 @@ static unsigned outer_uid(void) {
     }
     return u;
 }
-static void broker_name(char *out, size_t n) { snprintf(out, n, "pocketgpu-usbmuxd-%u", outer_uid()); }
+// 受け渡し役の名前：PGPU_BROKER（run-on-iphone-gpu.sh が起動ごとに作る名前）。無ければ pocketgpu-usbmuxd-<uid>（--broker で手で動かす物）
+static void broker_name(char *out, size_t n) {
+    const char *e = getenv(PGB_NAME_ENV);
+    if (e && *e && strlen(e) < n && strlen(e) < 100) snprintf(out, n, "%s", e[0] == '@' ? e + 1 : e);
+    else snprintf(out, n, "pocketgpu-usbmuxd-%u", outer_uid());
+}
 
-// 受け渡し役から usbmuxd につないだ口をもらう（icd.c の broker_get と同じ）
-static int broker_get(const char *name) {
+// 受け渡し役にあいさつして頼む（icd.c の broker_get と同じ。pgpu_broker.h）。op が 'G' なら usbmuxd の口を返す。
+// 返すのは役の答え（'K'・'P'・'E'・'A'）か 0（つなげない・確かめられない。why に理由）
+static char broker_ask(const char *name, char op, int *fd, const char **why) {
+    uint8_t key[16];
+    *fd = -1;
+    if (!pgb_key_from_env(key)) { *why = "notoken"; return 0; }
     int s = unix_connect(name, 1);
-    if (s < 0) return -1;
+    if (s < 0) { *why = "none"; return 0; }
     set_timeout(s, 5000);
-    char b = 0;
-    struct iovec iov = { &b, 1 };
-    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
-    memset(&u, 0, sizeof u);
-    struct msghdr m = { 0 };
-    m.msg_iov = &iov;
-    m.msg_iovlen = 1;
-    m.msg_control = u.buf;
-    m.msg_controllen = sizeof u.buf;
-    ssize_t r = recvmsg(s, &m, MSG_CMSG_CLOEXEC);
+    char r = pgb_ask(s, key, op, fd, why);
     close(s);
+    return r;
+}
+static int broker_get(const char *name) {
     int fd = -1;
-    if (r == 1)
-        for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c))
-            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) memcpy(&fd, CMSG_DATA(c), sizeof fd);
-    if (r != 1 || b != 'K') { if (fd >= 0) close(fd); errno = ECONNREFUSED; return -1; }
+    const char *why = "";
+    char r = broker_ask(name, 'G', &fd, &why);
+    if (r != 'K') { errno = ECONNREFUSED; return -1; }
     return fd;
 }
 
@@ -334,6 +342,17 @@ static int cmd_pair(long long id) {
     if (ok) { printf("PAIR OK\n"); return 0; }
     printf("PAIR NONE %lld\n", num);
     return 1;
+}
+
+// iPhone のアプリがその番号で待っているか（つないで、何も送らずに閉じる）。カメラ 50064・音 50063
+static int cmd_port(long long id, int port) {
+    const char *why = NULL;
+    long long num = 0;
+    int s = connect_phone(id, port, &why, &num);
+    if (s < 0) { printf("PORT NG %s %lld\n", why, num); return 1; }
+    close(s);
+    printf("PORT OK %d\n", port);
+    return 0;
 }
 
 // 受け手にあいさつ（VR_HELLO）して、GPU の名前とメモリを聞く（tools\pgpu_common.ps1 の Invoke-Hello と同じ読み方）
@@ -572,41 +591,39 @@ static int cmd_usb(void) {
 static volatile sig_atomic_t g_quit;
 static void on_term(int sig) { (void) sig; g_quit = 1; }
 
-static void broker_serve(int c, int quiet) {
-    struct ucred cr;
-    socklen_t cl = sizeof cr;
-    char ok = 'E';
-    int fd = -1;
-    // 同じ利用者のプロセスにだけ渡す（名前だけの socket には持ち主の権限が無いため）
-    if (getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl) == 0 && cr.uid == getuid()) {
-        char where[320];
-        fd = mux_open(where, sizeof where, 0);
-        if (fd >= 0) ok = 'K';
-        if (!quiet) fprintf(stderr, "[pgpu-probe] pid %d に %s\n", (int) cr.pid, fd >= 0 ? "usbmuxd の口を渡した" : "usbmuxd につながらないと返した");
-    } else if (!quiet) fprintf(stderr, "[pgpu-probe] 別の利用者からの頼みを断った\n");
-    struct iovec iov = { &ok, 1 };
-    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
-    memset(&u, 0, sizeof u);
-    struct msghdr m = { 0 };
-    m.msg_iov = &iov;
-    m.msg_iovlen = 1;
-    if (fd >= 0) {
-        m.msg_control = u.buf;
-        m.msg_controllen = sizeof u.buf;
-        struct cmsghdr *h = CMSG_FIRSTHDR(&m);
-        h->cmsg_level = SOL_SOCKET;
-        h->cmsg_type = SCM_RIGHTS;
-        h->cmsg_len = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(h), &fd, sizeof fd);
-    }
+// 1 つの頼みに答える。相手の uid と合言葉を確かめてから（pgpu_broker.h）、usbmuxd につないで口を渡す
+static void broker_serve(int c, const uint8_t key[16], int quiet) {
     set_timeout(c, 2000);
-    sendmsg(c, &m, MSG_NOSIGNAL);
+    struct ucred cr = { 0 };
+    socklen_t cl = sizeof cr;
+    getsockopt(c, SOL_SOCKET, SO_PEERCRED, &cr, &cl);
+    char op = 0;
+    if (!pgb_serve_auth(c, key, &op)) {
+        // 別の利用者・合言葉を知らない・古い版のドライバ。口は渡さない
+        pgb_reply(c, 'A', -1);
+        if (!quiet) fprintf(stderr, "[pgpu-probe] pid %d（uid %u）の頼みを断った（別の利用者か、合言葉が違う）\n", (int) cr.pid, (unsigned) cr.uid);
+        close(c);
+        return;
+    }
+    if (op == 'P') {
+        pgb_reply(c, 'P', -1);
+        close(c);
+        return;
+    }
+    char where[320];
+    int fd = mux_open(where, sizeof where, 0);
+    pgb_reply(c, fd >= 0 ? 'K' : 'E', fd);
+    if (!quiet) fprintf(stderr, "[pgpu-probe] pid %d に %s\n", (int) cr.pid, fd >= 0 ? "usbmuxd の口を渡した" : "usbmuxd につながらないと返した");
     if (fd >= 0) close(fd); // 渡した側の写しは閉じる（もらった側の口は残る）
     close(c);
 }
 
+// 受け渡し役。合言葉（PGPU_BROKER_TOKEN）が無ければ始めない。名前は PGPU_BROKER か pocketgpu-usbmuxd-<uid>。
+// 起こした親（run-on-iphone-gpu.sh やターミナルのシェル）が終わると一緒に終わる
 static int cmd_broker(int quiet) {
-    char name[64];
+    uint8_t key[16];
+    if (!pgb_key_from_env(key)) { printf("BROKER NG token\n"); return 1; }
+    char name[108];
     broker_name(name, sizeof name);
     struct sockaddr_un a;
     memset(&a, 0, sizeof a);
@@ -615,12 +632,13 @@ static int cmd_broker(int quiet) {
     int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (s < 0) { printf("BROKER NG socket\n"); return 1; }
     if (bind(s, (struct sockaddr *) &a, (socklen_t) (offsetof(struct sockaddr_un, sun_path) + 1 + strlen(name))) != 0) {
-        printf(errno == EADDRINUSE ? "BROKER BUSY @%s\n" : "BROKER NG bind\n", name);
+        // 名前が使われている：ほかの受け渡し役か、名前を先に取った物。どちらにしても、ここでは待たない（呼んだ側が broker-check で確かめる）
+        int busy = errno == EADDRINUSE;
+        printf(busy ? "BROKER BUSY @%s\n" : "BROKER NG bind\n", name);
         close(s);
-        return errno == EADDRINUSE ? 0 : 1;
+        return busy ? 3 : 1;
     }
     listen(s, 16);
-    // 起こした親（run-on-iphone-gpu.sh やターミナルのシェル）が終わったら一緒に終わる
     pid_t parent = getppid();
     prctl(PR_SET_PDEATHSIG, SIGTERM);
     if (getppid() != parent) return 0;
@@ -637,24 +655,28 @@ static int cmd_broker(int quiet) {
         int r = poll(&pf, 1, 1000);
         if (r <= 0) continue;
         int c = accept4(s, NULL, NULL, SOCK_CLOEXEC);
-        if (c >= 0) broker_serve(c, quiet);
+        if (c >= 0) broker_serve(c, key, quiet);
     }
     close(s);
     return 0;
 }
 
+// 受け渡し役が動いていて、同じ利用者で、同じ合言葉を知っているか（usbmuxd にはつながない）
 static int cmd_broker_check(void) {
-    char name[64];
+    char name[108];
     broker_name(name, sizeof name);
-    int s = unix_connect(name, 1);
-    if (s < 0) { printf("BROKER NONE @%s\n", name); return 1; }
-    close(s); // 何も頼まずに閉じる（受け渡し役は 1 回分の usbmuxd の口を作って閉じる）
-    printf("BROKER OK @%s\n", name);
-    return 0;
+    int fd = -1;
+    const char *why = "";
+    char r = broker_ask(name, 'P', &fd, &why);
+    if (fd >= 0) close(fd);
+    if (r == 'P') { printf("BROKER OK @%s\n", name); return 0; }
+    if (!strcmp(why, "none")) printf("BROKER NONE @%s\n", name);
+    else printf("BROKER NG @%s %s\n", name, r == 'A' ? "refused" : !strcmp(why, "notoken") ? "notoken" : "untrusted");
+    return 1;
 }
 
 static int usage(void) {
-    fprintf(stderr, "使い方：pgpu-probe mux|devices|pair <番号>|hello <番号> [proto] [ms] [port]|bw <番号> [MB]|loader|vklist|ww|usb|broker [--quiet]|broker-check\n");
+    fprintf(stderr, "使い方：pgpu-probe mux|devices|pair <番号>|port <番号> <port>|hello <番号> [proto] [ms] [port]|bw <番号> [MB]|loader|vklist|ww|usb|broker [--quiet]|broker-check\n");
     return 2;
 }
 
@@ -666,6 +688,7 @@ int main(int argc, char **argv) {
     if (!strcmp(c, "mux")) return cmd_mux();
     if (!strcmp(c, "devices")) return cmd_devices();
     if (!strcmp(c, "pair") && argc >= 3) return cmd_pair(atoll(argv[2]));
+    if (!strcmp(c, "port") && argc >= 4) return cmd_port(atoll(argv[2]), atoi(argv[3]));
     if (!strcmp(c, "hello") && argc >= 3)
         return cmd_hello(atoll(argv[2]), argc >= 4 ? (unsigned) atoi(argv[3]) : 3, argc >= 5 ? atoi(argv[4]) : 3000, argc >= 6 ? atoi(argv[5]) : RECV_PORT);
     if (!strcmp(c, "bw") && argc >= 3) return cmd_bw(atoll(argv[2]), argc >= 4 ? atoi(argv[3]) : 32);
@@ -675,5 +698,12 @@ int main(int argc, char **argv) {
     if (!strcmp(c, "usb")) return cmd_usb();
     if (!strcmp(c, "broker")) return cmd_broker(argc >= 3 && !strcmp(argv[2], "--quiet"));
     if (!strcmp(c, "broker-check")) return cmd_broker_check();
+    if (!strcmp(c, "token")) {
+        uint8_t k[16];
+        if (!pgb_random(k, 16)) return 1;
+        for (int i = 0; i < 16; i++) printf("%02x", k[i]);
+        printf("\n");
+        return 0;
+    }
     return usage();
 }

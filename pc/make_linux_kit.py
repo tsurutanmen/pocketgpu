@@ -2,7 +2,10 @@
 #   python make_linux_kit.py brewmaegger           → D:\iphone-rpc\tester_kit\PocketGPU-linux-brewmaegger.tar.gz
 #   python make_linux_kit.py --template フォルダ    印を入れないひな形のフォルダ（試験用。IPA・tar.gz・台帳は作らない）
 # ドライバ（libiphone_icd.so）と道具（pgpu-probe）は zig cc で glibc 2.31 に合わせて組む（Ubuntu 20.04・Steam Runtime sniper と同じ版）。
-# 組んだあと、ELF の中を読んで、要る glibc の版が 2.31 以下か・要るライブラリが libc の仲間だけかを見る（X・JPEG は動くときに dlopen）。
+# 32 ビットのゲーム用に i386 のドライバも組む（lib/i386。run-on-iphone-gpu.sh が両方の json を渡し、Vulkan のローダーが合う方を使う）。
+# カメラとマイクの道具（bin/webcam_rx・bin/ipaudio）も組む。元は PGKIT_MEDIA_SRC（無ければ横の pc\ か work\linux2kit\pc）。
+# 組んだあと、ELF の中を読んで、要る glibc の版が 2.31 以下か・要るライブラリが libc の仲間だけかを見る
+# （X・JPEG・FFmpeg・PipeWire・PulseAudio は動くときに dlopen）。
 # ドライバの「#」32 文字を、その人の印（名前＋乱数）に書き換える（Windows のキットと同じ印の場所・同じ作り方）。
 # iPhone のアプリの IPA にも同じ印のファイルを足す。誰に何を渡したかは tester_kit\ledger_linux.csv に足す。
 # キットの中：
@@ -11,6 +14,9 @@
 #   README.txt                手順（英語と日本語）
 #   bin/pgpu-probe            start と run が使う道具（usbmuxd・受け手へのあいさつ・USB の速度・Vulkan の一覧・usbmuxd の受け渡し役）
 #   lib/x86_64/libiphone_icd.so と iphone_icd.x86_64.json   ドライバ（json の library_path は横の .so）
+#   lib/i386/libiphone_icd.so と iphone_icd.i386.json       32 ビットのゲーム用のドライバ（--no-32 で入れない）
+#   start-mic-camera.sh       iPhone をマイクとカメラにする（GPU は使わない）。Windows の Start-Mic-Camera.cmd
+#   bin/webcam_rx・bin/ipaudio  カメラ（PipeWire か v4l2loopback へ）とマイク・スピーカー（PipeWire か PulseAudio へ）（--no-media で入れない）
 #   tools/kit.ini             受け手との約束の版（proto=）とアプリの版（app=）
 #   THIRD-PARTY.txt           ドライバに入っている他の人のコード（lz4・bcdec・stb_image）のライセンス
 #   RpcServer-*.ipa           iPhone のアプリ（印入り）
@@ -30,14 +36,22 @@ VK_HEADERS = os.environ.get('VK_HEADERS') or next(
     (p for p in (r'D:\iphone-rpc\third_party\Vulkan-Headers\include', os.path.join(VK_SRC, '..', '..', 'third_party', 'Vulkan-Headers', 'include'))
      if os.path.exists(os.path.join(p, 'vulkan', 'vulkan.h'))), '')
 TARGET = 'x86_64-linux-gnu.2.31'
+TARGET32 = 'x86-linux-gnu.2.31'
+MEDIA_SRC = os.environ.get('PGKIT_MEDIA_SRC') or next(
+    (p for p in (os.path.join(HERE, 'pc'), r'D:\iphone-rpc\work\linux2kit\pc') if os.path.exists(os.path.join(p, 'webcam_rx_linux.c'))), '')
 GLIBC_MAX = (2, 31)
-NEEDED_OK = {'libc.so.6', 'libpthread.so.0', 'libdl.so.2', 'libm.so.6', 'ld-linux-x86-64.so.2', 'librt.so.1'}
+NEEDED_OK = {'libc.so.6', 'libpthread.so.0', 'libdl.so.2', 'libm.so.6', 'ld-linux-x86-64.so.2', 'ld-linux.so.2', 'librt.so.1'}
 PLACE = b'PGKIT-MARK:' + b'#' * 32
 JSON_NAME = 'iphone_icd.x86_64.json'  # VK_LOADER_DRIVERS_SELECT=*iphone_icd* に当たる名前（Windows と同じ）
+JSON32_NAME = 'iphone_icd.i386.json'
 
 ICD_JSON = {
     'file_format_version': '1.0.1',
     'ICD': {'library_path': './libiphone_icd.so', 'library_arch': '64', 'api_version': '1.2.0'},
+}
+ICD_JSON32 = {
+    'file_format_version': '1.0.1',
+    'ICD': {'library_path': './libiphone_icd.so', 'library_arch': '32', 'api_version': '1.2.0'},
 }
 
 THIRD_PARTY_HEAD = '''Third-party code in lib/x86_64/libiphone_icd.so
@@ -58,11 +72,18 @@ def sha256(path):
 # ---- ELF の中を読む：要るライブラリ（DT_NEEDED）と、glibc の版（.gnu.version_r） ----
 def elf_needs(path):
     d = open(path, 'rb').read()
-    if d[:4] != b'\x7fELF' or d[4] != 2:
-        raise SystemExit(f'{path} は 64 ビットの ELF ではない')
-    shoff, = struct.unpack_from('<Q', d, 0x28)
-    shentsize, shnum, shstrndx = struct.unpack_from('<HHH', d, 0x3A)
-    secs = [struct.unpack_from('<IIQQQQIIQQ', d, shoff + i * shentsize) for i in range(shnum)]
+    if d[:4] != b'\x7fELF' or d[4] not in (1, 2):
+        raise SystemExit(f'{path} は ELF ではない')
+    b64 = d[4] == 2
+    if b64:
+        shoff, = struct.unpack_from('<Q', d, 0x28)
+        shentsize, shnum, shstrndx = struct.unpack_from('<HHH', d, 0x3A)
+        secs = [struct.unpack_from('<IIQQQQIIQQ', d, shoff + i * shentsize) for i in range(shnum)]
+    else:
+        shoff, = struct.unpack_from('<I', d, 0x20)
+        shentsize, shnum, shstrndx = struct.unpack_from('<HHH', d, 0x2E)
+        secs = [struct.unpack_from('<IIIIIIIIII', d, shoff + i * shentsize) for i in range(shnum)]
+    dsz, dfmt = (16, '<qQ') if b64 else (8, '<iI')
     # (name, type, flags, addr, offset, size, link, info, align, entsize)
     def strat(off, i):
         e = d.index(b'\0', off + i)
@@ -71,8 +92,8 @@ def elf_needs(path):
     for s in secs:
         if s[1] == 6:  # SHT_DYNAMIC
             stroff = secs[s[6]][4]
-            for k in range(s[5] // 16):
-                tag, val = struct.unpack_from('<qQ', d, s[4] + k * 16)
+            for k in range(s[5] // dsz):
+                tag, val = struct.unpack_from(dfmt, d, s[4] + k * dsz)
                 if tag == 1:
                     needed.append(strat(stroff, val))
                 if tag == 0:
@@ -97,14 +118,14 @@ def check_elf(path):
     needed, versions = elf_needs(path)
     bad = [n for n in needed if n not in NEEDED_OK]
     if bad:
-        raise SystemExit(f'{os.path.basename(path)} が libc の仲間以外を要る：{bad}（X・JPEG・Vulkan は dlopen にする）')
+        raise SystemExit(f'{os.path.basename(path)} が libc の仲間以外を要る：{bad}（X・JPEG・Vulkan・FFmpeg・PipeWire は dlopen にする）')
     gl = sorted((tuple(int(x) for x in v[6:].split('.')) for v in versions if v.startswith('GLIBC_')), reverse=True)
     if gl and gl[0] > GLIBC_MAX:
         raise SystemExit(f'{os.path.basename(path)} が glibc {".".join(map(str, gl[0]))} を要る（{".".join(map(str, GLIBC_MAX))} 以下にする）')
     return needed, '.'.join(map(str, gl[0])) if gl else '-'
 
 
-def build(out):
+def build(out, with32=True, media=True):
     if not VK_SRC:
         raise SystemExit('app\\vk が見つからない。PGKIT_VK_SRC で決める')
     if not VK_HEADERS:
@@ -119,6 +140,18 @@ def build(out):
                '-o', os.path.join(out, 'libiphone_icd.so'), '-lpthread', '-ldl'], 'libiphone_icd.so'),
         (cc + [os.path.join('tools', 'pgpu_probe.c'), '-o', os.path.join(out, 'pgpu-probe'), '-ldl'], 'pgpu-probe'),
     ]
+    if with32:
+        # 32 ビットのゲーム用（i386）。out/i386/libiphone_icd.so
+        os.makedirs(os.path.join(out, 'i386'), exist_ok=True)
+        cc32 = [c if c != TARGET else TARGET32 for c in cc]
+        jobs.append((cc32 + ['-fPIC', '-shared', '-fvisibility=hidden', '-rdynamic', os.path.join('icd', 'icd.c'),
+                             '-o', os.path.join(out, 'i386', 'libiphone_icd.so'), '-lpthread', '-ldl'], 'i386/libiphone_icd.so'))
+    if media:
+        if not MEDIA_SRC:
+            raise SystemExit('webcam_rx_linux.c が見つからない。PGKIT_MEDIA_SRC で決めるか --no-media')
+        inc = ['-I' + os.path.join(VK_SRC, 'icd'), '-I' + os.path.join(VK_SRC, 'remote')]
+        for src, name in (('webcam_rx_linux.c', 'webcam_rx'), ('ipaudio_linux.c', 'ipaudio')):
+            jobs.append((cc + inc + [os.path.join(MEDIA_SRC, src), '-o', os.path.join(out, name), '-lpthread', '-ldl', '-lm'], name))
     for cmd, name in jobs:
         print(f'組む：{name}', flush=True)
         r = subprocess.run(cmd, cwd=VK_SRC, capture_output=True, text=True, encoding='utf-8', errors='replace')
@@ -177,7 +210,7 @@ def kit_files(kit):
         for n in files:
             p = os.path.join(root, n)
             rel = os.path.relpath(p, kit).replace(os.sep, '/')
-            yield p, rel, rel.endswith('.sh') or rel == 'bin/pgpu-probe'
+            yield p, rel, rel.endswith('.sh') or rel.startswith('bin/')
 
 
 def write_tar(kit, path):
@@ -215,6 +248,8 @@ def main():
     ap.add_argument('--template', metavar='DIR', help='印を入れないひな形をこのフォルダに作る（試験用）。IPA・tar.gz・台帳は作らない')
     ap.add_argument('--no-build', action='store_true', help='組まずに PGKIT_LINUX_BUILD にある物を使う')
     ap.add_argument('--no-ipa', action='store_true', help='iPhone のアプリ（IPA）を入れない（試験用）')
+    ap.add_argument('--no-32', action='store_true', help='32 ビットのゲーム用のドライバ（lib/i386）を入れない')
+    ap.add_argument('--no-media', action='store_true', help='カメラとマイクの道具（webcam_rx・ipaudio・start-mic-camera.sh）を入れない')
     a = ap.parse_args()
     ledger = os.path.join(OUT, 'ledger_linux.csv')
     if a.template:
@@ -247,9 +282,11 @@ def main():
             raise SystemExit(f'{IPA_DIR} に RpcServer-*.ipa が無い。入れないなら --no-ipa')
 
     if not a.no_build:
-        build(BUILD)
+        build(BUILD, not a.no_32, not a.no_media)
     so, probe = os.path.join(BUILD, 'libiphone_icd.so'), os.path.join(BUILD, 'pgpu-probe')
-    for p in (so, probe):
+    so32 = os.path.join(BUILD, 'i386', 'libiphone_icd.so')
+    media = [os.path.join(BUILD, n) for n in ('webcam_rx', 'ipaudio')]
+    for p in [so, probe] + ([] if a.no_32 else [so32]) + ([] if a.no_media else media):
         if not os.path.exists(p):
             raise SystemExit(f'{p} が無い。--no-build を外して組む')
         needed, gl = check_elf(p)
@@ -263,7 +300,19 @@ def main():
         json.dump(ICD_JSON, f, indent=4)
         f.write('\n')
     shutil.copyfile(probe, os.path.join(kit, 'bin', 'pgpu-probe'))
-    for n in ('start-pocketgpu.sh', 'run-on-iphone-gpu.sh', 'README.txt'):
+    if not a.no_32:
+        os.makedirs(os.path.join(kit, 'lib', 'i386'), exist_ok=True)
+        stamp(so32, os.path.join(kit, 'lib', 'i386', 'libiphone_icd.so'), mark)
+        with open(os.path.join(kit, 'lib', 'i386', JSON32_NAME), 'w', encoding='ascii', newline='\n') as f:
+            json.dump(ICD_JSON32, f, indent=4)
+            f.write('\n')
+    names = ['start-pocketgpu.sh', 'run-on-iphone-gpu.sh', 'README.txt']
+    if not a.no_media:
+        # 道具には印を入れない（Windows のキットの extras\ と同じ）
+        for m in media:
+            shutil.copyfile(m, os.path.join(kit, 'bin', os.path.basename(m)))
+        names.append('start-mic-camera.sh')
+    for n in names:
         lf_copy(os.path.join(KIT_SRC, n), os.path.join(kit, n))
     try:
         app_ver = re.match(r'RpcServer-(.+)\.ipa$', os.path.basename(src_ipa or newest_ipa())).group(1)
