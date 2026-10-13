@@ -1,0 +1,8 @@
+# The kit files are used on Windows. cmd files are ASCII and CRLF. ps1 files are UTF-8 with BOM and CRLF.
+# The update server compares files by SHA-256, so the line endings must not change on checkout.
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.md  text eol=lf
+*.yml text eol=lf
+*.py  text eol=lf
+*.cs  text eol=lf
