@@ -2,6 +2,7 @@
 // Windows では試験用に vulkan-1.dll（RTX 3060）で、iPhone では MoltenVK（Metal）で動く。
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -70,6 +71,19 @@ static void qos_hi(void) {
 #define VR_HAVE_JPEG 1
 #endif
 
+// 記録の言語。環境変数 PGPU_LANG=en|ja で決める（無ければ日本語）。英語のときは JE(日本語, English) が English を返す。
+// iPhone は環境変数が使えないので、アプリから vkr_set_lang("en") で渡せる
+static int g_lang_en = -1;
+static int lang_en(void) {
+    if (g_lang_en < 0) {
+        const char *e = getenv("PGPU_LANG");
+        g_lang_en = e && (e[0] == 'e' || e[0] == 'E') ? 1 : 0;
+    }
+    return g_lang_en;
+}
+void vkr_set_lang(const char *lang) { g_lang_en = lang && (lang[0] == 'e' || lang[0] == 'E') ? 1 : 0; }
+#define JE(ja, en) (lang_en() ? (en) : (ja))
+
 // 記録。iPhone ではアプリの中の printf が見えないので os_log に出す（PC から USB で読める）
 static void vlog(const char *fmt, ...) {
     char line[512];
@@ -93,6 +107,59 @@ static void vlog(const char *fmt, ...) {
     __android_log_print(ANDROID_LOG_INFO, "iphone-rpc-vk", "%s", line);
 #endif
 #endif
+}
+
+// 口（bind・listen）を開けなかった理由。errno の名前と短い説明を日英で書く（Windows は WSA の番号を同じ名前にする）
+typedef struct { int code; const char *name, *ja, *en; } sock_err_ent;
+#ifdef _WIN32
+#define SE_C(w, p) (w)
+#else
+#define SE_C(w, p) (p)
+#endif
+static const sock_err_ent k_sock_errs[] = {
+    { SE_C(WSAEADDRINUSE, EADDRINUSE), "EADDRINUSE", "この口は別のプログラムが使っている", "the port is already in use by another program" },
+    { SE_C(WSAEACCES, EACCES), "EACCES", "この口を使う許可が無い", "no permission to use this port" },
+    { SE_C(WSAEADDRNOTAVAIL, EADDRNOTAVAIL), "EADDRNOTAVAIL", "このアドレスはこの端末に無い", "this address does not exist on this device" },
+    { SE_C(WSAEINVAL, EINVAL), "EINVAL", "アドレスか口の状態が正しくない", "invalid address or socket state" },
+    { SE_C(WSAEMFILE, EMFILE), "EMFILE", "開いているファイルが多すぎる", "too many open files" },
+    { SE_C(WSAENOBUFS, ENOBUFS), "ENOBUFS", "メモリが足りない", "out of buffer space" },
+    { SE_C(WSAENETDOWN, ENETDOWN), "ENETDOWN", "ネットワークが使えない", "the network is down" },
+    { SE_C(WSAEAFNOSUPPORT, EAFNOSUPPORT), "EAFNOSUPPORT", "この種類のアドレスは使えない", "address family not supported" },
+#ifndef _WIN32
+    { EPERM, "EPERM", "許されていない操作", "operation not permitted" },
+    { ENOMEM, "ENOMEM", "メモリが足りない", "out of memory" },
+#endif
+};
+#define SOCK_EINVAL SE_C(WSAEINVAL, EINVAL)
+static int sock_errno(void) {
+#ifdef _WIN32
+    return WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+static void sock_err_text(int e, char *buf, size_t n) {
+    for (size_t i = 0; i < sizeof k_sock_errs / sizeof k_sock_errs[0]; i++)
+        if (k_sock_errs[i].code == e) {
+            snprintf(buf, n, JE("%s（%s）", "%s (%s)"), k_sock_errs[i].name, JE(k_sock_errs[i].ja, k_sock_errs[i].en));
+            return;
+        }
+    snprintf(buf, n, "errno %d", e);
+}
+
+// plane_codec.h の pc_decode が返す理由（日本語）を、英語のときは英語にする（plane_codec.h は icd とも共有なので、ここで読み替える）
+static const char *pc_err_text(const char *e) {
+    static const char *const k[][2] = {
+        { "頭が読めない", "cannot read the header" },
+        { "表が壊れている", "the table is broken" },
+        { "段の並びが壊れている", "the segment layout is broken" },
+        { "メモリが足りない", "out of memory" },
+        { "流れが壊れている", "the data stream is broken" },
+    };
+    if (lang_en() && e)
+        for (size_t i = 0; i < sizeof k / sizeof k[0]; i++)
+            if (!strcmp(e, k[i][0])) return k[i][1];
+    return e;
 }
 
 // ---- 本物の Vulkan ----
@@ -224,7 +291,7 @@ static void alias_mem_props(VkPhysicalDeviceMemoryProperties *m) {
             g_alias_mem = (int) m->memoryTypeCount;
             m->memoryTypes[m->memoryTypeCount].heapIndex = m->memoryTypes[i].heapIndex;
             m->memoryTypes[m->memoryTypeCount++].propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-            vlog("試験用：メモリの種類 %u（GPU の手元だけ・中身は %u 番）を足した（VKR_ADD_LOCAL_MEM）", (unsigned) g_alias_mem, (unsigned) i);
+            vlog(JE("試験用：メモリの種類 %u（GPU の手元だけ・中身は %u 番）を足した（VKR_ADD_LOCAL_MEM）", "Test: added memory type %u (GPU-local only, backed by type %u) (VKR_ADD_LOCAL_MEM)"), (unsigned) g_alias_mem, (unsigned) i);
             return;
         }
 }
@@ -618,7 +685,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
         VkPhysicalDeviceRayQueryFeaturesKHR frq = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR, .pNext = &fas };
         VkPhysicalDeviceFeatures2 rf2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &frq };
         vkGetPhysicalDeviceFeatures2(g_pd, &rf2);
-        vlog("レイトレーシングの機能：accelerationStructure %u・rayQuery %u", (unsigned) fas.accelerationStructure, (unsigned) frq.rayQuery);
+        vlog(JE("レイトレーシングの機能：accelerationStructure %u・rayQuery %u", "Ray tracing features: accelerationStructure %u, rayQuery %u"), (unsigned) fas.accelerationStructure, (unsigned) frq.rayQuery);
         if (fas.accelerationStructure && frq.rayQuery) {
 #define LOAD_RT(n) n = (PFN_##n) gipa(g_inst, #n);
             VKFUNCS_RT(LOAD_RT)
@@ -636,7 +703,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
         VkPhysicalDeviceFeatures2 f2 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &r2 };
         vkGetPhysicalDeviceFeatures2(g_pd, &f2);
         g_nulldesc_gpu = r2.nullDescriptor == VK_TRUE && (!like_ios() || hang_env("VKR_HANG_NULLDESC"));
-        if (like_ios() && g_nulldesc_gpu) vlog("ffhang：iPhone のふりだが本物の空の descriptor を使う（VKR_HANG_NULLDESC）");
+        if (like_ios() && g_nulldesc_gpu) vlog(JE("ffhang：iPhone のふりだが本物の空の descriptor を使う（VKR_HANG_NULLDESC）", "ffhang: pretending to be an iPhone but using a real null descriptor (VKR_HANG_NULLDESC)"));
     }
     caps |= VR_CAP_NULL_DESC;
     caps |= VR_CAP_PROGRESS; // 終わった submit の番号を、GPU を待たずに答える
@@ -647,20 +714,20 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     const char *mask = getenv("VKR_CAPS");
     if (mask && *mask) caps &= (uint32_t) strtoul(mask, NULL, 0);
     g_caps = caps;
-    vlog("できること（caps）0x%x：1.3 %s・dynamic rendering %s・sync2 %s・render pass 2 %s・extended dynamic state %s・query %s",
+    vlog(JE("できること（caps）0x%x：1.3 %s・dynamic rendering %s・sync2 %s・render pass 2 %s・extended dynamic state %s・query %s", "Capabilities (caps) 0x%x: 1.3 %s, dynamic rendering %s, sync2 %s, render pass 2 %s, extended dynamic state %s, query %s"),
          caps, caps & VR_CAP_VK13 ? "○" : "×", caps & VR_CAP_DYNAMIC_RENDERING ? "○" : "×", caps & VR_CAP_SYNC2 ? "○" : "×",
          caps & VR_CAP_RENDER_PASS2 ? "○" : "×", caps & VR_CAP_EXT_DYNAMIC_STATE ? "○" : "×", caps & VR_CAP_QUERY ? "○" : "×");
     // 名乗れないときに原因を追えるように、GPU の拡張のあり無しも出す。iPhone の MoltenVK は、PR #2771 で組んだ物で
     // MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=1 のときだけ持つ（アプリの設定「レイトレーシングを試す」）
     {
         const char *mrt = getenv("MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING");
-        vlog("レイトレーシングの拡張：acceleration_structure %s・ray_query %s・deferred_host_operations %s・ray_tracing_pipeline %s・MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=%s",
+        vlog(JE("レイトレーシングの拡張：acceleration_structure %s・ray_query %s・deferred_host_operations %s・ray_tracing_pipeline %s・MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=%s", "Ray tracing extensions: acceleration_structure %s, ray_query %s, deferred_host_operations %s, ray_tracing_pipeline %s, MVK_CONFIG_ENABLE_EXPERIMENTAL_RAY_TRACING=%s"),
              has_ext(ep, ne, "VK_KHR_acceleration_structure") ? "○" : "×", has_ext(ep, ne, "VK_KHR_ray_query") ? "○" : "×",
              has_ext(ep, ne, "VK_KHR_deferred_host_operations") ? "○" : "×", has_ext(ep, ne, "VK_KHR_ray_tracing_pipeline") ? "○" : "×",
-             mrt && *mrt ? mrt : "なし");
+             mrt && *mrt ? mrt : JE("なし", "none"));
     }
-    vlog("レイトレーシングの土台（acceleration structure・ray query）%s%s", caps & VR_CAP_RT ? "○" : "×",
-         like_ios() ? (like_ios_rt() ? "（iPhone のふり・VKR_LIKE_IOS_RT で名乗る）" : "（iPhone のふり：名乗らない）") : "");
+    vlog(JE("レイトレーシングの土台（acceleration structure・ray query）%s%s", "Ray tracing support (acceleration structure, ray query) %s%s"), caps & VR_CAP_RT ? "○" : "×",
+         like_ios() ? (like_ios_rt() ? JE("（iPhone のふり・VKR_LIKE_IOS_RT で名乗る）", " (pretending to be an iPhone; advertised with VKR_LIKE_IOS_RT)") : JE("（iPhone のふり：名乗らない）", " (pretending to be an iPhone; not advertised)")) : "");
 }
 
 // ---- 起動 ----
@@ -674,7 +741,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL dbg_cb(VkDebugUtilsMessageSeverityFlagBits
     (void) type; (void) u;
     if (g_dbg_msgs < 300 && d && d->pMessage) {
         g_dbg_msgs++;
-        vlog("MoltenVK（%s）：%.440s", sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "誤り" : "注意", d->pMessage);
+        vlog(JE("MoltenVK（%s）：%.440s", "MoltenVK (%s): %.440s"), sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? JE("誤り", "error") : JE("注意", "warning"), d->pMessage);
     }
     return VK_FALSE;
 }
@@ -725,7 +792,7 @@ static int vk_init(void) {
     }
     free(ie);
     VkResult ir = vkCreateInstance(&ci, NULL, &g_inst);
-    if (ir != VK_SUCCESS) { vlog("vkCreateInstance が失敗 (%d)", ir); return 0; }
+    if (ir != VK_SUCCESS) { vlog(JE("vkCreateInstance が失敗 (%d)", "vkCreateInstance failed (%d)"), ir); return 0; }
     if (want_dbg) {
         PFN_vkCreateDebugUtilsMessengerEXT mk = (PFN_vkCreateDebugUtilsMessengerEXT) gipa(g_inst, "vkCreateDebugUtilsMessengerEXT");
         g_dbg_destroy = (PFN_vkDestroyDebugUtilsMessengerEXT) gipa(g_inst, "vkDestroyDebugUtilsMessengerEXT");
@@ -736,14 +803,14 @@ static int vk_init(void) {
             .pfnUserCallback = dbg_cb,
         };
         if (!mk || mk(g_inst, &mi, NULL, &g_dbg_mess) != VK_SUCCESS) g_dbg_mess = VK_NULL_HANDLE;
-        if (g_dbg_mess) vlog("MoltenVK の言い分を記録に流す");
+        if (g_dbg_mess) vlog(JE("MoltenVK の言い分を記録に流す", "Forwarding MoltenVK messages to the log"));
     }
 #define LOAD(n) n = (PFN_##n) gipa(g_inst, #n);
     VKFUNCS(LOAD)
 #undef LOAD
     uint32_t n = 1;
     VkResult r = vkEnumeratePhysicalDevices(g_inst, &n, &g_pd);
-    if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || n == 0) { vlog("GPU が見つからない (%d, %u 台)", r, n); return 0; }
+    if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || n == 0) { vlog(JE("GPU が見つからない (%d, %u 台)", "No GPU found (%d, %u devices)"), r, n); return 0; }
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_pd, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne ? ne : 1, sizeof *ep);
@@ -751,7 +818,7 @@ static int vk_init(void) {
     for (uint32_t i = 0; i < ne; i++) if (!strcmp(ep[i].extensionName, "VK_KHR_portability_subset")) g_portability = 1;
     VkPhysicalDeviceProperties p;
     vkGetPhysicalDeviceProperties(g_pd, &p);
-    vlog("受け手の GPU: %s", p.deviceName);
+    vlog(JE("受け手の GPU: %s", "Receiver GPU: %s"), p.deviceName);
     detect_caps(ep, ne, p.apiVersion < want ? p.apiVersion : want);
     free(ep);
     return 1;
@@ -1035,7 +1102,7 @@ static void drain_upto(int k) {
         g_st.waits++;
         if (g_cur_op < 128) { g_st.wait_by_op[g_cur_op]++; g_st.wait_ms_by_op[g_cur_op] += dt; }
         if (r != VK_SUCCESS) {
-            vlog("出した仕事を待てない (%d)", r);
+            vlog(JE("出した仕事を待てない (%d)", "Cannot wait for the submitted work (%d)"), r);
             if (r < 0) g_err = r;
         }
     }
@@ -1263,7 +1330,7 @@ static void watch_stop(void) {
     g_watch.n = g_watch.head = 0;
     g_watch.cur = VK_NULL_HANDLE;
     g_watch.dev = VK_NULL_HANDLE;
-    vlog("終わった submit の見張りを止めた（知らせた %llu 回・見張った submit %llu）", (unsigned long long) g_watch.pushes, (unsigned long long) g_watch.adds);
+    vlog(JE("終わった submit の見張りを止めた（知らせた %llu 回・見張った submit %llu）", "Stopped the submit watcher (notified %llu times, watched %llu submits)"), (unsigned long long) g_watch.pushes, (unsigned long long) g_watch.adds);
 }
 
 // 糸を起こしたばかりなら 2（いまの仕事の一覧を全部積んである）・動いていれば 1・使えなければ 0
@@ -1294,7 +1361,7 @@ static int watch_start(vr_sock s) {
         g_watch.run = 0;
         g_watch.on = 0;
         g_watch.n = 0;
-        vlog("見張りの糸を作れないので、終わった submit を知らせない");
+        vlog(JE("見張りの糸を作れないので、終わった submit を知らせない", "Cannot create the watcher thread, so finished submits will not be signaled"));
         watch_push(0, 1);
         return 0;
     }
@@ -1324,7 +1391,7 @@ static void watch_add(vr_sock s, VkFence f, uint64_t msg) {
     }
     watch_unlock();
     if (full) {
-        vlog("見張りの一覧が満ちたので、終わった submit の押し出しをやめる");
+        vlog(JE("見張りの一覧が満ちたので、終わった submit の押し出しをやめる", "The watcher list is full, so pushing finished submits is turned off"));
         watch_push(0, 1);
     }
 }
@@ -1545,12 +1612,12 @@ static void cleanup(void) {
     // 合図を待ったまま残った仕事は、待たれている値を受け手が合図して流してから待つ
     for (int round = 0; g_nfl && g_dev && round < 8; round++) {
         int n = unblock_waits();
-        if (n) vlog("切れたあとに合図を待っていた仕事が残ったので、受け手が %d 個合図した", n);
+        if (n) vlog(JE("切れたあとに合図を待っていた仕事が残ったので、受け手が %d 個合図した", "Jobs waiting on signals were left after the disconnect, so the receiver signaled %d of them"), n);
         drain();
         if (!n) break;
     }
     if (g_nfl) {
-        vlog("合図を待つ仕事が %d 本残ったまま片づける", g_nfl);
+        vlog(JE("合図を待つ仕事が %d 本残ったまま片づける", "Cleaning up with %d signal-waiting jobs still left"), g_nfl);
         g_nfl = 0;
     }
     jp_reset();
@@ -1716,7 +1783,7 @@ static void set_dynamic(VkCommandBuffer cb, uint32_t st, uint32_t n, const uint3
     case VK_DYNAMIC_STATE_STENCIL_REFERENCE: NEED(2); vkCmdSetStencilReference(cb, v[0], v[1]); return;
     default: break;
     }
-    if (!(g_caps & VR_CAP_EXT_DYNAMIC_STATE)) { vlog("この値（%u）は変えられない", st); return; }
+    if (!(g_caps & VR_CAP_EXT_DYNAMIC_STATE)) { vlog(JE("この値（%u）は変えられない", "This value (%u) cannot be changed"), st); return; }
     switch (st) {
     case VK_DYNAMIC_STATE_CULL_MODE: NEED(1); vkCmdSetCullMode(cb, v[0]); return;
     case VK_DYNAMIC_STATE_FRONT_FACE: NEED(1); vkCmdSetFrontFace(cb, (VkFrontFace) v[0]); return;
@@ -1735,7 +1802,7 @@ static void set_dynamic(VkCommandBuffer cb, uint32_t st, uint32_t n, const uint3
     default: break;
     }
 #undef NEED
-    vlog("知らない値の変え方 %u（値 %u 個）", st, n);
+    vlog(JE("知らない値の変え方 %u（値 %u 個）", "Unknown way to change a value %u (%u values)"), st, n);
 }
 
 // pipeline layout と pipeline が持つ set の数を覚える（ent の size に「数＋1」。0 は分からない。layout と pipeline では size を使っていない）。
@@ -1795,7 +1862,7 @@ static VkAccelerationStructureGeometryKHR *rd_geoms(vr_rd *r, uint32_t *count) {
             x->arrayOfPointers = vr_ru32(r);
             x->data.deviceAddress = vr_ru64(r);
         } else {
-            vlog("acceleration structure：知らない geometry の種類 %u", (unsigned) g[i].geometryType);
+            vlog(JE("acceleration structure：知らない geometry の種類 %u", "acceleration structure: unknown geometry type %u"), (unsigned) g[i].geometryType);
             r->bad = 1;
         }
     }
@@ -1829,7 +1896,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             uint32_t bp = vr_ru32(r);
             uint64_t pid = vr_ru64(r);
             VkPipeline pl = OBJ(VkPipeline, pid);
-            tracef(ci, "  pipeline %llu%s", (unsigned long long) pid, pl ? "" : "（無い）");
+            tracef(ci, "  pipeline %llu%s", (unsigned long long) pid, pl ? "" : JE("（無い）", " (missing)"));
             if (pl) vkCmdBindPipeline(cb, (VkPipelineBindPoint) bp, pl);
             if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) { gfx_pl = pl != VK_NULL_HANDLE; uses[0] = pipe_set_mask(pid); }
             else if (bp == VK_PIPELINE_BIND_POINT_COMPUTE) { cmp_pl = pl != VK_NULL_HANDLE; uses[1] = pipe_set_mask(pid); }
@@ -1848,7 +1915,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
                 if (!sets[i] && !nmiss++) miss_id = sid;
                 if (dbg_on() && ci) {
                     vr_buf *d = dset_of(sid);
-                    tracef(ci, "  set %llu%s：%.*s", (unsigned long long) sid, sets[i] ? "" : "（無い）", (int) d->n, d->p ? (const char *) d->p : "");
+                    tracef(ci, JE("  set %llu%s：%.*s", "  set %llu%s: %.*s"), (unsigned long long) sid, sets[i] ? "" : JE("（無い）", " (missing)"), (int) d->n, d->p ? (const char *) d->p : "");
                 }
                 if (ci) {
                     cbi_add_set(ci, sid);
@@ -1869,9 +1936,9 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             } else {
                 // つながなかった番号には前の set が残るか、何もつながっていない。どちらもその番号を使う draw は描けない
                 if (k >= 0) miss[k] |= range;
-                if (!pl) vlog("descriptor set をつなぐ layout が無いので飛ばした");
+                if (!pl) vlog(JE("descriptor set をつなぐ layout が無いので飛ばした", "Skipped: there is no layout to bind the descriptor set"));
                 else if (++g_missing_set_binds <= 20 || g_missing_set_binds % 1000 == 0)
-                    vlog("受け手に無い descriptor set（%llu）をつなごうとした（%u 番から %u 個のうち %u 個が無い・command buffer %llu・%llu 回目）。つながずに、その番号を使う draw・dispatch を飛ばす",
+                    vlog(JE("受け手に無い descriptor set（%llu）をつなごうとした（%u 番から %u 個のうち %u 個が無い・command buffer %llu・%llu 回目）。つながずに、その番号を使う draw・dispatch を飛ばす", "Tried to bind a descriptor set (%llu) the receiver does not have (from set %u: %u sets, %u missing; command buffer %llu, run %llu). Not binding it, and skipping the draws and dispatches that use those numbers"),
                          (unsigned long long) miss_id, first, n, nmiss, (unsigned long long) (ci ? ci->cb : 0), (unsigned long long) g_missing_set_binds);
             }
             SET_GATE();
@@ -1883,10 +1950,10 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             if (dbg_on() && d) {
                 char h[200] = "";
                 for (uint32_t i = 0; i < sz / 4 && i < 24; i++) snprintf(h + strlen(h), sizeof h - strlen(h), " %u", ((const uint32_t *) d)[i]);
-                tracef(ci, "  push %u バイト:%s", sz, h);
+                tracef(ci, JE("  push %u バイト:%s", "  push %u bytes:%s"), sz, h);
             }
             if (d && pl) vkCmdPushConstants(cb, pl, st, off, sz, d);
-            else if (d) vlog("push constants の layout が無いので飛ばした");
+            else if (d) vlog(JE("push constants の layout が無いので飛ばした", "Skipped: there is no layout for push constants"));
         } break;
         case VR_CMD_DISPATCH: {
             uint32_t x = vr_ru32(r), y = vr_ru32(r), z = vr_ru32(r);
@@ -1918,7 +1985,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             if (dbg_on()) {
                 ent *se = find(sid), *de = find(did);
                 for (uint32_t i = 0; i < n && i < 4; i++)
-                    tracef(ci, "  copy buffer %llu（%llu バイト）+%llu → %llu（%llu バイト）+%llu・%llu バイト", (unsigned long long) sid,
+                    tracef(ci, JE("  copy buffer %llu（%llu バイト）+%llu → %llu（%llu バイト）+%llu・%llu バイト", "  copy buffer %llu (%llu bytes) +%llu -> %llu (%llu bytes) +%llu, %llu bytes"), (unsigned long long) sid,
                            (unsigned long long) (se ? se->size : 0), (unsigned long long) rg[i].srcOffset, (unsigned long long) did,
                            (unsigned long long) (de ? de->size : 0), (unsigned long long) rg[i].dstOffset, (unsigned long long) rg[i].size);
             }
@@ -1930,7 +1997,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             use_buffer(ci, bid);
             VkBuffer b = OBJ(VkBuffer, bid);
             uint64_t off = vr_ru64(r), sz = vr_ru64(r);
-            tracef(ci, "  fill buffer %llu +%llu・%llu バイト", (unsigned long long) bid, (unsigned long long) off, (unsigned long long) sz);
+            tracef(ci, JE("  fill buffer %llu +%llu・%llu バイト", "  fill buffer %llu +%llu, %llu bytes"), (unsigned long long) bid, (unsigned long long) off, (unsigned long long) sz);
             vkCmdFillBuffer(cb, b, off, sz, vr_ru32(r));
         } break;
         case VR_CMD_UPDATE_BUFFER: {
@@ -2022,7 +2089,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
                 vkCmdBeginRenderPass(cb, &bi, (VkSubpassContents) contents);
                 rp_off = 0;
             } else {
-                vlog("render pass を始めない（%s が無い）。中の命令も飛ばす", bi.renderPass ? "framebuffer" : "render pass");
+                vlog(JE("render pass を始めない（%s が無い）。中の命令も飛ばす", "Not starting the render pass (no %s). Skipping the commands inside too"), bi.renderPass ? "framebuffer" : "render pass");
                 rp_off = 1;
             }
             if (cv != cv16) free(cv);
@@ -2160,7 +2227,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             ri.pColorAttachments = ca;
             if (vr_ru32(r)) { read_rendering_att(r, &da, ci); ri.pDepthAttachment = &da; }
             if (vr_ru32(r)) { read_rendering_att(r, &sa, ci); ri.pStencilAttachment = &sa; }
-            tracef(ci, "  begin rendering 色 %u・depth %s・stencil %s", nc, ri.pDepthAttachment ? "あり" : "なし", ri.pStencilAttachment ? "あり" : "なし");
+            tracef(ci, JE("  begin rendering 色 %u・depth %s・stencil %s", "  begin rendering color %u, depth %s, stencil %s"), nc, ri.pDepthAttachment ? JE("あり", "yes") : JE("なし", "no"), ri.pStencilAttachment ? JE("あり", "yes") : JE("なし", "no"));
             if (!r->bad && vkCmdBeginRendering) vkCmdBeginRendering(cb, &ri);
         } break;
         case VR_CMD_END_RENDERING:
@@ -2216,7 +2283,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             di.pBufferMemoryBarriers = bb;
             di.imageMemoryBarrierCount = ni;
             di.pImageMemoryBarriers = ib;
-            tracef(ci, "  barrier2 memory %u・buffer %u・image %u", nm, nb, ni);
+            tracef(ci, JE("  barrier2 memory %u・buffer %u・image %u", "  barrier2 memory %u, buffer %u, image %u"), nm, nb, ni);
             if (!r->bad && vkCmdPipelineBarrier2) vkCmdPipelineBarrier2(cb, &di);
             free(mb);
             free(bb);
@@ -2338,9 +2405,9 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
                 use_accel(ci, sid);
                 use_accel(ci, did);
             }
-            tracef(ci, "  acceleration structure を作る %u 個", n);
+            tracef(ci, JE("  acceleration structure を作る %u 個", "  creating %u acceleration structures"), n);
             if (ok && !r->bad && n) vkCmdBuildAccelerationStructuresKHR(cb, n, bi, (const VkAccelerationStructureBuildRangeInfoKHR *const *) rg);
-            else if (!r->bad) vlog("acceleration structure の build：作る先（作り直すなら元も）が無いので飛ばした");
+            else if (!r->bad) vlog(JE("acceleration structure の build：作る先（作り直すなら元も）が無いので飛ばした", "acceleration structure build: skipped because the destination (or the source for a rebuild) is missing"));
             for (uint32_t i = 0; i < n; i++) { free((void *) bi[i].pGeometries); free(rg[i]); }
             free(bi);
             free(rg);
@@ -2354,7 +2421,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             use_accel(ci, sid);
             use_accel(ci, did);
             if (!r->bad && cp.src && cp.dst) vkCmdCopyAccelerationStructureKHR(cb, &cp);
-            else if (!r->bad) vlog("acceleration structure の写し：元か先が無いので飛ばした");
+            else if (!r->bad) vlog(JE("acceleration structure の写し：元か先が無いので飛ばした", "acceleration structure copy: skipped because the source or destination is missing"));
         } break;
         case VR_CMD_WRITE_ACCEL_PROPS: {
             uint32_t n = vr_ru32(r);
@@ -2372,15 +2439,15 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             VkQueryPool qp = OBJ(VkQueryPool, vr_ru64(r));
             uint32_t first = vr_ru32(r);
             if (ok && qp && !r->bad && n) vkCmdWriteAccelerationStructuresPropertiesKHR(cb, n, as, qt, qp, first);
-            else if (!r->bad) vlog("acceleration structure の大きさの query：acceleration structure か pool が無いので飛ばした");
+            else if (!r->bad) vlog(JE("acceleration structure の大きさの query：acceleration structure か pool が無いので飛ばした", "acceleration structure size query: skipped because the acceleration structure or pool is missing"));
             free(as);
         } break;
         default:
-            vlog("知らない記録の命令 %u", op);
+            vlog(JE("知らない記録の命令 %u", "Unknown recorded command %u"), op);
             r->bad = 1;
         }
     }
-    if (skipped) vlog("描き方か計算の仕方がつながっていないので、draw・dispatch を %u 回飛ばした", skipped);
+    if (skipped) vlog(JE("描き方か計算の仕方がつながっていないので、draw・dispatch を %u 回飛ばした", "The pipeline is not bound, so %u draws/dispatches were skipped"), skipped);
 #undef SET_GATE
 }
 
@@ -2551,7 +2618,7 @@ static VkImageView dummy_iview(VkDevice d) {
         vkDestroyCommandPool(d, pool, NULL);
     }
     g_dummy_iview = v;
-    vlog("空の画像の代わりを作った");
+    vlog(JE("空の画像の代わりを作った", "Created a stand-in for an empty image"));
     return v;
 }
 
@@ -2647,7 +2714,7 @@ static VkImageView dummy_iview_typed(VkDevice d, uint32_t vt, VkFormat want, int
         vkDestroyCommandPool(d, pool, NULL);
     }
     g_tdummy[g_ntdummy++] = t;
-    vlog("ffhang：空の画像の代わりを作った（見え方の種類 %u・形式 %d・storage %d・頼まれた形式 %d）", vt, (int) f, storage, (int) want);
+    vlog(JE("ffhang：空の画像の代わりを作った（見え方の種類 %u・形式 %d・storage %d・頼まれた形式 %d）", "ffhang: created a stand-in for an empty image (view type %u, format %d, storage %d, requested format %d)"), vt, (int) f, storage, (int) want);
     return t.v;
 }
 
@@ -2663,7 +2730,7 @@ static VkBufferView dummy_bview(VkDevice d) {
     if (vkAllocateMemory(d, &ai, NULL, &g_dummy_tb_mem) != VK_SUCCESS || vkBindBufferMemory(d, g_dummy_tb, g_dummy_tb_mem, 0) != VK_SUCCESS) return VK_NULL_HANDLE;
     VkBufferViewCreateInfo vc = { .sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = g_dummy_tb, .format = VK_FORMAT_R32_UINT, .range = VK_WHOLE_SIZE };
     if (vkCreateBufferView(d, &vc, NULL, &g_dummy_bview) != VK_SUCCESS) { g_dummy_bview = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
-    vlog("空の texel buffer の代わりを作った");
+    vlog(JE("空の texel buffer の代わりを作った", "Created a stand-in for an empty texel buffer"));
     return g_dummy_bview;
 }
 
@@ -2688,7 +2755,7 @@ static VkBuffer dummy_vb(void) {
     vkBindBufferMemory(g_dev, b, m, 0);
     g_dummy_vb = b;
     g_dummy_mem = m;
-    vlog("空の頂点バッファの代わりを作った");
+    vlog(JE("空の頂点バッファの代わりを作った", "Created a stand-in for an empty vertex buffer"));
     return b;
 }
 
@@ -2714,7 +2781,7 @@ static VkBuffer dummy_sink(VkDevice d) {
     if (vkAllocateMemory(d, &ai, NULL, &m) != VK_SUCCESS) { vkDestroyBuffer(d, b, NULL); return VK_NULL_HANDLE; }
     vkBindBufferMemory(d, b, m, 0);
     g_sink_buf = b; g_sink_mem = m; g_sink_dev = d; g_sink_bview = VK_NULL_HANDLE;
-    vlog("ffhang：空の storage の書き込み先を別に作った（VKR_HANG_SEPDUMMY）");
+    vlog(JE("ffhang：空の storage の書き込み先を別に作った（VKR_HANG_SEPDUMMY）", "ffhang: made a separate write target for an empty storage (VKR_HANG_SEPDUMMY)"));
     return b;
 }
 static VkBufferView dummy_sink_bview(VkDevice d) {
@@ -2730,7 +2797,7 @@ static VkBufferView dummy_sink_bview(VkDevice d) {
 static void dummy_dirty_check(const char *why) {
     static int nlog;
     static size_t last_nz;
-    { static unsigned k; if ((++k % 4) == 0) vlog("ffhang：空の代わりの数 texel %d・画像 %d・buffer %d・型つき画像 %d・型が分からない画像 %d（%s）", g_hang_subst[0], g_hang_subst[1], g_hang_subst[2], g_hang_subst[3], g_hang_subst[4], why); }
+    { static unsigned k; if ((++k % 4) == 0) vlog(JE("ffhang：空の代わりの数 texel %d・画像 %d・buffer %d・型つき画像 %d・型が分からない画像 %d（%s）", "ffhang: stand-in counts texel %d, image %d, buffer %d, typed image %d, unknown-type image %d (%s)"), g_hang_subst[0], g_hang_subst[1], g_hang_subst[2], g_hang_subst[3], g_hang_subst[4], why); }
     if (!g_dummy_vb || !g_dummy_mem || !g_dev || nlog >= 40) return;
     void *p = NULL;
     if (vkMapMemory(g_dev, g_dummy_mem, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS || !p) return;
@@ -2741,7 +2808,7 @@ static void dummy_dirty_check(const char *why) {
     vkUnmapMemory(g_dev, g_dummy_mem);
     if (nz != last_nz) {
         nlog++;
-        vlog("ffhang：0 の代わりの buffer（1 MiB）の 0 でない 4 バイト %zu 個（最初は %zu バイト目の 0x%08x）・%s", nz, first == (size_t) -1 ? 0 : first, fv, why);
+        vlog(JE("ffhang：0 の代わりの buffer（1 MiB）の 0 でない 4 バイト %zu 個（最初は %zu バイト目の 0x%08x）・%s", "ffhang: %zu non-zero 4-byte values in the zero stand-in buffer (1 MiB) (first at byte %zu, 0x%08x), %s"), nz, first == (size_t) -1 ? 0 : first, fv, why);
         last_nz = nz;
     }
 }
@@ -2968,7 +3035,7 @@ static void *vid_open(uint32_t ew, uint32_t eh, uint32_t kbps, uint32_t fps, uin
                 }
                 if (e->t && mf_setup(e, kbps, fps, gop)) got = e;
                 else {
-                    vlog("H.264 のエンコーダ %s は使えない", e->name[0] ? e->name : "?");
+                    vlog(JE("H.264 のエンコーダ %s は使えない", "H.264 encoder %s cannot be used"), e->name[0] ? e->name : "?");
                     mf_free(e);
                 }
             }
@@ -2977,7 +3044,7 @@ static void *vid_open(uint32_t ew, uint32_t eh, uint32_t kbps, uint32_t fps, uin
         if (act) CoTaskMemFree(act);
     }
     if (got)
-        vlog("H.264 のエンコーダ：%s（%s）・%u x %u・%u kbps・%u コマ/秒・キーフレームは %u コマごと", got->name, got->hw ? "GPU" : "ソフト",
+        vlog(JE("H.264 のエンコーダ：%s（%s）・%u x %u・%u kbps・%u コマ/秒・キーフレームは %u コマごと", "H.264 encoder: %s (%s), %u x %u, %u kbps, %u fps, keyframe every %u frames"), got->name, got->hw ? "GPU" : JE("ソフト", "software"),
              ew, eh, kbps, fps, gop);
     return got;
 }
@@ -3053,7 +3120,7 @@ static int vid_encode(void *p, const uint8_t *px, uint32_t w, uint32_t h, uint32
     if (!com) { CoInitializeEx(NULL, COINIT_MULTITHREADED); com = 1; }
     int ok = mf_encode(e, px, w, h, stride, bgra, idx, key, out, iskey);
     // GPU の物が出さなくなったら、この先はソフトの物にする（作り直しは呼んだ側がする）
-    if (!ok && e->hw && !g_vid_hw_bad) { g_vid_hw_bad = 1; vlog("GPU の H.264 エンコーダ %s が出さない。この先はソフトの物を使う", e->name); }
+    if (!ok && e->hw && !g_vid_hw_bad) { g_vid_hw_bad = 1; vlog(JE("GPU の H.264 エンコーダ %s が出さない。この先はソフトの物を使う", "The GPU H.264 encoder %s produced no output. Using the software one from now on"), e->name); }
     return ok;
 }
 
@@ -3141,7 +3208,7 @@ static void *vid_open(uint32_t ew, uint32_t eh, uint32_t kbps, uint32_t fps, uin
     OSStatus st = VTCompressionSessionCreate(NULL, iw, ih, kCMVideoCodecType_H264, spec, attrs, NULL, vt_done, e, &e->s);
     CFRelease(attrs); CFRelease(ios); CFRelease(nh); CFRelease(nw); CFRelease(npf); CFRelease(spec);
     if (st != noErr || !e->s) {
-        vlog("H.264 のエンコーダを作れない（%d）", (int) st);
+        vlog(JE("H.264 のエンコーダを作れない（%d）", "Cannot create the H.264 encoder (%d)"), (int) st);
         free(e);
         return NULL;
     }
@@ -3155,7 +3222,7 @@ static void *vid_open(uint32_t ew, uint32_t eh, uint32_t kbps, uint32_t fps, uin
     vt_num(e->s, kVTCompressionPropertyKey_ExpectedFrameRate, (int32_t) fps);
     vt_num(e->s, kVTCompressionPropertyKey_MaxKeyFrameInterval, (int32_t) gop);
     VTCompressionSessionPrepareToEncodeFrames(e->s);
-    vlog("H.264 のエンコーダ：VideoToolbox・%u x %u・%u kbps・%u コマ/秒・キーフレームは %u コマごと", ew, eh, kbps, fps, gop);
+    vlog(JE("H.264 のエンコーダ：VideoToolbox・%u x %u・%u kbps・%u コマ/秒・キーフレームは %u コマごと", "H.264 encoder: VideoToolbox, %u x %u, %u kbps, %u fps, keyframe every %u frames"), ew, eh, kbps, fps, gop);
     return e;
 }
 
@@ -3214,7 +3281,7 @@ static int vid_encode(void *p, const uint8_t *px, uint32_t w, uint32_t h, uint32
     if (opt) CFRelease(opt);
     CVPixelBufferRelease(pb);
     if (st != noErr || e->err != noErr) {
-        vlog("H.264 に縮められない（%d・%d）", (int) st, (int) e->err);
+        vlog(JE("H.264 に縮められない（%d・%d）", "Cannot compress to H.264 (%d, %d)"), (int) st, (int) e->err);
         return 0;
     }
     // 落とされたら空のまま返し、次をキーフレームにする（ドライバは空のコマを飛ばす）
@@ -3373,11 +3440,11 @@ static void *vid_open(uint32_t ew, uint32_t eh, uint32_t kbps, uint32_t fps, uin
         if (ok) e->cand = i;
     }
     if (!ok) {
-        vlog("H.264 のエンコーダを作れない（MediaCodec）");
+        vlog(JE("H.264 のエンコーダを作れない（MediaCodec）", "Cannot create the H.264 encoder (MediaCodec)"));
         free(e);
         return NULL;
     }
-    vlog("H.264 のエンコーダ：MediaCodec %s・%u x %u（入力の行 %u・面の高さ %u）・%u kbps・%u コマ/秒・キーフレームは %u コマごと", e->name, ew, eh, e->stride, e->slice,
+    vlog(JE("H.264 のエンコーダ：MediaCodec %s・%u x %u（入力の行 %u・面の高さ %u）・%u kbps・%u コマ/秒・キーフレームは %u コマごと", "H.264 encoder: MediaCodec %s, %u x %u (input stride %u, slice height %u), %u kbps, %u fps, keyframe every %u frames"), e->name, ew, eh, e->stride, e->slice,
          kbps, fps, gop);
     return e;
 }
@@ -3387,12 +3454,12 @@ static void vid_close(void *p) { mc_free((mc_enc *) p); }
 static int vid_encode(void *p, const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride, int bgra, uint64_t idx, int key, vr_buf *out, int *iskey) {
     mc_enc *e = (mc_enc *) p;
     ssize_t ii = AMediaCodec_dequeueInputBuffer(e->c, 500000);
-    if (ii < 0) { vlog("H.264 の入力の席が空かない（%d）", (int) ii); g_mc_bad |= 1u << e->cand; return 0; }
+    if (ii < 0) { vlog(JE("H.264 の入力の席が空かない（%d）", "No free H.264 input slot (%d)"), (int) ii); g_mc_bad |= 1u << e->cand; return 0; }
     size_t cap = 0;
     uint8_t *ib = AMediaCodec_getInputBuffer(e->c, (size_t) ii, &cap);
     const size_t ysz = (size_t) e->stride * e->slice, total = ysz + (size_t) e->stride * e->eh / 2;
     if (!ib || cap < total) {
-        vlog("H.264 の入力バッファが小さい（%zu < %zu）", cap, total);
+        vlog(JE("H.264 の入力バッファが小さい（%zu < %zu）", "The H.264 input buffer is too small (%zu < %zu)"), cap, total);
         AMediaCodec_queueInputBuffer(e->c, (size_t) ii, 0, 0, 0, 0);
         return 0;
     }
@@ -3430,7 +3497,7 @@ static int vid_encode(void *p, const uint8_t *px, uint32_t w, uint32_t h, uint32
                 static int klog; // 最初の 2 枚のキーフレームだけ、SPS・PPS をどこから付けたかを記録に出す
                 if (iskey_now && klog < 2) {
                     klog++;
-                    vlog("H.264 のキーフレーム：SPS %s・%zu バイト", has7 ? "はエンコーダ自身が付けた" : e->cfgn ? "を付け足した" : "が無い", n);
+                    vlog(JE("H.264 のキーフレーム：SPS %s・%zu バイト", "H.264 keyframe: SPS %s, %zu bytes"), has7 ? JE("はエンコーダ自身が付けた", "added by the encoder itself") : e->cfgn ? JE("を付け足した", "added by the receiver") : JE("が無い", "missing"), n);
                 }
                 mc_put_annexb(out, d, n);
                 got = 1;
@@ -3440,7 +3507,7 @@ static int vid_encode(void *p, const uint8_t *px, uint32_t w, uint32_t h, uint32
     }
     // 出てこなかったときは落とされたことにして、空のまま返し、次をキーフレームにする（ドライバは空のコマを飛ばす）。
     // 最初のコマが出ないなら、このエンコーダは動かない。次の候補にする
-    if (!got && idx == 0) { vlog("H.264 の最初のコマが %.0f ms たっても出ない（%s）", t_ms() - t0, e->name); g_mc_bad |= 1u << e->cand; return 0; }
+    if (!got && idx == 0) { vlog(JE("H.264 の最初のコマが %.0f ms たっても出ない（%s）", "No first H.264 frame after %.0f ms (%s)"), t_ms() - t0, e->name); g_mc_bad |= 1u << e->cand; return 0; }
     e->force_key = !got;
     *iskey = iskey_now;
     return 1;
@@ -3472,7 +3539,7 @@ static int vid_probe(void) {
         if (r == 1) return 1;
         if (r < 0) break;
     }
-    vlog("H.264：試しの 1 コマが縮められなかった。H.264 は名乗らない");
+    vlog(JE("H.264：試しの 1 コマが縮められなかった。H.264 は名乗らない", "H.264: the test frame could not be compressed. Not advertising H.264"));
     return 0;
 }
 
@@ -3523,7 +3590,7 @@ static struct venc *venc_get(uint64_t stream, uint32_t w, uint32_t h, uint32_t k
         }
         void *e = vid_open((w + 1) & ~1u, (h + 1) & ~1u, kbps, fps, gop);
         if (!e) return NULL;
-        vlog("H.264 のエンコーダを作るのに %.0f ms（その間、窓の絵は止まる）", t_ms() - now);
+        vlog(JE("H.264 のエンコーダを作るのに %.0f ms（その間、窓の絵は止まる）", "Creating the H.264 encoder took %.0f ms (the window picture is paused meanwhile)"), t_ms() - now);
         spare->stream = stream, spare->n = 0, spare->w = w, spare->h = h, spare->kbps = kbps, spare->fps = fps, spare->gop = gop, spare->e = e;
         hit = spare;
     }
@@ -3552,7 +3619,7 @@ static int h264_frame(const uint8_t *px, uint32_t w, uint32_t h, uint32_t stride
         if (ub && g_upscale(px, w, h, stride, ub, dw, dh, dw * 4)) {
             px = ub, w = dw, h = dh, stride = dw * 4;
             ums += t_ms() - tu;
-            if (++un % 100 == 0) { vlog("MetalFX で広げた：%u x %u・1 コマ %.1f ms（100 コマの平均）", dw, dh, ums / 100); ums = 0; }
+            if (++un % 100 == 0) { vlog(JE("MetalFX で広げた：%u x %u・1 コマ %.1f ms（100 コマの平均）", "Upscaled with MetalFX: %u x %u, %.1f ms per frame (average of 100 frames)"), dw, dh, ums / 100); ums = 0; }
         }
     }
     const size_t at = out->n;
@@ -3732,7 +3799,7 @@ static int vh_reset(void) {
 static void vid_reset(void) {
     vh_reset();
     if (g_vhs.reqs)
-        vlog("この接続：H.264 を遅らせて写した %llu 回（写した %llu・捨てた %llu・書き換えの前に写した %llu・列があふれた %llu）・GPU を待つ %.0f ms・前のコマを待つ %.0f ms",
+        vlog(JE("この接続：H.264 を遅らせて写した %llu 回（写した %llu・捨てた %llu・書き換えの前に写した %llu・列があふれた %llu）・GPU を待つ %.0f ms・前のコマを待つ %.0f ms", "This connection: H.264 delayed copy %llu times (copied %llu, dropped %llu, copied before overwrite %llu, queue overflowed %llu), GPU wait %.0f ms, previous-frame wait %.0f ms"),
              (unsigned long long) g_vhs.reqs, (unsigned long long) g_vhs.started, (unsigned long long) g_vhs.dropped, (unsigned long long) g_vhs.forced,
              (unsigned long long) g_vhs.overflow, g_vhs.wait_ms, g_vhs.join_ms);
     memset(&g_vhs, 0, sizeof g_vhs);
@@ -3824,7 +3891,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             uint64_t ok = avail > (768ull << 20) ? (uint64_t) avail - (768ull << 20) : 0;
             for (uint32_t i = 0; i < m.memoryHeapCount; i++)
                 if (m.memoryHeaps[i].size > ok) m.memoryHeaps[i].size = ok;
-            vlog("使ってよいメモリ %llu MB（iOS がいま許す %llu MB から余裕を引いた）", (unsigned long long) (ok >> 20), (unsigned long long) (avail >> 20));
+            vlog(JE("使ってよいメモリ %llu MB（iOS がいま許す %llu MB から余裕を引いた）", "Usable memory %llu MB (what iOS allows now, %llu MB, minus a margin)"), (unsigned long long) (ok >> 20), (unsigned long long) (avail >> 20));
         }
 #endif
         alias_mem_props(&m);
@@ -3949,7 +4016,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             VkPhysicalDeviceFeatures m = feats;
             like_ios_mask(&m);
             if (memcmp(&m, &feats, sizeof m)) {
-                vlog("iPhone のふり：iPhone に無い機能を有効にしようとしたので断る");
+                vlog(JE("iPhone のふり：iPhone に無い機能を有効にしようとしたので断る", "Pretending to be an iPhone: refusing a request to enable a feature the iPhone does not have"));
                 return reply(s, VK_ERROR_FEATURE_NOT_PRESENT);
             }
         }
@@ -4013,7 +4080,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 }
             }
             if (missing) {
-                vlog("装置を作る：GPU が持たない機能を頼まれたので断る（VK_ERROR_FEATURE_NOT_PRESENT）");
+                vlog(JE("装置を作る：GPU が持たない機能を頼まれたので断る（VK_ERROR_FEATURE_NOT_PRESENT）", "Creating device: refusing a request for a feature the GPU does not have (VK_ERROR_FEATURE_NOT_PRESENT)"));
                 for (uint32_t i = 0; i < nc && i < 32; i++) free(blocks[i]);
                 return reply(s, VK_ERROR_FEATURE_NOT_PRESENT);
             }
@@ -4023,9 +4090,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             r2.robustBufferAccess2 = r2.robustImageAccess2 = VK_TRUE;
             feats.robustBufferAccess = VK_TRUE;
             if (!has_f) { has_f = 1; }
-            vlog("ffhang：robustBufferAccess2・robustImageAccess2 を有効にする（VKR_HANG_ROBUST2）");
+            vlog(JE("ffhang：robustBufferAccess2・robustImageAccess2 を有効にする（VKR_HANG_ROBUST2）", "ffhang: enabling robustBufferAccess2 and robustImageAccess2 (VKR_HANG_ROBUST2)"));
         }
-        vlog("ffhang：装置の robustBufferAccess %u（DXVK が頼んだ値）", (unsigned) feats.robustBufferAccess);
+        vlog(JE("ffhang：装置の robustBufferAccess %u（DXVK が頼んだ値）", "ffhang: device robustBufferAccess %u (the value DXVK asked for)"), (unsigned) feats.robustBufferAccess);
         // 調べ用（ffhang2・代役だけ）：VKR_LIKE_IOS_NOROBUST=1 で、名乗りはそのままに、範囲の外の読み書きの守りを GPU で有効にしない。
         // iPhone の MoltenVK は robustBufferAccess と robustImageAccess を「ある」と答えるが、Metal は buffer の範囲を確かめない。
         // 代役の GPU は本当に確かめるので、範囲の外の読みが 0 になり、iPhone で起きることが起きない。その違いを消す
@@ -4041,7 +4108,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 } else if (b->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_ROBUSTNESS_FEATURES_EXT)
                     ((VkPhysicalDevicePipelineRobustnessFeaturesEXT *) b)->pipelineRobustness = VK_FALSE;
             }
-            vlog("ffhang2：iPhone のふり：範囲の外の守りを GPU で有効にしない（VKR_LIKE_IOS_NOROBUST）");
+            vlog(JE("ffhang2：iPhone のふり：範囲の外の守りを GPU で有効にしない（VKR_LIKE_IOS_NOROBUST）", "ffhang2: pretending to be an iPhone: not enabling out-of-range protection on the GPU (VKR_LIKE_IOS_NOROBUST)"));
         }
         if (g_nulldesc_gpu || r2.robustBufferAccess2) {
             int has = 0;
@@ -4063,7 +4130,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 jp_reset();
                 vid_reset();
                 helpers_free(g_dev);
-                vlog("装置をもう 1 つ作った（前の装置も残す）");
+                vlog(JE("装置をもう 1 つ作った（前の装置も残す）", "Created one more device (keeping the previous one)"));
             }
             g_dev = dev;
         }
@@ -4090,7 +4157,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             g_dev = other;
         }
         dev_free(h, 0);
-        vlog("装置を 1 つ消した（ほかの装置は残す）");
+        vlog(JE("装置を 1 つ消した（ほかの装置は残す）", "Removed one device (keeping the others)"));
         return 1;
     }
     case VR_GET_QUEUE: {
@@ -4120,7 +4187,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             req.memoryTypeBits = alias_bits(req.memoryTypeBits);
         }
         if (op == VR_CREATE_BUFFER_NR) {
-            if (res != VK_SUCCESS) vlog("buffer を作れない (%d)", res);
+            if (res != VK_SUCCESS) vlog(JE("buffer を作れない (%d)", "Cannot create the buffer (%d)"), res);
             return 1;
         }
         vr_put(&g_out, &req, sizeof req);
@@ -4150,7 +4217,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         {
             size_t avail = os_proc_available_memory();
             if (mai.allocationSize + (256ull << 20) > (uint64_t) avail) {
-                vlog("メモリ %llu MB は確保しない（iOS がいま許すのは %llu MB）", (unsigned long long) (mai.allocationSize >> 20), (unsigned long long) (avail >> 20));
+                vlog(JE("メモリ %llu MB は確保しない（iOS がいま許すのは %llu MB）", "Not allocating %llu MB of memory (iOS allows only %llu MB now)"), (unsigned long long) (mai.allocationSize >> 20), (unsigned long long) (avail >> 20));
                 return reply(s, VK_ERROR_OUT_OF_DEVICE_MEMORY);
             }
         }
@@ -4209,7 +4276,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (e && e->map && d && off <= e->size && n <= e->size - off) {
             memcpy((uint8_t *) e->map + off, d, n);
             if (e->last) memcpy(e->last + off, d, n);
-        } else vlog("範囲の外への書き込みを捨てた（%llu + %u）", (unsigned long long) off, n);
+        } else vlog(JE("範囲の外への書き込みを捨てた（%llu + %u）", "Dropped a write out of range (%llu + %u)"), (unsigned long long) off, n);
         g_bst.memw++;
         return 1;
     }
@@ -4238,7 +4305,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             if (e && e->map && d && off <= e->size && len <= e->size - off) {
                 memcpy((uint8_t *) e->map + off, d, len);
                 if (e->last) memcpy(e->last + off, d, len);
-            } else vlog("範囲の外への書き込みを捨てた（%llu + %u）", (unsigned long long) off, len);
+            } else vlog(JE("範囲の外への書き込みを捨てた（%llu + %u）", "Dropped a write out of range (%llu + %u)"), (unsigned long long) off, len);
         }
         g_bst.spans_msgs++;
         g_bst.spans += n;
@@ -4264,12 +4331,12 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         ent *e = find(mid);
         uint64_t need = blob ? pc_blob_bytes(blob, n) : 0;
         if (!e || !e->map || !need || off > e->size || need > e->size - off) {
-            vlog("縮めた書き込みを捨てた（%llu + %llu・中身 %zu バイト）", (unsigned long long) off, (unsigned long long) need, n);
+            vlog(JE("縮めた書き込みを捨てた（%llu + %llu・中身 %zu バイト）", "Dropped a compressed write (%llu + %llu, payload %zu bytes)"), (unsigned long long) off, (unsigned long long) need, n);
             return 1;
         }
         double t0 = t_ms();
         const char *err = "";
-        if (pc_decode(blob, n, (uint8_t *) e->map + off, &err)) vlog("縮めた書き込みをほどけない（%s）。この範囲の中身はでたらめになる", err);
+        if (pc_decode(blob, n, (uint8_t *) e->map + off, &err)) vlog(JE("縮めた書き込みをほどけない（%s）。この範囲の中身はでたらめになる", "Cannot decode a compressed write (%s). The contents of this range will be garbage"), pc_err_text(err));
         else if (e->last) memcpy(e->last + off, (uint8_t *) e->map + off, (size_t) need);
         g_pcs.n++;
         g_pcs.in += n;
@@ -4318,7 +4385,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         pv_store(g_out.p + before, g_out.n - before); // アプリの画面に出す最新の 1 枚
         g_frames_total++;
         if (++jn % 100 == 0)
-            vlog("JPEG：%llu コマ・GPU を待つ %.1f ms・縮める %.1f ms・平均 %.1f KB（1 コマあたり）・熱 %d", (unsigned long long) jn,
+            vlog(JE("JPEG：%llu コマ・GPU を待つ %.1f ms・縮める %.1f ms・平均 %.1f KB（1 コマあたり）・熱 %d", "JPEG: %llu frames, GPU wait %.1f ms, compress %.1f ms, average %.1f KB per frame, thermal %d"), (unsigned long long) jn,
                  jt_wait / 100, jt_enc / 100, jbytes / 1024.0 / 100, g_thermal), jt_wait = jt_enc = 0, jbytes = 0;
         return reply(s, 0);
 #else
@@ -4355,7 +4422,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (!jp_start((const uint8_t *) e->map + off)) return reply(s, VK_ERROR_OUT_OF_HOST_MEMORY);
         g_frames_total++;
         if (++jpn % 100 == 0)
-            vlog("JPEG（先送り）：%llu コマ・GPU を待つ %.1f ms・前のコマを待つ %.1f ms・縮める %.1f ms（後ろで）・平均 %.1f KB（1 コマあたり）・熱 %d",
+            vlog(JE("JPEG（先送り）：%llu コマ・GPU を待つ %.1f ms・前のコマを待つ %.1f ms・縮める %.1f ms（後ろで）・平均 %.1f KB（1 コマあたり）・熱 %d", "JPEG (deferred): %llu frames, GPU wait %.1f ms, previous-frame wait %.1f ms, compress %.1f ms (in the background), average %.1f KB per frame, thermal %d"),
                  (unsigned long long) jpn, jp_wait / 100, jp_join_ms / 100, jp_enc / 100, jpbytes / 1024.0 / 100, g_thermal),
                 jp_wait = jp_join_ms = jp_enc = 0, jpbytes = 0;
         return reply(s, 0);
@@ -4407,7 +4474,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 vkeys += f & 1;
                 g_frames_total++;
                 if (++vn % 100 == 0)
-                    vlog("H.264（遅らせて写す）：%llu コマ・頼みで待つ %.1f ms・平均 %.1f KB・キーフレーム %llu 枚（100 コマあたり）",
+                    vlog(JE("H.264（遅らせて写す）：%llu コマ・頼みで待つ %.1f ms・平均 %.1f KB・キーフレーム %llu 枚（100 コマあたり）", "H.264 (delayed copy): %llu frames, wait for requests %.1f ms, average %.1f KB, %llu keyframes (per 100 frames)"),
                          (unsigned long long) vn, vt_wait / 100, vbytes / 1024.0 / 100, (unsigned long long) vkeys),
                         vt_wait = vt_join_ms = vt_enc = 0, vbytes = vkeys = 0;
             }
@@ -4457,7 +4524,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             vkeys += f & 1;
             g_frames_total++;
             if (++vn % 100 == 0)
-                vlog("H.264：%llu コマ・GPU を待つ %.1f ms・前のコマを待つ %.1f ms・縮める %.1f ms・平均 %.1f KB・キーフレーム %llu 枚（100 コマあたり）",
+                vlog(JE("H.264：%llu コマ・GPU を待つ %.1f ms・前のコマを待つ %.1f ms・縮める %.1f ms・平均 %.1f KB・キーフレーム %llu 枚（100 コマあたり）", "H.264: %llu frames, GPU wait %.1f ms, previous-frame wait %.1f ms, compress %.1f ms, average %.1f KB, %llu keyframes (per 100 frames)"),
                      (unsigned long long) vn, vt_wait / 100, vt_join_ms / 100, vt_enc / 100, vbytes / 1024.0 / 100, (unsigned long long) vkeys),
                     vt_wait = vt_join_ms = vt_enc = 0, vbytes = vkeys = 0;
         }
@@ -4539,7 +4606,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             n_mod++;
             if (arr4096 && ptr_uni) n_ubo64k++;
             if (rt_vec4 || (ptr_sb && 0)) n_ssbo_rt++;
-            if ((n_mod % 200) == 0 || n_mod == 50) vlog("ffhang：shader module %u 個・64 KiB の cbuffer を uniform（Block）で宣言 %u 個・storage（BufferBlock）で宣言 %u 個", n_mod, n_ubo64k, n_ssbo_rt);
+            if ((n_mod % 200) == 0 || n_mod == 50) vlog(JE("ffhang：shader module %u 個・64 KiB の cbuffer を uniform（Block）で宣言 %u 個・storage（BufferBlock）で宣言 %u 個", "ffhang: %u shader modules, %u declare a 64 KiB cbuffer as uniform (Block), %u as storage (BufferBlock)"), n_mod, n_ubo64k, n_ssbo_rt);
         }
         VkShaderModuleCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = n, .pCode = code };
         VkShaderModule m;
@@ -4581,7 +4648,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkDescriptorSetLayout l;
         VkResult res = vkCreateDescriptorSetLayout(d, &ci, NULL, &l);
         if (res == VK_SUCCESS) put(id, (uint64_t) l, K_DSL);
-        else vlog("descriptor set の形を作れない (%d)", res);
+        else vlog(JE("descriptor set の形を作れない (%d)", "Cannot create the descriptor set layout (%d)"), res);
         free(b);
         free(bf);
         return 1;
@@ -4620,8 +4687,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             if (sl[i]) continue;
             if (!empty) {
                 VkDescriptorSetLayoutCreateInfo ec = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-                if (vkCreateDescriptorSetLayout(d, &ec, NULL, &empty) != VK_SUCCESS) { vlog("pipeline layout：空の set layout を作れない。作らない"); return 1; }
-                vlog("pipeline layout：無い set layout を中身の無い物で埋めた");
+                if (vkCreateDescriptorSetLayout(d, &ec, NULL, &empty) != VK_SUCCESS) { vlog(JE("pipeline layout：空の set layout を作れない。作らない", "pipeline layout: cannot create an empty set layout. Not creating it")); return 1; }
+                vlog(JE("pipeline layout：無い set layout を中身の無い物で埋めた", "pipeline layout: filled the missing set layouts with empty ones"));
             }
             sl[i] = empty;
         }
@@ -4662,13 +4729,13 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rs = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = req_subgroup };
         if (req_subgroup) ci.stage.pNext = &rs;
         if (!d || !ci.stage.module || !ci.layout || r->bad) {
-            vlog("compute pipeline の装置・shader module・layout のどれかが無い。作らない");
+            vlog(JE("compute pipeline の装置・shader module・layout のどれかが無い。作らない", "compute pipeline: the device, shader module, or layout is missing. Not creating it"));
             return reply(s, VK_ERROR_INITIALIZATION_FAILED);
         }
         VkPipeline p;
         VkResult res = vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &ci, NULL, &p);
         if (res == VK_SUCCESS) { put(id, (uint64_t) p, K_PIPELINE); note_pipe_sets(id, lid); }
-        else vlog("compute pipeline を作れない (%d)", res);
+        else vlog(JE("compute pipeline を作れない (%d)", "Cannot create the compute pipeline (%d)"), res);
         return reply(s, res);
     }
     case VR_DESTROY_PIPELINE: {
@@ -4731,13 +4798,13 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                                                                       .descriptorSetCount = 1, .pDescriptorCounts = vcount ? &vcount[i] : NULL };
             if (vcount) ai.pNext = &vai;
             VkDescriptorSet ds;
-            if (!d || !pool || !l) { vlog("descriptor set：装置・pool・layout のどれかが無いので取らない"); continue; }
+            if (!d || !pool || !l) { vlog(JE("descriptor set：装置・pool・layout のどれかが無いので取らない", "descriptor set: the device, pool, or layout is missing, so not allocating")); continue; }
             VkResult res = vkAllocateDescriptorSets(d, &ai, &ds);
             if (res == VK_SUCCESS) {
                 put(id, (uint64_t) ds, K_DSET);
                 ent *se = find(id);
                 if (se) { se->aux = pid; se->size = (uint64_t) (uintptr_t) l; } // どの pool から取ったか・ffhang：layout
-            } else vlog("descriptor set を取れない (%d)", res);
+            } else vlog(JE("descriptor set を取れない (%d)", "Cannot allocate the descriptor set (%d)"), res);
         }
         free(vcount);
         return 1;
@@ -4774,15 +4841,15 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     for (uint32_t j = 0; j < g_fl[q].nsnap; j++) {
                         ent *oe = find(g_fl[q].snap[j]);
                         if (g_fl[q].snap[j] != sid && oe && (VkDescriptorSet) (uintptr_t) oe->h == hs) {
-                            vlog("取りこぼし（実物）：set %llu の実物は、%d 番目の仕事では set %llu として使われている（%s）", (unsigned long long) sid, q,
-                                 (unsigned long long) g_fl[q].snap[j], vkGetFenceStatus(g_dev, g_fl[q].f) == VK_SUCCESS ? "もう終わっている" : "まだ走っている");
+                            vlog(JE("取りこぼし（実物）：set %llu の実物は、%d 番目の仕事では set %llu として使われている（%s）", "Missed sync (real): the real set %llu is used by job #%d as set %llu (%s)"), (unsigned long long) sid, q,
+                                 (unsigned long long) g_fl[q].snap[j], vkGetFenceStatus(g_dev, g_fl[q].f) == VK_SUCCESS ? JE("もう終わっている", "already finished") : JE("まだ走っている", "still running"));
                             break;
                         }
                     }
                 if (k2 > k1) {
                     VkResult st = vkGetFenceStatus(g_dev, g_fl[k2].f);
-                    vlog("取りこぼし：set %llu を書き換える。今の判定は %d 番目まで待つが、submit の時点では %d 番目（%s）が使っていた。その command buffer：%llu",
-                         (unsigned long long) sid, k1, k2, st == VK_SUCCESS ? "もう終わっている" : "まだ走っている",
+                    vlog(JE("取りこぼし：set %llu を書き換える。今の判定は %d 番目まで待つが、submit の時点では %d 番目（%s）が使っていた。その command buffer：%llu", "Missed sync: rewriting set %llu. The current check waits up to job #%d, but at submit time job #%d (%s) was using it. Its command buffer: %llu"),
+                         (unsigned long long) sid, k1, k2, st == VK_SUCCESS ? JE("もう終わっている", "already finished") : JE("まだ走っている", "still running"),
                          (unsigned long long) (g_fl[k2].ncb ? g_fl[k2].cbs[0] : 0));
                 }
             }
@@ -4802,7 +4869,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 for (uint32_t k = 0; k < w.descriptorCount; k++) {
                     uint64_t vid = vr_ru64(r);
                     tv[k] = OBJ(VkBufferView, vid);
-                    if (!tv[k] && !g_nulldesc_gpu) { tv[k] = sepdummy_on() && w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ? dummy_sink_bview(d) : VK_NULL_HANDLE; if (!tv[k]) tv[k] = dummy_bview(d); if (g_hang_subst[0]++ < 5) vlog("ffhang：空の texel buffer（種類 %d・binding %u）を代わりに", (int) w.descriptorType, w.dstBinding + k); } // 空の見え方は代わりの物に
+                    if (!tv[k] && !g_nulldesc_gpu) { tv[k] = sepdummy_on() && w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ? dummy_sink_bview(d) : VK_NULL_HANDLE; if (!tv[k]) tv[k] = dummy_bview(d); if (g_hang_subst[0]++ < 5) vlog(JE("ffhang：空の texel buffer（種類 %d・binding %u）を代わりに", "ffhang: stand-in for an empty texel buffer (type %d, binding %u)"), (int) w.descriptorType, w.dstBinding + k); } // 空の見え方は代わりの物に
                     ent *ve = find(vid);
                     if (se && ve && ve->aux) idlist_add(&se->list, ve->aux); // 見え方の aux はもとの buffer
                 }
@@ -4838,7 +4905,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                                                        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                                        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = VK_LOD_CLAMP_NONE };
                             if (vkCreateSampler(d, &sc, NULL, &g_dummy_smp) != VK_SUCCESS) g_dummy_smp = VK_NULL_HANDLE;
-                            vlog("空の sampler が届いたので、代わりの sampler を入れる（ドライバの取りこぼし）");
+                            vlog(JE("空の sampler が届いたので、代わりの sampler を入れる（ドライバの取りこぼし）", "An empty sampler arrived, so a stand-in sampler is used (driver miss)"));
                         }
                         ii[k].sampler = g_dummy_smp;
                     }
@@ -4855,13 +4922,13 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     if (!ii[k].imageView && !g_nulldesc_gpu && w.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLER) {
                         vlearn *vl = viewfix_on() && se ? vlearn_at(se->size, vkey, 0) : NULL;
                         ii[k].imageView = vl ? dummy_iview_typed(d, vl->vt, (VkFormat) vl->fmt, w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) : VK_NULL_HANDLE;
-                        if (vl && g_hang_subst[3]++ < 20) vlog("ffhang：空の画像（種類 %d・binding %u）を見え方の種類 %u・形式 %u の代わりに", (int) w.descriptorType, w.dstBinding + k, vl->vt, vl->fmt);
-                        if (!vl && viewfix_on() && g_hang_subst[4]++ < 20) vlog("ffhang：空の画像（種類 %d・binding %u）は前の見え方が分からない。2D RGBA8 の代わりに", (int) w.descriptorType, w.dstBinding + k);
+                        if (vl && g_hang_subst[3]++ < 20) vlog(JE("ffhang：空の画像（種類 %d・binding %u）を見え方の種類 %u・形式 %u の代わりに", "ffhang: stand-in for an empty image (type %d, binding %u) with view type %u, format %u"), (int) w.descriptorType, w.dstBinding + k, vl->vt, vl->fmt);
+                        if (!vl && viewfix_on() && g_hang_subst[4]++ < 20) vlog(JE("ffhang：空の画像（種類 %d・binding %u）は前の見え方が分からない。2D RGBA8 の代わりに", "ffhang: an empty image (type %d, binding %u) has an unknown previous view. Using 2D RGBA8 as the stand-in"), (int) w.descriptorType, w.dstBinding + k);
                         if (!ii[k].imageView && sepdummy_on() && w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                             ii[k].imageView = dummy_iview_typed(d, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, 1); // 書ける代わりは読む代わりと別
                         if (!ii[k].imageView) ii[k].imageView = dummy_iview(d);
                         ii[k].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-                        if (g_hang_subst[1]++ < 20) vlog("ffhang：空の画像（種類 %d・binding %u・layout %d）を 2D RGBA8 の代わりに", (int) w.descriptorType, w.dstBinding + k, (int) ii[k].imageLayout);
+                        if (g_hang_subst[1]++ < 20) vlog(JE("ffhang：空の画像（種類 %d・binding %u・layout %d）を 2D RGBA8 の代わりに", "ffhang: stand-in 2D RGBA8 for an empty image (type %d, binding %u, layout %d)"), (int) w.descriptorType, w.dstBinding + k, (int) ii[k].imageLayout);
                     }
                     if (se && vid) idlist_add(&se->list, vid); // 見え方の aux はもとの画像のメモリ
                 }
@@ -4879,7 +4946,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 if (dbg_on()) {
                     ent *be = find(bid);
                     char t[160];
-                    int tn = snprintf(t, sizeof t, " b%u=%llu（%llu）+%llu/%lld", w.dstBinding + k, (unsigned long long) bid,
+                    int tn = snprintf(t, sizeof t, JE(" b%u=%llu（%llu）+%llu/%lld", " b%u=%llu (%llu)+%llu/%lld"), w.dstBinding + k, (unsigned long long) bid,
                                       (unsigned long long) (be ? be->size : 0), (unsigned long long) bi[k].offset,
                                       bi[k].range == VK_WHOLE_SIZE ? -1LL : (long long) bi[k].range);
                     vr_put(dset_of(sid), t, (size_t) tn);
@@ -4893,13 +4960,13 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     bi[k].buffer = !ubo && sepdummy_on() && dummy_sink(d) ? dummy_sink(d) : dummy_vb(); // ffhang：書ける種類は別の書き込み先へ
                     bi[k].offset = 0;
                     bi[k].range = ubo ? 16384 : VK_WHOLE_SIZE; // uniform は仕様の下限の 16 KiB に収める
-                    if (g_hang_subst[2]++ < 10) vlog("ffhang：空の buffer（種類 %d・binding %u）を代わりに", (int) w.descriptorType, w.dstBinding + k);
+                    if (g_hang_subst[2]++ < 10) vlog(JE("ffhang：空の buffer（種類 %d・binding %u）を代わりに", "ffhang: stand-in for an empty buffer (type %d, binding %u)"), (int) w.descriptorType, w.dstBinding + k);
                 }
             w.pBufferInfo = bi;
             if (w.dstSet) uds_add(&g_uds, d, &w, bi); else free(bi); // 取れなかった set（layout が無いなど）には書かない（NVIDIA は落ちる）
         }
         uds_flush(&g_uds, d, !r->bad);
-        { static unsigned nupd; if ((++nupd % 500) == 0) dummy_dirty_check("descriptor の書き込み 500 回ごと"); }
+        { static unsigned nupd; if ((++nupd % 500) == 0) dummy_dirty_check(JE("descriptor の書き込み 500 回ごと", "every 500 descriptor writes")); }
         return 1;
     }
     case VR_CREATE_COMMAND_POOL: {
@@ -5036,7 +5103,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             uint64_t slice = left < 100000000ull ? left : 100000000ull;
             VkResult wr = vkWaitForFences(d, n < 64 ? n : 64, f, all, slice);
             if (wr != VK_TIMEOUT || slice == left) return reply(s, wr);
-            if (peer_gone(s)) { vlog("fence を待つ間に PC が切れた"); return 0; }
+            if (peer_gone(s)) { vlog(JE("fence を待つ間に PC が切れた", "The PC disconnected while waiting for a fence")); return 0; }
         }
     }
     case VR_GET_FENCE_STATUS: {
@@ -5164,7 +5231,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             int k = -1;
             for (uint32_t i = 0; i < ncid; i++) { int q = last_with_cb(cids[i]); if (q > k) k = q; }
             if (k >= 0) {
-                if (vkr_check()) vlog("submit %llu：まだ走っている command buffer をもう一度出そうとした（%d 番目まで待つ）", (unsigned long long) g_st.submits + 1, k);
+                if (vkr_check()) vlog(JE("submit %llu：まだ走っている command buffer をもう一度出そうとした（%d 番目まで待つ）", "submit %llu: tried to submit a command buffer that is still running again (waiting up to #%d)"), (unsigned long long) g_st.submits + 1, k);
                 drain_upto(k);
             }
         }
@@ -5190,17 +5257,17 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (g_nfl == 256) drain();
         if (g_nfl == 256) {
             // 合図を待つ仕事で一覧が埋まった。覚えきれないので、前のやり方で全部を待つ
-            vlog("合図を待っている仕事が 256 本たまったので、全部を待つ");
+            vlog(JE("合図を待っている仕事が 256 本たまったので、全部を待つ", "256 jobs are waiting on signals, so waiting for all of them"));
             for (int i = 0; i < g_nfl; i++) g_fl[i].tl_over = 1;
             drain();
         }
         // iPhone のアプリが前にいない間は GPU を使えない。出すと GPU を失うので、前に戻るまで待つ（PC は待たされるだけ）
         if (g_paused) {
-            vlog("アプリが前にいないので、前に戻るまで GPU に仕事を出さずに待つ");
+            vlog(JE("アプリが前にいないので、前に戻るまで GPU に仕事を出さずに待つ", "The app is not in the foreground, so not submitting GPU work until it returns"));
             double t0 = t_ms();
             while (g_paused) sleep_ms(20);
             g_st.paused_ms += t_ms() - t0;
-            vlog("前に戻ったので続ける");
+            vlog(JE("前に戻ったので続ける", "Back in the foreground, continuing"));
         }
         double t0 = t_ms();
         VkResult res = g_err ? g_err : vkQueueSubmit(q, ns, si, f);
@@ -5209,7 +5276,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (dbg_on() && res == VK_SUCCESS) {
             VkResult w = vkQueueWaitIdle(q);
             if (w != VK_SUCCESS) {
-                vlog("submit %llu で GPU を失った (%d)。command buffer %u 本", (unsigned long long) g_st.submits, w, ncid);
+                vlog(JE("submit %llu で GPU を失った (%d)。command buffer %u 本", "Lost the GPU at submit %llu (%d). %u command buffers"), (unsigned long long) g_st.submits, w, ncid);
                 for (uint32_t k = 0; k < ncid; k++) {
                     vr_buf *t = trace_of(cids[k]);
                     printf("-- command buffer %llu\n%.*s", (unsigned long long) cids[k], (int) t->n, t->p ? (const char *) t->p : "");
@@ -5245,7 +5312,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             memcpy(e->cbs, cids, ncid * sizeof *cids);
             watch_add(s, f, my_msg); // 頼まれていれば、終わったら見張りの糸から知らせる
         } else {
-            if (!g_err) vlog("vkQueueSubmit 失敗 (%d)。この接続ではもう GPU を使えない", res);
+            if (!g_err) vlog(JE("vkQueueSubmit 失敗 (%d)。この接続ではもう GPU を使えない", "vkQueueSubmit failed (%d). The GPU can no longer be used on this connection"), res);
             if (res < 0) g_err = res;
             if (own && g_nfpool < 64) g_fpool[g_nfpool++] = f;
         }
@@ -5277,7 +5344,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             uint64_t slice = left < 100000000ull ? left : 100000000ull;
             wr = vkWaitSemaphores(d, &wi, slice);
             if (wr != VK_TIMEOUT || slice == left) break;
-            if (peer_gone(s)) { vlog("semaphore を待つ間に PC が切れた"); free(sm); free(v); return 0; }
+            if (peer_gone(s)) { vlog(JE("semaphore を待つ間に PC が切れた", "The PC disconnected while waiting for a semaphore")); free(sm); free(v); return 0; }
         }
         free(sm);
         free(v);
@@ -5321,7 +5388,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (!push) watch_stop();
         g_rx_ext = ext;
         g_watch.on = push;
-        vlog("返事の尾 %s・終わった submit の押し出し %s", ext ? "あり" : "なし", push ? "あり" : "なし");
+        vlog(JE("返事の尾 %s・終わった submit の押し出し %s", "Reply tail %s, pushing finished submits %s"), ext ? JE("あり", "yes") : JE("なし", "no"), push ? JE("あり", "yes") : JE("なし", "no"));
         return 1;
     }
     case VR_GET_LINK: {
@@ -5379,7 +5446,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             req.memoryTypeBits = alias_bits(req.memoryTypeBits);
         }
         if (op == VR_CREATE_IMAGE_NR) {
-            if (res != VK_SUCCESS) vlog("image を作れない (%d)", res);
+            if (res != VK_SUCCESS) vlog(JE("image を作れない (%d)", "Cannot create the image (%d)"), res);
             return 1;
         }
         vr_put(&g_out, &req, sizeof req);
@@ -5434,7 +5501,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             if (ve && ie) ve->aux = ie->aux; // 見え方からも、もとの画像のメモリが分かるように
             if (ve) ve->size = ((uint64_t) ci.viewType << 32) | (uint32_t) ci.format; // ffhang：空の画像の代わりを同じ形で作るため
         } else {
-            vlog("image view を作れない (%d)", res);
+            vlog(JE("image view を作れない (%d)", "Cannot create the image view (%d)"), res);
         }
         return 1;
     }
@@ -5519,7 +5586,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkRenderPass rp;
         VkResult res = r->bad || !d ? VK_ERROR_INITIALIZATION_FAILED : vkCreateRenderPass(d, &ci, NULL, &rp);
         if (res == VK_SUCCESS) put(id, (uint64_t) rp, K_RPASS);
-        else vlog("render pass を作れない (%d)", res);
+        else vlog(JE("render pass を作れない (%d)", "Cannot create the render pass (%d)"), res);
         free(att); free(sub); free(refs); free(pres); free(dep);
         return 1;
     }
@@ -5549,7 +5616,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             ent *fe = find(id);
             for (uint32_t i = 0; i < ci.attachmentCount && i < 32 && fe; i++) idlist_add(&fe->list, vids[i]);
         } else {
-            vlog("framebuffer を作れない (%d)", res);
+            vlog(JE("framebuffer を作れない (%d)", "Cannot create the framebuffer (%d)"), res);
         }
         free(v);
         return 1;
@@ -5587,7 +5654,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         }
         for (uint32_t i = 0; i < nst; i++)
             if (!st[i].module) {
-                vlog("shader module の無い段がある（段 0x%x）。pipeline を作らない", st[i].stage);
+                vlog(JE("shader module の無い段がある（段 0x%x）。pipeline を作らない", "A stage has no shader module (stage 0x%x). Not creating the pipeline"), st[i].stage);
                 return reply(s, VK_ERROR_INITIALIZATION_FAILED);
             }
         ci.stageCount = nst;
@@ -5737,19 +5804,19 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         // iPhone のふり：iPhone が頂点に使えない形式の属性があれば、iPhone と同じく作らない
         for (uint32_t i = 0; like_ios() && ci.pVertexInputState && i < vi.vertexAttributeDescriptionCount; i++)
             if (like_ios_no_vertex(va[i].format)) {
-                vlog("iPhone のふり：頂点の形式 %u は iPhone では頂点に使えないので pipeline を作らない", va[i].format);
+                vlog(JE("iPhone のふり：頂点の形式 %u は iPhone では頂点に使えないので pipeline を作らない", "Pretending to be an iPhone: vertex format %u cannot be used for vertices on an iPhone, so not creating the pipeline"), va[i].format);
                 return reply(s, VK_ERROR_INITIALIZATION_FAILED);
             }
         if (like_ios() && !ci.pTessellationState)
             for (uint32_t i = 0; i < nst; i++)
                 if (st[i].stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT || st[i].stage == VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) {
-                    vlog("iPhone のふり：テッセレーションの設定が無いので pipeline を作らない");
+                    vlog(JE("iPhone のふり：テッセレーションの設定が無いので pipeline を作らない", "Pretending to be an iPhone: there is no tessellation state, so not creating the pipeline"));
                     return reply(s, VK_ERROR_INITIALIZATION_FAILED);
                 }
         VkPipeline pp;
         VkResult res = r->bad ? VK_ERROR_INITIALIZATION_FAILED : vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &ci, NULL, &pp);
         if (res == VK_SUCCESS) { put(id, (uint64_t) pp, K_PIPELINE); note_pipe_sets(id, lid); }
-        else vlog("graphics pipeline を作れない (%d)", res);
+        else vlog(JE("graphics pipeline を作れない (%d)", "Cannot create the graphics pipeline (%d)"), res);
         return reply(s, res);
     }
     case VR_CREATE_SAMPLER: {
@@ -5760,7 +5827,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkSampler sm;
         VkResult res = vkCreateSampler(d, &ci, NULL, &sm);
         if (res == VK_SUCCESS) put(id, (uint64_t) sm, K_SAMPLER);
-        else vlog("sampler を作れない (%d)", res);
+        else vlog(JE("sampler を作れない (%d)", "Cannot create the sampler (%d)"), res);
         return 1;
     }
     case VR_DESTROY_SAMPLER: {
@@ -5886,7 +5953,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkRenderPass rp;
         VkResult res = r->bad || !vkCreateRenderPass2 ? VK_ERROR_INITIALIZATION_FAILED : vkCreateRenderPass2(d, &ci, NULL, &rp);
         if (res == VK_SUCCESS) put(id, (uint64_t) rp, K_RPASS);
-        else vlog("render pass 2 を作れない (%d)", res);
+        else vlog(JE("render pass 2 を作れない (%d)", "Cannot create render pass 2 (%d)"), res);
         free(att); free(sub); free(dsr); free(refs); free(pres); free(dep); free(dmb);
         return 1;
     }
@@ -5900,7 +5967,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkQueryPool qp;
         VkResult res = vkCreateQueryPool(d, &ci, NULL, &qp);
         if (res == VK_SUCCESS) put(id, (uint64_t) qp, K_QPOOL);
-        else vlog("query pool を作れない (%d)", res);
+        else vlog(JE("query pool を作れない (%d)", "Cannot create the query pool (%d)"), res);
         return 1;
     }
     case VR_DESTROY_QUERY_POOL: {
@@ -5958,7 +6025,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         ci.type = (VkAccelerationStructureTypeKHR) vr_ru32(r);
         ci.createFlags = vr_ru32(r) & ~(uint32_t) VK_ACCELERATION_STRUCTURE_CREATE_DEVICE_ADDRESS_CAPTURE_REPLAY_BIT_KHR; // 名乗っていない
         if (!d || !ci.buffer || r->bad || !(g_caps & VR_CAP_RT)) {
-            vlog("acceleration structure：装置・buffer のどれかが無いか、レイトレーシングを名乗っていない。作らない");
+            vlog(JE("acceleration structure：装置・buffer のどれかが無いか、レイトレーシングを名乗っていない。作らない", "acceleration structure: the device or buffer is missing, or ray tracing is not advertised. Not creating it"));
             vr_u64(&g_out, 0);
             return reply(s, VK_ERROR_INITIALIZATION_FAILED);
         }
@@ -5970,7 +6037,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             find(id)->aux = bid; // 置き場の buffer（使うメモリの帳簿に使う）
             VkAccelerationStructureDeviceAddressInfoKHR ai = { .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR, .accelerationStructure = as };
             addr = vkGetAccelerationStructureDeviceAddressKHR(d, &ai);
-        } else vlog("acceleration structure を作れない (%d)", res);
+        } else vlog(JE("acceleration structure を作れない (%d)", "Cannot create the acceleration structure (%d)"), res);
         vr_u64(&g_out, addr);
         return reply(s, res);
     }
@@ -6013,7 +6080,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         ci.offset = vr_ru64(r);
         ci.range = vr_ru64(r);
         // iPhone の GPU は texel buffer の見え方の始まりを 64 バイトに揃える必要がある（MoltenVK の答え）。ふりでは記録に出すだけ
-        if (like_ios() && ci.offset % 64) vlog("iPhone のふり：64 バイトに揃っていない texel buffer の見え方（offset %llu）。iPhone では作れないかもしれない", (unsigned long long) ci.offset);
+        if (like_ios() && ci.offset % 64) vlog(JE("iPhone のふり：64 バイトに揃っていない texel buffer の見え方（offset %llu）。iPhone では作れないかもしれない", "Pretending to be an iPhone: a texel buffer view not aligned to 64 bytes (offset %llu). An iPhone may not be able to create it"), (unsigned long long) ci.offset);
         VkBufferView v;
         VkResult res = r->bad ? VK_ERROR_INITIALIZATION_FAILED : vkCreateBufferView(d, &ci, NULL, &v);
         if (res == VK_SUCCESS) {
@@ -6021,7 +6088,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             ent *ve = find(id);
             if (ve) ve->aux = bid; // descriptor に入ったとき、もとの buffer を使っていると分かるように
         } else {
-            vlog("buffer view を作れない (%d)", res);
+            vlog(JE("buffer view を作れない (%d)", "Cannot create the buffer view (%d)"), res);
         }
         return 1;
     }
@@ -6049,7 +6116,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         return reply(s, 0);
     }
     }
-    vlog("知らない命令 %u", op);
+    vlog(JE("知らない命令 %u", "Unknown command %u"), op);
     return 0;
 }
 
@@ -6072,10 +6139,10 @@ static void serve_client(vr_sock c) {
             uint32_t raw = 0;
             if (h[1] < 4) break;
             memcpy(&raw, buf, 4);
-            if (raw > (512u << 20)) { vlog("縮めた命令が大きすぎる (%u)", raw); break; }
+            if (raw > (512u << 20)) { vlog(JE("縮めた命令が大きすぎる (%u)", "A compressed command is too large (%u)"), raw); break; }
             if (raw > pcap) { pcap = raw; pk = realloc(pk, pcap); }
             int got = LZ4_decompress_safe((const char *) buf + 4, (char *) pk, (int) h[1] - 4, (int) raw);
-            if (got != (int) raw) { vlog("縮めた命令をほどけない (%d)", got); break; }
+            if (got != (int) raw) { vlog(JE("縮めた命令をほどけない (%d)", "Cannot decode a compressed command (%d)"), got); break; }
             size_t pos = 0;
             int ok = 1;
             while (ok && pos + 8 <= raw) {
@@ -6101,15 +6168,15 @@ static void serve_client(vr_sock c) {
     free(buf);
     free(pk);
     if (g_st.submits)
-        vlog("この接続：submit %llu 回 %.0f ms・記録 %llu 回 %.0f ms・GPU を待った %llu 回 %.0f ms・後ろで止めた %.0f ms",
+        vlog(JE("この接続：submit %llu 回 %.0f ms・記録 %llu 回 %.0f ms・GPU を待った %llu 回 %.0f ms・後ろで止めた %.0f ms", "This connection: submit %llu times %.0f ms, recording %llu times %.0f ms, GPU wait %llu times %.0f ms, blocked in the background %.0f ms"),
              (unsigned long long) g_st.submits, g_st.submit_ms, (unsigned long long) g_st.records, g_st.record_ms,
              (unsigned long long) g_st.waits, g_st.wait_ms, g_st.paused_ms);
     if (g_pcs.n)
-        vlog("この接続：縮めた平面 %llu 回・%.1f MB を %.1f MB にほどいた（%.2f 倍）・ほどくのに %.0f ms（1 回 %.2f ms）", (unsigned long long) g_pcs.n,
+        vlog(JE("この接続：縮めた平面 %llu 回・%.1f MB を %.1f MB にほどいた（%.2f 倍）・ほどくのに %.0f ms（1 回 %.2f ms）", "This connection: decoded %llu compressed planes, %.1f MB to %.1f MB (x%.2f), decoding took %.0f ms (%.2f ms each)"), (unsigned long long) g_pcs.n,
              g_pcs.in / 1e6, g_pcs.out / 1e6, g_pcs.in ? (double) g_pcs.out / (double) g_pcs.in : 0.0, g_pcs.ms, g_pcs.ms / (double) g_pcs.n);
     memset(&g_pcs, 0, sizeof g_pcs);
     if (g_bst.memw || g_bst.spans_msgs || g_bst.uds_msgs)
-        vlog("この接続：書き込み 1 つずつ %llu 通・まとめて %llu 通（範囲 %llu）・descriptor の書き込み %llu 通（%llu 個・vkUpdateDescriptorSets %llu 回）",
+        vlog(JE("この接続：書き込み 1 つずつ %llu 通・まとめて %llu 通（範囲 %llu）・descriptor の書き込み %llu 通（%llu 個・vkUpdateDescriptorSets %llu 回）", "This connection: writes one by one %llu, batched %llu (ranges %llu), descriptor writes %llu (%llu items, vkUpdateDescriptorSets %llu times)"),
              (unsigned long long) g_bst.memw, (unsigned long long) g_bst.spans_msgs, (unsigned long long) g_bst.spans,
              (unsigned long long) g_bst.uds_msgs, (unsigned long long) g_bst.uds_writes, (unsigned long long) g_bst.uds_calls);
     memset(&g_bst, 0, sizeof g_bst);
@@ -6119,7 +6186,7 @@ static void serve_client(vr_sock c) {
         uint64_t tn = 0;
         double tms = 0, tw = 0;
         for (int i = 0; i < 128; i++) { tn += g_opt.n[i]; tms += g_opt.ms[i]; tw += g_opt.wait[i]; }
-        int at = snprintf(line, sizeof line, "命令の処理（主の糸・GPU を待った時間を除く）：全部 %llu 通 %.0f ms（待ち %.0f ms）・上位（番号:通:ms）", (unsigned long long) tn, tms - tw, tw);
+        int at = snprintf(line, sizeof line, JE("命令の処理（主の糸・GPU を待った時間を除く）：全部 %llu 通 %.0f ms（待ち %.0f ms）・上位（番号:通:ms）", "Command processing (main thread, excluding GPU wait): total %llu commands %.0f ms (wait %.0f ms), top (index:count:ms)"), (unsigned long long) tn, tms - tw, tw);
         int used[128] = { 0 };
         for (int k = 0; k < 8; k++) {
             int bi = -1;
@@ -6135,7 +6202,7 @@ static void serve_client(vr_sock c) {
     }
     if (g_st.waits) {
         char line[400];
-        int at = snprintf(line, sizeof line, "GPU を待った命令（命令の番号:回数:ms）");
+        int at = snprintf(line, sizeof line, JE("GPU を待った命令（命令の番号:回数:ms）", "Commands that waited for the GPU (index:count:ms)"));
         for (int i = 0; i < 128 && at < (int) sizeof line - 24; i++)
             if (g_st.wait_by_op[i]) at += snprintf(line + at, sizeof line - at, " %d:%llu:%.0f", i, (unsigned long long) g_st.wait_by_op[i], g_st.wait_ms_by_op[i]);
         vlog("%s", line);
@@ -6149,7 +6216,7 @@ static void serve_one(vr_sock c, int remote) {
     serve_lock();
     g_cur_remote = remote;
     g_dbg_msgs = 0;
-    vlog(remote ? "つながった（インターネット共有の口）" : "つながった");
+    vlog(remote ? JE("つながった（インターネット共有の口）", "Connected (internet sharing port)") : JE("つながった", "Connected"));
     g_clients = 1;
     serve_client(c);
     g_clients = 0;
@@ -6160,24 +6227,24 @@ static void serve_one(vr_sock c, int remote) {
 #ifdef _WIN32
         // PC の代役（RTX）は、GPU を失うと同じプロセスでは Vulkan を作り直しても装置を作れない（-3 が続く）。
         // プロセスごと終わり、立て直しは外の台本に任せる
-        dummy_dirty_check("GPU を失った時");
-        vlog("GPU を失ったので終わる（代役は立て直しが要る）");
+        dummy_dirty_check(JE("GPU を失った時", "when the GPU was lost"));
+        vlog(JE("GPU を失ったので終わる（代役は立て直しが要る）", "Lost the GPU, so exiting (the receiver must be restarted)"));
         exit(3);
 #endif
         // GPU を失ったあとは、同じ Vulkan のままだと次の装置が作れないことがある
-        vlog("GPU を失ったので、Vulkan を作り直す");
+        vlog(JE("GPU を失ったので、Vulkan を作り直す", "Lost the GPU, so recreating Vulkan"));
         dbg_stop();
         vkDestroyInstance(g_inst, NULL);
         g_inst = VK_NULL_HANDLE;
         g_lost = 0;
-        if (!vk_init()) vlog("Vulkan を作り直せない");
+        if (!vk_init()) vlog(JE("Vulkan を作り直せない", "Cannot recreate Vulkan"));
     }
 #ifdef _WIN32
     closesocket(c);
 #else
     close(c);
 #endif
-    vlog("切れた");
+    vlog(JE("切れた", "Disconnected"));
     serve_unlock();
 }
 
@@ -6201,7 +6268,7 @@ static void *extra_thread(void *p) {
         setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
         if (!g_token_ok || !vr_link_auth(c, g_token)) {
-            vlog("インターネット共有の口：合言葉が無い・違うので断った");
+            vlog(JE("インターネット共有の口：合言葉が無い・違うので断った", "Internet sharing port: refused because the token is missing or wrong"));
 #ifdef _WIN32
             closesocket(c);
 #else
@@ -6227,7 +6294,7 @@ int vkr_listen_extra(const char *host) {
 #else
             close(old);
 #endif
-            vlog("インターネット共有の口を閉じた");
+            vlog(JE("インターネット共有の口を閉じた", "Closed the internet sharing port"));
         }
         return 0;
     }
@@ -6239,8 +6306,11 @@ int vkr_listen_extra(const char *host) {
     struct sockaddr_in a = { 0 };
     a.sin_family = AF_INET;
     a.sin_port = htons((uint16_t) g_main_port);
-    if (inet_pton(AF_INET, host, &a.sin_addr) != 1 || bind(ls, (struct sockaddr *) &a, sizeof a) != 0 || listen(ls, 4) != 0) {
-        vlog("インターネット共有の口 %s:%d で待てない", host, g_main_port);
+    int bad_addr = inet_pton(AF_INET, host, &a.sin_addr) != 1;
+    if (bad_addr || bind(ls, (struct sockaddr *) &a, sizeof a) != 0 || listen(ls, 4) != 0) {
+        char et[160];
+        sock_err_text(bad_addr ? SOCK_EINVAL : sock_errno(), et, sizeof et);
+        vlog(JE("インターネット共有の口 %s:%d で待てない：%s", "Cannot listen on the internet sharing port %s:%d: %s"), host, g_main_port, et);
 #ifdef _WIN32
         closesocket(ls);
 #else
@@ -6265,7 +6335,7 @@ int vkr_listen_extra(const char *host) {
     pthread_t t;
     if (pthread_create(&t, NULL, extra_thread, (void *) (uintptr_t) ls) == 0) pthread_detach(t);
 #endif
-    vlog("インターネット共有の口：%s:%d でも待つ（合言葉つき）", host, g_main_port);
+    vlog(JE("インターネット共有の口：%s:%d でも待つ（合言葉つき）", "Internet sharing port: also listening on %s:%d (token required)"), host, g_main_port);
     return 0;
 }
 
@@ -6349,7 +6419,7 @@ int vkr_hotspot_tick(int on, char *out, int cap) {
 int vkr_serve(const char *host, int port) {
     qos_hi();
     g_main_port = port; // 共有の網の口も同じ番号で待つ。Vulkan が起きるとすぐ vkr_hotspot_tick が開けるので、先に決める
-    if (!vk_init()) { vlog("Vulkan を起動できない"); return 1; }
+    if (!vk_init()) { vlog(JE("Vulkan を起動できない", "Cannot start Vulkan")); return 1; }
     if (g_extra_env) vkr_listen_extra(g_extra_env);
 #ifdef _WIN32
     WSADATA w;
@@ -6362,8 +6432,13 @@ int vkr_serve(const char *host, int port) {
     a.sin_family = AF_INET;
     a.sin_port = htons((uint16_t) port);
     inet_pton(AF_INET, host, &a.sin_addr);
-    if (bind(ls, (struct sockaddr *) &a, sizeof a) != 0 || listen(ls, 4) != 0) { vlog("%s:%d で待てない", host, port); return 1; }
-    vlog("Vulkan の受け手：%s:%d で待っている", host, port);
+    if (bind(ls, (struct sockaddr *) &a, sizeof a) != 0 || listen(ls, 4) != 0) {
+        char et[160];
+        sock_err_text(sock_errno(), et, sizeof et);
+        vlog(JE("%s:%d で待てない：%s", "Cannot listen on %s:%d: %s"), host, port, et);
+        return 1;
+    }
+    vlog(JE("Vulkan の受け手：%s:%d で待っている", "Vulkan receiver: listening on %s:%d"), host, port);
     for (;;) {
         vr_sock c = accept(ls, NULL, NULL);
         if (c == VR_BAD_SOCK) continue;
@@ -6408,11 +6483,11 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     static volatile LONG once;
     if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
-    fprintf(stderr, "落ちた：例外 0x%08lx・命令 %u\n", code, g_cur_op);
-    where("場所", ep->ExceptionRecord->ExceptionAddress);
+    fprintf(stderr, JE("落ちた：例外 0x%08lx・命令 %u\n", "Crashed: exception 0x%08lx, command %u\n"), code, g_cur_op);
+    where(JE("場所", "location"), ep->ExceptionRecord->ExceptionAddress);
     void *fr[40];
     USHORT n = RtlCaptureStackBackTrace(0, 40, fr, NULL);
-    for (USHORT i = 0; i < n; i++) where("  呼び出し元", fr[i]);
+    for (USHORT i = 0; i < n; i++) where(JE("  呼び出し元", "  caller"), fr[i]);
     fflush(stderr);
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -6440,7 +6515,7 @@ static void *hs_ticker(void *p) {
     for (;;) {
         int r = vkr_hotspot_tick(1, now, sizeof now);
         if (r != 2 && strcmp(now, last)) {
-            vlog("試験用：共有の網の口 %s", now[0] ? now : "なし");
+            vlog(JE("試験用：共有の網の口 %s", "Test: internet sharing network port %s"), now[0] ? now : JE("なし", "none"));
             snprintf(last, sizeof last, "%s", now);
         }
         sleep_ms(1000);
@@ -6451,7 +6526,7 @@ static void *hs_ticker(void *p) {
 int main(int argc, char **argv) {
 #ifdef _WIN32
     AddVectoredExceptionHandler(1, crash_handler);
-    { const char *fu = getenv("VKR_FAKE_UPSCALE"); if (fu && *fu == '1') { vkr_set_upscaler(fake_upscale); vlog("試験用：CPU で広げる（VKR_FAKE_UPSCALE）"); } }
+    { const char *fu = getenv("VKR_FAKE_UPSCALE"); if (fu && *fu == '1') { vkr_set_upscaler(fake_upscale); vlog(JE("試験用：CPU で広げる（VKR_FAKE_UPSCALE）", "Test: upscaling on the CPU (VKR_FAKE_UPSCALE)")); } }
     SetConsoleOutputCP(CP_UTF8);
     // PC で代役をするときは、画面取り込みなどの部品（暗黙のレイヤー）を挟まない。
     // OBS が起動している間、OBS の部品が vkCreateDevice から戻ってこなかった
@@ -6462,7 +6537,7 @@ int main(int argc, char **argv) {
     if (ex && *ex) {
         g_main_port = argc > 2 ? atoi(argv[2]) : VR_DEFAULT_PORT;
         vkr_set_token(getenv("VKR_LINK_TOKEN"));
-        if (!g_token_ok) vlog("VKR_LINK_TOKEN が無い・読めないので、インターネット共有の口は全部断る");
+        if (!g_token_ok) vlog(JE("VKR_LINK_TOKEN が無い・読めないので、インターネット共有の口は全部断る", "VKR_LINK_TOKEN is missing or unreadable, so all internet sharing connections are refused"));
 #ifdef _WIN32
         WSADATA w;
         WSAStartup(MAKEWORD(2, 2), &w);
@@ -6486,7 +6561,7 @@ int main(int argc, char **argv) {
             }
         }
         vkr_set_token(getenv("VKR_LINK_TOKEN"));
-        if (!g_token_ok) vlog("VKR_LINK_TOKEN が無い・読めないので、インターネット共有の口は全部断る");
+        if (!g_token_ok) vlog(JE("VKR_LINK_TOKEN が無い・読めないので、インターネット共有の口は全部断る", "VKR_LINK_TOKEN is missing or unreadable, so all internet sharing connections are refused"));
         g_main_port = argc > 2 ? atoi(argv[2]) : VR_DEFAULT_PORT;
 #ifdef _WIN32
         WSADATA w;
@@ -6497,7 +6572,7 @@ int main(int argc, char **argv) {
         pthread_t t;
         if (pthread_create(&t, NULL, hs_ticker, NULL) == 0) pthread_detach(t);
 #endif
-        vlog("試験用：1 秒ごとに共有の網の口を探す（VKR_HOTSPOT）");
+        vlog(JE("試験用：1 秒ごとに共有の網の口を探す（VKR_HOTSPOT）", "Test: looking for the sharing network port every second (VKR_HOTSPOT)"));
     }
     return vkr_serve(argc > 1 ? argv[1] : "127.0.0.1", argc > 2 ? atoi(argv[2]) : VR_DEFAULT_PORT);
 }

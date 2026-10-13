@@ -181,15 +181,15 @@ static void *rec_open(int *failed) {
     double t0 = t_ms();
     // 音は、頼まれていて（arate が 0 でない）、口 50063 の音がいま届いているときだけ入れる（届いていないのに音の道を作ると、空の音の道ができる）
     uint32_t ar = g_rec.arate && g_rec.a_seen_ms > 0 && t0 - g_rec.a_seen_ms < 1000 ? g_rec.a_rate : 0, ach = g_rec.a_ch ? g_rec.a_ch : 2;
-    if (g_rec.arate && !ar) vlog("録画：口 50063 の PC の音が届いていないので、音なしで録る（スピーカーの係の ipaudio を動かすと入る）");
+    if (g_rec.arate && !ar) vlog(JE("録画：口 50063 の PC の音が届いていないので、音なしで録る（スピーカーの係の ipaudio を動かすと入る）", "Recording: no PC audio is arriving on port 50063, so recording without audio (it starts when the speaker helper ipaudio runs)"));
     g_rec.arate = ar, g_rec.ach = ach;
     void *ctx = g_recb.start(g_rec.name, g_rec.w, g_rec.h, g_rec.fps ? g_rec.fps : 60, g_rec.codec, kbps, ar, ach, g_rec.akbps,
                              g_rec.dest, g_rec.path, sizeof g_rec.path);
     if (!ctx) {
         *failed = 1;
-        vlog("録画：書き手を作れない（%u x %u）", g_rec.w, g_rec.h);
+        vlog(JE("録画：書き手を作れない（%u x %u）", "Recording: cannot create the writer (%u x %u)"), g_rec.w, g_rec.h);
     } else {
-        vlog("録画：%s・%u x %u・%s %u kbps・音 %u Hz %u ch・作るのに %.0f ms", g_rec.path, g_rec.w, g_rec.h,
+        vlog(JE("録画：%s・%u x %u・%s %u kbps・音 %u Hz %u ch・作るのに %.0f ms", "Recording: %s, %u x %u, %s %u kbps, audio %u Hz %u ch, took %.0f ms to create"), g_rec.path, g_rec.w, g_rec.h,
              g_rec.codec == VR_REC_HEVC ? "HEVC" : "H.264", kbps, g_rec.arate, g_rec.ach, t_ms() - t0);
     }
     return ctx;
@@ -245,7 +245,7 @@ static void *rec_thread(void *arg)
                 if (pts < 0) pts = 0;
                 if (!px || !g_recb.video(ctx, px, g_rec.w, g_rec.h, px == g_rec.v[slot].px ? g_rec.v[slot].stride : g_rec.w * 4, g_rec.v[slot].bgra, pts)) {
                     failed = 1;
-                    vlog("録画：コマを書けない（%llu コマ目）", (unsigned long long) g_rec.frames);
+                    vlog(JE("録画：コマを書けない（%llu コマ目）", "Recording: cannot write a frame (frame #%llu)"), (unsigned long long) g_rec.frames);
                 }
                 g_rec.busy_ms += t_ms() - t0;
                 g_rec.frames++;
@@ -289,7 +289,7 @@ static void *rec_thread(void *arg)
     if (ctx) {
         double t0 = t_ms();
         ok = g_recb.stop(ctx) && !failed;
-        vlog("録画：書き終えた（%s・%.0f ms）・%llu コマ・落とした %llu・音 %.1f 秒・書き手に渡す 1 コマ %.2f ms", ok ? "成功" : "失敗", t_ms() - t0,
+        vlog(JE("録画：書き終えた（%s・%.0f ms）・%llu コマ・落とした %llu・音 %.1f 秒・書き手に渡す 1 コマ %.2f ms", "Recording: finished writing (%s, %.0f ms), %llu frames, dropped %llu, audio %.1f s, %.2f ms per frame handed to the writer"), ok ? JE("成功", "ok") : JE("失敗", "failed"), t_ms() - t0,
              (unsigned long long) g_rec.frames, (unsigned long long) g_rec.dropped, g_rec.arate ? (double) g_rec.asamples / g_rec.arate : 0.0,
              g_rec.frames ? g_rec.busy_ms / g_rec.frames : 0.0);
         FILE *f = fopen(g_rec.path, "rb");
@@ -409,7 +409,7 @@ static void rec_status(vr_buf *o) {
 // 受け手が切れたとき（ゲームが終わった・落ちた）：録画中なら書き終える。ファイルは残す
 static void rec_on_disconnect(void) {
     if (g_rec.inited && g_rec.state == 1) {
-        vlog("録画：PC が切れたので書き終える");
+        vlog(JE("録画：PC が切れたので書き終える", "Recording: the PC disconnected, so finishing the file"));
         rec_end();
     }
 }
@@ -492,16 +492,16 @@ static mf_rec *mf_rec_open(const wchar_t *path, uint32_t w, uint32_t h, uint32_t
     IMFAttributes_SetUINT32(at, &RG_NO_THROTTLE, 1);
     HRESULT hr = g_rec_sw_create(path, NULL, at, &r->w);
     IMFAttributes_Release(at);
-    if (FAILED(hr)) { vlog("録画：Sink Writer を作れない（0x%08lx）", (unsigned long) hr); mf_rec_free(r); return NULL; }
+    if (FAILED(hr)) { vlog(JE("録画：Sink Writer を作れない（0x%08lx）", "Recording: cannot create the Sink Writer (0x%08lx)"), (unsigned long) hr); mf_rec_free(r); return NULL; }
     // 映像：出す形（H.264 は High）→ 入れる形（NV12）
     IMFMediaType *o = vid_type(codec, w, h, fps, kbps * 1000, IsEqualGUID(codec, &VG_H264) ? 100 : 0);
     hr = o ? IMFSinkWriter_AddStream(r->w, o, &r->vs) : E_FAIL;
     if (o) IMFMediaType_Release(o);
-    if (FAILED(hr)) { vlog("録画：映像の形を受け付けない（0x%08lx）", (unsigned long) hr); mf_rec_free(r); return NULL; }
+    if (FAILED(hr)) { vlog(JE("録画：映像の形を受け付けない（0x%08lx）", "Recording: the video format is not accepted (0x%08lx)"), (unsigned long) hr); mf_rec_free(r); return NULL; }
     IMFMediaType *in = vid_type(&VG_NV12, w, h, fps, 0, 0);
     hr = in ? IMFSinkWriter_SetInputMediaType(r->w, r->vs, in, NULL) : E_FAIL;
     if (in) IMFMediaType_Release(in);
-    if (FAILED(hr)) { vlog("録画：NV12 を入れられない（0x%08lx）", (unsigned long) hr); mf_rec_free(r); return NULL; }
+    if (FAILED(hr)) { vlog(JE("録画：NV12 を入れられない（0x%08lx）", "Recording: cannot set NV12 as the input (0x%08lx)"), (unsigned long) hr); mf_rec_free(r); return NULL; }
     // 音：AAC（毎秒のバイトは 12000・16000・20000・24000 のどれか）← 16 ビットの PCM
     if (arate == 44100 || arate == 48000) {
         uint32_t bps = akbps * 1000 / 8;
@@ -511,13 +511,13 @@ static mf_rec *mf_rec_open(const wchar_t *path, uint32_t w, uint32_t h, uint32_t
         if (SUCCEEDED(hr)) hr = IMFSinkWriter_SetInputMediaType(r->w, r->as, ai, NULL);
         if (ao) IMFMediaType_Release(ao);
         if (ai) IMFMediaType_Release(ai);
-        if (FAILED(hr)) { vlog("録画：音の形を受け付けない（0x%08lx）", (unsigned long) hr); mf_rec_free(r); return NULL; }
+        if (FAILED(hr)) { vlog(JE("録画：音の形を受け付けない（0x%08lx）", "Recording: the audio format is not accepted (0x%08lx)"), (unsigned long) hr); mf_rec_free(r); return NULL; }
         r->has_audio = 1;
     } else if (arate) {
-        vlog("録画：音の標本/秒 %u は AAC にできないので、音なしで録る", arate);
+        vlog(JE("録画：音の標本/秒 %u は AAC にできないので、音なしで録る", "Recording: the audio sample rate %u cannot be encoded as AAC, so recording without audio"), arate);
     }
     hr = IMFSinkWriter_BeginWriting(r->w);
-    if (FAILED(hr)) { vlog("録画：書き始められない（0x%08lx）", (unsigned long) hr); mf_rec_free(r); return NULL; }
+    if (FAILED(hr)) { vlog(JE("録画：書き始められない（0x%08lx）", "Recording: cannot begin writing (0x%08lx)"), (unsigned long) hr); mf_rec_free(r); return NULL; }
     return r;
 }
 
@@ -534,7 +534,7 @@ static void *mf_rec_start(const char *name, uint32_t w, uint32_t h, uint32_t fps
     mf_rec *r = NULL;
     if (codec == VR_REC_HEVC) {
         r = mf_rec_open(wp, w, h, fps, &RG_HEVC, kbps, arate, ach, akbps, hw);
-        if (!r) { vlog("録画：HEVC は使えないので H.264 で録る"); DeleteFileW(wp); }
+        if (!r) { vlog(JE("録画：HEVC は使えないので H.264 で録る", "Recording: HEVC is not available, so recording with H.264")); DeleteFileW(wp); }
     }
     if (!r) r = mf_rec_open(wp, w, h, fps, &VG_H264, kbps, arate, ach, akbps, hw);
     return r;
@@ -560,7 +560,7 @@ static int mf_rec_video(void *p, const uint8_t *px, uint32_t w, uint32_t h, uint
     IMFSample_SetSampleDuration(s, (LONGLONG) (10000000ull / r->fps));
     HRESULT hr = IMFSinkWriter_WriteSample(r->w, r->vs, s);
     IMFSample_Release(s);
-    if (FAILED(hr)) vlog("録画：WriteSample（映像）0x%08lx", (unsigned long) hr);
+    if (FAILED(hr)) vlog(JE("録画：WriteSample（映像）0x%08lx", "Recording: WriteSample (video) 0x%08lx"), (unsigned long) hr);
     return SUCCEEDED(hr);
 }
 
@@ -590,14 +590,14 @@ static int mf_rec_audio(void *p, const int16_t *pcm, uint32_t frames, uint32_t r
     IMFSample_SetSampleDuration(s, dur);
     HRESULT hr = IMFSinkWriter_WriteSample(r->w, r->as, s);
     IMFSample_Release(s);
-    if (FAILED(hr)) vlog("録画：WriteSample（音）0x%08lx", (unsigned long) hr);
+    if (FAILED(hr)) vlog(JE("録画：WriteSample（音）0x%08lx", "Recording: WriteSample (audio) 0x%08lx"), (unsigned long) hr);
     return SUCCEEDED(hr);
 }
 
 static int mf_rec_stop(void *p) {
     mf_rec *r = (mf_rec *) p;
     HRESULT hr = IMFSinkWriter_Finalize(r->w);
-    if (FAILED(hr)) vlog("録画：Finalize 0x%08lx", (unsigned long) hr);
+    if (FAILED(hr)) vlog(JE("録画：Finalize 0x%08lx", "Recording: Finalize 0x%08lx"), (unsigned long) hr);
     mf_rec_free(r);
     return SUCCEEDED(hr);
 }
@@ -624,7 +624,7 @@ static DWORD WINAPI ra_thread(LPVOID p) {
         memcpy(a.magic, "IPAK", 4);
         a.version = 1, a.flags = (h.flags & 1) ? 1 : 0, a.mic_rate = 48000, a.mic_ch = 1, a.mic_fmt = 1, a.hw_rate = 48000;
         if (!vr_send_all(c, &a, sizeof a)) { closesocket(c); continue; }
-        vlog("録画の音の受け口：つながった（%u Hz・%u ch・1 塊 %u コマ）", h.spk_rate, h.spk_ch, h.chunk);
+        vlog(JE("録画の音の受け口：つながった（%u Hz・%u ch・1 塊 %u コマ）", "Recording audio port: connected (%u Hz, %u ch, %u frames per chunk)"), h.spk_rate, h.spk_ch, h.chunk);
         uint64_t got = 0;
         for (;;) {
             ra_frame f;
@@ -642,7 +642,7 @@ static DWORD WINAPI ra_thread(LPVOID p) {
             }
         }
         closesocket(c);
-        vlog("録画の音の受け口：切れた（%.1f 秒受けた）", h.spk_rate ? (double) got / h.spk_rate : 0.0);
+        vlog(JE("録画の音の受け口：切れた（%.1f 秒受けた）", "Recording audio port: disconnected (received %.1f s)"), h.spk_rate ? (double) got / h.spk_rate : 0.0);
     }
     return 0;
 }
@@ -661,11 +661,11 @@ static void ra_listen(const char *where) {
     sa.sin_port = htons((u_short) port);
     sa.sin_addr.s_addr = inet_addr(host);
     if (ls == INVALID_SOCKET || bind(ls, (struct sockaddr *) &sa, sizeof sa) || listen(ls, 1)) {
-        vlog("録画の音の受け口：%s:%d を開けない", host, port);
+        vlog(JE("録画の音の受け口：%s:%d を開けない", "Recording audio port: cannot open %s:%d"), host, port);
         if (ls != INVALID_SOCKET) closesocket(ls);
         return;
     }
-    vlog("録画の音の受け口：%s:%d で待っている（口 50063 の約束）", host, port);
+    vlog(JE("録画の音の受け口：%s:%d で待っている（口 50063 の約束）", "Recording audio port: listening on %s:%d (the port 50063 convention)"), host, port);
     HANDLE t = CreateThread(NULL, 0, ra_thread, (LPVOID) (uintptr_t) ls, 0, NULL);
     if (t) CloseHandle(t);
 }
@@ -711,8 +711,8 @@ static int rec_cmd_ctl(vr_sock s, vr_rd *r) {
             // 大きさが分かれば先に書き手を作る（0 なら最初のコマの大きさ）
             g_rec.pre_w = w && w <= 8192 ? (w + 1) & ~1u : 0, g_rec.pre_h = h && h <= 8192 ? (h + 1) & ~1u : 0;
             rec_clean_name(nm ? nm : "", nm ? nn : 0, g_rec.name, sizeof g_rec.name);
-            if (!rec_begin()) vlog("録画：糸を作れない");
-            else vlog("録画：始める（%s・%u コマ/秒の目安・音 %u Hz）", g_rec.codec == VR_REC_HEVC ? "HEVC" : "H.264", g_rec.fps, g_rec.arate);
+            if (!rec_begin()) vlog(JE("録画：糸を作れない", "Recording: cannot create the thread"));
+            else vlog(JE("録画：始める（%s・%u コマ/秒の目安・音 %u Hz）", "Recording: starting (%s, about %u fps, audio %u Hz)"), g_rec.codec == VR_REC_HEVC ? "HEVC" : "H.264", g_rec.fps, g_rec.arate);
         }
         break;
     case VR_REC_STOP:
@@ -720,7 +720,7 @@ static int rec_cmd_ctl(vr_sock s, vr_rd *r) {
         break;
     case VR_REC_DELETE:
         if (g_rec.state != 1 && g_rec.last_path[0]) {
-            if (remove(g_rec.last_path) == 0) vlog("録画：%s を消した", g_rec.last_path);
+            if (remove(g_rec.last_path) == 0) vlog(JE("録画：%s を消した", "Recording: removed %s"), g_rec.last_path);
             g_rec.last_path[0] = 0;
             g_rec.path[0] = 0;
             g_rec.bytes = 0;
