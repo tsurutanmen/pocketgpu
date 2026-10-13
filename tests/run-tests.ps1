@@ -164,7 +164,7 @@ function Invoke-Fix($kit, [string[]]$fixArgs, [hashtable]$envs, [string]$answers
     foreach ($k in @($psi.EnvironmentVariables.Keys)) {
         if ($k -like 'PGPU_*' -or $k -like 'IPHONE_VK*' -or $k -in 'ADB', 'ANDROID_SERIAL', 'FAKE_ADB_STATE') { $psi.EnvironmentVariables.Remove($k) }
     }
-    $base = @{ PGPU_NOPROMPT = '1'; PGPU_NOPAUSE = '1'; PGPU_LANG = 'ja'; PGPU_TEST_VK_LOADER = '1.3.280'; PGPU_TEST_APPLE_SW = 'devices'
+    $base = @{ PGPU_NOPROMPT = '1'; PGPU_NOPAUSE = '1'; PGPU_TEST_ELEVATED = '0'; PGPU_LANG = 'ja'; PGPU_TEST_VK_LOADER = '1.3.280'; PGPU_TEST_APPLE_SW = 'devices'
                PGPU_TEST_LAUNCH_LOG = (Join-Path (Split-Path -Parent $kit) 'launch.log'); PGPU_TEST_HOLDER_ROOT = $kit; PGPU_VKLIST = (Join-Path $PSScriptRoot 'fakes\fake_vklist.cmd')
                PGPU_TEST_SERVICE_START = (Join-Path $PSScriptRoot 'fakes\noop.cmd'); IPHONE_VK_MUX = (Get-FreePort); PGPU_PORT = (Get-FreePort)
                ADB = (New-FakeAdb); FAKE_ADB_STATE = (Join-Path (Split-Path -Parent $kit) 'adb-state-default.txt') }

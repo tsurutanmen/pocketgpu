@@ -5,7 +5,7 @@
 # 試す人は使わない、試験用の差し替え：
 #   IPHONE_VK_MUX=番号         Apple のサービス（127.0.0.1:27015）の代わりにこの番号へ（ドライバと同じ名前）
 #   PGPU_VKLIST=パス            vklist.exe の代わり（GPU を使わずに試すため）
-#   PGPU_TEST_ELEVATED=1        管理者で動いていることにする
+#   PGPU_TEST_ELEVATED=1|0      管理者で動いていることにする・していないことにする（0 は管理者で動く試験の機械用）
 #   PGPU_TEST_APPLE_SW=none|devices|itunes|service  入っている Apple のソフトをこれにする（devices は Apple Devices・itunes はストアの iTunes・service は iTunes の Windows のサービス）
 #   PGPU_SHORTCUT_DIR=フォルダ   スタートメニューと「送る」の代わりに、ここへ入口を作る
 #   PGPU_NOPROMPT=1             聞かずに「いいえ」で進み、最後に止まらない
@@ -84,6 +84,7 @@ function Save-Log([string]$name) {
 # ---- この PC ----
 function Test-Elevated {
     if ($env:PGPU_TEST_ELEVATED -eq '1') { return $true }
+    if ($env:PGPU_TEST_ELEVATED -eq '0') { return $false }
     $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
