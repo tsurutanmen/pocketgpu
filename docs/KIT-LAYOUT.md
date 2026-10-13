@@ -11,7 +11,7 @@
 | `kit/report.cmd`・`kit/report.ps1` | 同じ場所 | PC の様子を 1 つのテキストにまとめる |
 | `kit/pocketgpu.cmd` | 同じ場所 | 起動の入口（Steam の起動オプション用） |
 | `kit/pocketgpu_android.cmd`・`kit/check_android.cmd` | 同じ場所 | Android 用の入口 |
-| `kit/android/*.cmd` | `android\` | Android の受け手を入れる・止める |
+| `kit/android/*.cmd` | `android\` | Android の受け手を入れる・止める。`android_app.cmd` は PocketGPU アプリ用（カメラ・マイク・スピーカー・GPU の口をつなぐ） |
 | `kit/tools/*.ps1` | `tools\` | 上の入口の中身（Windows PowerShell 5.1） |
 | `kit/tools/fix-data/*.cmd` | `tools\fix-data\` | Fix-PocketGPU.cmd が、古い入口と入れ替える新しい物 |
 
@@ -26,7 +26,7 @@
 
 - `iphone_icd.dll`・`iphone_icd.json`・`x86\`・`vklist.exe`
 - `PocketGPU.exe`・`extras\`（カメラ・マイク・字幕の道具と仮想カメラ）
-- iPhone のアプリ（ipa）・Android の受け手（`android\server_aarch64`）
+- iPhone のアプリ（ipa）・Android の受け手（`android\server_aarch64`）・Android のアプリ（`android\pocketgpu.apk`）
 - `tools\kit.ini`・`tools\update.ini`（人ごとの設定）
 - `README.txt`・`FAQ.txt`・`dxvk\`
 

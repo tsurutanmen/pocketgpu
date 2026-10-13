@@ -23,6 +23,7 @@
 #   PGPU_TEST_STOP_ALLOW=PID,PID    止めてよいプログラムを、この PID だけにする（試験が、自分の物以外を止めないための保険）
 #   PGPU_TEST_AV_EVENT=1           ウイルス対策ソフトが iphone_icd.dll を検出した記録があることにする
 #   ADB=パス・PGPU_PORT=番号        Android の adb.exe と、PC 側の口（既定は 50300。キットの android\ の cmd と同じ）
+#   PGPU_CAM_PORT=番号・PGPU_AUDIO_PORT=番号   Android のアプリのカメラとマイクの、PC 側の口（既定は 50064 と 50063。android\android_app.cmd と同じ）
 param(
     [switch]$CheckOnly,
     [string[]]$Only = @(),
@@ -396,12 +397,152 @@ function Get-AndroidState($adb, [string]$serial, [int]$port) {
     $s.Pids = @(($r.Out -split '\s+') | Where-Object { $_ -match '^\d+$' })
     $r = Invoke-Adb $adb ($sa + 'shell sha256sum /data/local/tmp/pgpu_server')
     if ($r.Out -match '^([0-9a-fA-F]{64})') { $s.PhoneHash = $Matches[1].ToLowerInvariant() }
-    $r = Invoke-Adb $adb 'forward --list'
-    foreach ($l in ($r.Out -split "`r?`n")) {
-        if ($l -match ('\btcp:' + $port + '\s+(tcp:\d+)')) { $s.Forward = $Matches[1] }
-    }
+    $s.Forward = (Get-AdbForwards $adb)[[string]$port]
     $s.Owners = @(Get-TcpOwners $port 'Listen')
     return $s
+}
+# adb forward の一覧：PC の口 -> 向け先（tcp:50060 や localabstract:pocketgpu-webcam）。端末が複数でも、口の番号で見る
+function Get-AdbForwards($adb) {
+    $m = @{}
+    $r = Invoke-Adb $adb 'forward --list'
+    foreach ($l in ($r.Out -split "`r?`n")) {
+        if ($l -match '\btcp:(\d+)\s+(\S+)') { $m[$Matches[1]] = $Matches[2] }
+    }
+    return $m
+}
+# PocketGPU アプリ（Android）の USB の口。アプリ 0.1.2 から、カメラとマイクの口は localabstract に変わった（安全のため。adb だけが入れる）。
+#   0.1.2 以上：adb forward tcp:50064 localabstract:pocketgpu-webcam・adb forward tcp:50063 localabstract:pocketgpu-audio
+#   0.1.1 以前：adb forward tcp:50064 tcp:50064・adb forward tcp:50063 tcp:50063（0.1.2 でも、アプリの設定で古い PC のツールを受け付けるときは使える）
+# PC の口は PGPU_CAM_PORT・PGPU_AUDIO_PORT で変えられる（既定は 50064・50063。キットの android\android_app.cmd と同じ）。端末の側の番号は変わらない
+$script:AppPkg = 'com.tsurutanmen.pocketgpu'
+function Get-AppPortSpecs {
+    return @(
+        @{ Name = 'webcam'; Port = $(if ($env:PGPU_CAM_PORT) { [int]$env:PGPU_CAM_PORT } else { 50064 }); New = 'localabstract:pocketgpu-webcam'; Old = 'tcp:50064' },
+        @{ Name = 'audio'; Port = $(if ($env:PGPU_AUDIO_PORT) { [int]$env:PGPU_AUDIO_PORT } else { 50063 }); New = 'localabstract:pocketgpu-audio'; Old = 'tcp:50063' }
+    )
+}
+# アプリの版 -> 向け方。0.1.2 以上は new、それより前は old、読めなければ unknown
+function Get-AppForm([string]$ver) {
+    if ($ver -match '^(\d+)\.(\d+)(?:\.(\d+))?') {
+        $third = $(if ($Matches[3]) { $Matches[3] } else { '0' })
+        $v = [Version]('{0}.{1}.{2}' -f $Matches[1], $Matches[2], $third)
+        if ($v -ge [Version]'0.1.2') { return 'new' } else { return 'old' }
+    }
+    return 'unknown'
+}
+function Get-AndroidApp($adb, [string]$serial) {
+    $sa = $(if ($serial) { '-s ' + $serial + ' ' } else { '' })
+    $a = @{ Installed = $false; Version = ''; Form = 'unknown' }
+    $r = Invoke-Adb $adb ($sa + 'shell pm path ' + $script:AppPkg)
+    if ($r.Out -notmatch 'package:') { return $a }
+    $a.Installed = $true
+    $r = Invoke-Adb $adb ($sa + 'shell dumpsys package ' + $script:AppPkg)
+    if ($r.Out -match '(?m)^\s*versionName=(\S+)') { $a.Version = $Matches[1]; $a.Form = Get-AppForm $a.Version }
+    return $a
+}
+# アプリの口の adb forward のうち、このキットの形（新旧どちらか）をしている物の PC の口の番号
+function Get-AppLeftoverPorts($fw) {
+    $l = @()
+    foreach ($sp in (Get-AppPortSpecs)) {
+        $t = $fw[[string]$sp.Port]
+        if ($t -and ($t -eq $sp.New -or $t -eq $sp.Old)) { $l += $sp.Port }
+    }
+    return $l
+}
+# 今の状態の問題を数える。Quiet でなければ、画面にも出す。Problems の名前：
+#   GPU の口   norecv dup oldrecv portconflict fwdmissing fwdwrong fwdstale busy nohello
+#   アプリの口 appleft（アプリが無いのに残っている）・appfwdwrong（版に合わない向け方、または別の物を指す）・appfwdhalf（片方しか無い）・appfwdstale（口が開いていない）・appportconflict
+function Get-AndroidProblems($adb, [string]$serial, [int]$port, [string]$localHash, [bool]$Quiet) {
+    $r = @{ Problems = @(); Conflict = @(); AppFix = @(); AppLeft = @(); AppConflict = @(); AppRecv = $false; Hello = $null; Note = ''; App = $null }
+    $pr = New-Object System.Collections.Generic.List[string]
+    $out = { param([string]$kind, [string]$text) if (-not $Quiet) { switch ($kind) { 'ok' { Say-OK $text } 'ng' { Say-NG $text } default { Say-Info $text } } } }
+    $s = Get-AndroidState $adb $serial $port
+    $app = Get-AndroidApp $adb $serial
+    $r.App = $app
+    # アプリの中の受け手（端末の 50060）だけが動いている形：android\android_app.cmd が作る。キットの受け手は動いていない
+    $appRecv = ($s.Pids.Count -eq 0) -and $app.Installed -and ($s.Forward -eq 'tcp:50060')
+    $r.AppRecv = $appRecv
+    if ($s.Pids.Count -eq 0) {
+        if ($appRecv) { & $out 'ok' (M 'スマートフォンでは、PocketGPU アプリの中の受け手（端末の 50060）を使っています。' 'The phone uses the receiver inside the PocketGPU app (port 50060 on the phone).') }
+        else { $pr.Add('norecv'); & $out 'ng' (M 'スマートフォンで受け手（pgpu_server）が動いていません。' 'The receiver (pgpu_server) is not running on the phone.') }
+    }
+    elseif ($s.Pids.Count -gt 1) { $pr.Add('dup'); & $out 'ng' ((M 'スマートフォンで受け手（pgpu_server）が {0} 個、二重に動いています。PID：{1}' 'The receiver (pgpu_server) runs {0} times on the phone. PIDs: {1}') -f $s.Pids.Count, ($s.Pids -join ' ')) }
+    else { & $out 'ok' ((M 'スマートフォンで受け手が 1 個、動いています。PID {0}' 'One receiver runs on the phone. PID {0}') -f $s.Pids[0]) }
+    if ($s.Pids.Count -gt 0 -and $localHash -and $s.PhoneHash -and $s.PhoneHash -ne $localHash) {
+        $pr.Add('oldrecv'); & $out 'ng' (M 'スマートフォンで動いている受け手が、このキットの受け手（android\server_aarch64）と違います。古い受け手が残っています。' 'The receiver on the phone differs from the one in this kit (android\server_aarch64). An old receiver remains.')
+    }
+    $conflict = @($s.Owners | Where-Object { $_.Name -notmatch '^adb' })
+    $r.Conflict = $conflict
+    if ($conflict.Count -gt 0) {
+        $pr.Add('portconflict')
+        & $out 'ng' ((M 'PC の口 {0} を、adb ではないプログラムが使っています：' 'Port {0} on this PC is used by a program that is not adb: ') -f $port)
+        foreach ($o in $conflict) { & $out 'info' (Get-ProcLabel $o.Name $o.Pid $o.Exe) }
+    } elseif (-not $s.Forward) { $pr.Add('fwdmissing'); & $out 'ng' ((M '口 {0} の adb forward がありません。' 'There is no adb forward for port {0}.') -f $port) }
+    elseif ($s.Forward -ne ('tcp:' + $port) -and -not $appRecv) { $pr.Add('fwdwrong'); & $out 'ng' ((M '口 {0} の adb forward が、別の口 {1} を指しています。' 'The adb forward for port {0} points at another port, {1}.') -f $port, $s.Forward) }
+    elseif ($s.Owners.Count -eq 0) { $pr.Add('fwdstale'); & $out 'ng' ((M 'adb forward は残っていますが、PC の口 {0} が開いていません（adb が再起動したあと）。' 'The adb forward is listed but port {0} on this PC is not open (after an adb restart).') -f $port) }
+    else { & $out 'ok' ((M 'PC の口 {0} は adb の forward でスマートフォンにつながっています。' 'Port {0} on this PC is connected to the phone by adb forward.') -f $port) }
+
+    $hello = $null
+    if ($pr.Count -eq 0) {
+        $c = Connect-Tcp '127.0.0.1' $port 1500
+        if ($c) { try { $hello = Invoke-Hello $c 3000 } finally { $c.Close() } } else { $hello = @{ Ok = $false; Why = 'closed' } }
+        if ($hello.Ok) { & $out 'ok' ((M '受け手が応答しました：' 'The receiver answered: ') + $hello.Name) }
+        elseif ($hello.Why -eq 'timeout') { $pr.Add('busy'); & $out 'ng' (M '受け手が応答しません。PC のほかのプログラムが使っているか、前の接続が残っています。' 'The receiver does not answer. Another program on this PC is using it, or an old connection remains.') }
+        else {
+            $pr.Add('nohello'); & $out 'ng' (M '口はつながっていますが、受け手が答えません。' 'The port is connected but the receiver does not answer.')
+            if ($appRecv) { & $out 'info' (M 'アプリの中の受け手です。PocketGPU アプリを開いて、GPU がオンになっているか確かめてください。キットの受け手に切り替えることもできます。' 'This is the receiver inside the app. Open the PocketGPU app and check that GPU is on. You can also switch to the kit receiver.') }
+        }
+    }
+    $r.Hello = $hello
+
+    # ---- PocketGPU アプリのカメラとマイクの口 ----
+    $fw = Get-AdbForwards $adb
+    $specs = Get-AppPortSpecs
+    $form = $app.Form
+    if (-not $app.Installed) {
+        $left = @(Get-AppLeftoverPorts $fw)
+        if ($left.Count -gt 0) {
+            $pr.Add('appleft'); $r.AppLeft = $left
+            & $out 'ng' ((M 'PocketGPU アプリが入っていないのに、口 {0} の adb forward が残っています。' 'The PocketGPU app is not on the phone, but the adb forward for port(s) {0} remains.') -f ($left -join ' '))
+        }
+    } else {
+        $appInfo = $(if ($app.Version) { $app.Version } else { M '版を読めませんでした' 'version unknown' })
+        $present = @($specs | Where-Object { $fw.ContainsKey([string]$_.Port) })
+        if ($present.Count -eq 0) {
+            & $out 'info' ((M 'PocketGPU アプリ（{0}）：カメラとマイクの口は、まだ開いていません。使うときは android\android_app.cmd を実行してください。' 'PocketGPU app ({0}): the camera and mic ports are not open yet. To use them, run android\android_app.cmd.') -f $appInfo)
+        } else {
+            foreach ($sp in $specs) {
+                $t = $fw[[string]$sp.Port]
+                $want = $(if ($form -eq 'old') { $sp.Old } else { $sp.New })
+                $owners = @(Get-TcpOwners $sp.Port 'Listen')
+                $foreign = @($owners | Where-Object { $_.Name -notmatch '^adb' })
+                if ($foreign.Count -gt 0) {
+                    $pr.Add('appportconflict'); $r.AppFix += $sp
+                    $r.AppConflict += @($foreign | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Pid = $_.Pid; Exe = $_.Exe; Port = $sp.Port } })
+                    & $out 'ng' ((M 'PC の口 {0} を、adb ではないプログラムが使っています：' 'Port {0} on this PC is used by a program that is not adb: ') -f $sp.Port)
+                    foreach ($o in $foreign) { & $out 'info' (Get-ProcLabel $o.Name $o.Pid $o.Exe) }
+                } elseif (-not $t) {
+                    $pr.Add('appfwdhalf'); $r.AppFix += $sp
+                    & $out 'ng' ((M '{0} の口 {1} の adb forward がありません。カメラとマイクの組のもう片方はつながっています。' 'There is no adb forward for the {0} port {1}, but the other one of the camera and mic pair is connected.') -f $sp.Name, $sp.Port)
+                } elseif ($t -ne $sp.New -and $t -ne $sp.Old) {
+                    $pr.Add('appfwdwrong'); $r.AppFix += $sp
+                    & $out 'ng' ((M '{0} の口 {1} の adb forward が、別の物 {2} を指しています。' 'The adb forward for the {0} port {1} points at something else, {2}.') -f $sp.Name, $sp.Port, $t)
+                } elseif ($form -ne 'unknown' -and $t -ne $want) {
+                    $pr.Add('appfwdwrong'); $r.AppFix += $sp
+                    if ($form -eq 'new') { & $out 'ng' ((M '{0} の口 {1} が古い向け方（{2}）です。アプリ {3} は、設定で「古い PC のツールも受け付ける」をオンにしたときしか、古い向け方を受けません。' 'The {0} port {1} uses the old form ({2}). App {3} takes the old form only when "Also accept old PC tools" is on in its settings.') -f $sp.Name, $sp.Port, $t, $appInfo) }
+                    else { & $out 'ng' ((M '{0} の口 {1} が新しい向け方（{2}）です。アプリ {3} は、この向け方を受けません。' 'The {0} port {1} uses the new form ({2}). App {3} does not take this form.') -f $sp.Name, $sp.Port, $t, $appInfo) }
+                } elseif ($owners.Count -eq 0) {
+                    $pr.Add('appfwdstale'); $r.AppFix += $sp
+                    & $out 'ng' ((M 'adb forward は残っていますが、PC の口 {0} が開いていません（adb が再起動したあと）。' 'The adb forward is listed but port {0} on this PC is not open (after an adb restart).') -f $sp.Port)
+                } else {
+                    & $out 'ok' ((M '{0} の口 {1}：adb forward {2}（アプリ {3}）' 'The {0} port {1}: adb forward {2} (app {3})') -f $sp.Name, $sp.Port, $t, $appInfo)
+                }
+            }
+        }
+    }
+    $r.Problems = @($pr)
+    $r.Note = $(if ($hello -and $hello.Ok) { $hello.Name } elseif ($appRecv) { 'app receiver' } else { '' })
+    return $r
 }
 
 # ---- ウイルス対策の気配 ----
@@ -843,7 +984,7 @@ if (Want 'iphone') {
     }
 }
 
-# ==== 7. Android の受け手 ====
+# ==== 7. Android の受け手とアプリの口 ====
 if (Want 'android') {
     Say-Step 7 $script:Total (M 'Android の受け手' 'Android receiver')
     $t = M 'Android' 'Android'
@@ -864,20 +1005,25 @@ if (Want 'android') {
         foreach ($l in ($dl.Out -split "`r?`n" | Select-Object -Skip 1)) {
             if ($l -match '^(\S+)\s+(\S+)') { if ($Matches[2] -eq 'device') { $devices += $Matches[1] } else { $others += ($Matches[1] + ' ' + $Matches[2]) } }
         }
-        $fwd = Invoke-Adb $adb 'forward --list'
-        $hasFwd = $fwd.Out -match ('tcp:' + $port + '\s')
+        $fwdAll = Get-AdbForwards $adb
+        $hasFwd = $fwdAll.ContainsKey([string]$port)
+        $leftApp = @(Get-AppLeftoverPorts $fwdAll)
+        $leftAll = @()
+        if ($hasFwd) { $leftAll += $port }
+        $leftAll += $leftApp
         $serial = $(if ($env:ANDROID_SERIAL) { $env:ANDROID_SERIAL } elseif ($devices.Count -eq 1) { $devices[0] } else { '' })
         if ($devices.Count -eq 0) {
             if ($others | Where-Object { $_ -match 'unauthorized' }) {
                 Say-NG (M 'スマートフォンはつながっていますが、許可されていません。ロックを解除して、「USB デバッグを許可しますか？」で「許可」をタップしてください。' 'The phone is connected but not allowed. Unlock it and tap Allow on "Allow USB debugging?".')
                 Add-Result 'android' 'unfixed' $t (M '許可されていない（案内を出した）' 'not allowed (instructions shown)')
-            } elseif ($hasFwd) {
-                Say-NG ((M 'スマートフォンはつながっていないのに、口 {0} の adb forward が残っています。' 'No phone is connected, but the adb forward for port {0} remains.') -f $port)
+            } elseif ($leftAll.Count -gt 0) {
+                Say-NG ((M 'スマートフォンはつながっていないのに、口 {0} の adb forward が残っています。' 'No phone is connected, but the adb forward for port(s) {0} remains.') -f ($leftAll -join ' '))
                 Say-Info (M '直し方：残っている adb forward を外します（adb forward --remove）。' 'Fix: remove the leftover adb forward (adb forward --remove).')
                 if (Offer (M '残っている adb forward を外しますか？' 'Remove the leftover adb forward?')) {
-                    [void](Invoke-Adb $adb ('forward --remove tcp:' + $port))
-                    $f2 = Invoke-Adb $adb 'forward --list'
-                    if ($f2.Out -notmatch ('tcp:' + $port + '\s')) { Say-OK (M '外しました。' 'Removed.'); Add-Result 'android' 'fixed' $t (M '残っていた adb forward を外した' 'removed a leftover adb forward') }
+                    foreach ($lp in $leftAll) { [void](Invoke-Adb $adb ('forward --remove tcp:' + $lp)) }
+                    $f2 = Get-AdbForwards $adb
+                    $still = @($leftAll | Where-Object { $f2.ContainsKey([string]$_) })
+                    if ($still.Count -eq 0) { Say-OK (M '外しました。' 'Removed.'); Add-Result 'android' 'fixed' $t (M '残っていた adb forward を外した' 'removed a leftover adb forward') }
                     else { Add-Result 'android' 'unfixed' $t (M 'adb forward を外せなかった' 'could not remove the adb forward') }
                 } else { Add-Result 'android' 'unfixed' $t (M '古い adb forward が残っている' 'a leftover adb forward remains') }
             } else {
@@ -889,35 +1035,13 @@ if (Want 'android') {
             Add-Result 'android' 'unfixed' $t (M '端末が複数。ANDROID_SERIAL の指定が要る' 'several devices; ANDROID_SERIAL is needed')
         } else {
             $sa = '-s ' + $serial + ' '
-            $problems = @()
-            $s = Get-AndroidState $adb $serial $port
             $local = Join-Path $script:KitDir 'android\server_aarch64'
             $localHash = $(if (Test-Path -LiteralPath $local) { (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash.ToLowerInvariant() } else { '' })
-            if ($s.Pids.Count -eq 0) { $problems += 'norecv'; Say-NG (M 'スマートフォンで受け手（pgpu_server）が動いていません。' 'The receiver (pgpu_server) is not running on the phone.') }
-            elseif ($s.Pids.Count -gt 1) { $problems += 'dup'; Say-NG ((M 'スマートフォンで受け手（pgpu_server）が {0} 個、二重に動いています。PID：{1}' 'The receiver (pgpu_server) runs {0} times on the phone. PIDs: {1}') -f $s.Pids.Count, ($s.Pids -join ' ')) }
-            else { Say-OK ((M 'スマートフォンで受け手が 1 個、動いています。PID {0}' 'One receiver runs on the phone. PID {0}') -f $s.Pids[0]) }
-            if ($s.Pids.Count -gt 0 -and $localHash -and $s.PhoneHash -and $s.PhoneHash -ne $localHash) {
-                $problems += 'oldrecv'; Say-NG (M 'スマートフォンで動いている受け手が、このキットの受け手（android\server_aarch64）と違います。古い受け手が残っています。' 'The receiver on the phone differs from the one in this kit (android\server_aarch64). An old receiver remains.')
-            }
-            $conflict = @($s.Owners | Where-Object { $_.Name -notmatch '^adb' })
-            if ($conflict.Count -gt 0) {
-                $problems += 'portconflict'
-                Say-NG ((M 'PC の口 {0} を、adb ではないプログラムが使っています：' 'Port {0} on this PC is used by a program that is not adb: ') -f $port)
-                foreach ($o in $conflict) { Say-Info (Get-ProcLabel $o.Name $o.Pid $o.Exe) }
-            } elseif (-not $s.Forward) { $problems += 'fwdmissing'; Say-NG ((M '口 {0} の adb forward がありません。' 'There is no adb forward for port {0}.') -f $port) }
-            elseif ($s.Forward -ne ('tcp:' + $port)) { $problems += 'fwdwrong'; Say-NG ((M '口 {0} の adb forward が、別の口 {1} を指しています。' 'The adb forward for port {0} points at another port, {1}.') -f $port, $s.Forward) }
-            elseif ($s.Owners.Count -eq 0) { $problems += 'fwdstale'; Say-NG ((M 'adb forward は残っていますが、PC の口 {0} が開いていません（adb が再起動したあと）。' 'The adb forward is listed but port {0} on this PC is not open (after an adb restart).') -f $port) }
-            else { Say-OK ((M 'PC の口 {0} は adb の forward でスマートフォンにつながっています。' 'Port {0} on this PC is connected to the phone by adb forward.') -f $port) }
-
-            $hello = $null
-            if ($problems.Count -eq 0) {
-                $c = Connect-Tcp '127.0.0.1' $port 1500
-                if ($c) { try { $hello = Invoke-Hello $c 3000 } finally { $c.Close() } } else { $hello = @{ Ok = $false; Why = 'closed' } }
-                if ($hello.Ok) { Say-OK ((M '受け手が応答しました：' 'The receiver answered: ') + $hello.Name) }
-                elseif ($hello.Why -eq 'timeout') { $problems += 'busy'; Say-NG (M '受け手が応答しません。PC のほかのプログラムが使っているか、前の接続が残っています。' 'The receiver does not answer. Another program on this PC is using it, or an old connection remains.') }
-                else { $problems += 'nohello'; Say-NG (M '口はつながっていますが、受け手が答えません。' 'The port is connected but the receiver does not answer.') }
-            }
-            if ($problems.Count -eq 0) { Add-Result 'android' 'ok' $t $hello.Name }
+            $a1 = Get-AndroidProblems $adb $serial $port $localHash $false
+            $problems = @($a1.Problems)
+            $conflict = @($a1.Conflict)
+            $hello = $a1.Hello
+            if ($problems.Count -eq 0) { Add-Result 'android' 'ok' $t $(if ($a1.Note) { $a1.Note } else { 'ok' }) }
             else {
                 $acts = @()
                 $okAll = $true
@@ -952,23 +1076,45 @@ if (Want 'android') {
                     }
                     if (Offer (M 'adb forward をやり直しますか？' 'Redo the adb forward?')) {
                         [void](Invoke-Adb $adb ($sa + 'forward --remove tcp:' + $port))
-                        $r = Invoke-Adb $adb ($sa + 'forward tcp:' + $port + ' tcp:' + $port)
+                        $gpuDest = $(if ($a1.AppRecv) { 'tcp:50060' } else { 'tcp:' + $port })
+                        $r = Invoke-Adb $adb ($sa + 'forward tcp:' + $port + ' ' + $gpuDest)
                         if ($r.Exit -ne 0) { Say-NG ((M 'adb forward に失敗しました：{0}' 'adb forward failed: {0}') -f $r.Err.Trim()); $okAll = $false } else { $acts += 'redid adb forward' }
                     } else { $okAll = $false }
                 }
+                # 4) PocketGPU アプリのカメラとマイクの口：アプリの版に合う向け方でつなぎ直す。アプリが無いのに残っている物は外す
+                if ($problems -contains 'appleft') {
+                    Say-Info (M '直し方：残っている adb forward を外します（adb forward --remove）。' 'Fix: remove the leftover adb forward (adb forward --remove).')
+                    if (Offer (M 'PocketGPU アプリの口の、残っている adb forward を外しますか？' 'Remove the leftover adb forward for the PocketGPU app ports?')) {
+                        foreach ($lp in @($a1.AppLeft)) { [void](Invoke-Adb $adb ($sa + 'forward --remove tcp:' + $lp)) }
+                        $acts += 'removed leftover app forwards'
+                    } else { $okAll = $false }
+                }
+                if ($problems | Where-Object { $_ -in 'appfwdwrong', 'appfwdhalf', 'appfwdstale', 'appportconflict' }) {
+                    foreach ($o in @($a1.AppConflict)) {
+                        if (Offer ((M '{0} (PID {1}) を止めますか？ 口 {2} を adb が使えるようになります。' 'Stop {0} (PID {1})? Then adb can use port {2}.') -f $o.Name, $o.Pid, $o.Port)) {
+                            if (Stop-ByPid $o.Pid) { $acts += ('stopped ' + $o.Name + ' PID ' + $o.Pid); Say-OK ((M '止めました：PID {0}' 'Stopped: PID {0}') -f $o.Pid) }
+                        }
+                    }
+                    $formWord = $(if ($a1.App.Form -eq 'old') { M '古い向け方（アプリ 0.1.1 以前）' 'the old form (app 0.1.1 and older)' } else { M '新しい向け方（アプリ 0.1.2 以上。localabstract）' 'the new form (app 0.1.2 and newer, localabstract)' })
+                    Say-Info ((M '直し方：カメラとマイクの adb forward を、{0}でつなぎ直します。アプリは操作しません。' 'Fix: connect the camera and mic adb forward again in {0}. The app itself is not touched.') -f $formWord)
+                    if (Offer (M 'カメラとマイクの adb forward をやり直しますか？' 'Redo the camera and mic adb forward?')) {
+                        foreach ($sp in @($a1.AppFix)) {
+                            $dest = $(if ($a1.App.Form -eq 'old') { $sp.Old } else { $sp.New })
+                            [void](Invoke-Adb $adb ($sa + 'forward --remove tcp:' + $sp.Port))
+                            $r = Invoke-Adb $adb ($sa + 'forward tcp:' + $sp.Port + ' ' + $dest)
+                            if ($r.Exit -ne 0) { Say-NG ((M 'adb forward に失敗しました：{0}' 'adb forward failed: {0}') -f $r.Err.Trim()); $okAll = $false } else { $acts += ('redid ' + $sp.Name + ' forward ' + $dest) }
+                        }
+                    } else { $okAll = $false }
+                }
                 # 直ったかを確かめ直す
-                $s2 = Get-AndroidState $adb $serial $port
-                $c = Connect-Tcp '127.0.0.1' $port 1500
-                $h2 = $null
-                if ($c) { try { $h2 = Invoke-Hello $c 3000 } finally { $c.Close() } }
-                $good = ($s2.Pids.Count -eq 1) -and ($s2.Forward -eq ('tcp:' + $port)) -and $h2 -and $h2.Ok -and (-not $localHash -or -not $s2.PhoneHash -or $s2.PhoneHash -eq $localHash)
-                if ($good) {
-                    Say-OK ((M '直りました。受け手が応答しました：' 'Fixed. The receiver answered: ') + $h2.Name)
+                $a2 = Get-AndroidProblems $adb $serial $port $localHash $true
+                if ($a2.Problems.Count -eq 0) {
+                    Say-OK ((M '直りました。' 'Fixed. ') + $(if ($a2.Hello -and $a2.Hello.Ok) { (M '受け手が応答しました：' 'The receiver answered: ') + $a2.Hello.Name } else { '' }))
                     Add-Result 'android' 'fixed' $t ((M '直した：' 'fixed: ') + (Format-List2 $problems) + ' (' + (Format-List2 $acts) + ')')
                 } else {
                     Say-NG (M 'まだ直っていません。' 'Not fixed yet.')
-                    Say-Info (M 'スマートフォンのロックを解除して画面をつけたまま、android\stop_android.cmd のあとに android\start_android.cmd を実行してみてください。それでも直らないときは、受け手のログ（android\README_android.txt の「報告」）を送ってください。' 'With the phone unlocked and the screen on, run android\stop_android.cmd and then android\start_android.cmd. If it still fails, send the receiver log (see "Reporting" in android\README_android.txt).')
-                    Add-Result 'android' 'unfixed' $t ((M '直らなかった：' 'not fixed: ') + (Format-List2 $problems))
+                    Say-Info (M 'スマートフォンのロックを解除して画面をつけたまま、android\stop_android.cmd のあとに android\start_android.cmd を実行してみてください。アプリを使っているなら、android\android_app.cmd stop のあとに android\android_app.cmd を実行してください。それでも直らないときは、受け手のログ（android\README_android.txt の「報告」）を送ってください。' 'With the phone unlocked and the screen on, run android\stop_android.cmd and then android\start_android.cmd. If you use the app, run android\android_app.cmd stop and then android\android_app.cmd. If it still fails, send the receiver log (see "Reporting" in android\README_android.txt).')
+                    Add-Result 'android' 'unfixed' $t ((M '直らなかった：' 'not fixed: ') + (Format-List2 $a2.Problems))
                 }
             }
         }

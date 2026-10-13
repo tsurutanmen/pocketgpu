@@ -467,25 +467,64 @@ function Scn-IphoneOther([string]$mode) {
 }
 
 # Android：adb の状態は偽の adb.exe（状態ファイル）。PC の口は偽の adb が開く
-function New-AndroidKit([string]$name, [hashtable]$state, [bool]$withForward) {
+#   $more：最初から足しておく adb forward。@{ Port = 口; Target = 'tcp:50060' や 'localabstract:pocketgpu-webcam' } の並び
+function New-AndroidKit([string]$name, [hashtable]$state, [bool]$withForward, [object[]]$more = @()) {
     $kit = New-Kit $name
     $adb = New-FakeAdb
     $st = Join-Path (Split-Path -Parent $kit) 'adb-state.txt'
     $port = Get-FreePort
+    $cam = Get-FreePort
+    $aud = Get-FreePort
     $localHash = (Get-Sha (Join-Path $kit 'android\server_aarch64')).ToLowerInvariant()
     if ($state.hash -eq '@local') { $state.hash = $localHash }
     Set-AdbState $st $state
     $env:FAKE_ADB_STATE = $st
     try {
         if ($withForward) { & $adb forward "tcp:$port" "tcp:$port" | Out-Null }
+        foreach ($f in $more) {
+            $p = $(if ($f.Port -eq '@cam') { $cam } elseif ($f.Port -eq '@aud') { $aud } elseif ($f.Port -eq '@gpu') { $port } else { $f.Port })
+            & $adb forward "tcp:$p" $f.Target | Out-Null
+        }
     } finally { Remove-Item Env:\FAKE_ADB_STATE }
-    $s = Get-AdbState $st
-    if ($withForward -and $s.fwdpid) { $script:Spawned.Add([int]$s.fwdpid) }
-    return @{ Kit = $kit; Adb = $adb; State = $st; Port = $port; LocalHash = $localHash }
+    foreach ($id in (Get-FwdPids $st)) { $script:Spawned.Add($id) }
+    return @{ Kit = $kit; Adb = $adb; State = $st; Port = $port; CamPort = $cam; AudioPort = $aud; LocalHash = $localHash }
 }
 function Invoke-AndroidFix($k, [string]$answers, [string[]]$more = @()) {
-    return (Invoke-Fix $k.Kit (@('-Only', 'android') + $more) @{ ADB = $k.Adb; FAKE_ADB_STATE = $k.State; PGPU_PORT = $k.Port; IPHONE_VK_MUX = (Get-FreePort) } $answers)
+    return (Invoke-Fix $k.Kit (@('-Only', 'android') + $more) @{ ADB = $k.Adb; FAKE_ADB_STATE = $k.State; PGPU_PORT = $k.Port; PGPU_CAM_PORT = $k.CamPort; PGPU_AUDIO_PORT = $k.AudioPort; IPHONE_VK_MUX = (Get-FreePort) } $answers)
 }
+# 偽の adb の forward の一覧（状態ファイルから）：口 -> 向け先
+function Get-FwdMap([string]$statePath) {
+    $m = @{}
+    $s = Get-AdbState $statePath
+    if ($s.fwds) { foreach ($e in ($s.fwds -split ';')) { $p = $e -split '>'; if ($p.Count -ge 2) { $m[$p[0]] = $p[1] } } }
+    return $m
+}
+function Get-FwdPids([string]$statePath) {
+    $l = @()
+    $s = Get-AdbState $statePath
+    if ($s.fwds) { foreach ($e in ($s.fwds -split ';')) { $p = $e -split '>'; if ($p.Count -ge 3 -and $p[2] -match '^\d+$') { $l += [int]$p[2] } } }
+    return $l
+}
+# アプリの口につないで、偽のアプリの答え（webcam か audio）を読む。答えなければ空
+function Test-AppAnswer([int]$port) {
+    $c = New-Object Net.Sockets.TcpClient
+    try {
+        $ar = $c.BeginConnect('127.0.0.1', $port, $null, $null)
+        if (-not $ar.AsyncWaitHandle.WaitOne(1500)) { return '' }
+        $c.EndConnect($ar)
+        $s = $c.GetStream(); $s.ReadTimeout = 1500
+        $b = New-Object byte[] 64
+        $n = $s.Read($b, 0, 64)
+        if ($n -le 0) { return '' }
+        $t = [Text.Encoding]::ASCII.GetString($b, 0, $n)
+        if ($t -match '^PGFAKE-APP (\w+)') { return $Matches[1] } else { return '' }
+    } catch { return '' } finally { $c.Close() }
+}
+$script:AppNew = @{ Cam = 'localabstract:pocketgpu-webcam'; Aud = 'localabstract:pocketgpu-audio' }
+$script:AppOld = @{ Cam = 'tcp:50064'; Aud = 'tcp:50063' }
+# アプリが入っていて、アプリの中の受け手（50060）だけが動く形の端末の状態
+function New-AppState([string]$ver) { return @{ serial = 'EMU1'; dstate = 'device'; pids = ''; hash = ''; file = '0'; next = '7001'; app = $ver; apprecv = '1' } }
+
 function Scn-AndroidDupOld([string]$mode) {
     $k = New-AndroidKit "android-dup-$mode" @{ serial = 'EMU1'; dstate = 'device'; pids = '1111 2222'; hash = 'ab' * 32; file = '1'; next = '7001' } $true
     Use-Mode $mode $k.Kit
@@ -498,12 +537,14 @@ function Scn-AndroidDupOld([string]$mode) {
     else { Check '断ったので二重のまま・終わりのコード 1' (($s.pids -eq '1111 2222') -and $r.Exit -eq 1) 'safety' }
 }
 function Scn-AndroidStaleFwd([string]$mode) {
-    $k = New-AndroidKit "android-stale-$mode" @{ serial = ''; pids = ''; hash = ''; file = '0'; next = '7001' } $true
+    # 端末が無いのに、GPU の口と、アプリのカメラとマイクの口（新旧の両方の形）が残っている
+    $k = New-AndroidKit "android-stale-$mode" @{ serial = ''; pids = ''; hash = ''; file = '0'; next = '7001' } $true @(
+        @{ Port = '@cam'; Target = $script:AppNew.Cam }, @{ Port = '@aud'; Target = $script:AppOld.Aud })
     Use-Mode $mode $k.Kit
     $r = Invoke-AndroidFix $k (Get-Mode $mode 'y')
-    $s = Get-AdbState $k.State
-    Check '端末が無いのに残っていた adb forward が外れ、口も閉じる' (($s.forward -eq '') -and (Wait-Until { -not (Test-Port $k.Port) } 4))
-    if ($mode -eq 'decline') { Check '断ったので残ったまま' ($s.forward -ne '') 'safety' }
+    $m = Get-FwdMap $k.State
+    Check '端末が無いのに残っていた adb forward（GPU の口・カメラ・マイク）が全部外れ、口も閉じる' (($m.Count -eq 0) -and (Wait-Until { -not (Test-Port $k.Port) -and -not (Test-Port $k.CamPort) -and -not (Test-Port $k.AudioPort) } 4))
+    if ($mode -eq 'decline') { Check '断ったので 3 つとも残ったまま' ($m.Count -eq 3) 'safety' }
 }
 function Scn-AndroidPortConflict([string]$mode) {
     $k = New-AndroidKit "android-port-$mode" @{ serial = 'EMU1'; dstate = 'device'; pids = '1111'; hash = '@local'; file = '1'; next = '7001' } $false
@@ -519,9 +560,201 @@ function Scn-AndroidFwdMissing([string]$mode) {
     Use-Mode $mode $k.Kit
     $r = Invoke-AndroidFix $k (Get-Mode $mode 'y')
     $s = Get-AdbState $k.State
-    if ($s.fwdpid) { $script:Spawned.Add([int]$s.fwdpid) }
+    foreach ($id in (Get-FwdPids $k.State)) { $script:Spawned.Add($id) }
     Check 'adb forward が作り直され、応答する' (Test-Hello $k.Port)
     Check '受け手（スマートフォン側）には触れていない（PID・SHA がそのまま）' (($s.pids -eq '1111') -and ($s.hash -eq $k.LocalHash)) 'safety'
+}
+
+# アプリ 0.1.2：カメラとマイクの口が古い向け方（tcp:50064・tcp:50063）のまま -> 新しい向け方（localabstract）につなぎ直す。GPU はアプリの受け手（50060）で動いたまま
+function Scn-AndroidAppOldFormOnNew([string]$mode) {
+    $k = New-AndroidKit "android-app-oldform-$mode" (New-AppState '0.1.2') $false @(
+        @{ Port = '@gpu'; Target = 'tcp:50060' }, @{ Port = '@cam'; Target = $script:AppOld.Cam }, @{ Port = '@aud'; Target = $script:AppOld.Aud })
+    Check '準備：アプリ 0.1.2 は古い向け方を断る（偽のアプリが答えない）' ((Test-AppAnswer $k.CamPort) -eq '') 'safety'
+    Use-Mode $mode $k.Kit
+    $r = Invoke-AndroidFix $k (Get-Mode $mode 'y')
+    $m = Get-FwdMap $k.State
+    foreach ($id in (Get-FwdPids $k.State)) { $script:Spawned.Add($id) }
+    Check 'カメラとマイクの adb forward が新しい向け方（localabstract）になる' (($m[[string]$k.CamPort] -eq $script:AppNew.Cam) -and ($m[[string]$k.AudioPort] -eq $script:AppNew.Aud))
+    Check 'PC の口で、アプリがカメラ・マイクとして応答する（実際につないで確認）' (((Test-AppAnswer $k.CamPort) -eq 'webcam') -and ((Test-AppAnswer $k.AudioPort) -eq 'audio'))
+    Check 'GPU の口はアプリの受け手（tcp:50060）のまま・応答する（触れていない）' (($m[[string]$k.Port] -eq 'tcp:50060') -and (Test-Hello $k.Port)) 'safety'
+    Check 'アプリ（版・受け手）には触れていない' ((Get-AdbState $k.State).app -eq '0.1.2' -and (Get-AdbState $k.State).apprecv -eq '1') 'safety'
+    if ($mode -eq 'fix') { Check 'まとめに「直った」・終わりのコード 0' (($r.Summary -match '\[直った\] Android') -and $r.Exit -eq 0) 'safety' }
+    else { Check '直していないので、終わりのコード 1・古い向け方のまま' (($r.Exit -eq 1) -and ($m[[string]$k.CamPort] -eq $script:AppOld.Cam)) 'safety' }
+}
+# アプリ 0.1.1：新しい向け方（localabstract）で作られている -> 古い向け方につなぎ直す
+function Scn-AndroidAppNewFormOnOld([string]$mode) {
+    $k = New-AndroidKit "android-app-newform-$mode" (New-AppState '0.1.1') $false @(
+        @{ Port = '@gpu'; Target = 'tcp:50060' }, @{ Port = '@cam'; Target = $script:AppNew.Cam }, @{ Port = '@aud'; Target = $script:AppNew.Aud })
+    Use-Mode $mode $k.Kit
+    $r = Invoke-AndroidFix $k (Get-Mode $mode 'y')
+    $m = Get-FwdMap $k.State
+    foreach ($id in (Get-FwdPids $k.State)) { $script:Spawned.Add($id) }
+    Check 'カメラとマイクの adb forward が古い向け方（tcp:50064・tcp:50063）になる' (($m[[string]$k.CamPort] -eq $script:AppOld.Cam) -and ($m[[string]$k.AudioPort] -eq $script:AppOld.Aud))
+    Check 'PC の口で、アプリ 0.1.1 がカメラ・マイクとして応答する（実際につないで確認）' (((Test-AppAnswer $k.CamPort) -eq 'webcam') -and ((Test-AppAnswer $k.AudioPort) -eq 'audio'))
+    Check 'GPU の口はアプリの受け手（tcp:50060）のまま（触れていない）' ($m[[string]$k.Port] -eq 'tcp:50060') 'safety'
+}
+# カメラだけつながっていて、マイクの口が無い（欠け）-> 版に合う向け方で足す
+function Scn-AndroidAppHalf([string]$mode) {
+    $k = New-AndroidKit "android-app-half-$mode" (New-AppState '0.1.2') $false @(
+        @{ Port = '@gpu'; Target = 'tcp:50060' }, @{ Port = '@cam'; Target = $script:AppNew.Cam })
+    Use-Mode $mode $k.Kit
+    $r = Invoke-AndroidFix $k (Get-Mode $mode 'y')
+    $m = Get-FwdMap $k.State
+    foreach ($id in (Get-FwdPids $k.State)) { $script:Spawned.Add($id) }
+    Check '無かったマイクの adb forward が、新しい向け方で足され、応答する' (($m[[string]$k.AudioPort] -eq $script:AppNew.Aud) -and ((Test-AppAnswer $k.AudioPort) -eq 'audio'))
+    Check 'つながっていたカメラの口は、そのまま応答する' ((Test-AppAnswer $k.CamPort) -eq 'webcam') 'safety'
+}
+# adb forward の一覧には残っているが、PC の口が開いていない（adb の再起動のあと）-> つなぎ直す
+function Scn-AndroidAppStale([string]$mode) {
+    $k = New-AndroidKit "android-app-stale-$mode" (New-AppState '0.1.2') $false @(
+        @{ Port = '@gpu'; Target = 'tcp:50060' }, @{ Port = '@cam'; Target = $script:AppNew.Cam }, @{ Port = '@aud'; Target = $script:AppNew.Aud })
+    # 口を開けている偽の adb（この試験が起こした物）だけを止める。一覧には残る
+    $camPid = [int](((Get-AdbState $k.State).fwds -split ';' | Where-Object { $_ -like ($k.CamPort.ToString() + '>*') }) -split '>')[2]
+    Stop-Process -Id $camPid -Force
+    Check '準備：カメラの口が閉じ、一覧には残っている' ((Wait-Until { -not (Test-Port $k.CamPort) } 4) -and (Get-FwdMap $k.State).ContainsKey([string]$k.CamPort)) 'safety'
+    Use-Mode $mode $k.Kit
+    $r = Invoke-AndroidFix $k (Get-Mode $mode 'y')
+    foreach ($id in (Get-FwdPids $k.State)) { $script:Spawned.Add($id) }
+    Check '閉じていたカメラの口が開き直り、アプリが応答する' ((Test-AppAnswer $k.CamPort) -eq 'webcam')
+    Check '閉じていなかったマイクの口は、そのまま応答する' ((Test-AppAnswer $k.AudioPort) -eq 'audio') 'safety'
+}
+# アプリの口を、adb ではないプログラムが使っている（一覧には残っている）-> 止めてから、つなぎ直す
+function Scn-AndroidAppConflict([string]$mode) {
+    $k = New-AndroidKit "android-app-conflict-$mode" (New-AppState '0.1.2') $false @(
+        @{ Port = '@gpu'; Target = 'tcp:50060' }, @{ Port = '@aud'; Target = $script:AppNew.Aud })
+    # カメラの口は、一覧にだけ書いて（口を開ける偽の adb は無し）、別のプログラムに握らせる
+    $s = Get-AdbState $k.State
+    $s.fwds = $s.fwds + ';' + $k.CamPort + '>' + $script:AppNew.Cam + '>0'
+    Set-AdbState $k.State $s
+    $blocker = Start-Blocker $k.CamPort
+    Use-Mode $mode $k.Kit
+    $r = Invoke-AndroidFix $k (Get-Mode $mode 'y,y')
+    foreach ($id in (Get-FwdPids $k.State)) { $script:Spawned.Add($id) }
+    Check '口を使っていた adb ではないプログラムが止まり、カメラの口がつながって応答する' ((-not (Test-Alive $blocker.Id)) -and ((Test-AppAnswer $k.CamPort) -eq 'webcam'))
+    if ($mode -eq 'decline') { Check '断ったので別のプログラムは生きている' (Test-Alive $blocker.Id) 'safety' }
+}
+# アプリが入っていないのに、カメラとマイクの口が残っている -> 外す。GPU の口（キットの受け手）は残す
+function Scn-AndroidAppLeft([string]$mode) {
+    $k = New-AndroidKit "android-app-left-$mode" @{ serial = 'EMU1'; dstate = 'device'; pids = '1111'; hash = '@local'; file = '1'; next = '7001' } $true @(
+        @{ Port = '@cam'; Target = $script:AppNew.Cam }, @{ Port = '@aud'; Target = $script:AppOld.Aud })
+    Use-Mode $mode $k.Kit
+    $r = Invoke-AndroidFix $k (Get-Mode $mode 'y')
+    $m = Get-FwdMap $k.State
+    Check 'アプリが無いのに残っていたカメラとマイクの adb forward が外れ、口も閉じる' (($m.ContainsKey([string]$k.CamPort) -eq $false) -and ($m.ContainsKey([string]$k.AudioPort) -eq $false) -and (Wait-Until { -not (Test-Port $k.CamPort) -and -not (Test-Port $k.AudioPort) } 4))
+    Check 'GPU の口（キットの受け手）は残り、応答する' (($m.ContainsKey([string]$k.Port)) -and (Test-Hello $k.Port)) 'safety'
+}
+# 何も壊れていない：アプリ 0.1.2 の新しい向け方・アプリ 0.1.1 の古い向け方・版が読めない（どちらの向け方も触らない）
+function Scn-PristineApp([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $cases = @(
+        @{ Name = 'new'; Ver = '0.1.2'; Cam = $script:AppNew.Cam; Aud = $script:AppNew.Aud },
+        @{ Name = 'old'; Ver = '0.1.1'; Cam = $script:AppOld.Cam; Aud = $script:AppOld.Aud },
+        @{ Name = 'unknown-old-form'; Ver = 'dev'; Cam = $script:AppOld.Cam; Aud = $script:AppOld.Aud },
+        @{ Name = 'unknown-new-form'; Ver = 'dev'; Cam = $script:AppNew.Cam; Aud = $script:AppNew.Aud })
+    foreach ($c in $cases) {
+        $k = New-AndroidKit ('pristine-app-' + $c.Name) (New-AppState $c.Ver) $false @(
+            @{ Port = '@gpu'; Target = 'tcp:50060' }, @{ Port = '@cam'; Target = $c.Cam }, @{ Port = '@aud'; Target = $c.Aud })
+        $before = Get-FwdMap $k.State
+        $r = Invoke-AndroidFix $k 'n,n,n'
+        $after = Get-FwdMap $k.State
+        $same = ($before.Count -eq $after.Count) -and (@($before.Keys | Where-Object { $before[$_] -ne $after[$_] }).Count -eq 0)
+        Check ('正常（アプリ ' + $c.Ver + '・' + $c.Name + '）：誤検出なし・adb forward は何も変わらない・終わりのコード 0') (($r.Exit -eq 0) -and $same -and ($r.Summary -match '直った 0 / 直らなかった 0 / 気をつけたい 0 / 問題なし 1')) 'safety'
+        Stop-Spawned
+    }
+}
+# android\android_app.cmd を、偽の adb で動かす。版に合う向け方を選ぶこと、選べないときの決め方、stop
+function Invoke-AppCmd($k, [string]$cmdArgs = '', [hashtable]$envs = @{}) {
+    $cmd = Join-Path $k.Kit 'android\android_app.cmd'
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $env:ComSpec
+    $psi.Arguments = '/c ""' + $cmd + '" ' + $cmdArgs + '"'
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    $psi.WorkingDirectory = $Work
+    foreach ($key in @($psi.EnvironmentVariables.Keys)) { if ($key -like 'PGPU_*' -or $key -in 'ADB', 'ANDROID_SERIAL', 'FAKE_ADB_STATE', 'FAKE_ADB_LOG') { $psi.EnvironmentVariables.Remove($key) } }
+    $base = @{ ADB = $k.Adb; FAKE_ADB_STATE = $k.State; FAKE_ADB_LOG = (Join-Path (Split-Path -Parent $k.Kit) 'adb-calls.txt'); PGPU_NOPAUSE = '1'
+               PGPU_PORT = $k.Port; PGPU_CAM_PORT = $k.CamPort; PGPU_AUDIO_PORT = $k.AudioPort }
+    foreach ($key in $base.Keys) { $psi.EnvironmentVariables[$key] = [string]$base[$key] }
+    foreach ($key in $envs.Keys) { $psi.EnvironmentVariables[$key] = [string]$envs[$key] }
+    $p = [Diagnostics.Process]::Start($psi)
+    $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit(60000)) { try { $p.Kill() } catch { }; return @{ Exit = -99; Out = $o.Result; Err = 'TIMEOUT'; Calls = '' } }
+    [void]$p.WaitForExit()
+    foreach ($id in (Get-FwdPids $k.State)) { if (-not $script:Spawned.Contains($id)) { $script:Spawned.Add($id) } }
+    $calls = $(if (Test-Path $base.FAKE_ADB_LOG) { [IO.File]::ReadAllText($base.FAKE_ADB_LOG) } else { '' })
+    return @{ Exit = $p.ExitCode; Out = $o.Result + $e.Result; Calls = $calls }
+}
+function Scn-AndroidAppCmd([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $idle = @{ serial = 'EMU1'; dstate = 'device'; pids = ''; hash = ''; file = '0'; next = '7001' }
+    # 1) アプリ 0.1.2：新しい向け方
+    $s = $idle.Clone(); $s.app = '0.1.2'
+    $k = New-AndroidKit 'appcmd-new' $s $false
+    $r = Invoke-AppCmd $k
+    $m = Get-FwdMap $k.State
+    Check 'android_app.cmd・アプリ 0.1.2：localabstract の向け方でつなぎ、PC の口でアプリが応答する' (($r.Exit -eq 0) -and ($m[[string]$k.CamPort] -eq $script:AppNew.Cam) -and ($m[[string]$k.AudioPort] -eq $script:AppNew.Aud) -and ((Test-AppAnswer $k.CamPort) -eq 'webcam') -and ((Test-AppAnswer $k.AudioPort) -eq 'audio')) 'safety'
+    Check 'android_app.cmd・アプリ 0.1.2：GPU の口は、キットの受け手が無いので、アプリの受け手（tcp:50060）へ' (($m[[string]$k.Port] -eq 'tcp:50060') -and (Test-Hello $k.Port)) 'safety'
+    Check 'android_app.cmd・アプリ 0.1.2：古い向け方の forward は 1 回も打たない' ($r.Calls -notmatch 'forward tcp:\d+ tcp:5006[34]') 'safety'
+    $r2 = Invoke-AppCmd $k 'stop'
+    Check 'android_app.cmd stop：3 つの adb forward が外れる' (($r2.Exit -eq 0) -and ((Get-FwdMap $k.State).Count -eq 0)) 'safety'
+    Stop-Spawned
+    # 2) アプリ 0.1.1：古い向け方。行末が CR CR LF の古い adb でも版を読める
+    $s = $idle.Clone(); $s.app = '0.1.1'; $s.crlf = '1'
+    $k = New-AndroidKit 'appcmd-old' $s $false
+    $r = Invoke-AppCmd $k
+    $m = Get-FwdMap $k.State
+    Check 'android_app.cmd・アプリ 0.1.1：tcp:50064・tcp:50063 の向け方でつなぎ、PC の口でアプリが応答する（行末 CR CR LF の adb でも）' (($r.Exit -eq 0) -and ($m[[string]$k.CamPort] -eq $script:AppOld.Cam) -and ($m[[string]$k.AudioPort] -eq $script:AppOld.Aud) -and ((Test-AppAnswer $k.CamPort) -eq 'webcam') -and ((Test-AppAnswer $k.AudioPort) -eq 'audio')) 'safety'
+    Check 'android_app.cmd・アプリ 0.1.1：古いアプリだと知らせ、更新のしかたを出す' ($r.Out -match 'The app on the phone is old') 'safety'
+    Stop-Spawned
+    # 3) 版の読めない形（0.1.10・0.2.0・1.0・0.1.2-debug は新、0.0.9・0.1 は古い）
+    foreach ($v in @(@('0.1.10', 'new'), @('0.2.0', 'new'), @('1.0', 'new'), @('0.1.2-debug', 'new'), @('0.0.9', 'old'), @('0.1', 'old'))) {
+        $s = $idle.Clone(); $s.app = $v[0]
+        $k = New-AndroidKit ('appcmd-ver-' + $v[0]) $s $false
+        $r = Invoke-AppCmd $k
+        $m = Get-FwdMap $k.State
+        $want = $(if ($v[1] -eq 'new') { $script:AppNew.Cam } else { $script:AppOld.Cam })
+        Check ('android_app.cmd・アプリ ' + $v[0] + ' は ' + $v[1] + ' の向け方を選ぶ') (($r.Exit -eq 0) -and ($m[[string]$k.CamPort] -eq $want)) 'safety'
+        Stop-Spawned
+    }
+    # 4) 版が読めない（dumpsys が何も返さない）：新しい向け方。adb が新しい向け方を断ったら、古い向け方
+    $s = $idle.Clone(); $s.app = 'dev'
+    $k = New-AndroidKit 'appcmd-unknown' $s $false
+    $r = Invoke-AppCmd $k
+    Check 'android_app.cmd・版が読めない：新しい向け方を先に使う' (((Get-FwdMap $k.State)[[string]$k.CamPort] -eq $script:AppNew.Cam)) 'safety'
+    Stop-Spawned
+    $s = $idle.Clone(); $s.app = 'dev'; $s.refuse_abstract = '1'
+    $k = New-AndroidKit 'appcmd-refuse' $s $false
+    $r = Invoke-AppCmd $k
+    $m = Get-FwdMap $k.State
+    Check 'android_app.cmd・adb が新しい向け方を断ったら、古い向け方に切り替える' (($r.Exit -eq 0) -and ($m[[string]$k.CamPort] -eq $script:AppOld.Cam) -and ($m[[string]$k.AudioPort] -eq $script:AppOld.Aud) -and ($r.Calls -match 'localabstract')) 'safety'
+    Stop-Spawned
+    $s = $idle.Clone(); $s.app = '0.1.2'; $s.refuse_abstract = '1'
+    $k = New-AndroidKit 'appcmd-refuse-forced' $s $false
+    $r = Invoke-AppCmd $k '' @{ PGPU_APP_FORWARD = 'new' }
+    Check 'android_app.cmd・PGPU_APP_FORWARD=new で断られたら、古い向け方に切り替えずに失敗する' (($r.Exit -eq 1) -and ((Get-FwdMap $k.State).Count -eq 0)) 'safety'
+    Stop-Spawned
+    # 5) PGPU_APP_FORWARD=old で、0.1.2 のアプリにも古い向け方（設定で古いツールを受け付けるとき）
+    $s = $idle.Clone(); $s.app = '0.1.2'; $s.legacy = '1'
+    $k = New-AndroidKit 'appcmd-forced-old' $s $false
+    $r = Invoke-AppCmd $k '' @{ PGPU_APP_FORWARD = 'old' }
+    Check 'android_app.cmd・PGPU_APP_FORWARD=old：古い向け方で、設定がオンの 0.1.2 のアプリが応答する' (((Get-FwdMap $k.State)[[string]$k.CamPort] -eq $script:AppOld.Cam) -and ((Test-AppAnswer $k.CamPort) -eq 'webcam')) 'safety'
+    Stop-Spawned
+    # 6) キットの受け手が動いていれば、GPU の口はそちらへ
+    $s = $idle.Clone(); $s.app = '0.1.2'; $s.pids = '1111'; $s.file = '1'; $s.hash = 'ab' * 32
+    $k = New-AndroidKit 'appcmd-kitrecv' $s $false
+    $r = Invoke-AppCmd $k
+    $m = Get-FwdMap $k.State
+    Check 'android_app.cmd・キットの受け手が動いているときは、GPU の口をキットの受け手（tcp:口）へ向け、アプリの受け手は起こされない' (($m[[string]$k.Port] -eq ('tcp:' + $k.Port)) -and (Test-Hello $k.Port) -and ((Get-AdbState $k.State).apprecv -eq '0')) 'safety'
+    Stop-Spawned
+    # 7) アプリが入っていない
+    $s = $idle.Clone()
+    $k = New-AndroidKit 'appcmd-noapp' $s $false
+    $r = Invoke-AppCmd $k
+    Check 'android_app.cmd・アプリが入っていなければ、入れ方を出して終わりのコード 1・adb forward は作らない' (($r.Exit -eq 1) -and ($r.Out -match 'not installed') -and ((Get-FwdMap $k.State).Count -eq 0)) 'safety'
+    # 8) 端末が無い stop：口は閉じる
+    $s = $idle.Clone(); $s.serial = ''
+    $k = New-AndroidKit 'appcmd-stop-nodev' $s $true @(@{ Port = '@cam'; Target = $script:AppNew.Cam })
+    $r = Invoke-AppCmd $k 'stop'
+    Check 'android_app.cmd stop・端末が無くても PC の口は閉じる（終わりのコードは 1）' (($r.Exit -eq 1) -and ((Get-FwdMap $k.State).Count -eq 0)) 'safety'
 }
 
 # iPhone の GPU が見えない -> 原因の案内。ウイルス対策の気配
@@ -601,7 +834,7 @@ function Scn-Pristine([string]$mode) {
     [void](Start-FakeMux $mux)
     Wait-Until { Test-Port $mux } 10 | Out-Null
     $before = Get-TreeHash $k.Kit
-    $r = Invoke-Fix $k.Kit @() @{ IPHONE_VK_MUX = $mux; ADB = $k.Adb; FAKE_ADB_STATE = $k.State; PGPU_PORT = $k.Port } 'n,n,n,n'
+    $r = Invoke-Fix $k.Kit @() @{ IPHONE_VK_MUX = $mux; ADB = $k.Adb; FAKE_ADB_STATE = $k.State; PGPU_PORT = $k.Port; PGPU_CAM_PORT = $k.CamPort; PGPU_AUDIO_PORT = $k.AudioPort } 'n,n,n,n'
     Check '正常なキット・正常な環境では、8 項目すべてが「問題なし」（誤検出なし）・何も変わらない' (($r.Exit -eq 0) -and ((Get-TreeHash $k.Kit) -eq $before) -and ($r.Summary -match '直った 0 / 直らなかった 0 / 気をつけたい 0') -and ((Get-Launch $k.Kit) -notmatch '(?m)^(url|app|service) ')) 'safety'
 }
 # 管理者権限で動いているふり -> 直せないので案内だけ（iPhone の GPU の確認は対象外）
@@ -645,6 +878,14 @@ $scenarios = [ordered]@{
     'android-stale' = { param($m) Scn-AndroidStaleFwd $m }
     'android-port'  = { param($m) Scn-AndroidPortConflict $m }
     'android-fwd'   = { param($m) Scn-AndroidFwdMissing $m }
+    'android-app-oldform' = { param($m) Scn-AndroidAppOldFormOnNew $m }
+    'android-app-newform' = { param($m) Scn-AndroidAppNewFormOnOld $m }
+    'android-app-half'    = { param($m) Scn-AndroidAppHalf $m }
+    'android-app-stale'   = { param($m) Scn-AndroidAppStale $m }
+    'android-app-conflict' = { param($m) Scn-AndroidAppConflict $m }
+    'android-app-left'    = { param($m) Scn-AndroidAppLeft $m }
+    'android-app-cmd'     = { param($m) Scn-AndroidAppCmd $m }
+    'pristine-app'        = { param($m) Scn-PristineApp $m }
     'gpu-av'        = { param($m) Scn-GpuAv $m }
     'checkonly'     = { param($m) Scn-CheckOnly $m }
     'privacy'       = { param($m) Scn-Privacy $m }
