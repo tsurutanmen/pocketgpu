@@ -29,7 +29,8 @@ IPA_DIR = os.environ.get('PGKIT_IPA_DIR', r'D:\iphone-rpc\ipa\serve')
 OUT = os.environ.get('PGKIT_OUT', r'D:\iphone-rpc\tester_kit')
 ANDROID_DIR = r'D:\iphone-rpc\androidbuild'   # app\vk\build_android.sh で組んだ受け手（server_aarch64 と server_x86_64）
 ANDROID_APK = r'D:\iphone-rpc\work\android_app\out\pocketgpu.apk'   # work\android_app\build_apk.sh で組んだ PocketGPU アプリ（Android）
-ANDROID_APK_MIN = (0, 1, 2)   # これより古い版のアプリはキットに入れない。0.1.2 からカメラとマイクの口が localabstract に変わった（android_app.cmd が版を見て向け方を選ぶ）
+ANDROID_APK_MIN = (0, 1, 4)   # これより古い版のアプリはキットに入れない。0.1.2 からカメラとマイクの口が、0.1.4 から GPU の口も localabstract に変わった（android_app.cmd が版を見て向け方を選ぶ）。
+                              # 0.1.3 までは端末の 50060 が使えないと GPU の受け手がすぐ終わった（10/14 テスターの Redmagic 9S Pro）。0.1.4 は次の番号と localabstract:pocketgpu-gpu でも待つ
 AAPT2 = r'D:\android-sdk\build-tools\35.0.0\aapt2.exe'   # APK の版を読む。無ければ版の確認だけ飛ばす
 PLACE = b'PGKIT-MARK:' + b'#' * 32
 PROTO_H = os.environ.get('PGKIT_PROTO_H', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'vk', 'remote', 'proto.h'))
@@ -406,8 +407,13 @@ rem   If the version cannot be read it uses the new form. If adb refuses the new
 rem   To choose the form yourself:   set PGPU_APP_FORWARD=new   or   set PGPU_APP_FORWARD=old
 rem   The 0.1.2 app also takes the old form when "Also accept old PC tools" is on in the app settings. It is off by default.
 rem Other ports:   set PGPU_CAM_PORT=50064   set PGPU_AUDIO_PORT=50063   set PGPU_PORT=50300
-rem GPU: nothing changed. If the kit receiver from android\start_android.cmd is running on the phone, the app does not
-rem   start its own receiver and the kit receiver is used. Otherwise port %PGPU_PORT% goes to the receiver inside the app (port 50060).
+rem GPU: if the kit receiver from android\start_android.cmd is running on the phone, the app does not start its own
+rem   receiver and port %PGPU_PORT% goes to the kit receiver (tcp:%PGPU_PORT%). Otherwise it goes to the receiver inside the app:
+rem   app 0.1.4 and newer:   adb forward tcp:50300 localabstract:pocketgpu-gpu   (no port number on the phone, so nothing else can be in the way)
+rem   app 0.1.3 and older:   adb forward tcp:50300 tcp:50060
+rem   If the version cannot be read it uses tcp:50060 (the 0.1.4 app also listens there when 50060 is free on the phone).
+rem   If adb refuses the localabstract form it uses tcp:50060.
+rem   To choose the GPU form yourself:   set PGPU_APP_GPU=usb   or   set PGPU_APP_GPU=tcp
 setlocal
 call "%~dp0_common.cmd"
 if errorlevel 1 goto nodev
@@ -425,6 +431,8 @@ set "APPVER="
 for /f "tokens=1,2 delims== " %%U in ('"%ADB%" shell dumpsys package %PKG%') do if "%%U"=="versionName" if not defined APPVER set "APPVER=%%V"
 set "FORM=new"
 set "FORMBY=the app version could not be read"
+set "GPUFORM=tcp"
+set "GPUOLD="
 set "V1="
 set "V2="
 set "V3="
@@ -437,6 +445,8 @@ if errorlevel 1 goto ver_done
 set /a VN=1000000*%V1%+1000*%V2%+%V3%
 set "FORMBY=app version %APPVER%"
 if %VN% LSS 1002 set "FORM=old"
+if %VN% GEQ 1004 set "GPUFORM=usb"
+if %VN% LSS 1004 set "GPUOLD=1"
 :ver_done
 set "FORCED="
 if /i "%PGPU_APP_FORWARD%"=="new" set "FORM=new"
@@ -462,14 +472,32 @@ set "FORMBY=adb refused the new form"
 "%ADB%" forward tcp:%PGPU_AUDIO_PORT% tcp:50063 >nul || goto forward_failed
 :fwd_done
 
+rem ---- GPU: the kit receiver if it runs, else the receiver inside the app in the form for this app version ----
+set "GPU_FORCED="
+if /i "%PGPU_APP_GPU%"=="usb" set "GPUFORM=usb"
+if /i "%PGPU_APP_GPU%"=="usb" set "GPU_FORCED=1"
+if /i "%PGPU_APP_GPU%"=="tcp" set "GPUFORM=tcp"
+if /i "%PGPU_APP_GPU%"=="tcp" set "GPU_FORCED=1"
 set "GPU_TARGET=tcp:50060"
-set "GPU_WHO=the app receiver"
+set "GPU_WHO=the app receiver, port 50060 on the phone"
+if "%GPUFORM%"=="usb" set "GPU_TARGET=localabstract:pocketgpu-gpu"
+if "%GPUFORM%"=="usb" set "GPU_WHO=the app receiver, USB port pocketgpu-gpu"
 "%ADB%" shell pidof pgpu_server | findstr /r "[0-9]" >nul
 if errorlevel 1 goto gpu_forward
 set "GPU_TARGET=tcp:%PGPU_PORT%"
 set "GPU_WHO=the kit receiver started by android\start_android.cmd"
+set "GPU_FORCED=1"
+set "GPUOLD="
 :gpu_forward
-"%ADB%" forward tcp:%PGPU_PORT% %GPU_TARGET% >nul || goto forward_failed
+"%ADB%" forward tcp:%PGPU_PORT% %GPU_TARGET% >nul 2>&1
+if not errorlevel 1 goto gpu_done
+if defined GPU_FORCED goto forward_failed
+if not "%GPU_TARGET%"=="localabstract:pocketgpu-gpu" goto forward_failed
+echo adb did not accept the USB port form for the GPU. Using port 50060 on the phone ...
+set "GPU_TARGET=tcp:50060"
+set "GPU_WHO=the app receiver, port 50060 on the phone"
+"%ADB%" forward tcp:%PGPU_PORT% tcp:50060 >nul || goto forward_failed
+:gpu_done
 "%ADB%" shell am start -n %APP% --ez webcam true --ez audio true --ez gpu true >nul
 echo.
 echo Done. If the phone asks for camera or microphone access, tap Allow.
@@ -477,6 +505,8 @@ echo Port form: %FORM% (%FORMBY%)
 echo   Webcam:          webcam_rx.exe --addr 127.0.0.1:%PGPU_CAM_PORT%
 echo   Speaker and mic: ipaudio.exe --connect 127.0.0.1:%PGPU_AUDIO_PORT% --speaker --mic
 echo   GPU:             pocketgpu_android.cmd "C:\path\to\app.exe"   (uses %GPU_WHO%)
+echo   GPU port form:   adb forward tcp:%PGPU_PORT% %GPU_TARGET%
+if defined GPUOLD echo The app is older than 0.1.4. If the GPU does not answer, update the app:   "%ADB%" install -r "%~dp0pocketgpu.apk"
 if "%FORM%"=="old" echo The app on the phone is old. The new app is android\pocketgpu.apk. To update:   "%ADB%" install -r "%~dp0pocketgpu.apk"
 if "%FORM%"=="old" if not defined FORCED echo The new app takes the camera and the mic only from adb, so other apps on the phone cannot read them.
 echo When you are finished: android\android_app.cmd stop
@@ -543,6 +573,8 @@ ANDROID_LAUNCH = r'''@echo off
 rem PocketGPU: run one app or game on the Android phone GPU. Run android\start_android.cmd first.
 rem   pocketgpu_android.cmd "C:\path\to\game.exe"
 rem Only the app started from this file sees the phone GPU. Nothing is written to the registry.
+rem DirectX 11 games also need DXVK next to the game. Start-Android-GPU.cmd puts it there for you (it asks first).
+rem DXVK_FILTER_DEVICE_NAME=PocketGPU makes DXVK pick the phone GPU ("PocketGPU phone (...)").
 setlocal
 if "%~1"=="" (
   echo Usage: pocketgpu_android.cmd "C:\path\to\app.exe"
@@ -551,6 +583,7 @@ if "%~1"=="" (
 set "VK_ADD_DRIVER_FILES=%~dp0iphone_icd.json;%~dp0x86\iphone_icd.json"
 if "%PGPU_PORT%"=="" set PGPU_PORT=50300
 set IPHONE_VK=127.0.0.1:%PGPU_PORT%
+if "%DXVK_FILTER_DEVICE_NAME%"=="" if "%IPHONE_VK_NAME%"=="" set DXVK_FILTER_DEVICE_NAME=PocketGPU
 if "%IPHONE_VK_ONLY%"=="" set IPHONE_VK_ONLY=1
 if "%IPHONE_VK_ONLY%"=="1" set "VK_LOADER_DRIVERS_SELECT=*iphone_icd*"
 if "%IPHONE_VK_ONLY%"=="1" set "VK_ICD_FILENAMES=%VK_ADD_DRIVER_FILES%"
@@ -579,6 +612,9 @@ ANDROID_EASY = r'''@echo off
 rem PocketGPU for Android: the easy way. Double-click this file.
 rem It copies the receiver to the phone, starts it, connects it to this PC and checks that Windows sees the phone GPU.
 rem Then drag a game's .exe onto this window (or onto this file) to start it on the phone GPU.
+rem The game is started by tools\run.ps1, the same as Run-on-iPhone-GPU.cmd but for the Android phone (PGPU_ANDROID=1).
+rem It reads the .exe and tells DirectX 11, 12, 9, Unity and Unreal games apart. For DirectX 11 it asks before it puts
+rem DXVK (dxvk\x64 or dxvk\x32) next to the game, and never replaces another d3d11.dll or dxgi.dll.
 rem The "Use as a GPU" switch in the phone app is not needed for this. Needs adb.exe, see android\README_android.txt.
 rem Only English here on purpose: a Japanese Windows reads .cmd files as Shift_JIS.
 setlocal
@@ -607,8 +643,8 @@ set "VK_ICD_FILENAMES="
 if not "%GAME%"=="" goto run
 :ask
 echo.
-echo Drag a game's .exe into this window and press Enter.
-echo You can also drop a game's .exe onto pocketgpu_android.cmd later.
+echo Drag a game's .exe into this window and press Enter. To finish, just press Enter.
+echo Next time you can also drop the game's .exe onto Start-Android-GPU.cmd itself.
 set "GAME="
 set /p GAME=Game:
 if not defined GAME goto end
@@ -616,6 +652,18 @@ set "GAME=%GAME:"=%"
 if "%GAME%"=="" goto end
 :run
 if not exist "%GAME%" goto no_game
+if not exist "%~dp0tools\run.ps1" goto run_plain
+echo.
+set PGPU_ANDROID=1
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\run.ps1" "%GAME%"
+set "RUNRC=%errorlevel%"
+set "PGPU_ANDROID="
+echo.
+if not "%RUNRC%"=="0" echo The game was not started.
+echo The receiver keeps running on the phone until you run android\stop_android.cmd or restart the phone.
+goto ask
+:run_plain
+rem tools\run.ps1 is missing: start the game directly. DirectX 11 games then need DXVK copied by hand (android\README_android.txt step 6).
 rem Start the game in its own folder, as Steam and Explorer do. Some games look for their files there.
 for %%G in ("%GAME%") do cd /d "%%~dpG"
 echo Starting "%GAME%" on the phone GPU ...
@@ -679,6 +727,9 @@ Steps
 6. Start a Vulkan app with:   pocketgpu_android.cmd "C:\path\to\app.exe"
    DirectX 11 games: copy d3d11.dll and dxgi.dll from dxvk\x64 (64-bit games) or dxvk\x32 (32-bit games)
    next to the game's .exe, then start the game with pocketgpu_android.cmd. Delete those two files to undo.
+   With Start-Android-GPU.cmd: it does steps 4 and 5 for you. Then drag the game's .exe into its window.
+   It sees whether the game uses DirectX 11, and asks (y/N) before it puts the two DXVK files next to the game.
+   It never replaces a d3d11.dll or dxgi.dll that is already there. DirectX 12 and DirectX 9 games do not work yet.
    Keep the phone unlocked with the screen on while the app runs.
 7. When you are finished, double-click android\stop_android.cmd. It stops the receiver and removes it from the phone.
    (Restarting the phone also stops it.)
@@ -699,6 +750,11 @@ C. If the phone asks for camera or microphone access, tap Allow. Then start the 
        webcam_rx.exe --addr 127.0.0.1:50064
        ipaudio.exe --connect 127.0.0.1:50063 --speaker --mic
 D. GPU: if android\start_android.cmd has started the receiver, the app uses that one. If not, the app uses its own receiver. pocketgpu_android.cmd and check_android.cmd work the same either way.
+   android\android_app.cmd connects the GPU port 50300 to the app receiver in the form for the app version:
+   - App 0.1.4 and newer:  adb forward tcp:50300 localabstract:pocketgpu-gpu
+     No port number is used on the phone, so another program on the phone cannot be in the way.
+   - App 0.1.3 and older:  adb forward tcp:50300 tcp:50060
+   If the version cannot be read, or adb refuses the first form, it uses tcp:50060. To choose yourself:   set PGPU_APP_GPU=usb   or   set PGPU_APP_GPU=tcp
 E. When you are finished, run   android\android_app.cmd stop
 If the camera or the mic does not connect, run Fix-PocketGPU.cmd. It checks these ports against the app version and connects them again in the right form.
 
@@ -762,6 +818,9 @@ Windows の PC から、Android のスマートフォンの GPU を Vulkan の G
 6. Vulkan のアプリは、pocketgpu_android.cmd "C:\アプリの場所\app.exe" で起動してください。
    DirectX 11 のゲームの場合は、64 ビットのゲームなら dxvk\x64、32 ビットのゲームなら dxvk\x32 の d3d11.dll と dxgi.dll を、
    ゲームの .exe と同じフォルダにコピーしてから、pocketgpu_android.cmd で起動してください。元に戻すときは、その 2 つのファイルを削除してください。
+   Start-Android-GPU.cmd を使う場合は、手順 4 と 5 をまとめて行います。そのあと、ゲームの .exe をそのウィンドウにドラッグしてください。
+   DirectX 11 のゲームかどうかを調べて、DXVK の 2 つのファイルをゲームと同じフォルダに配置するかを y/N で聞きます。
+   すでにある d3d11.dll と dxgi.dll は上書きしません。DirectX 12 と DirectX 9 のゲームは、まだ動きません。
    アプリが動作している間は、スマートフォンのロックを解除したまま、画面をオンにしておいてください
 7. 終わったら、android\stop_android.cmd をダブルクリックしてください。受信アプリを停止して、スマートフォンから削除します
    スマートフォンを再起動しても、受信アプリは停止します
@@ -782,6 +841,11 @@ C. スマートフォンがカメラやマイクの許可を求めたら、「�
        webcam_rx.exe --addr 127.0.0.1:50064
        ipaudio.exe --connect 127.0.0.1:50063 --speaker --mic
 D. GPU：android\start_android.cmd で受信アプリを起動してあれば、アプリはそれを使います。起動していなければ、アプリの中の受信アプリを使います。pocketgpu_android.cmd と check_android.cmd は、どちらでも同じように使えます。
+   android\android_app.cmd は、GPU のポート 50300 を、アプリの版に合う向け方でアプリの中の受信アプリにつなぎます。
+   - アプリ 0.1.4 以上：adb forward tcp:50300 localabstract:pocketgpu-gpu
+     スマートフォンのポート番号を使わないので、スマートフォンの他のアプリとぶつかりません。
+   - アプリ 0.1.3 以前：adb forward tcp:50300 tcp:50060
+   版が読めないときや、adb が最初の向け方を断ったときは、tcp:50060 を使います。自分で決めるときは、set PGPU_APP_GPU=usb か set PGPU_APP_GPU=tcp を入力してください。
 E. 終わったら、android\android_app.cmd stop を実行してください。
 カメラやマイクがつながらないときは、Fix-PocketGPU.cmd を実行してください。これらの口をアプリの版と照らして、合う向け方でつなぎ直します。
 
@@ -853,11 +917,11 @@ def check_apk(path):
     # キットに入れる APK が ANDROID_APK_MIN 以上の版か。版を読めたときだけ止める。版を返す。読めなければ ''
     ver = apk_version(path)
     if ver is None:
-        print(f'注意：{path} の版を読めなかった（aapt2 が無い）。0.1.2 以上かを自分で確かめる')
+        print(f'注意：{path} の版を読めなかった（aapt2 が無い）。{".".join(map(str, ANDROID_APK_MIN))} 以上かを自分で確かめる')
         return ''
     m = re.match(r'(\d+)\.(\d+)(?:\.(\d+))?', ver)
     if not m or tuple(int(x or 0) for x in m.groups()) < ANDROID_APK_MIN:
-        raise SystemExit(f'{path} の版は {ver}。{".".join(map(str, ANDROID_APK_MIN))} 以上の APK でないと入れない（0.1.1 以前はカメラとマイクの口の向け方が違う）。work/android_app/build_apk.sh で組み直す')
+        raise SystemExit(f'{path} の版は {ver}。{".".join(map(str, ANDROID_APK_MIN))} 以上の APK でないと入れない（0.1.1 以前はカメラとマイクの口の向け方が違い、0.1.3 以前は端末の 50060 が使えないと GPU の受け手が動かない）。work/android_app/build_apk.sh で組み直す')
     return ver
 
 
@@ -906,7 +970,7 @@ def main():
     ap.add_argument('who', nargs='?', default='', help='渡す人の名前（Reddit の名前など・英数字）。--template のときは要らない')
     ap.add_argument('--discord-id', default='', help='Discord の bot から作るときの、その人の番号。同じ番号には 2 つめを作らない')
     ap.add_argument('--android-dir', default=ANDROID_DIR, help='Android の受け手（server_aarch64）がある所')
-    ap.add_argument('--android-apk', default=ANDROID_APK, help='Android の PocketGPU アプリ（pocketgpu.apk）。0.1.2 以上でないと入れない')
+    ap.add_argument('--android-apk', default=ANDROID_APK, help='Android の PocketGPU アプリ（pocketgpu.apk）。ANDROID_APK_MIN（0.1.4）以上でないと入れない')
     ap.add_argument('--no-android-apk', action='store_true', help='Android のアプリ（android\pocketgpu.apk）を入れない')
     ap.add_argument('--with-x86_64', action='store_true', help='エミュレーター用の server_x86_64 も入れる（試験用・配るキットには入れない）')
     ap.add_argument('--no-android', action='store_true', help='Android の物を入れない（今までと同じ中身）')
