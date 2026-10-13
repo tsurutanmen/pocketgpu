@@ -384,7 +384,7 @@ function Invoke-VkList {
     $out = $o.Result + $er.Result
     $gpus = @($out -split "`r?`n" | Where-Object { $_ -match '^GPU\d+: ' })
     # PC の GPU（Intel・NVIDIA・AMD・Microsoft・Mesa の CPU）しか見えないときは、iPhone の GPU が見えていない
-    $gpus = @($gpus | Where-Object { $_ -notmatch '\(vendor 0x(8086|10de|1002|1414|10005|10004)' })
+    $gpus = @($gpus | Where-Object { $_ -notmatch '\(vendor 0x(8086|10de|1002|1414|10005|10004)\b' })
     return @{ Ok = ($gpus.Count -gt 0); Gpus = $gpus; Output = $out; Exit = $p.ExitCode }
 }
 
