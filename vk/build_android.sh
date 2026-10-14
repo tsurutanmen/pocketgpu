@@ -5,7 +5,7 @@
 set -e
 NDK=${NDK:-/d/android-sdk/ndk/27.3.13750724}
 BIN=$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin
-API=${API:-30}
+API=${API:-29}   # アプリの minSdk（29）。30 にすると、API 30 の記号（AMEDIAFORMAT_KEY_LOW_LATENCY など）を使っても通ってしまい、Android 10 で受け手が起動しない
 cd "$(dirname "$0")"
 OUT=${1:-/d/iphone-rpc/work/android/out}
 VKH=-I/d/iphone-rpc/third_party/Vulkan-Headers/include

@@ -860,8 +860,8 @@ static int mem_room_ok(uint64_t size) {
     while (fgets(line, sizeof line, f)) if (sscanf(line, "MemAvailable: %lld kB", &avail_kb) == 1) break;
     fclose(f);
     if (avail_kb < 0) return 1;
-    uint64_t avail = (uint64_t) avail_kb << 10, need = size + ((uint64_t) margin << 20);
-    if (need <= avail) return 1;
+    uint64_t avail = (uint64_t) avail_kb << 10;
+    if (size <= avail && avail - size >= ((uint64_t) margin << 20)) return 1; // size + 余裕 のあふれを避けて、引き算で比べる
     vlog(JE("メモリ %llu MB は確保しない（端末に残っているのは %llu MB・余裕 %lld MB）", "Not allocating %llu MB of memory (the phone has %llu MB available, margin %lld MB)"),
          (unsigned long long) (size >> 20), (unsigned long long) (avail >> 20), margin);
     return 0;
@@ -3805,7 +3805,9 @@ static int mc_try(mc_enc *e, const char *name, int pass, uint32_t kbps, uint32_t
     // 遅れを小さくする。知らない鍵は無視される
     AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_PRIORITY, 0);      // 実時間
     AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_LATENCY, 1);
-    AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_LOW_LATENCY, 1);
+    // AMEDIAFORMAT_KEY_LOW_LATENCY は API 30 の記号で、使うと Android 10（API 29。アプリの minSdk）では受け手が「cannot locate symbol」で起動できない。
+    // 値の文字列（MediaFormat.KEY_LOW_LATENCY）を直接渡す。知らない機械は無視する
+    AMediaFormat_setInt32(f, "low-latency", 1);
     AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_OPERATING_RATE, (int32_t) fps);
     AMediaFormat_setInt32(f, "max-bframes", 0);                  // B フレームなし（API 34 の KEY_MAX_B_FRAMES。古い機械では無視）
     if (pass == 0) AMediaFormat_setInt32(f, AMEDIAFORMAT_KEY_PROFILE, 8); // AVCProfileHigh。だめなら 2 回目で外す
@@ -7441,18 +7443,33 @@ static void *hs_ticker(void *p) {
 // Android の受け手が落ちたときに、記録（pgpu_server.log）の最後に、合図と処理していた命令を書く。
 // 前は何も書かずに消え、PC では次の命令から全部 device lost になるだけで、どこで落ちたか分からなかった（devlost1015）
 #include <signal.h>
-static void and_crash(int sig) {
-    char line[160];
-    int n = snprintf(line, sizeof line, lang_en() ? "Crashed: signal %d, command %u\n" : "落ちた：合図 %d・命令 %u\n", sig, g_cur_op);
+// 前の合図の受け手（Android の debuggerd・tombstone を書く物）。記録に書いたあと、これに渡して、logcat -b crash に出る backtrace を残す。
+// 前は signal() で debuggerd の受け手を置き換え、SIG_DFL にして raise していたので、Adreno や Mali のドライバの中で落ちても tombstone が出なかった
+static struct sigaction g_old_sa[NSIG];
+static void and_crash(int sig, siginfo_t *si, void *uc) {
+    (void) uc;
+    char line[200];
+    int n = snprintf(line, sizeof line, lang_en() ? "Crashed: signal %d, command %u (code %d, address %p)\n" : "落ちた：合図 %d・命令 %u（code %d・アドレス %p）\n",
+                     sig, g_cur_op, si ? si->si_code : 0, si ? si->si_addr : NULL);
     if (n > 0) { ssize_t w = write(1, line, (size_t) n); (void) w; }
     __android_log_print(ANDROID_LOG_ERROR, "iphone-rpc-vk", "%s", line);
-    signal(sig, SIG_DFL);
-    raise(sig);
+    // 前の受け手に戻す。自分で起こした合図（abort など。si_code が 0 以下）は出し直し、
+    // 本物の落ち（アクセス違反など）は戻るだけでよい（同じ命令がもう一度落ち、前の受け手が受ける）
+    if (sig > 0 && sig < NSIG) sigaction(sig, &g_old_sa[sig], NULL);
+    else signal(sig, SIG_DFL);
+    if (!si || si->si_code <= 0) raise(sig);
 }
 // 落ちたときの記録の支度と、OOM で殺されやすさ（oom_score_adj）・端末に残っているメモリを記録に書く
 static void and_crash_init(void) {
-    int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT };
-    for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) signal(sigs[i], and_crash);
+    int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGSYS };
+    for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = and_crash;
+        sa.sa_flags = SA_SIGINFO | SA_ONSTACK; // 糸ごとの予備の stack（bionic が用意する）があれば、stack を使い切った落ちでも記録できる
+        sigemptyset(&sa.sa_mask);
+        sigaction(sigs[i], &sa, &g_old_sa[sigs[i]]);
+    }
     char adj[32] = "?";
     FILE *f = fopen("/proc/self/oom_score_adj", "r");
     if (f) { if (!fgets(adj, sizeof adj, f)) snprintf(adj, sizeof adj, "?"); fclose(f); }
