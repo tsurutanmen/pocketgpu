@@ -46,6 +46,13 @@ import VideoToolbox
 // 10/13（work/ios1013b）Wi-Fi のつなぎは、HELLO の合言葉を確かめてから古いつなぎと入れ替える（accept・acceptWifi）。
 //   前は、つながった時点で古いつなぎを切っていたので、同じ Wi-Fi にいる人が、合言葉を知らなくても何度でも PC のカメラを切れた。
 //   USB（127.0.0.1）の扱いは前のまま：つながったらすぐ入れ替える
+//
+// 10/15（work/camgpu1015）PC の GPU の負荷を iPhone に移す：
+//   PC は、仮想カメラが 1920×1080 までしか出せないのに、PC アプリで 4K を選ぶと 4K を頼み、GPU（NVDEC）でほどいたあと CPU に読み戻して縮めて捨てていた。
+//   HELLO の flags に WC_HELLO_FIT（16）が立っているとき、40 バイト目からの max_w・max_h（PC が使える最大の大きさ）を読み、
+//   PC の指定でも画面の設定でも、その箱（縦横どちらの向きでもよい）に収まる大きさにする（resolve。fitSize）。ACK の flags に WC_ACK_FIT（64）を立てて守ったと知らせる。
+//   小さい形で撮ればカメラの中（ISP）で縮むので、iPhone は何も増やさない。その大きさの形が無いとき（シネマティック・エフェクトで形が限られるとき）だけ、
+//   大きめに撮ってエンコーダの前で縮める（切り抜きと同じ stage の道）。FIT の印が無い PC（古い webcam_rx）には、今までどおり何も変えない
 final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureMetadataOutputObjectsDelegate {
     static let shared = CameraBridge()
     static let port: UInt16 = 50064
@@ -61,7 +68,9 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     // HELLO と ACK の flags（pc/wcam.h と同じ）
     private enum Flag {
         static let mirror: UInt32 = 1, cameraSet: UInt32 = 2, live: UInt32 = 4
+        static let fit: UInt32 = 16        // camgpu1015：HELLO。PC が使える大きさの上限（max_w・max_h）がある
         static let ackAppSettings: UInt32 = 1, ackAppPriority: UInt32 = 2, ackLive: UInt32 = 4, ackChanged: UInt32 = 8
+        static let ackFit: UInt32 = 64     // camgpu1015：ACK。この iPhone は上限を守った（FIT を名乗った PC にだけ立てる）
         static let ackThermal: UInt32 = 16 // camctl：熱のためにコマ数を下げた（work/camctl/PROTOCOL.md の案。古い PC は見ない）
         static let ctrl: UInt32 = 8        // camctl2：HELLO。PC は CTRL のメッセージを受け、送れる
         static let ackCtrl: UInt32 = 32    // camctl2：ACK。この iPhone は CTRL を受ける（CTRL を名乗った PC にだけ立てる）
@@ -134,6 +143,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     // PC の頼み（HELLO の中身）
     private struct Hello {
         var version: UInt32, width: Int, height: Int, fps: Int, kbps: Int, gop: Int, camera: UInt32, flags: UInt32, quality: Int
+        var maxW = 0, maxH = 0 // camgpu1015：40 バイト目からの「PC が使える最大の大きさ」（flags に FIT があるときだけ意味がある。古い PC は 0）
     }
     // 頼みと画面の設定を混ぜて決めた形（実際に撮る大きさは pickFormat で決まる）
     private struct Resolved: Equatable {
@@ -151,6 +161,8 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         var capH = 0             // stage のときに撮る高さ（切り抜いても粗くならないように大きめに撮る）
         var face = false         // 顔の位置を調べる（切り抜きを顔に合わせる）
         var fx = 0               // コントロールセンターで入っているエフェクト（対応する形とコマ数が変わる）
+        var fitShrunk = false    // camgpu1015：PC の上限（FIT）に合わせて、頼まれた（か画面の設定の）大きさより小さくした
+        var fitStage = false     // camgpu1015：箱に収まる形が無いので、大きく撮ってエンコーダの前で縮める（stage を使う）
     }
 
     // 作り直すときに決める、カメラと形と送る大きさ
@@ -655,7 +667,10 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             let f = (0..<8).map { Self.u32(body, $0 * 4) } // version, width, height, fps, kbps, gop, camera, flags
             // 36 バイト目からは画質の段（camset の PC だけが送る。古い PC は 32 か 36 バイト）
             let quality = body.count >= 40 ? Int(Self.u32(body, 36)) : 0
-            let hi = Hello(version: f[0], width: Int(f[1]), height: Int(f[2]), fps: Int(f[3]), kbps: Int(f[4]), gop: Int(f[5]), camera: f[6], flags: f[7], quality: quality)
+            // 40 バイト目からは PC が使える最大の大きさ（camgpu1015 の PC だけが送る。古い PC は 32〜40 バイトなので 0）
+            let maxW = body.count >= 48 ? Int(Self.u32(body, 40)) : 0
+            let maxH = body.count >= 48 ? Int(Self.u32(body, 44)) : 0
+            let hi = Hello(version: f[0], width: Int(f[1]), height: Int(f[2]), fps: Int(f[3]), kbps: Int(f[4]), gop: Int(f[5]), camera: f[6], flags: f[7], quality: quality, maxW: maxW, maxH: maxH)
             lastHello = hi
             // camctl2：CTRL を名乗った PC か（頼み直しの HELLO でも読み直す）
             let wantCtl = hi.flags & Flag.ctrl != 0
@@ -715,6 +730,14 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         if !useMirror && appMirror { r.ackFlags |= Flag.ackAppSettings }
         // 形はいつも横長で選ぶ（カメラの形は横長）。縦長にするのは回転
         if r.h > r.w { (r.w, r.h) = (r.h, r.w) }
+        // camgpu1015：PC が使える大きさの上限（HELLO の FIT）。PC の指定でも画面の設定でも、箱に収まる大きさにする。
+        // 画面の「PC からの指定を優先する」とは別の話（上限は好みではなく、PC が受け取れない大きさ）なので、優先を切っていても守る
+        let box = hi.flags & Flag.fit != 0 && hi.maxW > 0 && hi.maxH > 0
+        if box {
+            r.ackFlags |= Flag.ackFit
+            let (fw, fh) = Self.fitSize(w: r.w, h: r.h, maxW: hi.maxW, maxH: hi.maxH)
+            if fw != r.w || fh != r.h { r.w = fw; r.h = fh; r.fitShrunk = true }
+        }
         // 回転と上下反転。上下反転は 180 度回して左右反転するのと同じ
         let want = d.integer(forKey: Key.rotation)
         var rot = [0, 90, 180, 270].contains(want) ? want : 0
@@ -740,6 +763,19 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             r.capH = Self.captureHeight(camera: cam, outH: r.h, fps: r.fps, scale: s)
         }
         r.fx = Self.effectsMask()
+        // camgpu1015：箱に収まる大きさを頼んでも、撮れる形のほうが箱より大きくなってしまう（その大きさの形が無い）ときだけ、
+        // その形で撮って、エンコーダの前で箱の大きさに縮める（切り抜きと同じ stage の道。切り抜きも水平も切ってあれば、ただの縮小になる）。
+        // plan は capH の高さの形をぴったりで選ぶので、ここで選んだ形と同じ形になる
+        if box, !r.stage, let dev = r.cinematic ? Self.cinematicDevice(cam) : Self.device(cam),
+           let picked = Self.pickFormat(dev, w: r.w, h: r.h, fps: r.fps, only: r.cinematic ? Self.cinematicFormat : nil, prefer: Self.effectScore(r.fx)) {
+            let dims = CMVideoFormatDescriptionGetDimensions(picked.0.formatDescription)
+            let fw = Int(dims.width), fh = Int(dims.height)
+            if !Self.fitsBox(fw, fh, maxW: hi.maxW, maxH: hi.maxH), Self.heightChoices.contains(fh), Self.size(forHeight: fh).0 == fw {
+                r.stage = true
+                r.fitStage = true
+                r.capH = fh
+            }
+        }
         return r
     }
 
@@ -972,7 +1008,14 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             ctlStart()
         }
         let ctlOn = ctl
-        log("ウェブカメラ：\(changed ? "切り替えた" : "始める") \(aw)×\(ah)・\(fr) コマ/秒・\(kb) kbps・カメラ \(r.camera)（\(dev.localizedName)）・回転 \(r.rot)・反転 \(r.connMirror ? 1 : 0)・切り抜き \(pool != nil ? 1 : 0)・手ぶれ補正 \(r.stab)・シネマティック \(cineOn ? 1 : 0)・ACK flags \(ackFlags)")
+        // camgpu1015：PC が使える大きさの上限を、記録に出す（縮めたか・形が無くてエンコーダの前で縮めているか）
+        var fitText = "なし"
+        if hi.flags & Flag.fit != 0 {
+            fitText = "\(hi.maxW)×\(hi.maxH)"
+            if r.fitShrunk { fitText += "に収めた" }
+            if r.fitStage { fitText += "（その大きさの形が無いので、大きく撮ってエンコーダの前で縮める）" }
+        }
+        log("ウェブカメラ：\(changed ? "切り替えた" : "始める") \(aw)×\(ah)・\(fr) コマ/秒・\(kb) kbps・カメラ \(r.camera)（\(dev.localizedName)）・回転 \(r.rot)・反転 \(r.connMirror ? 1 : 0)・切り抜き \(pool != nil ? 1 : 0)・手ぶれ補正 \(r.stab)・シネマティック \(cineOn ? 1 : 0)・ACK flags \(ackFlags)・PC の上限 \(fitText)")
         // startRunning は返ってくるまでに時間がかかるので、カメラの糸で（前のカメラの stopRunning のあとに並ぶ）。
         // ライトは走り始めてからもう一度当てる。走らせる前（上の liveApply(initial:)）に点けても、走り始めで消えて点かないことがあった
         captureQueue.async { [weak self] in
@@ -1318,6 +1361,22 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         case 2160: return (3840, 2160)
         default: return (1920, 1080)
         }
+    }
+
+    // camgpu1015：PC が使える箱（maxW × maxH）に収まるか。縦長でも横長でもよいので、長い辺と短い辺で比べる
+    static func fitsBox(_ w: Int, _ h: Int, maxW: Int, maxH: Int) -> Bool {
+        max(w, h) <= max(maxW, maxH) && min(w, h) <= min(maxW, maxH)
+    }
+    // 箱に収まる、いちばん大きい標準の大きさ（16:9 の 720・1080・2160）。頼まれた高さより大きくはしない。
+    // 標準の大きさが一つも入らない小さい箱のときだけ、縦横比を保って縮める（偶数にそろえる）
+    static func fitSize(w: Int, h: Int, maxW: Int, maxH: Int) -> (Int, Int) {
+        if fitsBox(w, h, maxW: maxW, maxH: maxH) { return (w, h) }
+        for hh in heightChoices.reversed() {
+            let (sw, sh) = size(forHeight: hh)
+            if sh <= h && fitsBox(sw, sh, maxW: maxW, maxH: maxH) { return (sw, sh) }
+        }
+        let s = min(Double(max(maxW, maxH)) / Double(max(w, h)), Double(min(maxW, maxH)) / Double(min(w, h)))
+        return (max(64, Int(Double(w) * s) & ~1), max(64, Int(Double(h) * s) & ~1))
     }
 
     // 画面に出す選び肢。4K は 30 fps まで（Windows の H.264 のデコーダの資料は level 5.1 まで。4K の 60 fps は level 5.2 が要る）
