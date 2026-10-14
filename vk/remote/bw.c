@@ -93,6 +93,7 @@ static void *bw_extra_thread(void *p) {
 #ifdef _WIN32
             break;
 #else
+            poll(NULL, 0, 100); // 受け付けに失敗し続けても（fd が足りないなど）、poll がすぐ戻る口で空回りしない
             continue;
 #endif
         }

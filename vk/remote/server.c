@@ -1541,6 +1541,20 @@ static int last_with_dpool(uint64_t pool) {
     return -1;
 }
 
+// pool の行の並びから、もう無い・別の pool の物・重なった番号を除く（印は set の行の gwsz。set では使っていない）
+static void dpool_list_compact(idlist *x, uint64_t pool) {
+    static uint64_t stamp;
+    stamp++;
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < x->n; i++) {
+        ent *e = find(x->ids[i]);
+        if (!e || e->kind != K_DSET || e->aux != pool || e->gwsz == stamp) continue;
+        e->gwsz = stamp;
+        x->ids[w++] = x->ids[i];
+    }
+    x->n = w;
+}
+
 // pool を空にしたり消したりしたら、そこから取った set の表の行も消す
 static void drop_sets_of_pool(uint64_t pool) {
     ent *pe = fast_book() ? find(pool) : NULL;
@@ -1814,6 +1828,10 @@ static int gw_want(uint64_t mid, ent *e, int k, uint64_t need, VkQueue *qout) {
     }
     for (int i = 0; i < g_nfl; i++) if (g_fl[i].ntw || g_fl[i].tl_over) return pend ? -1 : 0; // 合図を待つ仕事があるときは前のやり方
     VkQueue q = pend ? g_gw.s[g_gw.cur].q : g_fl[k].q;
+    // 待つはずの仕事（k まで）に、別のキューで走っている物があれば前のやり方。写しは同じキューの前の仕事の後にしか並ばないので、別のキューの仕事が
+    // まだそのメモリを読んでいても待たずに書き換えてしまう（DXVK は転送用のキューを分けることがある）
+    for (int i = 0; i <= k && i < g_nfl; i++)
+        if (g_fl[i].q != q && vkGetFenceStatus(fl_dev(&g_fl[i]), g_fl[i].f) != VK_SUCCESS) return pend ? -1 : 0;
     uint32_t fam = UINT32_MAX;
     for (size_t i = 0; i < g_cap; i++)
         if (g_tab[i].id && g_tab[i].kind == K_QUEUE && g_tab[i].h == (uint64_t) (uintptr_t) q) {
@@ -4565,6 +4583,13 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         // ほかの装置が残る：この装置の物だけを片づける（前は全部を片づけ、残った装置で作ると落ちていた）
         drain();
         watch_stop(); // 消す装置の fence を見張りが待たないように。次の submit のときに、残る装置で見張り直す
+        // 消す装置の上の、使い回し用の自前の fence と書き込みの写し場（g_dev でない装置の分は、下の helpers_free に来ないので、ここで放す。
+        // 残すと、あとの cleanup が消えた装置で vkDestroyFence を呼ぶ）
+        for (int i = 0; i < g_nfpool;) {
+            if (g_fpool[i].d == h) { vkDestroyFence(h, g_fpool[i].f, NULL); g_fpool[i] = g_fpool[--g_nfpool]; }
+            else i++;
+        }
+        if (g_gw.ready && g_gw.d == h && g_dev != h) gw_free(h);
         if (g_dev == h) {
             jp_reset();
             vid_reset();
@@ -5306,8 +5331,16 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     if (pe && pe->kind == K_DPOOL) {
                         if (!pe->list) pe->list = calloc(1, sizeof *pe->list);
                         idlist *x = pe->list;
-                        if (x && x->n == x->cap) { x->cap = x->cap ? x->cap * 2 : 64; x->ids = realloc(x->ids, x->cap * sizeof *x->ids); }
-                        if (x) x->ids[x->n++] = id;
+                        if (x && x->n == x->cap) {
+                            // 返した・取り直された番号を詰める（vkFreeDescriptorSets で返し続け、pool を reset しないアプリで、並びが増え続けないように）
+                            if (x->n >= 64) dpool_list_compact(x, pid);
+                            if (x->n >= x->cap / 2) {
+                                uint32_t nc = x->cap ? x->cap * 2 : 64;
+                                uint64_t *ni = realloc(x->ids, nc * sizeof *x->ids);
+                                if (ni) { x->ids = ni; x->cap = nc; } else x = NULL;
+                            }
+                        }
+                        if (x && x->n < x->cap) x->ids[x->n++] = id;
                     }
                 }
             } else vlog(JE("descriptor set を取れない (%d)", "Cannot allocate the descriptor set (%d)"), res);

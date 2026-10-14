@@ -853,17 +853,30 @@ static DWORD WINAPI sq_thread(LPVOID arg) {
     return 0;
 }
 
-// g_lock を持って呼ぶ。src の中身（p を含む）を列に渡し、src には空の入れ物を戻す
-static void sq_push_locked(vr_buf *src, int raw) {
+// 送る糸を起こす（g_lock を持って呼ぶ）。起こせなければ 0（呼ぶ側は、呼んだ糸で送る前のやり方にする）
+static int sq_start_locked(void) {
     if (!g_sq.started) {
         InitializeSRWLock(&g_sq.lk);
         InitializeConditionVariable(&g_sq.cv_item);
         InitializeConditionVariable(&g_sq.cv_room);
         g_sq.thr = CreateThread(NULL, 0, sq_thread, NULL, 0, NULL);
         g_sq.started = 1;
+        if (!g_sq.thr) g_stream_min = (size_t) -1; // 糸を作れなかった：誰も送らないまま列に溜め続けない
     }
+    return g_sq.thr != NULL;
+}
+
+// g_lock を持って呼ぶ。src の中身（p を含む）を列に渡し、src には空の入れ物を戻す。sq_start_locked が 1 を返したあとだけ呼ぶ
+static void sq_push_locked(vr_buf *src, int raw) {
     AcquireSRWLockExclusive(&g_sq.lk);
     while ((g_sq.n >= SQ_N || g_sq.bytes > SQ_MAX_BYTES) && !g_dead) SleepConditionVariableSRW(&g_sq.cv_room, &g_sq.lk, INFINITE, 0);
+    // 切れたあとに満杯のまま抜けたとき、そのまま足すと輪が 1 つ溢れて、いちばん古い物を上書きし、同じ物を 2 回処理する。
+    // 切れていれば送る先は無いので、捨てる（src の入れ物はそのまま使い回す）
+    if (g_sq.n >= SQ_N) {
+        src->n = 0;
+        ReleaseSRWLockExclusive(&g_sq.lk);
+        return;
+    }
     sq_item it = { src->p, src->n, src->cap, raw };
     if (g_sq.nspare) {
         sq_item sp = g_sq.spare[--g_sq.nspare];
@@ -885,7 +898,7 @@ static int flush_locked(void) {
     if (g_dead || g_sock == VR_BAD_SOCK) { g_q.n = 0; return 0; }
     stat_tick();
     if (g_q.n) g_stat.flushes++;
-    if (sq_on()) {
+    if (sq_on() && sq_start_locked()) {
         if (g_q.n) sq_push_locked(&g_q, 0);
         return !g_dead;
     }
@@ -903,7 +916,7 @@ static void put_msg_locked(uint32_t op, const vr_buf *b) {
     vr_put(&g_q, h, 8);
     vr_put(&g_q, b->p, b->n);
     // 送る糸があれば、ある程度ためた命令は submit や往復を待たずに渡す（g_q は丸ごと完結した命令の並びなので、いつ切ってもよい）
-    if (g_q.n >= g_stream_min && !g_dead && g_sock != VR_BAD_SOCK) sq_push_locked(&g_q, 0);
+    if (g_q.n >= g_stream_min && !g_dead && g_sock != VR_BAD_SOCK && sq_start_locked()) sq_push_locked(&g_q, 0);
 }
 
 // 送った VR_QUEUE_SUBMIT の数。受け手も届いた順に数えるので、何番目の submit かで話が通じる
@@ -996,7 +1009,7 @@ static void rpc_send_raw(uint32_t op, const uint8_t *msg, size_t n) {
     if (op < VR_OP_COUNT) { g_stat.sends[op]++; g_stat.bytes[op] += n; g_stat.wmsg[op]++; }
     if (flush_locked()) {
         g_stat.flushes++;
-        if (sq_on()) {
+        if (sq_on() && sq_start_locked()) {
             vr_buf cp = { 0 };
             vr_put(&cp, msg, n);
             sq_push_locked(&cp, 1);
