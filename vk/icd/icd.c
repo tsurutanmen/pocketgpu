@@ -745,37 +745,152 @@ static int dq_take_locked(uint32_t op, const vr_buf *b) {
     return 1;
 }
 
+// 縮まりそうにない中身か（頂点や画像の、乱数のように並んだ大きな書き込み）。256 KB 以上の物の 3 か所（8 KB ずつ）を試しに縮め、どれも 1 割も縮まなければ
+// 全体を縮めるのをやめる（1.5 MB に約 0.4〜0.5 ms かけて、縮まらずにそのまま送っていた）。IPHONE_VK_PACK_SKIP=0 で前のやり方
+static int pack_hopeless(const uint8_t *p, size_t n) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("IPHONE_VK_PACK_SKIP"); on = !(e && *e == '0'); }
+    if (!on || n < (256u << 10)) return 0;
+    char tmp[LZ4_COMPRESSBOUND(8192)];
+    for (int k = 1; k <= 5; k += 2) {
+        int cl = LZ4_compress_default((const char *) p + (n / 6) * (size_t) k - 4096, tmp, 8192, (int) sizeof tmp);
+        if (cl <= 0 || cl < 8192 / 10 * 9) return 0;
+    }
+    return 1;
+}
+
+// 命令の並び（p・n）を、1 KB 以上なら LZ4 で縮めて 1 つの命令（VR_PACKED）にして送る。縮まらなければそのまま。pk は縮めた物を置く作業場（呼ぶ糸ごとに 1 つ）
+static void send_packed(vr_buf *pk, const uint8_t *p, size_t n) {
+    if (!n) return;
+    if (n >= 1024 && n < (1u << 30) && g_can_pack && pack_on() && !pack_hopeless(p, n)) {
+        int bound = LZ4_compressBound((int) n);
+        pk->n = 0;
+        vr_reserve(pk, (size_t) bound + 12);
+        double t0 = now_ms();
+        int cl = LZ4_compress_default((const char *) p, (char *) pk->p + 12, (int) n, bound);
+        g_stat.pack_ms += now_ms() - t0;
+        if (cl > 0 && (size_t) cl + 12 < n / 10 * 9) {
+            uint32_t h[3] = { VR_PACKED, (uint32_t) cl + 4, (uint32_t) n };
+            memcpy(pk->p, h, 12);
+            g_stat.pack_in += n;
+            g_stat.pack_out += (uint64_t) cl + 12;
+            g_stat.wire_out += (uint64_t) cl + 12;
+            double ts0 = now_ms();
+            if (!vr_send_all(g_sock, pk->p, (size_t) cl + 12)) conn_lost("送る所");
+            g_stat.send_ms += now_ms() - ts0;
+            return;
+        }
+    }
+    g_stat.wire_out += n;
+    double ts1 = now_ms();
+    if (!vr_send_all(g_sock, p, n)) conn_lost("送る所");
+    g_stat.send_ms += now_ms() - ts1;
+}
+
+// ---- 送る糸（IPHONE_VK_SEND_THREAD=0 で、今までどおり呼んだ糸で縮めて送る） ----
+// 前は flush_locked を呼んだ糸（DXVK の submit の糸）が、LZ4 で縮めて send が終わるまで止まっていた。その糸は present の返事も待つので、
+// 送っている間は次の submit も組めず、受け手には submit の終わりごとにまとめて届いていた。
+// いまは flush_locked が「ためた命令を送る糸の列に渡す」だけで戻り、縮めて送るのは専用の糸が順に行う（順は渡した順のまま）。
+// ためた命令が SEND_STREAM_KB（既定 32 KB）を超えたら、submit や往復を待たずに渡す。受け手は組み立て中のコマの命令を、届いたそばから読める
+typedef struct { uint8_t *p; size_t n, cap; int raw; } sq_item;
+#define SQ_N 128
+#define SQ_MAX_BYTES (48u << 20)
+static struct {
+    SRWLOCK lk;
+    CONDITION_VARIABLE cv_item, cv_room;
+    sq_item q[SQ_N];
+    unsigned head, n;
+    uint64_t bytes; // 渡されて、まだ送り終わっていない量
+    sq_item spare[4];
+    unsigned nspare;
+    HANDLE thr;
+    int started;
+} g_sq;
+static size_t g_stream_min = (size_t) -1; // これ以上ためたら渡す（送る糸を使わないときは使わない）
+
+static int sq_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("IPHONE_VK_SEND_THREAD");
+        v = !(e && *e == '0');
+        const char *k = getenv("IPHONE_VK_SEND_STREAM_KB");
+        if (v) g_stream_min = (size_t) (k && atoi(k) > 0 ? atoi(k) : 32) << 10;
+    }
+    return v;
+}
+
+static DWORD WINAPI sq_thread(LPVOID arg) {
+    (void) arg;
+    vr_buf pk = { 0 };
+    for (;;) {
+        AcquireSRWLockExclusive(&g_sq.lk);
+        while (!g_sq.n) SleepConditionVariableSRW(&g_sq.cv_item, &g_sq.lk, INFINITE, 0);
+        sq_item it = g_sq.q[g_sq.head];
+        g_sq.head = (g_sq.head + 1) % SQ_N;
+        g_sq.n--;
+        ReleaseSRWLockExclusive(&g_sq.lk);
+        if (!g_dead && g_sock != VR_BAD_SOCK) {
+            if (it.raw) {
+                g_stat.wire_out += it.n;
+                double t0 = now_ms();
+                if (!vr_send_all(g_sock, it.p, it.n)) conn_lost("送る所");
+                g_stat.send_ms += now_ms() - t0;
+            } else {
+                send_packed(&pk, it.p, it.n);
+            }
+        }
+        AcquireSRWLockExclusive(&g_sq.lk);
+        g_sq.bytes -= it.n;
+        if (g_sq.nspare < 4 && it.cap <= (16u << 20)) {
+            it.n = 0;
+            g_sq.spare[g_sq.nspare++] = it;
+        } else {
+            free(it.p);
+        }
+        WakeConditionVariable(&g_sq.cv_room);
+        ReleaseSRWLockExclusive(&g_sq.lk);
+    }
+    return 0;
+}
+
+// g_lock を持って呼ぶ。src の中身（p を含む）を列に渡し、src には空の入れ物を戻す
+static void sq_push_locked(vr_buf *src, int raw) {
+    if (!g_sq.started) {
+        InitializeSRWLock(&g_sq.lk);
+        InitializeConditionVariable(&g_sq.cv_item);
+        InitializeConditionVariable(&g_sq.cv_room);
+        g_sq.thr = CreateThread(NULL, 0, sq_thread, NULL, 0, NULL);
+        g_sq.started = 1;
+    }
+    AcquireSRWLockExclusive(&g_sq.lk);
+    while ((g_sq.n >= SQ_N || g_sq.bytes > SQ_MAX_BYTES) && !g_dead) SleepConditionVariableSRW(&g_sq.cv_room, &g_sq.lk, INFINITE, 0);
+    sq_item it = { src->p, src->n, src->cap, raw };
+    if (g_sq.nspare) {
+        sq_item sp = g_sq.spare[--g_sq.nspare];
+        src->p = sp.p;
+        src->cap = sp.cap;
+    } else {
+        src->p = NULL;
+        src->cap = 0;
+    }
+    src->n = 0;
+    g_sq.q[(g_sq.head + g_sq.n++) % SQ_N] = it;
+    g_sq.bytes += it.n;
+    WakeConditionVariable(&g_sq.cv_item);
+    ReleaseSRWLockExclusive(&g_sq.lk);
+}
+
 static int flush_locked(void) {
     if (g_da.n || g_du_has) dq_flush_locked();
     if (g_dead || g_sock == VR_BAD_SOCK) { g_q.n = 0; return 0; }
     stat_tick();
     if (g_q.n) g_stat.flushes++;
-    // 1 KB 以上なら、命令の並びをまとめて縮め、1 つの命令にして送る。縮まらなければそのまま
-    if (g_q.n >= 1024 && g_q.n < (1u << 30) && g_can_pack && pack_on()) {
-        static vr_buf pk;
-        int bound = LZ4_compressBound((int) g_q.n);
-        pk.n = 0;
-        vr_reserve(&pk, (size_t) bound + 12);
-        double t0 = now_ms();
-        int cl = LZ4_compress_default((const char *) g_q.p, (char *) pk.p + 12, (int) g_q.n, bound);
-        g_stat.pack_ms += now_ms() - t0;
-        if (cl > 0 && (size_t) cl + 12 < g_q.n / 10 * 9) {
-            uint32_t h[3] = { VR_PACKED, (uint32_t) cl + 4, (uint32_t) g_q.n };
-            memcpy(pk.p, h, 12);
-            g_stat.pack_in += g_q.n;
-            g_stat.pack_out += (uint64_t) cl + 12;
-            g_stat.wire_out += (uint64_t) cl + 12;
-            double ts0 = now_ms();
-            if (!vr_send_all(g_sock, pk.p, (size_t) cl + 12)) conn_lost("送る所");
-            g_stat.send_ms += now_ms() - ts0;
-            g_q.n = 0;
-            return !g_dead;
-        }
+    if (sq_on()) {
+        if (g_q.n) sq_push_locked(&g_q, 0);
+        return !g_dead;
     }
-    g_stat.wire_out += g_q.n;
-    double ts1 = now_ms();
-    if (g_q.n && !vr_send_all(g_sock, g_q.p, g_q.n)) conn_lost("送る所");
-    g_stat.send_ms += now_ms() - ts1;
+    static vr_buf pk;
+    send_packed(&pk, g_q.p, g_q.n);
     g_q.n = 0;
     return !g_dead;
 }
@@ -787,6 +902,8 @@ static void put_msg_locked(uint32_t op, const vr_buf *b) {
     if (op < VR_OP_COUNT) { g_stat.bytes[op] += 8 + b->n; g_stat.wmsg[op]++; }
     vr_put(&g_q, h, 8);
     vr_put(&g_q, b->p, b->n);
+    // 送る糸があれば、ある程度ためた命令は submit や往復を待たずに渡す（g_q は丸ごと完結した命令の並びなので、いつ切ってもよい）
+    if (g_q.n >= g_stream_min && !g_dead && g_sock != VR_BAD_SOCK) sq_push_locked(&g_q, 0);
 }
 
 // 送った VR_QUEUE_SUBMIT の数。受け手も届いた順に数えるので、何番目の submit かで話が通じる
@@ -879,10 +996,17 @@ static void rpc_send_raw(uint32_t op, const uint8_t *msg, size_t n) {
     if (op < VR_OP_COUNT) { g_stat.sends[op]++; g_stat.bytes[op] += n; g_stat.wmsg[op]++; }
     if (flush_locked()) {
         g_stat.flushes++;
-        g_stat.wire_out += n;
-        double t0 = now_ms();
-        if (!vr_send_all(g_sock, msg, n)) conn_lost("送る所");
-        g_stat.send_ms += now_ms() - t0;
+        if (sq_on()) {
+            vr_buf cp = { 0 };
+            vr_put(&cp, msg, n);
+            sq_push_locked(&cp, 1);
+            free(cp.p);
+        } else {
+            g_stat.wire_out += n;
+            double t0 = now_ms();
+            if (!vr_send_all(g_sock, msg, n)) conn_lost("送る所");
+            g_stat.send_ms += now_ms() - t0;
+        }
     }
     ReleaseSRWLockExclusive(&g_lock);
 }
@@ -890,7 +1014,20 @@ static void rpc_send_raw(uint32_t op, const uint8_t *msg, size_t n) {
 // 返事を待つ。返事の中身は out に入る（要らなければ NULL）
 // あとで受け取る返事。窓に出す絵を頼んだら返事を待たずにアプリを先へ進め、次のコマで受け取る。
 // 返事は頼んだ順にしか届かないので、ほかの命令が返事を読む前に、先にこれを読んで取っておく
-static struct { int active, ready; VkResult r; vr_buf out; uint32_t op; } g_defer; // op：頼んだ命令（数えるため）
+// 輪にして何個でも（DQ_RING まで）頼める。返事は頼んだ順にしか届かない。head から n 個が入っていて、先頭の ready 個は読み終わり、残りは返事待ち
+// （前は 1 つだけで、次を頼む前に前の返事を待っていた。IPHONE_VK_PRESENT_DEPTH で何個まで残すかを決める）
+#define DQ_RING 8
+typedef struct { VkResult r; vr_buf out; uint32_t op; uint64_t tag; } defer_ent; // op：頼んだ命令（数えるため）・tag：呼んだ側の印（返事に入っている絵が何回目の present の物か）
+static struct { defer_ent e[DQ_RING]; unsigned head, n, ready; } g_dr;
+// つながりが切れた：返事待ちの物は全部「失敗」で読み終わったことにする
+static void dr_kill_locked(void) {
+    for (unsigned i = g_dr.ready; i < g_dr.n; i++) {
+        defer_ent *d = &g_dr.e[(g_dr.head + i) % DQ_RING];
+        d->r = VK_ERROR_DEVICE_LOST;
+        d->out.n = 0;
+    }
+    g_dr.ready = g_dr.n;
+}
 
 // つながりが切れたことにする。最初の 1 回だけ書く（IPHONE_VK_LOG が無くても書く）
 static void banner(const wchar_t *t);
@@ -1017,11 +1154,39 @@ static void note_done(uint64_t done, uint32_t ep, int push) {
 
 // 返事の頭を読む（尾があれば尾も）。押し出しの知らせは読み捨てて次を読む。
 // wait=0 なら待たない：届いている物が押し出しだけで尽きたら 2（返事は読んでいない）。1＝返事の頭を読んだ・0＝切れた
+#ifndef _WIN32
+#include <sys/ioctl.h>
+#endif
+// 受け取り用の入れ物に届いている量。分からなければ (size_t) -1
+static size_t sock_avail(vr_sock s) {
+#ifdef _WIN32
+    u_long n = 0;
+    if (ioctlsocket(s, FIONREAD, &n) != 0) return (size_t) -1;
+    return (size_t) n;
+#else
+    int n = 0;
+    if (ioctl(s, FIONREAD, &n) != 0 || n < 0) return (size_t) -1;
+    return (size_t) n;
+#endif
+}
+
 static int rx_head(uint32_t h[2], uint32_t op, int wait) {
     for (;;) {
         if (!wait) {
             WSAPOLLFD pf = { .fd = g_sock, .events = POLLRDNORM };
             if (g_dead || WSAPoll(&pf, 1, 0) <= 0) return g_dead ? 0 : 2;
+            // 返事の本体が半分しか届いていないうちは読まない。読み始めると、残りが届くまで g_lock を持ったまま止まり、
+            // その間 DXVK の命令を組む糸が命令を足せない（窓の絵の返事は数百 KB・USB で数 ms〜十数 ms）。1 MB を超える返事は待たずに読む
+            {
+                size_t hd = 8 + ((g_ext_on && g_rx_seq >= g_rx_ext_from) ? VR_EXT_BYTES : 0), av = sock_avail(g_sock);
+                if (av != (size_t) -1) {
+                    uint8_t pk[8 + VR_EXT_BYTES];
+                    uint32_t hl;
+                    if (av < hd || recv(g_sock, (char *) pk, (int) hd, MSG_PEEK) != (int) hd) return 2;
+                    memcpy(&hl, pk + 4, 4);
+                    if (hl <= (1u << 20) && av < hd + hl) return 2;
+                }
+            }
             if (!vr_recv_all(g_sock, h, 8)) { conn_lost("返事を読む所"); return 0; }
             if (h[1] > (512u << 20)) { say("受け手の返事が大きすぎる（%u バイト）", h[1]); conn_lost("返事の長さ"); return 0; }
         } else if (!recv_head_raw(h, op)) {
@@ -1068,7 +1233,7 @@ static int pend_read_one_locked(int wait) {
     if (!g_pend_n) return 0;
     int kind = g_pend[g_pend_head];
     uint32_t h[2];
-    int got = rx_head(h, kind == PEND_DEFER ? g_defer.op : kind == PEND_STATUS ? VR_GET_STATUS : VR_GET_PROGRESS, wait);
+    int got = rx_head(h, kind == PEND_DEFER ? g_dr.e[(g_dr.head + g_dr.ready) % DQ_RING].op : kind == PEND_STATUS ? VR_GET_STATUS : VR_GET_PROGRESS, wait);
     if (got == 2) return 2;
     g_pend_head = (g_pend_head + 1) % sizeof g_pend;
     g_pend_n--;
@@ -1085,15 +1250,15 @@ static int pend_read_one_locked(int wait) {
         return 1;
     }
     if (kind == PEND_DEFER) {
-        g_defer.active = 0;
-        g_defer.ready = 1;
-        g_defer.r = VK_ERROR_DEVICE_LOST;
-        g_defer.out.n = 0;
+        defer_ent *d = &g_dr.e[(g_dr.head + g_dr.ready) % DQ_RING];
+        g_dr.ready++;
+        d->r = VK_ERROR_DEVICE_LOST;
+        d->out.n = 0;
         if (!got) return 0;
-        vr_reserve(&g_defer.out, h[1]);
-        if (h[1] && !vr_recv_all(g_sock, g_defer.out.p, h[1])) { conn_lost("窓の絵の返事の途中"); return 0; }
-        g_defer.out.n = h[1];
-        g_defer.r = (VkResult) (int32_t) h[0];
+        vr_reserve(&d->out, h[1]);
+        if (h[1] && !vr_recv_all(g_sock, d->out.p, h[1])) { conn_lost("窓の絵の返事の途中"); return 0; }
+        d->out.n = h[1];
+        d->r = (VkResult) (int32_t) h[0];
         g_stat.bytes_in += 8 + h[1];
         return 1;
     }
@@ -1115,7 +1280,7 @@ static int pend_read_one_locked(int wait) {
 static void read_deferred_locked(void) {
     while (g_pend_n && !g_dead)
         if (pend_read_one_locked(1) != 1) break;
-    if (g_dead) { g_pend_n = 0; g_prog_out = 0; g_status_out = 0; g_defer.active = 0; }
+    if (g_dead) { g_pend_n = 0; g_prog_out = 0; g_status_out = 0; dr_kill_locked(); }
 }
 
 // g_lock の中で、届いている物を待たずに読めるだけ読む（押し出しの知らせと、列の返事）
@@ -1130,16 +1295,29 @@ static void rx_pump_locked(void) {
             break;
         }
     }
-    if (g_dead) { g_pend_n = 0; g_prog_out = 0; g_status_out = 0; g_defer.active = 0; }
+    if (g_dead) { g_pend_n = 0; g_prog_out = 0; g_status_out = 0; dr_kill_locked(); }
 }
 
-// 頼んで、返事は待たない。返事は rpc_take_deferred で受け取る（受け取る前に頼めるのは 1 つだけ）
-static void rpc_call_deferred(uint32_t op, vr_buf *b) {
+// 頼んで、返事は待たない。返事は rpc_take_deferred で受け取る（受け取る前に DQ_RING 個まで頼める）
+static void rpc_call_deferred(uint32_t op, vr_buf *b, uint64_t tag) {
     AcquireSRWLockExclusive(&g_lock);
     if (op < VR_OP_COUNT) g_stat.calls[op]++;
-    if (g_defer.active) { flush_locked(); read_deferred_locked(); }
+    if (g_dr.n == DQ_RING) {
+        // 輪がいっぱい：全部読んで、いちばん古い読み終わりを捨てる（呼ぶ側は depth で、こうならないようにしている）
+        flush_locked();
+        read_deferred_locked();
+        if (g_dr.n == DQ_RING) { g_dr.head = (g_dr.head + 1) % DQ_RING; g_dr.n--; if (g_dr.ready) g_dr.ready--; }
+    }
     put_msg_locked(op, b);
-    if (flush_locked()) { g_defer.active = 1; g_defer.ready = 0; g_defer.op = op; pend_push_locked(PEND_DEFER); }
+    if (flush_locked()) {
+        defer_ent *d = &g_dr.e[(g_dr.head + g_dr.n) % DQ_RING];
+        d->op = op;
+        d->tag = tag;
+        d->r = VK_NOT_READY;
+        d->out.n = 0;
+        g_dr.n++;
+        pend_push_locked(PEND_DEFER);
+    }
     ReleaseSRWLockExclusive(&g_lock);
     b->n = 0;
 }
@@ -1153,34 +1331,80 @@ static int defer_unlocked(void) {
     return v;
 }
 
-static VkResult rpc_take_deferred(vr_buf *out) {
+// 先頭の返事（読み終わった物）を取り出す。g_lock を持って呼ぶ。無ければ VK_NOT_READY
+static VkResult dr_pop_locked(vr_buf *out, uint64_t *tag) {
+    if (!g_dr.ready) return VK_NOT_READY;
+    defer_ent *d = &g_dr.e[g_dr.head];
+    VkResult r = d->r;
+    out->n = 0;
+    vr_reserve(out, d->out.n);
+    if (d->out.n) memcpy(out->p, d->out.p, d->out.n);
+    out->n = d->out.n;
+    if (tag) *tag = d->tag;
+    g_dr.head = (g_dr.head + 1) % DQ_RING;
+    g_dr.n--;
+    g_dr.ready--;
+    return r;
+}
+
+// 先頭の返事が読み終わるまで、届くのを待って読む（g_lock を持って呼ぶ。後ろの返事までは待たない）
+static void read_deferred_one_locked(void) {
+    while (g_pend_n && !g_dr.ready && !g_dead)
+        if (pend_read_one_locked(1) != 1) break;
+    if (g_dead) { g_pend_n = 0; g_prog_out = 0; g_status_out = 0; dr_kill_locked(); }
+}
+
+// あとで受け取る返事のうち、いちばん古い物を受け取る。まだ届いていなければ待つ。頼んでいなければ VK_NOT_READY
+// 届くのを待つ間は錠を放す（IPHONE_VK_DEFER_UNLOCKED=0 で前のやり方）。前は錠を持ったまま待ち、
+// iPhone が前のコマを描き終えるまで、DXVK の命令を組み立てる糸も fence を待つ糸も止めていた（1080p の Heaven で両方が暇になっていた）
+static VkResult rpc_take_deferred(vr_buf *out, uint64_t *tag) {
     double t0 = now_ms();
     if (defer_unlocked()) {
-        // 返事が届いた分だけ錠の中で読み、まだなら錠の外で 1 ms ずつ待つ。待つ間にほかの糸が先に読んでもよい（g_defer.ready に入る）
+        // 返事が全部届いた分だけ錠の中で読み（rx_head が、半分しか届いていない返事は読まない）、まだなら錠の外で待つ。
+        // 待つ間にほかの糸が先に読んでもよい（g_dr に入る）
+        size_t last_av = 0;
+        double t_grow = now_ms();
         for (;;) {
             AcquireSRWLockExclusive(&g_lock);
-            if (g_defer.active && flush_locked()) rx_pump_locked();
-            int done = !g_defer.active || g_dead;
+            if (!g_dr.ready && g_dr.n && flush_locked()) rx_pump_locked();
+            int done = g_dr.ready || !g_dr.n || g_dead;
             ReleaseSRWLockExclusive(&g_lock);
             if (done) break;
             WSAPOLLFD pf = { .fd = g_sock, .events = POLLRDNORM };
-            WSAPoll(&pf, 1, 1);
+            if (WSAPoll(&pf, 1, 1) > 0) {
+                // 返事の一部だけ届いている：続きを待つ（錠は放してある）。届く量が 20 ms 増えなければ、待つのをやめて下で錠の中で読む
+                size_t av = sock_avail(g_sock);
+                double tn = now_ms();
+                if (av != last_av) { last_av = av; t_grow = tn; }
+                else if (tn - t_grow > 20) break;
+                YieldProcessor();
+            }
         }
     }
     AcquireSRWLockExclusive(&g_lock);
-    if (g_defer.active && flush_locked()) read_deferred_locked();
-    VkResult r = VK_NOT_READY;
-    if (g_defer.ready) {
-        g_defer.ready = 0;
-        r = g_defer.r;
-        out->n = 0;
-        vr_reserve(out, g_defer.out.n);
-        if (g_defer.out.n) memcpy(out->p, g_defer.out.p, g_defer.out.n);
-        out->n = g_defer.out.n;
-    }
-    g_stat.wait_ms[g_defer.op ? g_defer.op : VR_READ_JPEG_PIPE] += now_ms() - t0;
+    if (!g_dr.ready && g_dr.n && flush_locked()) read_deferred_one_locked();
+    uint32_t op = g_dr.ready ? g_dr.e[g_dr.head].op : 0;
+    VkResult r = dr_pop_locked(out, tag);
+    g_stat.wait_ms[op ? op : VR_READ_JPEG_PIPE] += now_ms() - t0;
     ReleaseSRWLockExclusive(&g_lock);
     return r;
+}
+
+// 待たずに、届いている返事があれば受け取る。無ければ VK_NOT_READY
+static VkResult rpc_try_take_deferred(vr_buf *out, uint64_t *tag) {
+    AcquireSRWLockExclusive(&g_lock);
+    if (!g_dr.ready && g_dr.n && flush_locked()) rx_pump_locked();
+    VkResult r = dr_pop_locked(out, tag);
+    ReleaseSRWLockExclusive(&g_lock);
+    return r;
+}
+
+// 頼んでまだ受け取っていない返事の数
+static unsigned rpc_deferred_count(void) {
+    AcquireSRWLockExclusive(&g_lock);
+    unsigned n = g_dr.n;
+    ReleaseSRWLockExclusive(&g_lock);
+    return n;
 }
 
 static VkResult rpc_call(uint32_t op, vr_buf *b, vr_buf *out) {
@@ -6775,6 +6999,11 @@ struct swapchain {
     VkCommandBuffer cmd[8]; // 画像 i を持ち帰り用 i に写す（あらかじめ記録しておく）
     VkFence fence[8];
     int pend;               // 写しを頼んだが、まだ窓に出していない画像（無ければ -1）
+    // 窓の絵を頼むのを遅らせる（IPHONE_VK_PRESENT_LAG）。出した順に (画像の番号, present の番号) を覚え、lag 回あとの present で頼む
+    uint32_t lq_idx[8];
+    uint64_t lq_ser[8];
+    uint32_t lq_n;
+    uint64_t jreq_prev;     // ひとつ前に JPEG を頼んだコマの present の番号（次の返事に入っている絵がそのコマの物）
     VkQueue q;
     uint64_t frames;
     double t0;
@@ -7146,15 +7375,41 @@ static int jdec_decode(struct jdec *j, const uint8_t *data, size_t n, uint32_t w
 // 今の設定で、返ってきた JPEG が何回前に頼んだ物か（先送りで 1・返事を次のコマで受け取るので 1）
 static int jpeg_lag(void);
 
-static int jpeg_request(struct swapchain *sc, uint32_t j, vr_buf *out) {
+// 返事待ちを何個まで残して次を頼むか（IPHONE_VK_PRESENT_DEPTH。1 なら前のコマの返事を受け取ってから頼む＝前のやり方）。
+// 受け手は返事を頼んだ順にしか返さないので、増やすと present は返事を待たずに戻り、アプリは次のコマの submit を先に送れる。窓に出るのは 1 つにつき 1 コマ遅くなる
+// （返事が届いていれば、depth に関わらず届いたそばから受け取って出す）
+#define PRESENT_DEPTH_DEFAULT 1
+static int present_depth(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("IPHONE_VK_PRESENT_DEPTH");
+        v = e && *e ? atoi(e) : PRESENT_DEPTH_DEFAULT;
+        if (v < 1) v = 1;
+        if (v > DQ_RING - 2) v = DQ_RING - 2;
+    }
+    return v;
+}
+
+// 返事も待たない先送りか（IPHONE_VK_ASYNC_PRESENT=0 で、今までどおり待つ）
+static int jpeg_async(void) {
+    static int async = -1;
+    if (async < 0) {
+        const char *e = getenv("IPHONE_VK_ASYNC_PRESENT"), *pp = getenv("IPHONE_VK_JPEG_PIPE");
+        int pipe = (g_hw.caps & VR_CAP_JPEG_PIPE) && !(pp && *pp == '0');
+        async = pipe && !(e && *e == '0');
+    }
+    return async;
+}
+
+// serial：このコマの present の番号。*got：取れた JPEG が何回目の present の物か（先送りの返事は、ひとつ前に頼んだコマの絵。先送りでなければ 0）
+static int jpeg_request(struct swapchain *sc, uint32_t j, uint64_t serial, vr_buf *out, uint64_t *got) {
     static int q = -1, pipe = -1;
     if (q < 0) { const char *e = getenv("IPHONE_VK_JPEG_Q"); q = e && atoi(e) > 0 ? atoi(e) : 80; }
     // 先送り：受け手は今のコマを後ろで縮め、ひとつ前のコマの JPEG を返す（窓に出るのは 1 コマ遅れる）
     if (pipe < 0) { const char *e = getenv("IPHONE_VK_JPEG_PIPE"); pipe = (g_hw.caps & VR_CAP_JPEG_PIPE) && !(e && *e == '0'); }
     // 返事も待たない：頼んだら次のコマで受け取る。そのあいだにアプリは次のコマを作れる（窓に出るのはもう 1 コマ遅れる）。
     // IPHONE_VK_ASYNC_PRESENT=0 で、今までどおり待つ
-    static int async = -1;
-    if (async < 0) { const char *e = getenv("IPHONE_VK_ASYNC_PRESENT"); async = pipe && !(e && *e == '0'); }
+    int async = jpeg_async();
     vr_buf b = { 0 };
     vr_u64(&b, ID(sc->rbmem[j]));
     vr_u64(&b, 0);
@@ -7166,9 +7421,25 @@ static int jpeg_request(struct swapchain *sc, uint32_t j, vr_buf *out) {
     VkResult r;
     out->n = 0;
     if (async) {
-        r = rpc_take_deferred(out); // 前のコマで頼んだ返事
-        rpc_call_deferred(VR_READ_JPEG_PIPE, &b);
-        if (r == VK_NOT_READY) r = VK_SUCCESS; // 最初のコマ：まだ出す物が無い
+        // 届いている返事を全部受け取り（いちばん新しい中身のある 1 枚だけを窓に出す）、返事待ちが depth 個以上なら古い物から待つ。そのあとで今のコマを頼む
+        int depth = present_depth();
+        r = VK_SUCCESS;
+        for (;;) {
+            vr_buf t = { 0 };
+            uint64_t tg = 0;
+            VkResult x = rpc_deferred_count() >= (unsigned) depth ? rpc_take_deferred(&t, &tg) : rpc_try_take_deferred(&t, &tg);
+            if (x == VK_NOT_READY) { free(t.p); break; }
+            if (x != VK_SUCCESS) r = x;
+            if (x == VK_SUCCESS && t.n) {
+                free(out->p);
+                *out = t;
+                *got = tg;
+            } else {
+                free(t.p);
+            }
+        }
+        rpc_call_deferred(VR_READ_JPEG_PIPE, &b, sc->jreq_prev);
+        sc->jreq_prev = serial;
     } else {
         r = rpc_call(pipe ? VR_READ_JPEG_PIPE : VR_READ_JPEG, &b, out);
     }
@@ -7208,7 +7479,8 @@ static int jpeg_fetch(struct swapchain *sc, uint32_t j) {
         if (!(jok = jdec_open(&jd))) return 0;
     }
     vr_buf out = { 0 };
-    int k = jpeg_request(sc, j, &out);
+    uint64_t got = 0;
+    int k = jpeg_request(sc, j, 0, &out, &got);
     if (k == 1) k = jdec_decode(&jd, out.p, out.n, sc->w, sc->h, sc->px[j]);
     free(out.p);
     return k;
@@ -7570,9 +7842,9 @@ static VkResult video_request(struct swapchain *sc, uint32_t j, uint64_t serial,
     VkResult r;
     if (!now && async) {
         // 前のコマで頼んだ返事を受け取ってから、今のコマを頼む（返事は次のコマで受け取る）
-        r = rpc_take_deferred(&out);
+        r = rpc_take_deferred(&out, NULL);
         if (r == VK_NOT_READY) r = VK_SUCCESS;
-        if (r == VK_SUCCESS) rpc_call_deferred(VR_READ_H264, &b);
+        if (r == VK_SUCCESS) rpc_call_deferred(VR_READ_H264, &b, 0);
         else if (key) InterlockedExchange(&sc->v_need_key, 1);
     } else {
         r = rpc_call(VR_READ_H264, &b, &out);
@@ -7636,8 +7908,9 @@ static VkResult blit(struct swapchain *sc, uint32_t j, uint64_t serial) {
         }
         // JPEG を取ってきて表示の糸に渡し、ほどいて描くのを待たずに戻る
         vr_buf out = { 0 };
-        int k = jpeg_request(sc, j, &out);
-        uint64_t got = jpeg_serial(sc, serial);
+        uint64_t got = 0;
+        int k = jpeg_request(sc, j, serial, &out, &got);
+        if (!jpeg_async()) got = jpeg_serial(sc, serial);
         if (k == 1) disp_give(sc, &out, got);
         free(out.p);
         if (ask_resize(sc)) return VK_SUBOPTIMAL_KHR;
@@ -7736,6 +8009,33 @@ static double pace_present(struct swapchain *sc) {
     return now_ms() - t0;
 }
 
+// 窓の絵を頼むのを、何回あとの present まで遅らせるか（IPHONE_VK_PRESENT_LAG。既定 PRESENT_LAG_DEFAULT）。
+// 受け手は絵を頼まれると、その絵を写した仕事が GPU で終わるまで次の命令を読まない。今のコマの頼みを今のコマの submit の直後に送ると、
+// 受け手は次のコマの命令を読む前に GPU が今のコマを描き終えるのを待ち、GPU はそのあいだ次の仕事が無い（受け手の処理と GPU が重ならない）。
+// 頼みを lag コマ遅らせて送れば、頼みの前に次のコマの submit まで読んで GPU に渡してあるので、待つあいだ GPU は次のコマを描ける。
+// 受け手は変えない。窓に出るのは lag コマ遅くなる。持ち帰り用のメモリは画像ごとなので、lag が swapchain の枚数より小さければ、頼むまで上書きされない
+#define PRESENT_LAG_DEFAULT 1
+static int present_lag(const struct swapchain *sc) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_PRESENT_LAG"); v = e && *e ? atoi(e) : PRESENT_LAG_DEFAULT; if (v < 0) v = 0; if (v > 6) v = 6; }
+    int m = (int) sc->n - 1;
+    return v < m ? v : (m > 0 ? m : 0);
+}
+
+static VkResult present_blit(struct swapchain *sc, uint32_t idx, uint64_t serial) {
+    int lag = present_lag(sc);
+    if (lag <= 0) return blit(sc, idx, serial);
+    sc->lq_idx[sc->lq_n] = idx;
+    sc->lq_ser[sc->lq_n] = serial;
+    sc->lq_n++;
+    if (sc->lq_n <= (uint32_t) lag) return VK_SUCCESS;
+    uint32_t j = sc->lq_idx[0];
+    uint64_t s = sc->lq_ser[0];
+    sc->lq_n--;
+    for (uint32_t i = 0; i < sc->lq_n; i++) { sc->lq_idx[i] = sc->lq_idx[i + 1]; sc->lq_ser[i] = sc->lq_ser[i + 1]; }
+    return blit(sc, j, s);
+}
+
 static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi) {
     VkResult worst = VK_SUCCESS;
     struct swapchain *sc0 = pi->swapchainCount ? (struct swapchain *) pi->pSwapchains[0] : NULL;
@@ -7771,7 +8071,7 @@ static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi)
             static int every = -1;
             if (every < 0) { const char *e = getenv("IPHONE_VK_PRESENT_EVERY"); every = e && atoi(e) > 1 ? atoi(e) : 1; if (every > 1) say("窓の絵は %d コマに 1 回だけ受け取る（測る用）", every); }
             if (r == VK_SUCCESS && every > 1 && serial % every) { g_stat.blits++; continue; }
-            if (r == VK_SUCCESS) r = sc->low && sc->hwnd ? blit_now(sc, idx, serial) : blit(sc, idx, serial);
+            if (r == VK_SUCCESS) r = sc->low && sc->hwnd ? blit_now(sc, idx, serial) : present_blit(sc, idx, serial);
             g_stat.blit_ms += now_ms() - tb;
             g_stat.blits++;
             // 前の present の終わりから今までの、区切りで待った分を除いた長さが、区切りの 9 割を 10 回続けて超えたら、先送りに戻す
