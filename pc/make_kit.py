@@ -15,6 +15,8 @@
 # 古い iPhone（iOS 15・16）用の PocketCam-*.ipa も、RpcServer の IPA と同じ印を足して入れる（カメラとマイクだけのアプリ。PC 側は Start-Mic-Camera.cmd）
 # 新しく足した物（extras\ の道具・PocketGPU.exe・PocketCam の IPA）は、キットのフォルダを作る前に揃っているか見る
 # （途中で止まると同じ人のフォルダが残って、作り直せなくなるため）。入れないときは --no-media・--no-app
+# Android の PC 側の口（10/14）：adb forward が PC で待つ口（50300・50064・50063）を Windows が予約していると待てない。android\_common.cmd が
+# tools\pgpu_port.ps1 を呼んで、予約の範囲の外の口（47300・47400・47500 から順）を選び、android\port.txt に覚える。ほかの cmd・run.ps1・Fix-PocketGPU も同じ口を読む
 # 更新（10/12）：tools\update.ini に、更新を聞く先（url=）と、その人の更新用の合言葉（token=）を書く。合言葉は乱数で、
 # 最後に UPDATE_TOKEN= の行で出す（kit_pool.py が KV の upd:<合言葉> に印と一緒に置く）。kit.ini は全員同じ中身なので、
 # 更新でそのまま差し替えられるよう、人ごとの物は update.ini に分けた。入口は Update-PocketGPU.cmd（中身は tools\update.ps1）
@@ -227,10 +229,17 @@ Start-Mic-Camera.cmd と PocketGPU.exe が使うツールです。直接開く�
 # 受け手（server_aarch64）は /data/local/tmp/pgpu_server に置いて、127.0.0.1 だけで待たせ、adb forward で PC につなぐ。
 ANDROID_COMMON = r'''@echo off
 rem PocketGPU for Android: shared part. The other android\*.cmd files call it. Do not run it by itself.
-rem Sets ADB, ANDROID_SERIAL and PGPU_PORT. Exits with code 1 and a message when something is missing.
+rem Sets ADB, ANDROID_SERIAL, PGPU_PORT, PGPU_CAM_PORT and PGPU_AUDIO_PORT. Exits with code 1 and a message when something is missing.
 rem ADB_OK is set once adb.exe is found, so that the caller can still use adb when the phone is missing.
+rem The ports on this PC are chosen in this order: the variable (set PGPU_PORT=...) > the port saved in android\port.txt > the default (50300, 50064, 50063).
+rem If the PC port is reserved by Windows (see: netsh int ipv4 show excludedportrange protocol=tcp) or used by another program, tools\pgpu_port.ps1
+rem   picks a free port outside the reserved ranges (47300, 47400, 47500 and up), prints one line about it, and saves it in android\port.txt.
+rem   This happens when the caller sets PGPU_PICK=gpu or PGPU_PICK=gpu,cam,audio before calling this file. To forget the saved ports: delete android\port.txt.
 set "ADB_OK="
+call :load_ports
 if "%PGPU_PORT%"=="" set PGPU_PORT=50300
+if "%PGPU_CAM_PORT%"=="" set PGPU_CAM_PORT=50064
+if "%PGPU_AUDIO_PORT%"=="" set PGPU_AUDIO_PORT=50063
 
 rem ---- find adb.exe. It is not in this kit: get SDK Platform-Tools from Google ----
 if defined ADB goto adb_given
@@ -268,7 +277,8 @@ if %NDEV% GTR 1 if not defined ANDROID_SERIAL goto many_devices
 if not defined ANDROID_SERIAL set "ANDROID_SERIAL=%ONE%"
 "%ADB%" get-state 2>nul | findstr /b /c:"device" >nul
 if errorlevel 1 goto bad_serial
-exit /b 0
+if not defined PGPU_PICK exit /b 0
+goto pick_ports
 
 :count
 if "%~2"=="device" set /a NDEV+=1
@@ -299,6 +309,32 @@ exit /b 1
 echo.
 echo ERROR: the device "%ANDROID_SERIAL%" is not ready. Run   "%ADB%" devices   to check.
 exit /b 1
+
+:pick_ports
+rem Check the ports on this PC and save the ones that had to change. The result is read back from android\port.txt.
+if exist "%~dp0..\tools\pgpu_port.ps1" "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\tools\pgpu_port.ps1" -PgpuPick "%PGPU_PICK%" <nul
+call :load_ports force
+exit /b 0
+
+rem Read android\port.txt (lines like gpu=47300). Without "force" a variable that is already set wins; with "force" the file wins.
+:load_ports
+if not exist "%~dp0port.txt" exit /b 0
+for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0port.txt") do call :load_one "%%A" "%%B" %1
+exit /b 0
+:load_one
+set "LP_KEY=%~1"
+set "LP_VAL=%~2"
+echo %LP_VAL%| findstr /r /x "[0-9][0-9]*" >nul
+if errorlevel 1 exit /b 0
+if /i "%LP_KEY%"=="gpu" if "%PGPU_PORT%"=="" set "PGPU_PORT=%LP_VAL%"
+if /i "%LP_KEY%"=="gpu" if "%~3"=="force" set "PGPU_PORT=%LP_VAL%"
+if /i "%LP_KEY%"=="cam" if "%PGPU_CAM_PORT%"=="" set "PGPU_CAM_PORT=%LP_VAL%"
+if /i "%LP_KEY%"=="cam" if "%~3"=="force" set "PGPU_CAM_PORT=%LP_VAL%"
+if /i "%LP_KEY%"=="audio" if "%PGPU_AUDIO_PORT%"=="" set "PGPU_AUDIO_PORT=%LP_VAL%"
+if /i "%LP_KEY%"=="audio" if "%~3"=="force" set "PGPU_AUDIO_PORT=%LP_VAL%"
+set "LP_KEY="
+set "LP_VAL="
+exit /b 0
 '''
 
 ANDROID_START = r'''@echo off
@@ -308,6 +344,8 @@ rem Needs adb.exe (Google SDK Platform-Tools). See README_android.txt.
 rem Nothing is installed on the phone and no root is needed. The receiver is a file in /data/local/tmp.
 rem Only English here on purpose: a Japanese Windows reads .cmd files as Shift_JIS.
 setlocal
+rem Check the port on this PC first (Windows can reserve some ports). The chosen port is saved in android\port.txt, and the other files use it.
+set "PGPU_PICK=gpu"
 call "%~dp0_common.cmd"
 if errorlevel 1 goto fail
 
@@ -379,8 +417,9 @@ echo Unlock the phone and run this file again. If it happens again, send us this
 goto fail
 :forward_failed
 echo.
-echo ERROR: could not open port %PGPU_PORT% on this PC. Another program may be using it.
-echo Run android\stop_android.cmd, or use another port:   set PGPU_PORT=50301
+echo ERROR: could not open port %PGPU_PORT% on this PC. Another program may be using it, or Windows reserved it.
+echo Run android\stop_android.cmd and try again. This file picks a free port by itself; to choose one:   set PGPU_PORT=47301
+echo To see what Windows reserved:   netsh int ipv4 show excludedportrange protocol=tcp
 goto fail
 
 :fail
@@ -407,6 +446,9 @@ rem   If the version cannot be read it uses the new form. If adb refuses the new
 rem   To choose the form yourself:   set PGPU_APP_FORWARD=new   or   set PGPU_APP_FORWARD=old
 rem   The 0.1.2 app also takes the old form when "Also accept old PC tools" is on in the app settings. It is off by default.
 rem Other ports:   set PGPU_CAM_PORT=50064   set PGPU_AUDIO_PORT=50063   set PGPU_PORT=50300
+rem   Ports on this PC: if Windows reserved one of them (netsh int ipv4 show excludedportrange protocol=tcp) or another program uses it,
+rem   this file picks a free port outside the reserved ranges (47300, 47400 and 47500 and up), says so, and saves it in android\port.txt.
+rem   Use the numbers this file prints. stop and the other files in this kit read android\port.txt, so they use the same ports.
 rem GPU: if the kit receiver from android\start_android.cmd is running on the phone, the app does not start its own
 rem   receiver and port %PGPU_PORT% goes to the kit receiver (tcp:%PGPU_PORT%). Otherwise it goes to the receiver inside the app:
 rem   app 0.1.4 and newer:   adb forward tcp:50300 localabstract:pocketgpu-gpu   (no port number on the phone, so nothing else can be in the way)
@@ -415,6 +457,7 @@ rem   If the version cannot be read it uses tcp:50060 (the 0.1.4 app also listen
 rem   If adb refuses the localabstract form it uses tcp:50060.
 rem   To choose the GPU form yourself:   set PGPU_APP_GPU=usb   or   set PGPU_APP_GPU=tcp
 setlocal
+if /i not "%~1"=="stop" set "PGPU_PICK=gpu,cam,audio"
 call "%~dp0_common.cmd"
 if errorlevel 1 goto nodev
 set "PKG=com.tsurutanmen.pocketgpu"
@@ -537,8 +580,9 @@ echo ERROR: the PocketGPU app is not installed on the phone. Install it with:   
 goto fail
 :forward_failed
 echo.
-echo ERROR: could not open a port on this PC. Another program may be using %PGPU_CAM_PORT%, %PGPU_AUDIO_PORT% or %PGPU_PORT%.
-echo Run android\android_app.cmd stop, or use other ports (see the top of this file).
+echo ERROR: could not open a port on this PC. Another program may be using %PGPU_CAM_PORT%, %PGPU_AUDIO_PORT% or %PGPU_PORT%, or Windows reserved it.
+echo Run android\android_app.cmd stop and try again. To see what Windows reserved:   netsh int ipv4 show excludedportrange protocol=tcp
+echo To choose other ports (see the top of this file):   set PGPU_PORT=47301
 goto fail
 
 :fail
@@ -559,11 +603,14 @@ if errorlevel 1 goto nodev
 echo Stopping the receiver on the phone ...
 "%ADB%" shell "kill $(pidof pgpu_server) 2>/dev/null; rm -f /data/local/tmp/pgpu_server; true" >nul 2>&1
 "%ADB%" forward --remove tcp:%PGPU_PORT% >nul 2>&1
+rem The port saved in android\port.txt (the one start_android.cmd used) is closed too, even if PGPU_PORT is set to something else in this window.
+if exist "%~dp0port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0port.txt") do if /i "%%A"=="gpu" "%ADB%" forward --remove tcp:%%B >nul 2>&1
 echo Stopped. The receiver is removed from the phone; its log stays at /data/local/tmp/pgpu_server.log.
 if "%PGPU_NOPAUSE%"=="" pause
 exit /b 0
 :nodev
 if defined ADB_OK "%ADB%" forward --remove tcp:%PGPU_PORT% >nul 2>&1
+if defined ADB_OK if exist "%~dp0port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0port.txt") do if /i "%%A"=="gpu" "%ADB%" forward --remove tcp:%%B >nul 2>&1
 echo The receiver on the phone was not stopped. Connect the phone and run this file again, or restart the phone.
 if "%PGPU_NOPAUSE%"=="" pause
 exit /b 1
@@ -581,6 +628,8 @@ if "%~1"=="" (
   exit /b 1
 )
 set "VK_ADD_DRIVER_FILES=%~dp0iphone_icd.json;%~dp0x86\iphone_icd.json"
+rem The port on this PC: the variable PGPU_PORT, else the port saved in android\port.txt by android\start_android.cmd, else 50300.
+if "%PGPU_PORT%"=="" if exist "%~dp0android\port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0android\port.txt") do if /i "%%A"=="gpu" echo %%B| findstr /r /x "[0-9][0-9]*" >nul && set "PGPU_PORT=%%B"
 if "%PGPU_PORT%"=="" set PGPU_PORT=50300
 set IPHONE_VK=127.0.0.1:%PGPU_PORT%
 if "%DXVK_FILTER_DEVICE_NAME%"=="" if "%IPHONE_VK_NAME%"=="" set DXVK_FILTER_DEVICE_NAME=PocketGPU
@@ -597,6 +646,8 @@ ANDROID_CHECK = r'''@echo off
 rem PocketGPU: check that Windows can see the Android phone GPU. Run android\start_android.cmd first.
 setlocal
 set "VK_ADD_DRIVER_FILES=%~dp0iphone_icd.json;%~dp0x86\iphone_icd.json"
+rem The port on this PC: the variable PGPU_PORT, else the port saved in android\port.txt by android\start_android.cmd, else 50300.
+if "%PGPU_PORT%"=="" if exist "%~dp0android\port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0android\port.txt") do if /i "%%A"=="gpu" echo %%B| findstr /r /x "[0-9][0-9]*" >nul && set "PGPU_PORT=%%B"
 if "%PGPU_PORT%"=="" set PGPU_PORT=50300
 set IPHONE_VK=127.0.0.1:%PGPU_PORT%
 set "VK_ICD_FILENAMES=%VK_ADD_DRIVER_FILES%"
@@ -629,6 +680,8 @@ if errorlevel 1 goto failed
 echo.
 echo [2/2] Checking that Windows sees the phone GPU ...
 set "VK_ADD_DRIVER_FILES=%~dp0iphone_icd.json;%~dp0x86\iphone_icd.json"
+rem start_android.cmd may have picked another port (Windows can reserve some ports) and saved it in android\port.txt. That one wins here.
+if exist "%~dp0android\port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0android\port.txt") do if /i "%%A"=="gpu" echo %%B| findstr /r /x "[0-9][0-9]*" >nul && set "PGPU_PORT=%%B"
 if "%PGPU_PORT%"=="" set PGPU_PORT=50300
 set IPHONE_VK=127.0.0.1:%PGPU_PORT%
 set "VK_ICD_FILENAMES=%VK_ADD_DRIVER_FILES%"
@@ -722,6 +775,8 @@ Steps
 4. Double-click android\start_android.cmd.
    It finds adb, checks the phone, copies the receiver (android\server_aarch64) to /data/local/tmp on the phone,
    starts it, and connects port 50300 on this PC to it with "adb forward". Nothing is installed on the phone and no root is needed.
+   Some PCs reserve port ranges for Hyper-V or WSL, and then port 50300 cannot be used. If so, start_android.cmd says so, picks a free port
+   outside the reserved ranges (47300 and up) by itself, and saves it in android\port.txt. The other files in this kit use the same port.
    If it says "Done", go on.
 5. Double-click check_android.cmd. You should see a GPU named "PocketGPU phone (...)" in the list.
 6. Start a Vulkan app with:   pocketgpu_android.cmd "C:\path\to\app.exe"
@@ -764,7 +819,11 @@ Notes
 - The receiver listens only inside the phone (127.0.0.1). It is reachable only through the USB cable.
 - Do not use games with anti-cheat (Easy Anti-Cheat, BattlEye, VAC, Vanguard). Your account may be banned.
 - The iPhone files in this kit (RpcServer-*.ipa, Start-PocketGPU.cmd, Run-on-iPhone-GPU.cmd, pocketgpu.cmd) are not needed for Android.
-- Another port: set PGPU_PORT=50301 before step 4, 5 and 6 (use the same number in all of them).
+- Ports on this PC: the kit checks them before it uses them. If Windows reserved a port (netsh int ipv4 show excludedportrange protocol=tcp shows the reserved ranges)
+  or another program uses it, it picks a free one (47300 and up for the GPU) and saves it in android\port.txt. check_android.cmd, pocketgpu_android.cmd,
+  android_app.cmd and stop_android.cmd read that file, so you do not have to type the number. To forget it: delete android\port.txt.
+  To choose a port yourself: set PGPU_PORT=47301 before step 4, 5 and 6 (use the same number in all of them). The camera and mic ports of android_app.cmd work the same way
+  (PGPU_CAM_PORT and PGPU_AUDIO_PORT, usually 50064 and 50063): use the numbers it prints for webcam_rx.exe and ipaudio.exe.
 - More than one phone connected: run   adb devices   and set ANDROID_SERIAL=the-serial before step 4.
 - To send the window picture as video (less data, the PC needs to decode H.264): set IPHONE_VK_VIDEO=1 before step 6.
 
@@ -814,6 +873,8 @@ Windows の PC から、Android のスマートフォンの GPU を Vulkan の G
 4. android\start_android.cmd をダブルクリックしてください。
    adb を探し、スマートフォンをチェックして、受信アプリの android\server_aarch64 をスマートフォンの /data/local/tmp にコピーして起動します。
    さらに、PC のポート 50300 を「adb forward」で受信アプリに接続します。スマートフォンには何もインストールしません。root 権限も必要ありません。
+   PC によっては、Hyper-V や WSL のために Windows がポートの範囲を予約していて、50300 を使えないことがあります。その場合は、start_android.cmd がそのことを表示して、
+   予約の範囲の外の空いているポート（47300 から順）を自動で選び、android\port.txt に覚えます。キットのほかのファイルも、同じポートを使います。
    「Done」と表示されたら、次へ進んでください
 5. check_android.cmd をダブルクリックしてください。一覧に「PocketGPU phone (…)」という名前の GPU が表示されれば成功です
 6. Vulkan のアプリは、pocketgpu_android.cmd "C:\アプリの場所\app.exe" で起動してください。
@@ -856,7 +917,11 @@ E. 終わったら、android\android_app.cmd stop を実行してください。
 - 受信アプリは、スマートフォンの中の 127.0.0.1 だけで待ち受けています。USB ケーブルを通してしか接続できません
 - Easy Anti-Cheat、BattlEye、VAC、Vanguard などのアンチチートを導入しているゲームでは使用しないでください。アカウントが停止されることがあります
 - このキットの iPhone 用のファイル RpcServer-*.ipa、Start-PocketGPU.cmd、Run-on-iPhone-GPU.cmd、pocketgpu.cmd は、Android では必要ありません
-- 別のポート番号を使う場合は、手順 4・5・6 の前に set PGPU_PORT=50301 を入力してください。3 つの手順で同じ番号を使ってください
+- PC のポートは、使う前にキットがチェックします。Windows が予約している場合（予約の範囲は netsh int ipv4 show excludedportrange protocol=tcp で表示できます）や、
+  ほかのプログラムが使っている場合は、空いているポート（GPU は 47300 から順）を選んで android\port.txt に覚えます。check_android.cmd・pocketgpu_android.cmd・
+  android_app.cmd・stop_android.cmd はそのファイルを読むので、番号を入力する必要はありません。覚えた番号を消すには、android\port.txt を削除してください
+  自分でポートを決める場合は、手順 4・5・6 の前に set PGPU_PORT=47301 を入力してください。3 つの手順で同じ番号を使ってください。
+  android_app.cmd のカメラとマイクのポート（PGPU_CAM_PORT と PGPU_AUDIO_PORT。通常は 50064 と 50063）も同じ仕組みです。webcam_rx.exe と ipaudio.exe には、表示された番号を使ってください
 - スマートフォンを 2 台以上接続している場合は、adb devices を入力し、手順 4 の前に set ANDROID_SERIAL=一覧の番号 を入力してください
 - ウィンドウの映像を動画で送る場合は、手順 6 の前に set IPHONE_VK_VIDEO=1 を入力してください。通信量が減りますが、PC で H.264 をデコードする必要があります
 
@@ -1034,7 +1099,7 @@ def main():
     for name in ('Start-PocketGPU.cmd', 'Run-on-iPhone-GPU.cmd', 'Update-PocketGPU.cmd'):
         shutil.copy2(os.path.join(HERE, 'kit', name), os.path.join(kit, name))
     os.makedirs(os.path.join(kit, 'tools'), exist_ok=True)
-    for name in ('pgpu_common.ps1', 'start.ps1', 'run.ps1', 'update.ps1'):
+    for name in ('pgpu_common.ps1', 'pgpu_port.ps1', 'start.ps1', 'run.ps1', 'update.ps1'):
         shutil.copy2(os.path.join(HERE, 'kit', 'tools', name), os.path.join(kit, 'tools', name))
     # 更新を聞く先と、その人の合言葉。人ごとの物なので更新では差し替えない。ひな形には入れない
     if not a.template:
