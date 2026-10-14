@@ -53,6 +53,17 @@ import VideoToolbox
 //   PC の指定でも画面の設定でも、その箱（縦横どちらの向きでもよい）に収まる大きさにする（resolve。fitSize）。ACK の flags に WC_ACK_FIT（64）を立てて守ったと知らせる。
 //   小さい形で撮ればカメラの中（ISP）で縮むので、iPhone は何も増やさない。その大きさの形が無いとき（シネマティック・エフェクトで形が限られるとき）だけ、
 //   大きめに撮ってエンコーダの前で縮める（切り抜きと同じ stage の道）。FIT の印が無い PC（古い webcam_rx）には、今までどおり何も変えない
+//
+// 10/15（work/cam60）PC が 60 コマ/秒を頼んだのに 30 で来ていたのを直す：
+//   ACK の fps は「作る前に決めた値（plan）」で、PC の指定が通ったあとにコマ数が下がる道が、記録に何も残さず 4 つあった：
+//   シネマティック（30 まで）・コントロールセンターのエフェクト（その形の上限）・熱・その大きさの形が 60 を撮れないとき（大きさの違う別の形に替わっていた）。
+//   1. PC がコマ数を頼んだときは、シネマティックを止めて頼みを通す（resolve。画面の「PC からの指定を優先する」を切っているときは、前のまま画面の設定）
+//   2. エフェクトの上限は、そのエフェクトに対応しない同じ大きさの形で頼みのコマ数を撮れるなら、その形に替えて避ける（plan）
+//   3. その大きさの形が頼みのコマ数を撮れないときは、大きさを変えずに、撮れる最高のコマ数にする（pickFormat。前は大きさの違う別の形になった）。
+//      420v に無くて 420f にだけ在るときは 420f の形を使う（出力は 420v のまま）
+//   4. 下がったときは、頼まれたコマ数・下がった理由・その大きさの形の一覧を記録に出す。画面にも書く（pcNote）
+//   5. カメラが実際に受けているコマ数を、走らせる前に読み直して ACK に書く（iOS が直してしまったとき用）。走り始めて 2〜5 秒の実測も記録に出す
+//   6. エンコーダ：キーフレームの間隔を秒でも縛る。60 コマ/秒で作れなければ、30 コマ/秒に落として作り直す。1080p60 の画質の段を 20 Mbps に
 final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureMetadataOutputObjectsDelegate {
     static let shared = CameraBridge()
     static let port: UInt16 = 50064
@@ -163,6 +174,33 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         var fx = 0               // コントロールセンターで入っているエフェクト（対応する形とコマ数が変わる）
         var fitShrunk = false    // camgpu1015：PC の上限（FIT）に合わせて、頼まれた（か画面の設定の）大きさより小さくした
         var fitStage = false     // camgpu1015：箱に収まる形が無いので、大きく撮ってエンコーダの前で縮める（stage を使う）
+        var askedFps = 0         // cam60：PC（か画面）が決めたコマ数。シネマティックなどで下げる前の値
+        var cineDropped = false  // cam60：PC がコマ数を頼んだので、シネマティックを止めた
+    }
+
+    // cam60：決めたコマ数から下がった理由
+    private enum FpsWhy {
+        case cinematic, format, effect, hot, ios, encoder
+        var ja: String {
+            switch self {
+            case .cinematic: return "シネマティックは 30 コマ/秒まで"
+            case .format: return "その大きさの形が撮れる最高のコマ数"
+            case .effect: return "コントロールセンターのエフェクトの上限"
+            case .hot: return "iPhone が熱い"
+            case .ios: return "iOS がカメラの設定を直した"
+            case .encoder: return "エンコーダがそのコマ数で作れなかった"
+            }
+        }
+        var en: String {
+            switch self {
+            case .cinematic: return "Cinematic is limited to 30 fps"
+            case .format: return "the camera's maximum for that size"
+            case .effect: return "the limit of a Control Center effect"
+            case .hot: return "the iPhone is hot"
+            case .ios: return "iOS changed the camera setting"
+            case .encoder: return "the encoder could not be created at that rate"
+            }
+        }
     }
 
     // 作り直すときに決める、カメラと形と送る大きさ
@@ -170,6 +208,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let dev: AVCaptureDevice, fmt: AVCaptureDevice.Format, frameDur: CMTime, fps: Int
         let baseFps: Int         // 熱で下げる前のコマ数
         let outW: Int, outH: Int // エンコーダと PC に渡す大きさ（回したあと）
+        let why: [FpsWhy]        // cam60：r.askedFps から下がった理由（下がっていなければ空）
     }
 
     // エンコーダの前で切り抜く・水平を保つための値。q で作り、カメラの糸が lock の中で写して読む
@@ -727,6 +766,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                          quality: useRate && hi.quality > 0 ? min(hi.quality, 3) : appQ, kbps: useRate ? hi.kbps : 0, gop: hi.gop,
                          mirror: useMirror || appMirror, ackFlags: flags, pcSize: useSize, pcFps: useFps, pcCam: useCam)
         r.pcMirror = useMirror
+        r.askedFps = r.fps
         if !useMirror && appMirror { r.ackFlags |= Flag.ackAppSettings }
         // 形はいつも横長で選ぶ（カメラの形は横長）。縦長にするのは回転
         if r.h > r.w { (r.w, r.h) = (r.h, r.w) }
@@ -753,6 +793,12 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         r.stab = max(0, min(3, d.integer(forKey: Key.stab)))
         // シネマティックは 30 fps まで（WWDC25 の 319：1080p と 4K の 30 fps）。実際の上限は形の値で plan が決め直す
         r.cinematic = d.bool(forKey: Key.cinematic) && Self.cinematicDevice(cam) != nil
+        // cam60：PC が 31 コマ/秒以上を頼んだ（画面の「PC からの指定を優先する」が入っていて、それが通る）ときは、頼みを通してシネマティックを止める。
+        // 前は、画面で背景ぼかしを入れたままだと、PC が 60 を頼んでも黙って 30 になっていた。PC の指定を優先しない設定のときは、前のまま（画面の設定が通る）
+        if r.cinematic && useFps && hi.fps > 30 {
+            r.cinematic = false
+            r.cineDropped = true
+        }
         if r.cinematic { r.fps = min(r.fps, 30) }
         let cropOn = d.bool(forKey: Key.crop)
         let levelOn = d.bool(forKey: Key.level) && Self.levelAvailable(r.cinematic ? Self.cinematicDevice(cam) : Self.device(cam))
@@ -767,7 +813,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         // その形で撮って、エンコーダの前で箱の大きさに縮める（切り抜きと同じ stage の道。切り抜きも水平も切ってあれば、ただの縮小になる）。
         // plan は capH の高さの形をぴったりで選ぶので、ここで選んだ形と同じ形になる
         if box, !r.stage, let dev = r.cinematic ? Self.cinematicDevice(cam) : Self.device(cam),
-           let picked = Self.pickFormat(dev, w: r.w, h: r.h, fps: r.fps, only: r.cinematic ? Self.cinematicFormat : nil, prefer: Self.effectScore(r.fx)) {
+           let picked = Self.pickFormat(dev, w: r.w, h: r.h, fps: r.fps, only: r.cinematic ? Self.cinematicFormat : nil, prefer: Self.effectScore(r.fx), full: !r.cinematic) {
             let dims = CMVideoFormatDescriptionGetDimensions(picked.0.formatDescription)
             let fw = Int(dims.width), fh = Int(dims.height)
             if !Self.fitsBox(fw, fh, maxW: hi.maxW, maxH: hi.maxH), Self.heightChoices.contains(fh), Self.size(forHeight: fh).0 == fw {
@@ -817,14 +863,35 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         guard let dev = r.cinematic ? Self.cinematicDevice(r.camera) : Self.device(r.camera) else { return nil }
         // 切り抜くときは大きめに撮って、送る大きさに縮める
         let (cw, ch) = r.stage ? Self.size(forHeight: r.capH) : (r.w, r.h)
-        guard let picked = Self.pickFormat(dev, w: cw, h: ch, fps: r.fps, only: r.cinematic ? Self.cinematicFormat : nil, prefer: Self.effectScore(r.fx)) else { return nil }
-        let fmt = picked.0
+        guard let picked = Self.pickFormat(dev, w: cw, h: ch, fps: r.fps, only: r.cinematic ? Self.cinematicFormat : nil, prefer: Self.effectScore(r.fx), full: !r.cinematic) else { return nil }
+        var fmt = picked.0
         var dur = picked.1, fr = picked.2
-        // エフェクトが入っているときは、そのコマ数の範囲に収める（iOS も自分で収めるが、ACK に正しいコマ数を書くため）
+        // cam60：決めたコマ数から下がった理由を覚える（記録と画面に出す）
+        var why: [FpsWhy] = []
+        if r.fps < r.askedFps { why.append(.cinematic) }
+        if fr < r.fps { why.append(.format) }
+        // エフェクトが入っているときは、そのコマ数の範囲に収める（iOS も自分で収めるが、ACK に正しいコマ数を書くため）。
+        // cam60：その前に、エフェクトに対応しない同じ大きさの形で、頼みのコマ数を撮れるなら、その形に替える（エフェクトは入らなくなるが、頼みが通る）
         let cap = Self.effectFpsCap(fmt, fx: r.fx, cinematic: r.cinematic)
-        if cap > 0 && fr > cap, Self.canRun(fmt, cap) {
-            fr = cap
-            dur = CMTime(value: 1, timescale: CMTimeScale(cap))
+        if cap > 0 && fr > cap {
+            let fx = r.fx
+            var avoided = false
+            if !r.cinematic,
+               let alt = Self.pickFormat(dev, w: cw, h: ch, fps: r.fps, only: { Self.effectFpsCap($0, fx: fx, cinematic: false) == 0 }, prefer: nil),
+               alt.2 == fr {
+                let d0 = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
+                let d1 = CMVideoFormatDescriptionGetDimensions(alt.0.formatDescription)
+                if d0.width == d1.width && d0.height == d1.height {
+                    fmt = alt.0
+                    dur = alt.1
+                    avoided = true
+                }
+            }
+            if !avoided, Self.canRun(fmt, cap) {
+                fr = cap
+                dur = CMTime(value: 1, timescale: CMTimeScale(cap))
+                why.append(.effect)
+            }
         }
         let base = fr
         // iPhone が熱いときは、コマ数を下げて始める（設定で切れる）。下げたあとに冷えたら applyThermal が戻す
@@ -832,17 +899,24 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         if hot < fr, Self.canRun(fmt, hot) {
             fr = hot
             dur = CMTime(value: 1, timescale: CMTimeScale(hot))
+            why.append(.hot)
         }
         let dims = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
         var ow = Int(dims.width), oh = Int(dims.height)
         if r.stage { ow = r.w & ~1; oh = r.h & ~1 }
         if r.portrait { (ow, oh) = (oh, ow) }
-        return Plan(dev: dev, fmt: fmt, frameDur: dur, fps: fr, baseFps: base, outW: ow, outH: oh)
+        return Plan(dev: dev, fmt: fmt, frameDur: dur, fps: fr, baseFps: base, outW: ow, outH: oh, why: why)
     }
 
     // その形がそのコマ数で撮れるか（範囲の外を activeVideoMinFrameDuration に入れると例外で落ちる）
     private static func canRun(_ f: AVCaptureDevice.Format, _ fps: Int) -> Bool {
         fps > 0 && f.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= Double(fps) && Double(fps) <= $0.maxFrameRate }
+    }
+
+    // cam60：1 コマの長さ（秒）から、1 秒のコマ数（四捨五入）。長さが読めなければ 0
+    private static func fpsOf(_ d: CMTime) -> Int {
+        let s = CMTimeGetSeconds(d)
+        return s.isFinite && s > 0 ? Int((1 / s).rounded()) : 0
     }
 
     // 熱いときのコマ数。serious は 60 を 30 に・30 を 24 に、critical は 15。設定を切っているときはそのまま
@@ -921,7 +995,9 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         }
         guard let r = resolve(hi), Self.device(r.camera) != nil else { refuse(2, "使えるカメラが無い"); return }
         guard let p = plan(r) else { refuse(2, "そのカメラに使える形が無い"); return }
-        let dev = p.dev, fmt = p.fmt, fr = p.fps
+        let dev = p.dev, fmt = p.fmt
+        var fr = p.fps
+        var fpsWhy = p.why
         let s = AVCaptureSession()
         s.beginConfiguration()
         s.sessionPreset = .inputPriority // 形は device.activeFormat で決める（プリセットだと 1080p は 30 コマまでのことがある）
@@ -968,12 +1044,56 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             return
         }
         s.commitConfiguration()
+        // cam60：カメラが実際に受けているコマ数を読み直す。iOS が設定を直してしまうことがあるので、ACK には作る前に決めた値ではなく、読み直した値を書く。
+        // 違っていたら、決めたコマ数をもう一度当ててみて、それでも違えば iOS の値に合わせる
+        var base = p.baseFps
+        let planned = fr
+        if Self.canRun(fmt, planned), Self.fpsOf(dev.activeVideoMinFrameDuration) != planned {
+            let seen = Self.fpsOf(dev.activeVideoMinFrameDuration)
+            do {
+                try dev.lockForConfiguration()
+                dev.activeVideoMinFrameDuration = p.frameDur
+                dev.activeVideoMaxFrameDuration = p.frameDur
+                dev.unlockForConfiguration()
+            } catch {
+                log("ウェブカメラ：コマ数を当て直せない（\(error)）")
+            }
+            let again = Self.fpsOf(dev.activeVideoMinFrameDuration)
+            log("ウェブカメラ：カメラのコマ数が決めた値（\(planned)）と違った（読み直し \(seen)・当て直したあと \(again)）")
+            if again > 0 && again != planned {
+                fr = again
+                fpsWhy.append(.ios)
+            }
+        }
+        if fr < planned && planned == base { base = fr } // 熱で下げたのではないので、戻す先も下げる
         // 送る大きさ。回せなかったときは、センサーの向きのまま（幅と高さも元のまま）
         var aw = p.outW, ah = p.outH
         if !rotated && r.portrait { (aw, ah) = (ah, aw) }
-        let kb = r.kbps > 0 ? r.kbps : Self.qualityKbps(r.quality, w: aw, h: ah, fps: fr)
-        let g = r.gop > 0 ? r.gop : fr * 2
-        guard let enc = makeEncoder(w: aw, h: ah, fps: fr, kbps: kb, gop: g) else {
+        var kb = r.kbps > 0 ? r.kbps : Self.qualityKbps(r.quality, w: aw, h: ah, fps: fr)
+        var g = r.gop > 0 ? r.gop : fr * 2
+        var encMade = makeEncoder(w: aw, h: ah, fps: fr, kbps: kb, gop: g)
+        // cam60：31 コマ/秒以上で作れないときは、低遅延の方式を使わずに作ってみる。それでも作れなければ 30 コマ/秒に落とす
+        if encMade == nil && fr > 30 {
+            encMade = makeEncoder(w: aw, h: ah, fps: fr, kbps: kb, gop: g, lowLatency: false)
+        }
+        if encMade == nil && fr > 30 && Self.canRun(fmt, 30) {
+            let d30 = CMTime(value: 1, timescale: 30)
+            do {
+                try dev.lockForConfiguration()
+                dev.activeVideoMinFrameDuration = d30
+                dev.activeVideoMaxFrameDuration = d30
+                dev.unlockForConfiguration()
+                fr = 30
+                fpsWhy.append(.encoder)
+                base = min(base, fr)
+                kb = r.kbps > 0 ? r.kbps : Self.qualityKbps(r.quality, w: aw, h: ah, fps: fr)
+                g = r.gop > 0 ? r.gop : fr * 2
+                encMade = makeEncoder(w: aw, h: ah, fps: fr, kbps: kb, gop: g)
+            } catch {
+                log("ウェブカメラ：30 コマ/秒に落とせない（\(error)）")
+            }
+        }
+        guard let enc = encMade else {
             deviceInput = nil
             captureQueue.async { for i in s.inputs { s.removeInput(i) }; for o in s.outputs { s.removeOutput(o) } }
             refuse(4, "エンコーダを作れない")
@@ -986,7 +1106,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         venc = enc
         curFps = fr; curKbps = kb; curW = aw; curH = ah
         curReq = r
-        baseFps = p.baseFps
+        baseFps = base
         focusTargetApplied = -1
         lock.lock()
         sendConn = c; encCopy = enc; fpsCopy = fr; wCopy = aw; hCopy = ah; forceKey = true; inflight = 0; if !changed { seq = 0; sent = 0; dropped = 0 }
@@ -996,7 +1116,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         // ピント・明るさ・色・ズーム・ライト・切り抜きの値を、走らせる前に当てる
         liveApply(initial: true)
         // camctl2：CTRL の PC には ACK に CTRL を立てる。熱でコマ数を下げて始めたときは THERMAL も立てる
-        let hot = fr < p.baseFps
+        let hot = fr < base
         var ackFlags = r.ackFlags | Flag.ackLive | (changed ? Flag.ackChanged : 0)
         if ctl { ackFlags |= Flag.ackCtrl | (hot ? Flag.ackThermal : 0) }
         sendAck(status: 0, w: aw, h: ah, fps: fr, kbps: kb, camera: Self.ackCamera(r.camera), flags: ackFlags)
@@ -1016,6 +1136,15 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             if r.fitStage { fitText += "（その大きさの形が無いので、大きく撮ってエンコーダの前で縮める）" }
         }
         log("ウェブカメラ：\(changed ? "切り替えた" : "始める") \(aw)×\(ah)・\(fr) コマ/秒・\(kb) kbps・カメラ \(r.camera)（\(dev.localizedName)）・回転 \(r.rot)・反転 \(r.connMirror ? 1 : 0)・切り抜き \(pool != nil ? 1 : 0)・手ぶれ補正 \(r.stab)・シネマティック \(cineOn ? 1 : 0)・ACK flags \(ackFlags)・PC の上限 \(fitText)")
+        // cam60：頼まれたコマ数から下がったときは、理由と、その大きさの形の一覧を記録に出す（本物で何が撮れるかが、ここで分かる）
+        let askedFps = r.askedFps
+        let whyJa = fpsWhy.map { $0.ja }.joined(separator: "、")
+        let whyEn = fpsWhy.map { $0.en }.joined(separator: ", ")
+        if fr < askedFps {
+            let dims = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
+            log("ウェブカメラ：頼まれたコマ数 \(askedFps) を \(fr) に下げた（\(whyJa.isEmpty ? "理由が分からない" : whyJa)）。\(dims.width)×\(dims.height) の形：\(Self.formatList(dev, w: Int(dims.width), h: Int(dims.height)))・エフェクト \(r.fx)・熱 \(ProcessInfo.processInfo.thermalState.rawValue)・シネマティック \(cineOn ? 1 : 0)")
+        }
+        if r.cineDropped { log("ウェブカメラ：PC が \(hi.fps) コマ/秒を頼んだので、背景ぼかし（シネマティック）を止めた") }
         // startRunning は返ってくるまでに時間がかかるので、カメラの糸で（前のカメラの stopRunning のあとに並ぶ）。
         // ライトは走り始めてからもう一度当てる。走らせる前（上の liveApply(initial:)）に点けても、走り始めで消えて点かないことがあった
         captureQueue.async { [weak self] in
@@ -1025,10 +1154,34 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                 self.applyTorch(input.device)
             }
         }
+        // cam60：走り始めて 2 秒後から 3 秒の間に送ったコマ数を数えて、実測のコマ数を記録に出す（ACK の値と実際が合っているかを、本物で確かめるため）
+        let ackFps = fr
+        q.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self, self.session === s else { return }
+            self.lock.lock(); let n0 = self.sent; self.lock.unlock()
+            let t0 = Date()
+            self.q.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                guard let self, self.session === s else { return }
+                self.lock.lock(); let n1 = self.sent; let drop = self.dropped; self.lock.unlock()
+                let secs = Date().timeIntervalSince(t0)
+                let rate = (secs > 0 && n1 >= n0) ? Double(n1 - n0) / secs : 0
+                let camFps = Self.fpsOf(dev.activeVideoMinFrameDuration)
+                self.log("ウェブカメラ：実測 \(String(format: "%.1f", rate)) コマ/秒（ACK \(ackFps)・頼み \(askedFps)・カメラの設定 \(camFps)・捨てたコマ \(drop)・熱 \(ProcessInfo.processInfo.thermalState.rawValue)）")
+            }
+        }
         let name = Self.cameraName(r.camera)
-        let note = Self.pcNoteText(r, w: aw, h: ah, fps: fr)
+        var noteText = Self.pcNoteText(r, w: aw, h: ah, fps: fr)
+        if fr < askedFps {
+            let extra = L("\(askedFps) fps を \(fr) fps に下げています（\(whyJa)）。", "Lowered from \(askedFps) fps to \(fr) fps (\(whyEn)).")
+            noteText = noteText.isEmpty ? extra : noteText + " " + extra
+        }
+        if r.cineDropped {
+            let extra = L("コマ数を優先して、背景ぼかしを止めています。", "Background blur is off to keep the frame rate.")
+            noteText = noteText.isEmpty ? extra : noteText + " " + extra
+        }
+        let note = noteText
         let skipped = r.rotSkipped
-        let hotNote = fr < p.baseFps ? L("iPhone が熱いため、フレームレートを \(fr) fps に下げています。", "The iPhone is hot, so the frame rate is lowered to \(fr) fps.") : ""
+        let hotNote = fr < base ? L("iPhone が熱いため、フレームレートを \(fr) fps に下げています。", "The iPhone is hot, so the frame rate is lowered to \(fr) fps.") : ""
         DispatchQueue.main.async { [weak self] in
             self?.connected = true
             self?.detail = "\(aw)×\(ah)・\(fr) fps・\(name)・\(String(format: "%.0f", Double(kb) / 1000)) Mbps"
@@ -1379,13 +1532,13 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         return (max(64, Int(Double(w) * s) & ~1), max(64, Int(Double(h) * s) & ~1))
     }
 
-    // 画面に出す選び肢。4K は 30 fps まで（Windows の H.264 のデコーダの資料は level 5.1 まで。4K の 60 fps は level 5.2 が要る）
+    // 画面に出す選び肢。cam60：4K の 60 fps も出す（前は 30 まで。Windows の H.264 のデコーダの資料は level 5.1 までだが、GPU（NVDEC）でも CPU でも、4K60 は PC で実際にほどけた。PC の負荷は大きい）
     static let heightChoices = [720, 1080, 2160]
     static let fpsChoices = [30, 60]
     static func availableCameras() -> [UInt32] { [UInt32(0), 4, 1, 2, 3].filter { device($0) != nil } }
     static func heights(for cam: UInt32) -> [Int] { heightChoices.filter { !rates(for: cam, height: $0).isEmpty } }
     static func rates(for cam: UInt32, height: Int) -> [Int] {
-        fpsChoices.filter { f in !(height >= 2160 && f > 30) && supports(camera: cam, height: height, fps: f) }
+        fpsChoices.filter { f in supports(camera: cam, height: height, fps: f) }
     }
     // そのカメラが、その大きさ（16:9）とコマ数を NV12（420v）で撮れるか
     static func supports(camera: UInt32, height: Int, fps: Int) -> Bool {
@@ -1401,14 +1554,19 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     }
 
     // 撮る形を選ぶ。返すのは形・1 コマの長さ・実際のコマ数。
-    //   1. 大きさがぴったりで、そのコマ数を撮れる形。同じ大きさが何種類かあれば、いちばん広く写る物（videoFieldOfView が大きい）
-    //   2. そのコマ数を撮れる中で、面積がいちばん近い形
-    //   3. どの形もそのコマ数を撮れない：大きさがぴったりの形（無ければ面積がいちばん近い形）を、その形の最高のコマ数で
+    //   1. 大きさがぴったりで、そのコマ数を撮れる形（420v）。同じ大きさが何種類かあれば、いちばん広く写る物（videoFieldOfView が大きい）
+    //   2. cam60：420v に無ければ、420f（フルレンジ）の同じ大きさの形。出力は 420v に指定してあるので、iOS が変換する（full が true のときだけ）
+    //   3. cam60：同じ大きさの形はあるが、そのコマ数は撮れない：大きさを変えずに、頼みにいちばん近いコマ数（たいていは撮れる最高）で。
+    //      前は、ここで大きさの違う別の形（そのコマ数を撮れて、面積がいちばん近い形）に替わっていた。PC の頼みの大きさは守り、コマ数を下げて ACK に正しく書く
+    //   4. 同じ大きさの形がまったく無い：そのコマ数を撮れる中で、面積がいちばん近い形
+    //   5. それも無い：面積がいちばん近い形を、頼みにいちばん近いコマ数で
     // activeVideoMinFrameDuration に範囲の外の値を入れると例外で落ちるので、1 コマの長さは必ず範囲の中の値にする
     // camctl：only は使える形を絞る（シネマティック）。prefer は同じ大きさの中で先に選ぶ形の点数（エフェクトに対応する形）
     private static func pickFormat(_ dev: AVCaptureDevice, w: Int, h: Int, fps: Int,
-                                   only: ((AVCaptureDevice.Format) -> Bool)? = nil, prefer: ((AVCaptureDevice.Format) -> Int)? = nil) -> (AVCaptureDevice.Format, CMTime, Int)? {
+                                   only: ((AVCaptureDevice.Format) -> Bool)? = nil, prefer: ((AVCaptureDevice.Format) -> Int)? = nil,
+                                   full: Bool = false) -> (AVCaptureDevice.Format, CMTime, Int)? {
         let nv = dev.formats.filter { CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && (only?($0) ?? true) }
+        let nf = full ? dev.formats.filter { CMFormatDescriptionGetMediaSubType($0.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange && (only?($0) ?? true) } : []
         let score = prefer ?? { _ in 0 }
         let want = Double(fps)
         func area(_ f: AVCaptureDevice.Format) -> Int {
@@ -1427,21 +1585,70 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             }
         }
         func nearest(_ list: [AVCaptureDevice.Format]) -> AVCaptureDevice.Format? { list.min { abs(area($0) - w * h) < abs(area($1) - w * h) } }
-        if let f = widest(nv.filter { exact($0) && canDo($0) }) ?? nearest(nv.filter(canDo)) {
+        // 頼みにいちばん近いコマ数で撮れる形。頼みが範囲の外なら、範囲の端（上の外なら最高・下の外なら最低）。同じ近さなら、点数・広さの順
+        func closest(_ list: [AVCaptureDevice.Format]) -> (AVCaptureDevice.Format, CMTime, Int)? {
+            var best: (f: AVCaptureDevice.Format, dur: CMTime, fps: Int, diff: Double)?
+            for f in list {
+                for rg in f.videoSupportedFrameRateRanges {
+                    let rate = min(max(want, rg.minFrameRate), rg.maxFrameRate)
+                    let diff = abs(rate - want)
+                    var better = best == nil
+                    if let b = best {
+                        if diff < b.diff - 0.001 {
+                            better = true
+                        } else if abs(diff - b.diff) <= 0.001 {
+                            let sa = score(f), sb = score(b.f)
+                            better = sa != sb ? sa > sb : f.videoFieldOfView > b.f.videoFieldOfView
+                        }
+                    }
+                    guard better else { continue }
+                    let n = max(1, Int((rate + 0.05).rounded(.down)))
+                    let dur: CMTime
+                    if rate >= rg.maxFrameRate { dur = rg.minFrameDuration }
+                    else if rate <= rg.minFrameRate { dur = rg.maxFrameDuration }
+                    else { dur = CMTime(value: 1, timescale: CMTimeScale(n)) }
+                    best = (f, dur, n, diff)
+                }
+            }
+            guard let b = best else { return nil }
+            return (b.f, b.dur, b.fps)
+        }
+        if let f = widest(nv.filter { exact($0) && canDo($0) }) ?? widest(nf.filter { exact($0) && canDo($0) }) {
             return (f, CMTime(value: 1, timescale: CMTimeScale(fps)), fps)
         }
-        guard let f = widest(nv.filter(exact)) ?? nearest(nv),
-              let r = f.videoSupportedFrameRateRanges.max(by: { $0.maxFrameRate < $1.maxFrameRate }) else { return nil }
-        return (f, r.minFrameDuration, max(1, Int(r.maxFrameRate.rounded(.down))))
+        let sameSize = nv.filter(exact) + nf.filter(exact)
+        if !sameSize.isEmpty { return closest(sameSize) }
+        if let f = nearest(nv.filter(canDo)) {
+            return (f, CMTime(value: 1, timescale: CMTimeScale(fps)), fps)
+        }
+        guard let f = nearest(nv) else { return nil }
+        return closest([f])
+    }
+
+    // cam60：その大きさの形の一覧（記録用）。例：「420v 1-30 / 420v 1-60 / 420f 1-30」。コマ数が下がったときに、本物で何が撮れるかを知るため
+    private static func formatList(_ dev: AVCaptureDevice, w: Int, h: Int) -> String {
+        func code(_ t: FourCharCode) -> String {
+            let b: [UInt8] = [UInt8((t >> 24) & 255), UInt8((t >> 16) & 255), UInt8((t >> 8) & 255), UInt8(t & 255)]
+            return String(bytes: b, encoding: .ascii) ?? "?"
+        }
+        var items: [String] = []
+        for f in dev.formats {
+            let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+            guard Int(d.width) == w && Int(d.height) == h else { continue }
+            let rs = f.videoSupportedFrameRateRanges.map { String(format: "%.0f-%.0f", $0.minFrameRate, $0.maxFrameRate) }.joined(separator: ",")
+            items.append("\(code(CMFormatDescriptionGetMediaSubType(f.formatDescription))) \(rs)")
+        }
+        return items.isEmpty ? "なし" : items.joined(separator: " / ")
     }
 
     // 画質の段とビットレート（kbps）。表は [段][720p・1080p・4K][30・60 fps]
     //   最高は USB（毎秒 50 MB 以上）の太さを生かす値。1080p60 で 36 Mbps（H.264 の level 4.2 の上限は High で 62.5 Mbps）、
     //   4K30 で 50 Mbps（level 5.1 の上限は 300 Mbps）。PC のほどく側（Windows の H.264 デコーダ）は level 5.1 までと資料にある。
-    //   PC の work/camset/pc/fake_iphone.c の quality_kbps と同じ表
+    //   cam60：高画質の段（q=2。初めの値）の 1080p60 を 18 から 20 Mbps に（目安は 1080p60 で 20 Mbps 前後・4K60 で 40〜50 Mbps 前後。4K60 は 45 Mbps のまま）。
+    //   PC の work/camset/pc/fake_iphone.c の quality_kbps は 1080p60 の高画質だけ 18 のまま（偽の iPhone なので、本物とずれても動作に関係しない）
     static func qualityKbps(_ q: Int, w: Int, h: Int, fps: Int) -> Int {
         let table: [[[Int]]] = [[[4000, 6000], [8000, 12000], [20000, 30000]],
-                                [[6000, 9000], [12000, 18000], [30000, 45000]],
+                                [[6000, 9000], [12000, 20000], [30000, 45000]],
                                 [[12000, 18000], [24000, 36000], [50000, 60000]]]
         let tier = max(1, min(3, q)) - 1
         let size = w * h >= 3840 * 2160 ? 2 : w * h >= 1920 * 1080 ? 1 : 0
@@ -1462,9 +1669,10 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
     // ---- エンコーダ（VideoToolbox・server.c の vid_open と同じ設定） ----
 
-    private func makeEncoder(w: Int, h: Int, fps: Int, kbps: Int, gop: Int) -> VTCompressionSession? {
+    // cam60：lowLatency を false にすると、低遅延の方式を使わずに作る（60 コマ/秒で低遅延の方式が使えないときの、作り直し用）
+    private func makeEncoder(w: Int, h: Int, fps: Int, kbps: Int, gop: Int, lowLatency: Bool = true) -> VTCompressionSession? {
         var s: VTCompressionSession?
-        let spec = [kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String: true] as CFDictionary
+        let spec: CFDictionary? = lowLatency ? ([kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String: true] as CFDictionary) : nil
         var st = VTCompressionSessionCreate(allocator: nil, width: Int32(w), height: Int32(h), codecType: kCMVideoCodecType_H264, encoderSpecification: spec,
                                             imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &s)
         if st != noErr || s == nil {
@@ -1486,8 +1694,17 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         set(kVTCompressionPropertyKey_AverageBitRate, NSNumber(value: kbps * 1000))
         setPeak(s, kbps)
         set(kVTCompressionPropertyKey_ExpectedFrameRate, NSNumber(value: fps))
+        // キーフレームの間隔：コマ数（gop）と秒の両方で縛る。60 コマ/秒でも gop が 2 秒分（fps × 2）なら同じ 2 秒。
+        // カメラが遅れたコマを捨てると、コマ数だけでは間隔が秒で伸びるので、秒でも縛る（PC が途中から受け始めても、2 秒以内にほどける）
         set(kVTCompressionPropertyKey_MaxKeyFrameInterval, NSNumber(value: gop))
-        VTCompressionSessionPrepareToEncodeFrames(s)
+        set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: Double(gop) / Double(max(fps, 1))))
+        let ps = VTCompressionSessionPrepareToEncodeFrames(s)
+        // 31 コマ/秒以上は、準備できなければ失敗にして、呼ぶ側が別の方式か 30 コマ/秒で作り直す（30 以下は前のまま、結果を見ない）
+        if ps != noErr && fps > 30 {
+            log("ウェブカメラ：\(w)×\(h)・\(fps) コマ/秒のエンコーダを準備できない（\(ps)・低遅延 \(lowLatency ? 1 : 0)）")
+            VTCompressionSessionInvalidate(s)
+            return nil
+        }
         return s
     }
 
@@ -2470,7 +2687,9 @@ struct CameraSettingsView: View {
             Text(Self.qualityNote(quality, height: height, fps: fps)).font(.footnote)
             Toggle(L("PC からの指定を優先する", "Use the settings chosen on the PC first"), isOn: bind($preferPC))
             if height >= 2160 {
-                Text(L("4K は 30 fps までです。カメラを使うアプリには、PC で 1920×1080 に縮めて渡します。", "4K is up to 30 fps. Apps on the PC get it scaled to 1920×1080.")).font(.footnote)
+                Text(fps > 30
+                     ? L("4K の 60 fps は、PC の負荷が大きくなります。カメラを使うアプリには、PC で 1920×1080 に縮めて渡します。", "4K at 60 fps puts a heavy load on the PC. Apps on the PC get it scaled to 1920×1080.")
+                     : L("カメラを使うアプリには、PC で 1920×1080 に縮めて渡します。", "Apps on the PC get it scaled to 1920×1080.")).font(.footnote)
             }
         }
     }
