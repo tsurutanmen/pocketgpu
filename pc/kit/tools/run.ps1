@@ -1,7 +1,7 @@
 ﻿# iPhone の GPU で起動：1 つのゲームやアプリを、iPhone の GPU が見える形で起動する。Run-on-iPhone-GPU.cmd から呼ぶ。
 #   Run-on-iPhone-GPU.cmd "C:\Games\game.exe" [ゲームに渡す引数]   .exe か、そのショートカット（.lnk）を上に落としてもよい
 #   Run-on-iPhone-GPU.cmd                                       何も無ければ .exe を選ぶ窓を出す
-# 起動する前に見ること：管理者で動く設定のアプリか・iPhone のアプリが答えるか・DirectX 11 なら DXVK が横にあるか
+# 起動する前に見ること：管理者で動く設定のアプリか・iPhone のアプリが答えるか・DirectX 9・10・11 なら DXVK が横にあるか
 # 環境変数はこの起動にだけ付ける。レジストリには書かない。DXVK を置くのは、聞いて「はい」のときだけ
 # 試験：PGPU_DRYRUN=1 で、最後に起動せず、何を起動するかだけ出す（DXVK を置くのは本当に行う。試験は試験用のフォルダで）
 # Android（10/14）：PGPU_ANDROID=1 のときは、Android のスマートフォンの GPU で起動する。Start-Android-GPU.cmd が付けて呼ぶ。
@@ -31,6 +31,13 @@ function Done([int]$code) {
 function Warn([string]$t) { Say-Warn $t; $script:Warned = $true }
 
 function Get-FileHashText([string]$p) { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash }
+# ファイル名を「a と b」「a、b と c」（英語は「a and b」「a, b and c」）の形に並べる
+function Join-Names([string[]]$n, [bool]$ja) {
+    $n = @($n)
+    if ($n.Count -le 1) { return ($n -join '') }
+    if ($ja) { return (($n[0..($n.Count - 2)] -join '、') + ' と ' + $n[-1]) }
+    return (($n[0..($n.Count - 2)] -join ', ') + ' and ' + $n[-1])
+}
 
 # ---- 何を起動するか ----
 $target = $null
@@ -137,35 +144,56 @@ if ($pe) {
     # Unity のゲームは .exe が UnityPlayer.dll を読むだけで、d3d11.dll は後から読む（取り込みの表に出ない）。Windows の Unity の既定は DirectX 11 なので、DirectX 11 のゲームとして扱う
     $isUnity = ($dxTarget -eq $target) -and ($imp -contains 'unityplayer.dll')
     if ($isUnity) { Say-Info (M 'Unity のゲームのようです。DirectX 11 のゲームとして扱います。' 'This looks like a Unity game. It is treated as a DirectX 11 game.') }
+    # API ごとに必要な DXVK のファイル：DirectX 9 は d3d9.dll、DirectX 10 は d3d10core.dll・d3d11.dll・dxgi.dll、DirectX 11 は d3d11.dll・dxgi.dll
+    # DXVK 1.10 に d3d10.dll と d3d10_1.dll は無い（DirectX 10 は d3d10core が d3d11 と dxgi を呼ぶ）。Windows の d3d10.dll が、横の d3d10core.dll を読む
+    $viaVulkan = $imp -notcontains 'vulkan-1.dll'
+    $wantDx9  = ($imp -contains 'd3d9.dll') -and $viaVulkan
+    $wantDx10 = (($imp -contains 'd3d10.dll') -or ($imp -contains 'd3d10_1.dll') -or ($imp -contains 'd3d10core.dll')) -and $viaVulkan
+    $wantDx11 = ((($imp -contains 'd3d11.dll') -or ($imp -contains 'dxgi.dll')) -and $viaVulkan) -or $isUnity
     if ($imp -contains 'd3d12.dll') {
         Warn (M ('DirectX 12 のゲームのようです。このキットは、まだ DirectX 12 を ' + $GJa + ' の GPU で描画できません。') ('This looks like a DirectX 12 game. This kit cannot draw DirectX 12 on the ' + $GEn + ' GPU yet.'))
-    } elseif ($imp -contains 'd3d9.dll') {
-        Warn (M ('DirectX 9 のゲームのようです。このキットは、まだ DirectX 9 を ' + $GJa + ' の GPU で描画できません。') ('This looks like a DirectX 9 game. This kit cannot draw DirectX 9 on the ' + $GEn + ' GPU yet.'))
-    } elseif ((($imp -contains 'd3d11.dll' -or $imp -contains 'dxgi.dll') -and $imp -notcontains 'vulkan-1.dll') -or $isUnity) {
+    } elseif ($wantDx9 -or $wantDx10 -or $wantDx11) {
         $arch = $(if ($dxPe.Machine -eq 0x8664) { 'x64' } elseif ($dxPe.Machine -eq 0x14c) { 'x32' } else { '' })
         $dir = Split-Path -Parent $dxTarget
-        $here = Join-Path $dir 'd3d11.dll'
-        $kitDll = $(if ($arch) { Join-Path $script:KitDir ('dxvk\' + $arch + '\d3d11.dll') } else { '' })
         if (-not $arch) {
             Warn (M 'このゲームのアーキテクチャは DXVK に対応していません。' 'This game''s CPU type does not match DXVK.')
-        } elseif (Test-Path -LiteralPath $here) {
-            if ((Test-Path $kitDll) -and (Get-FileHashText $here) -eq (Get-FileHashText $kitDll)) { Say-OK (M 'DXVK がゲームと同じフォルダに配置されています。' 'DXVK is next to the game.') }
-            else { Warn (M 'ゲームと同じフォルダに別の d3d11.dll があります。上書きしないため、DirectX 11 は普通の GPU で描画されます。' 'There is another d3d11.dll next to the game. It is not replaced, so DirectX 11 will use the normal GPU.') }
         } else {
-            Say-Info (M ('DirectX 11 のゲームのようです。' + $GJa + ' の GPU で描画するには、DXVK の 2 つのファイルをゲームと同じフォルダに配置します。') ('This looks like a DirectX 11 game. To draw it on the ' + $GEn + ' GPU, two DXVK files go next to the game.'))
-            Say-Info ((M '配置先：' 'Where: ') + $dir)
-            Say-Info (M '元に戻すときは、そのフォルダの d3d11.dll と dxgi.dll を削除してください。' 'To undo, delete d3d11.dll and dxgi.dll there.')
-            if (Ask-YesNo (M 'DXVK を配置しますか？' 'Put DXVK there?')) {
-                $dxgiHere = Join-Path $dir 'dxgi.dll'
-                if (Test-Path -LiteralPath $dxgiHere) {
-                    Warn (M 'ゲームと同じフォルダに dxgi.dll があります。上書きしないため、DXVK は配置しませんでした。' 'There is a dxgi.dll next to the game. Nothing was copied, so nothing is overwritten.')
+            # DirectX 9 と、DirectX 10・11 は別々に扱う（DirectX 10 と 11 は d3d11.dll と dxgi.dll を共有する）
+            $groups = @()
+            if ($wantDx9) { $groups += , @{ Ver = @('9'); Files = @('d3d9.dll') } }
+            if ($wantDx10) { $groups += , @{ Ver = @('10') + $(if (($imp -contains 'd3d11.dll') -or $isUnity) { @('11') } else { @() }); Files = @('d3d10core.dll', 'd3d11.dll', 'dxgi.dll') } }
+            elseif ($wantDx11) { $groups += , @{ Ver = @('11'); Files = @('d3d11.dll', 'dxgi.dll') } }
+            foreach ($g in $groups) {
+                $verJa = 'DirectX ' + ($g.Ver -join '・'); $verEn = 'DirectX ' + ($g.Ver -join '/')
+                $dxvkSrc = Join-Path $script:KitDir ('dxvk\' + $arch)
+                $absent = @(); $other = @(); $same = 0; $noKit = @()
+                foreach ($n in $g.Files) {
+                    $kitF = Join-Path $dxvkSrc $n
+                    $hereF = Join-Path $dir $n
+                    if (-not (Test-Path -LiteralPath $kitF)) { $noKit += $n }
+                    if (Test-Path -LiteralPath $hereF) {
+                        if ((Test-Path -LiteralPath $kitF) -and (Get-FileHashText $hereF) -eq (Get-FileHashText $kitF)) { $same++ } else { $other += $n }
+                    } else { $absent += $n }
+                }
+                if ($other.Count -gt 0) {
+                    Warn ((M ('ゲームと同じフォルダに別の ' + (Join-Names $other $true) + ' があります。上書きしないため、' + $verJa + ' は普通の GPU で描画されます。') ('There is another ' + (Join-Names $other $false) + ' next to the game. It is not replaced, so ' + $verEn + ' will use the normal GPU.')))
+                } elseif ($absent.Count -eq 0) {
+                    Say-OK (M ('DXVK（' + $verJa + '）がゲームと同じフォルダに配置されています。') ('DXVK (' + $verEn + ') is next to the game.'))
+                } elseif ($noKit.Count -gt 0) {
+                    Warn (M ('このキットには DXVK の ' + (Join-Names $noKit $true) + ' がありません。Update-PocketGPU.cmd でキットを更新してください。') ('This kit has no DXVK ' + (Join-Names $noKit $false) + '. Run Update-PocketGPU.cmd to update the kit.'))
                 } else {
-                    try {
-                        Copy-Item -LiteralPath $kitDll -Destination $dir
-                        Copy-Item -LiteralPath (Join-Path $script:KitDir ('dxvk\' + $arch + '\dxgi.dll')) -Destination $dir
-                        Say-OK (M '配置しました。' 'Done.')
-                    } catch {
-                        Warn ((M '配置できませんでした。管理者権限がないと書き込めない場所の可能性があります：' 'Could not copy. The folder may need administrator rights: ') + $_.Exception.Message)
+                    $cnt = $absent.Count
+                    $cntEn = @('', 'one', 'two', 'three', 'four')[$cnt]
+                    Say-Info (M ($verJa + ' のゲームのようです。' + $GJa + ' の GPU で描画するには、DXVK の ' + $cnt + ' つのファイルをゲームと同じフォルダに配置します。') ('This looks like a ' + $verEn.Replace('/', ' / ') + ' game. To draw it on the ' + $GEn + ' GPU, ' + $cntEn + ' DXVK file' + $(if ($cnt -gt 1) { 's' } else { '' }) + ' go next to the game.'))
+                    Say-Info ((M '配置先：' 'Where: ') + $dir)
+                    Say-Info (M ('元に戻すときは、そのフォルダの ' + (Join-Names $absent $true) + ' を削除してください。') ('To undo, delete ' + (Join-Names $absent $false) + ' there.'))
+                    if (Ask-YesNo (M 'DXVK を配置しますか？' 'Put DXVK there?')) {
+                        try {
+                            foreach ($n in $absent) { Copy-Item -LiteralPath (Join-Path $dxvkSrc $n) -Destination $dir }
+                            Say-OK (M '配置しました。' 'Done.')
+                        } catch {
+                            Warn ((M '配置できませんでした。管理者権限がないと書き込めない場所の可能性があります：' 'Could not copy. The folder may need administrator rights: ') + $_.Exception.Message)
+                        }
                     }
                 }
             }

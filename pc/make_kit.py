@@ -100,7 +100,7 @@ Steps
 4. Double-click Start-PocketGPU.cmd. It checks each part in order and tells you what to do when something is missing.
 5. To run a game or app on the iPhone GPU, drop its .exe onto Run-on-iPhone-GPU.cmd.
    You can also double-click Run-on-iPhone-GPU.cmd and choose the .exe.
-   For a DirectX 11 game it offers to put two DXVK files next to the game. To undo, delete d3d11.dll and dxgi.dll there.
+   For a DirectX 9, 10 or 11 game it offers to put the DXVK files next to the game (9: d3d9.dll. 10: d3d10core.dll, d3d11.dll and dxgi.dll. 11: d3d11.dll and dxgi.dll). To undo, delete those files there.
    Steam games: put this line in the game's Properties > Launch Options:
        "C:\path\to\this\folder\pocketgpu.cmd" %command%
    Start-PocketGPU.cmd shows this line with the real path and can copy it for you.
@@ -163,7 +163,7 @@ iPhone ではなく Android のスマートフォンを使う場合は、以下�
 4. Start-PocketGPU.cmd をダブルクリックしてください。必要な項目を順にチェックして、足りない物があれば対処方法を表示します
 5. ゲームやアプリを iPhone の GPU で動かすには、その .exe を Run-on-iPhone-GPU.cmd にドラッグ＆ドロップしてください。
    Run-on-iPhone-GPU.cmd をダブルクリックして、.exe を選択することもできます。
-   DirectX 11 のゲームの場合は、DXVK の 2 つのファイルをゲームと同じフォルダに配置するかどうかを聞きます。元に戻すときは、そのフォルダの d3d11.dll と dxgi.dll を削除してください。
+   DirectX 9・10・11 のゲームの場合は、DXVK のファイルをゲームと同じフォルダに配置するかどうかを聞きます（DirectX 9 は d3d9.dll、DirectX 10 は d3d10core.dll・d3d11.dll・dxgi.dll、DirectX 11 は d3d11.dll と dxgi.dll）。元に戻すときは、配置したファイルを削除してください。
    Steam のゲームは、ゲームのプロパティの「起動オプション」に次の 1 行を入力してください：
        "C:\このフォルダの場所\pocketgpu.cmd" %command%
    Start-PocketGPU.cmd は、実際のパスに置き換えたこの 1 行を表示して、コピーすることもできます
@@ -573,7 +573,7 @@ ANDROID_LAUNCH = r'''@echo off
 rem PocketGPU: run one app or game on the Android phone GPU. Run android\start_android.cmd first.
 rem   pocketgpu_android.cmd "C:\path\to\game.exe"
 rem Only the app started from this file sees the phone GPU. Nothing is written to the registry.
-rem DirectX 11 games also need DXVK next to the game. Start-Android-GPU.cmd puts it there for you (it asks first).
+rem DirectX 9, 10 and 11 games also need DXVK next to the game. Start-Android-GPU.cmd puts it there for you (it asks first).
 rem DXVK_FILTER_DEVICE_NAME=PocketGPU makes DXVK pick the phone GPU ("PocketGPU phone (...)").
 setlocal
 if "%~1"=="" (
@@ -613,8 +613,8 @@ rem PocketGPU for Android: the easy way. Double-click this file.
 rem It copies the receiver to the phone, starts it, connects it to this PC and checks that Windows sees the phone GPU.
 rem Then drag a game's .exe onto this window (or onto this file) to start it on the phone GPU.
 rem The game is started by tools\run.ps1, the same as Run-on-iPhone-GPU.cmd but for the Android phone (PGPU_ANDROID=1).
-rem It reads the .exe and tells DirectX 11, 12, 9, Unity and Unreal games apart. For DirectX 11 it asks before it puts
-rem DXVK (dxvk\x64 or dxvk\x32) next to the game, and never replaces another d3d11.dll or dxgi.dll.
+rem It reads the .exe and tells DirectX 9, 10, 11, 12, Unity and Unreal games apart. For DirectX 9, 10 and 11 it asks before it puts
+rem DXVK (dxvk\x64 or dxvk\x32) next to the game, and never replaces another d3d9.dll, d3d10core.dll, d3d11.dll or dxgi.dll.
 rem The "Use as a GPU" switch in the phone app is not needed for this. Needs adb.exe, see android\README_android.txt.
 rem Only English here on purpose: a Japanese Windows reads .cmd files as Shift_JIS.
 setlocal
@@ -663,7 +663,7 @@ if not "%RUNRC%"=="0" echo The game was not started.
 echo The receiver keeps running on the phone until you run android\stop_android.cmd or restart the phone.
 goto ask
 :run_plain
-rem tools\run.ps1 is missing: start the game directly. DirectX 11 games then need DXVK copied by hand (android\README_android.txt step 6).
+rem tools\run.ps1 is missing: start the game directly. DirectX 9, 10 and 11 games then need DXVK copied by hand (android\README_android.txt step 6).
 rem Start the game in its own folder, as Steam and Explorer do. Some games look for their files there.
 for %%G in ("%GAME%") do cd /d "%%~dpG"
 echo Starting "%GAME%" on the phone GPU ...
@@ -726,10 +726,11 @@ Steps
 5. Double-click check_android.cmd. You should see a GPU named "PocketGPU phone (...)" in the list.
 6. Start a Vulkan app with:   pocketgpu_android.cmd "C:\path\to\app.exe"
    DirectX 11 games: copy d3d11.dll and dxgi.dll from dxvk\x64 (64-bit games) or dxvk\x32 (32-bit games)
-   next to the game's .exe, then start the game with pocketgpu_android.cmd. Delete those two files to undo.
+   next to the game's .exe, then start the game with pocketgpu_android.cmd. Delete those files to undo.
+   DirectX 10 games: copy d3d10core.dll, d3d11.dll and dxgi.dll the same way. DirectX 9 games: copy d3d9.dll.
    With Start-Android-GPU.cmd: it does steps 4 and 5 for you. Then drag the game's .exe into its window.
-   It sees whether the game uses DirectX 11, and asks (y/N) before it puts the two DXVK files next to the game.
-   It never replaces a d3d11.dll or dxgi.dll that is already there. DirectX 12 and DirectX 9 games do not work yet.
+   It sees whether the game uses DirectX 9, 10 or 11, and asks (y/N) before it puts the DXVK files next to the game.
+   It never replaces a d3d9.dll, d3d10core.dll, d3d11.dll or dxgi.dll that is already there. DirectX 12 games do not work yet.
    Keep the phone unlocked with the screen on while the app runs.
 7. When you are finished, double-click android\stop_android.cmd. It stops the receiver and removes it from the phone.
    (Restarting the phone also stops it.)
@@ -817,10 +818,11 @@ Windows の PC から、Android のスマートフォンの GPU を Vulkan の G
 5. check_android.cmd をダブルクリックしてください。一覧に「PocketGPU phone (…)」という名前の GPU が表示されれば成功です
 6. Vulkan のアプリは、pocketgpu_android.cmd "C:\アプリの場所\app.exe" で起動してください。
    DirectX 11 のゲームの場合は、64 ビットのゲームなら dxvk\x64、32 ビットのゲームなら dxvk\x32 の d3d11.dll と dxgi.dll を、
-   ゲームの .exe と同じフォルダにコピーしてから、pocketgpu_android.cmd で起動してください。元に戻すときは、その 2 つのファイルを削除してください。
+   ゲームの .exe と同じフォルダにコピーしてから、pocketgpu_android.cmd で起動してください。元に戻すときは、そのファイルを削除してください。
+   DirectX 10 のゲームは d3d10core.dll・d3d11.dll・dxgi.dll の 3 つを、DirectX 9 のゲームは d3d9.dll を、同じようにコピーしてください。
    Start-Android-GPU.cmd を使う場合は、手順 4 と 5 をまとめて行います。そのあと、ゲームの .exe をそのウィンドウにドラッグしてください。
-   DirectX 11 のゲームかどうかを調べて、DXVK の 2 つのファイルをゲームと同じフォルダに配置するかを y/N で聞きます。
-   すでにある d3d11.dll と dxgi.dll は上書きしません。DirectX 12 と DirectX 9 のゲームは、まだ動きません。
+   DirectX 9・10・11 のゲームかどうかを調べて、DXVK のファイルをゲームと同じフォルダに配置するかを y/N で聞きます。
+   すでにある d3d9.dll・d3d10core.dll・d3d11.dll・dxgi.dll は上書きしません。DirectX 12 のゲームは、まだ動きません。
    アプリが動作している間は、スマートフォンのロックを解除したまま、画面をオンにしておいてください
 7. 終わったら、android\stop_android.cmd をダブルクリックしてください。受信アプリを停止して、スマートフォンから削除します
    スマートフォンを再起動しても、受信アプリは停止します
@@ -1022,7 +1024,7 @@ def main():
     shutil.copy2(os.path.join(KITBUILD, 'vklist.exe'), os.path.join(kit, 'vklist.exe'))
     for arch in ('x64', 'x32'):
         os.makedirs(os.path.join(kit, 'dxvk', arch), exist_ok=True)
-        for n in ('d3d11.dll', 'dxgi.dll', 'd3d10core.dll'):
+        for n in ('d3d11.dll', 'dxgi.dll', 'd3d10core.dll', 'd3d9.dll'):
             shutil.copy2(os.path.join(DXVK, arch, n), os.path.join(kit, 'dxvk', arch, n))
     shutil.copy2(DXVK_LICENSE, os.path.join(kit, 'dxvk', 'LICENSE'))
     for name, text in (('pocketgpu.cmd', LAUNCH), ('report.cmd', REPORT)):

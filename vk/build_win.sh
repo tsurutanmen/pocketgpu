@@ -51,6 +51,12 @@ for w in $WHAT; do
     tests)
         for t in tri tri13 vecadd pushdesc copydesc copyimg extlist; do $CC $VKH tests/$t.c -o "$OUT/$t.exe" $VKLIB; done
         for t in d3d11tri d3d11cube d3d11event; do $CC -Wall -Wno-unused-parameter tests/$t.c -o "$OUT/d3d11/$t.exe" -ld3d11 -ldxguid -luuid -luser32 -lgdi32; done
+        # DirectX 9・10 の小さな試験（tests/d3d9tri.c・d3d10tri.c）。横に DXVK の d3d9.dll か d3d10core.dll・d3d11.dll・dxgi.dll を置くとドライバ越し。32 ビット版は x86 に出す（Need for Speed Carbon のような 32 ビットのゲームの代わり）
+        mkdir -p "$OUT/dx910/x64" "$OUT/dx910/x86"
+        $CC -Wall -Wno-unused-parameter tests/d3d9tri.c -o "$OUT/dx910/x64/d3d9tri.exe" -ld3d9 -luser32 -lgdi32
+        $CC -Wall -Wno-unused-parameter tests/d3d10tri.c -o "$OUT/dx910/x64/d3d10tri.exe" -ld3d10 -ldxguid -luuid -luser32 -lgdi32
+        zig cc -target x86-windows-gnu -O2 -g -Wall -Wno-unused-parameter tests/d3d9tri.c -o "$OUT/dx910/x86/d3d9tri.exe" -ld3d9 -luser32 -lgdi32
+        zig cc -target x86-windows-gnu -O2 -g -Wall -Wno-unused-parameter tests/d3d10tri.c -o "$OUT/dx910/x86/d3d10tri.exe" -ld3d10 -ldxguid -luuid -luser32 -lgdi32
         # geometry shader の真似の試験（場面と比べ方は tests/gs/gstest.c と cmp.py）
         $CC -Wall -Wno-unused-parameter tests/gs/gstest.c -o "$OUT/d3d11/gstest.exe" -ld3d11 -ldxguid -luuid -luser32 -lgdi32
         # DirectX 11 の機能を 1 つずつ試す 29 の場面（feat.exe list・比べ方は tests/feat/cmp_all.py）
