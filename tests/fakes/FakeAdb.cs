@@ -13,6 +13,7 @@
 //   crlf=1          shell の出力の行末を CR CR LF にする（古い adb のふり）
 //   fwds=口>先>pid;…   今の adb forward の一覧（先は tcp:番号 か localabstract:名前。pid は口を開けている偽の adb の PID）
 //   next=7001       次に使う pid
+//   lport=47300     キットの受け手（nohup ./pgpu_server 127.0.0.1 口）に渡された口。受け手が動いている間、ログに「Vulkan receiver: listening on 127.0.0.1:口」を出す
 // 環境変数 FAKE_ADB_LOG に書くと、呼ばれた adb の引数を 1 行ずつそのファイルに足す。
 // adb forward のふり：口を開けて待つ「adb.exe __serve 口 状態ファイル」を別に起こす。つながると、先と状態に応じて答える：
 //   tcp:番号（GPU）             キットの受け手が動いていれば GPU のあいさつに答える。先が 50060 なら、アプリの受け手が 50060 で動いていれば答える
@@ -167,6 +168,9 @@ public static class FakeAdb
         {
             int next = int.Parse(Get(s, "next") == "" ? "7001" : Get(s, "next"));
             s["pids"] = next.ToString(); s["next"] = (next + 1).ToString();
+            // 受け手に渡された口（./pgpu_server 127.0.0.1 口）。ログの「待っています」の行に使う
+            var lm = System.Text.RegularExpressions.Regex.Match(cmd, @"pgpu_server 127\.0\.0\.1 (\d+)");
+            s["lport"] = lm.Success ? lm.Groups[1].Value : "";
             Save(st, s);
             return 0;
         }
@@ -178,7 +182,13 @@ public static class FakeAdb
             Save(st, s);
             return 0;
         }
-        if (cmd.StartsWith("cat /data/local/tmp/pgpu_server.log")) { Line("fake receiver log"); return 0; }
+        if (cmd.StartsWith("cat /data/local/tmp/pgpu_server.log"))
+        {
+            // 受け手が動いていて、口が分かれば、本物と同じ「待っています」の行を出す（start_android.cmd が待つ行）
+            if (Get(s, "pids") != "" && Get(s, "lport") != "") Line("Vulkan receiver: listening on 127.0.0.1:" + Get(s, "lport"));
+            else Line("fake receiver log");
+            return 0;
+        }
         return 0;
     }
 

@@ -3,6 +3,8 @@
 # 日本語を含むので UTF-8（BOM 付き）で保存する。BOM が無いと 5.1 は Shift_JIS として読んで壊れる。
 # 画面の文は仮。M '日本語' 'English' の組で並べてあるので、言い回しはここで直す。
 #
+# Android の PC 側の口（50300 など）を Windows が予約していると、adb forward が待てない。その口が予約の範囲に入っていたら、聞いてから、
+# 範囲の外の口を選んで android\port.txt に覚える（android\ の cmd・run.ps1 が同じ口を読む）。Windows の予約の設定は変えない。
 # 決まり：
 #   - 自分では何も消さない。止める・入れ替える・取り直す前に、必ず「y/N」で聞く。聞かれて y と答えた物だけを直す
 #   - 入れ替える前の物は fix-backup\<日時>\ に残す（取り直しは update.ps1 が update-backup\ に残す）
@@ -23,6 +25,7 @@
 #   PGPU_TEST_STOP_ALLOW=PID,PID    止めてよいプログラムを、この PID だけにする（試験が、自分の物以外を止めないための保険）
 #   PGPU_TEST_AV_EVENT=1           ウイルス対策ソフトが iphone_icd.dll を検出した記録があることにする
 #   ADB=パス・PGPU_PORT=番号        Android の adb.exe と、PC 側の口（既定は 50300。キットの android\ の cmd と同じ）
+#   PGPU_TEST_NETSH=パス           netsh の代わりに、Windows が予約している口の範囲を出す .cmd（pgpu_port.ps1 の説明を見る）
 #   PGPU_CAM_PORT=番号・PGPU_AUDIO_PORT=番号   Android のアプリのカメラとマイクの、PC 側の口（既定は 50064 と 50063。android\android_app.cmd と同じ）
 param(
     [switch]$CheckOnly,
@@ -31,6 +34,9 @@ param(
     [switch]$NoSummary
 )
 . (Join-Path $PSScriptRoot 'pgpu_common.ps1')
+# PC 側の口の選び方（Windows の予約の範囲・android\port.txt）。キットの android\_common.cmd が使う物と同じ
+$script:PortLib = Join-Path $PSScriptRoot 'pgpu_port.ps1'
+if (Test-Path -LiteralPath $script:PortLib) { . $script:PortLib }
 
 $script:FixVersion = '1'
 $script:LoaderMin = [Version]'1.3.234'
@@ -221,7 +227,7 @@ function Get-RequiredFiles {
         @{ P = 'tools\update.ps1'; K = 'ps1' }, @{ P = 'tools\kit.ini'; K = 'text' }
     )
     if (Test-Path -LiteralPath (Join-Path $script:KitDir 'android')) {
-        $l += @{ P = 'android\_common.cmd'; K = 'text' }, @{ P = 'android\start_android.cmd'; K = 'text' }, @{ P = 'android\stop_android.cmd'; K = 'text' }, @{ P = 'android\server_aarch64'; K = 'text' }
+        $l += @{ P = 'android\_common.cmd'; K = 'text' }, @{ P = 'android\start_android.cmd'; K = 'text' }, @{ P = 'android\stop_android.cmd'; K = 'text' }, @{ P = 'android\server_aarch64'; K = 'text' }, @{ P = 'tools\pgpu_port.ps1'; K = 'ps1' }
     }
     return $l
 }
@@ -379,6 +385,58 @@ function Wait-Mux([int]$seconds) {
 }
 
 # ---- Android ----
+# PC 側の口：環境変数 > android\port.txt に覚えた口 > 既定（キットの android\_common.cmd と同じ順）。key は gpu・cam・audio
+function Get-FixPort([string]$key) {
+    if (Get-Command Get-PortSetting -CommandType Function -ErrorAction SilentlyContinue) { return (Get-PortSetting $key (Join-Path $script:KitDir 'android')) }
+    $def = @{ gpu = 50300; cam = 50064; audio = 50063 }
+    $env2 = @{ gpu = 'PGPU_PORT'; cam = 'PGPU_CAM_PORT'; audio = 'PGPU_AUDIO_PORT' }
+    $v = [Environment]::GetEnvironmentVariable($env2[$key])
+    if ($v -and $v -match '^\d+$') { return [int]$v }
+    return [int]$def[$key]
+}
+# PC 側の口が Windows の予約の範囲（除外されたポートの範囲）に入っていないか。入っていれば、聞いてから、範囲の外の口を選んで android\port.txt に覚える。
+# 戻り値：$null（問題なし）か @{ Fixed = 直ったか; Note = 結果に書く文 }。Windows の予約の設定は変えない（読むだけ）
+function Repair-AndroidPortReservation([string]$androidDir) {
+    if (-not (Get-Command Get-ExcludedPortRanges -CommandType Function -ErrorAction SilentlyContinue)) { return $null }
+    $ex = Get-ExcludedPortRanges
+    $hit = @()
+    foreach ($r in $script:PortRoles) {
+        $p = Get-FixPort $r.Key
+        if (Test-PortExcluded $p $ex.Ranges) { $hit += [pscustomobject]@{ Key = $r.Key; Port = $p } }
+    }
+    if ($hit.Count -eq 0) { return $null }
+    $list = Format-List2 ($hit | ForEach-Object { $_.Port })
+    Say-NG ((M 'PC の口 {0} が、Windows の予約の範囲（除外されたポートの範囲）に入っています。adb forward がこの口で待てないので、Android がつながりません。' 'Port(s) {0} on this PC are inside a range that Windows reserved (excluded port range). adb forward cannot listen on them, so Android cannot connect.') -f $list)
+    Say-Info (M '予約の範囲は netsh int ipv4 show excludedportrange protocol=tcp で見えます（Hyper-V や WSL などが予約します）。この予約の設定は、このツールでは変えません。' 'The reserved ranges are shown by: netsh int ipv4 show excludedportrange protocol=tcp (Hyper-V, WSL and others reserve them). This tool does not change the reservation.')
+    Say-Info (M '直し方：予約の範囲の外の空いている口を選んで、android\port.txt に覚えます。キットの android\ の cmd と tools\run.ps1 が、同じ口を使います。' 'Fix: pick a free port outside the reserved ranges and save it in android\port.txt. The cmd files in android\ and tools\run.ps1 use the same port.')
+    if (-not (Offer (M '別の口を選んで、覚えますか？' 'Pick another port and remember it?'))) {
+        return @{ Fixed = $false; Note = ((M 'PC の口 {0} が Windows の予約の範囲に入っている' 'port(s) {0} are in a range reserved by Windows') -f $list) }
+    }
+    $taken = @($hit | ForEach-Object { $_.Port })
+    $notes = @()
+    foreach ($h in $hit) {
+        $sel = Select-PortFor $h.Key $h.Port $ex.Ranges $taken
+        if ($sel.Port -eq 0) { Say-NG ((M '口 {0} の代わりの、空いている口が見つかりませんでした。' 'No free port was found to replace {0}.') -f $h.Port); continue }
+        Set-RememberedPort $h.Key $sel.Port $androidDir
+        # 覚えられたときだけ、この実行でもその口を使う（環境変数を、この実行の中だけ書き換える）
+        $saved = Read-PortFile $androidDir
+        if ($saved.ContainsKey($h.Key) -and $saved[$h.Key] -eq $sel.Port) {
+            $role = Get-PortRole $h.Key
+            [Environment]::SetEnvironmentVariable($role.Env, [string]$sel.Port, 'Process')
+            $taken += $sel.Port
+            $notes += ('{0} -> {1}' -f $h.Port, $sel.Port)
+            Say-OK ((M '口 {0} の代わりに {1} を使います（android\port.txt に覚えました）。' 'Port {1} is used instead of {0} (saved in android\port.txt).') -f $h.Port, $sel.Port)
+        } else { Say-NG ((M 'android\port.txt に覚えられませんでした。' 'Could not save the port in android\port.txt.')) }
+    }
+    $still = @($hit | Where-Object { Test-PortExcluded (Get-FixPort $_.Key) $ex.Ranges })
+    if ($still.Count -gt 0) { return @{ Fixed = $false; Note = ((M '別の口を覚えられなかった（口 {0}）' 'could not save another port ({0})') -f (Format-List2 ($still | ForEach-Object { $_.Port }))) } }
+    # 古い版のキットの android\ の cmd は port.txt を読まない。そのときは更新を案内する
+    $common = Join-Path $androidDir '_common.cmd'
+    if ((Test-Path -LiteralPath $common) -and -not ([IO.File]::ReadAllText($common) -match 'port\.txt')) {
+        Say-Warn (M 'このキットの android\ の cmd は、まだ port.txt を読みません。Update-PocketGPU.cmd で更新してください。更新するまでは、使う前に set PGPU_PORT=口の番号 を入力してください。' 'The cmd files in android\ of this kit do not read port.txt yet. Run Update-PocketGPU.cmd. Until then, type set PGPU_PORT=the-port-number before you use them.')
+    }
+    return @{ Fixed = $true; Note = ((M 'PC の口が Windows の予約の範囲に入っていたので、別の口にした：' 'a PC port was inside a range reserved by Windows; changed: ') + (Format-List2 $notes)) }
+}
 function Find-Adb {
     if ($env:ADB -and (Test-Path -LiteralPath $env:ADB)) { return $env:ADB }
     $c = Get-Command adb.exe -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -417,8 +475,8 @@ function Get-AdbForwards($adb) {
 $script:AppPkg = 'com.tsurutanmen.pocketgpu'
 function Get-AppPortSpecs {
     return @(
-        @{ Name = 'webcam'; Port = $(if ($env:PGPU_CAM_PORT) { [int]$env:PGPU_CAM_PORT } else { 50064 }); New = 'localabstract:pocketgpu-webcam'; Old = 'tcp:50064' },
-        @{ Name = 'audio'; Port = $(if ($env:PGPU_AUDIO_PORT) { [int]$env:PGPU_AUDIO_PORT } else { 50063 }); New = 'localabstract:pocketgpu-audio'; Old = 'tcp:50063' }
+        @{ Name = 'webcam'; Port = (Get-FixPort 'cam'); New = 'localabstract:pocketgpu-webcam'; Old = 'tcp:50064' },
+        @{ Name = 'audio'; Port = (Get-FixPort 'audio'); New = 'localabstract:pocketgpu-audio'; Old = 'tcp:50063' }
     )
 }
 # アプリの版 -> 向け方。0.1.2 以上は new、それより前は old、読めなければ unknown
@@ -1019,14 +1077,23 @@ if (Want 'iphone') {
 if (Want 'android') {
     Say-Step 7 $script:Total (M 'Android の受け手' 'Android receiver')
     $t = M 'Android' 'Android'
-    $port = $(if ($env:PGPU_PORT) { [int]$env:PGPU_PORT } else { 50300 })
+    $androidDir = Join-Path $script:KitDir 'android'
+    $port = Get-FixPort 'gpu'
     $adb = Find-Adb
+    # PC の口が Windows の予約の範囲に入っていれば、先にそれを直す（入っていると、adb forward が待てない）
+    $portFix = $null
+    if ($adb -and (Test-Path -LiteralPath (Join-Path $androidDir '_common.cmd'))) {
+        $portFix = Repair-AndroidPortReservation $androidDir
+        $port = Get-FixPort 'gpu'
+    }
     if (-not (Test-Path -LiteralPath (Join-Path $script:KitDir 'android\_common.cmd'))) {
         Say-Info (M 'このキットには Android 用のファイルがありません。Android を使わないなら問題ありません。' 'This kit has no Android files. That is fine if you do not use Android.')
         Add-Result 'android' 'skip' $t (M 'Android 用のファイルが無い' 'no Android files')
     } elseif (-not $adb) {
         Say-Info (M 'adb.exe が見つかりません。Android を使わないなら問題ありません。使うときは、Google の SDK Platform-Tools を展開して、android\README_android.txt の手順 2 を行ってください。' 'adb.exe was not found. That is fine if you do not use Android. If you do, unzip Google SDK Platform-Tools and do step 2 in android\README_android.txt.')
         Add-Result 'android' 'skip' $t (M 'adb が無い（Android 未使用）' 'no adb (Android not used)')
+    } elseif ($portFix -and -not $portFix.Fixed) {
+        Add-Result 'android' 'unfixed' $t $portFix.Note
     } else {
         Say-Info ((M 'adb：{0}' 'adb: {0}') -f $adb)
         [void](Invoke-Adb $adb 'start-server')
@@ -1094,6 +1161,9 @@ if (Want 'android') {
                         foreach ($l in @($r.Out -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 4)) { Say-Info $l }
                         if ($r.Exit -ne 0) { Say-NG (M 'start_android.cmd が失敗しました。上の表示を見てください。' 'start_android.cmd failed. See the lines above.'); $okAll = $false }
                         else { $acts += 'restarted the receiver' }
+                        # start_android.cmd は、口が予約・使用中なら別の口を選んで android\port.txt に覚える。以後の確かめはその口で行う
+                        $savedPorts = Read-PortFile $androidDir
+                        if ($savedPorts.ContainsKey('gpu')) { $port = [int]$savedPorts['gpu'] }
                     } else { $okAll = $false }
                 } elseif ($problems | Where-Object { $_ -in 'fwdmissing', 'fwdwrong', 'fwdstale', 'busy', 'portconflict', 'appgpufwd' }) {
                     # 3) adb forward だけやり直す。アプリの中の受け手なら、アプリの版に合う向け方（版が読めなければ今の向け方）で
@@ -1157,6 +1227,13 @@ if (Want 'android') {
                     Add-Result 'android' 'unfixed' $t ((M '直らなかった：' 'not fixed: ') + (Format-List2 $a2.Problems))
                 }
             }
+        }
+    }
+    if ($portFix -and $portFix.Fixed) {
+        $lastA = @($script:Results | Where-Object { $_.Id -eq 'android' }) | Select-Object -Last 1
+        if ($lastA) {
+            if ($lastA.State -eq 'ok' -or $lastA.State -eq 'skip') { $lastA.State = 'fixed' }
+            $lastA.Note = $portFix.Note + $(if ($lastA.Note) { ' / ' + $lastA.Note } else { '' })
         }
     }
 }

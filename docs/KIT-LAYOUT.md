@@ -12,7 +12,7 @@
 | `kit/pocketgpu.cmd` | 同じ場所 | 起動の入口（Steam の起動オプション用） |
 | `kit/pocketgpu_android.cmd`・`kit/check_android.cmd` | 同じ場所 | Android 用の入口 |
 | `kit/android/*.cmd` | `android\` | Android の受け手を入れる・止める。`android_app.cmd` は PocketGPU アプリ用（カメラ・マイク・スピーカー・GPU の口をつなぐ） |
-| `kit/tools/*.ps1` | `tools\` | 上の入口の中身（Windows PowerShell 5.1） |
+| `kit/tools/*.ps1` | `tools\` | 上の入口の中身（Windows PowerShell 5.1）。`pgpu_port.ps1` は Android の PC 側の口を選んで `android\port.txt` に覚える |
 | `kit/tools/fix-data/*.cmd` | `tools\fix-data\` | Fix-PocketGPU.cmd が、古い入口と入れ替える新しい物 |
 
 ## 守ること / Rules
@@ -28,6 +28,7 @@
 - `PocketGPU.exe`・`extras\`（カメラ・マイク・字幕の道具と仮想カメラ）
 - iPhone のアプリ（ipa）・Android の受け手（`android\server_aarch64`）・Android のアプリ（`android\pocketgpu.apk`）
 - `tools\kit.ini`・`tools\update.ini`（人ごとの設定）
+- `android\port.txt`（Windows が PC の口を予約していたとき、`tools\pgpu_port.ps1` が選んで覚えた口。使っているうちにできる。`gpu=47300` の形。消すと既定に戻る）
 - `README.txt`・`FAQ.txt`・`dxvk\`
 
 これらは、キットを組む側が入れます。道具（`kit/` の `.cmd` と `.ps1`）は、これらを呼び出すだけです。

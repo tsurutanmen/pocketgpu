@@ -137,6 +137,7 @@ function Invoke-Native([string]$exe, [string]$arguments, [int]$timeoutMs = 20000
     return (Invoke-NativeReal $exe $arguments $timeoutMs $envs)
 }
 function Replace-Launcher([string]$name) { return @{ Ok = $true; Backup = '' } }
+function Set-RememberedPort([string]$key, [int]$port, [string]$androidDir) { }
 function Stop-ByPid([int]$procId) { return $true }
 function Invoke-KitUpdate { return @{ Ran = $true; Exit = 0 } }
 function Invoke-Launch([string]$kind, [string]$target) { return $true }
@@ -491,8 +492,10 @@ function New-AndroidKit([string]$name, [hashtable]$state, [bool]$withForward, [o
     foreach ($id in (Get-FwdPids $st)) { $script:Spawned.Add($id) }
     return @{ Kit = $kit; Adb = $adb; State = $st; Port = $port; CamPort = $cam; AudioPort = $aud; LocalHash = $localHash }
 }
-function Invoke-AndroidFix($k, [string]$answers, [string[]]$more = @()) {
-    return (Invoke-Fix $k.Kit (@('-Only', 'android') + $more) @{ ADB = $k.Adb; FAKE_ADB_STATE = $k.State; PGPU_PORT = $k.Port; PGPU_CAM_PORT = $k.CamPort; PGPU_AUDIO_PORT = $k.AudioPort; IPHONE_VK_MUX = (Get-FreePort) } $answers)
+function Invoke-AndroidFix($k, [string]$answers, [string[]]$more = @(), [hashtable]$extraEnv = @{}) {
+    $e = @{ ADB = $k.Adb; FAKE_ADB_STATE = $k.State; PGPU_PORT = $k.Port; PGPU_CAM_PORT = $k.CamPort; PGPU_AUDIO_PORT = $k.AudioPort; IPHONE_VK_MUX = (Get-FreePort) }
+    foreach ($key in $extraEnv.Keys) { $e[$key] = $extraEnv[$key] }
+    return (Invoke-Fix $k.Kit (@('-Only', 'android') + $more) $e $answers)
 }
 # 偽の adb の forward の一覧（状態ファイルから）：口 -> 向け先
 function Get-FwdMap([string]$statePath) {
@@ -701,26 +704,29 @@ function Scn-PristineApp([string]$mode) {
     }
 }
 # android\android_app.cmd を、偽の adb で動かす。版に合う向け方を選ぶこと、選べないときの決め方、stop
-function Invoke-AppCmd($k, [string]$cmdArgs = '', [hashtable]$envs = @{}) {
-    $cmd = Join-Path $k.Kit 'android\android_app.cmd'
+function Invoke-KitCmd($k, [string]$rel, [string]$cmdArgs = '', [hashtable]$envs = @{}, [string]$stdin = $null) {
+    $cmd = Join-Path $k.Kit $rel
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName = $env:ComSpec
     $psi.Arguments = '/c ""' + $cmd + '" ' + $cmdArgs + '"'
     $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    if ($null -ne $stdin) { $psi.RedirectStandardInput = $true }
     $psi.WorkingDirectory = $Work
-    foreach ($key in @($psi.EnvironmentVariables.Keys)) { if ($key -like 'PGPU_*' -or $key -in 'ADB', 'ANDROID_SERIAL', 'FAKE_ADB_STATE', 'FAKE_ADB_LOG') { $psi.EnvironmentVariables.Remove($key) } }
-    $base = @{ ADB = $k.Adb; FAKE_ADB_STATE = $k.State; FAKE_ADB_LOG = (Join-Path (Split-Path -Parent $k.Kit) 'adb-calls.txt'); PGPU_NOPAUSE = '1'
+    foreach ($key in @($psi.EnvironmentVariables.Keys)) { if ($key -like 'PGPU_*' -or $key -in 'ADB', 'ANDROID_SERIAL', 'FAKE_ADB_STATE', 'FAKE_ADB_LOG', 'FAKE_NETSH_OUT') { $psi.EnvironmentVariables.Remove($key) } }
+    $base = @{ ADB = $k.Adb; FAKE_ADB_STATE = $k.State; FAKE_ADB_LOG = (Join-Path (Split-Path -Parent $k.Kit) 'adb-calls.txt'); PGPU_NOPAUSE = '1'; PGPU_LANG = 'en'
                PGPU_PORT = $k.Port; PGPU_CAM_PORT = $k.CamPort; PGPU_AUDIO_PORT = $k.AudioPort }
     foreach ($key in $base.Keys) { $psi.EnvironmentVariables[$key] = [string]$base[$key] }
-    foreach ($key in $envs.Keys) { $psi.EnvironmentVariables[$key] = [string]$envs[$key] }
+    foreach ($key in $envs.Keys) { if ($null -eq $envs[$key]) { [void]$psi.EnvironmentVariables.Remove($key) } else { $psi.EnvironmentVariables[$key] = [string]$envs[$key] } }
     $p = [Diagnostics.Process]::Start($psi)
     $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
+    if ($null -ne $stdin) { $p.StandardInput.Write($stdin); $p.StandardInput.Close() }
     if (-not $p.WaitForExit(60000)) { try { $p.Kill() } catch { }; return @{ Exit = -99; Out = $o.Result; Err = 'TIMEOUT'; Calls = '' } }
     [void]$p.WaitForExit()
     foreach ($id in (Get-FwdPids $k.State)) { if (-not $script:Spawned.Contains($id)) { $script:Spawned.Add($id) } }
     $calls = $(if (Test-Path $base.FAKE_ADB_LOG) { [IO.File]::ReadAllText($base.FAKE_ADB_LOG) } else { '' })
     return @{ Exit = $p.ExitCode; Out = $o.Result + $e.Result; Calls = $calls }
 }
+function Invoke-AppCmd($k, [string]$cmdArgs = '', [hashtable]$envs = @{}) { return (Invoke-KitCmd $k ('android' + [char]92 + 'android_app.cmd') $cmdArgs $envs) }
 function Scn-AndroidAppCmd([string]$mode) {
     if ($mode -ne 'fix') { return }
     $idle = @{ serial = 'EMU1'; dstate = 'device'; pids = ''; hash = ''; file = '0'; next = '7001' }
@@ -835,6 +841,202 @@ function Scn-AndroidAppCmd([string]$mode) {
     $k = New-AndroidKit 'appcmd-stop-nodev' $s $true @(@{ Port = '@cam'; Target = $script:AppNew.Cam })
     $r = Invoke-AppCmd $k 'stop'
     Check 'android_app.cmd stop・端末が無くても PC の口は閉じる（終わりのコードは 1）' (($r.Exit -eq 1) -and ((Get-FwdMap $k.State).Count -eq 0)) 'safety'
+}
+
+# =====================================================================
+# PC 側の口が Windows に予約されているとき（Hyper-V・WSL などの「除外されたポートの範囲」）
+# 本物の netsh の代わりに、予約の範囲を本物と同じ形で出す偽の netsh（tests\fakes\fake_netsh.cmd）を使う。予約の設定は読むだけ
+# =====================================================================
+# ranges：'開始-終了' の並び。空なら予約なし
+function New-FakeNetsh([string]$dir, [string[]]$ranges) {
+    $f = Join-Path $dir ('netsh-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.txt')
+    $l = New-Object System.Collections.Generic.List[string]
+    $l.Add(''); $l.Add('Protocol tcp Port Exclusion Ranges'); $l.Add(''); $l.Add('Start Port    End Port'); $l.Add('----------    --------')
+    foreach ($r in $ranges) { $a = $r -split '-'; $l.Add(('{0,10}    {1,8}' -f [int]$a[0], [int]$a[1])) }
+    $l.Add(''); $l.Add('* - Administered port exclusions.')
+    [IO.File]::WriteAllLines($f, $l.ToArray(), [Text.Encoding]::ASCII)
+    return @{ PGPU_TEST_NETSH = (Join-Path $PSScriptRoot 'fakes\fake_netsh.cmd'); FAKE_NETSH_OUT = $f }
+}
+function Merge-Env([hashtable]$a, [hashtable]$b) { $m = @{}; foreach ($x in $a.Keys) { $m[$x] = $a[$x] }; foreach ($x in $b.Keys) { $m[$x] = $b[$x] }; return $m }
+# android\port.txt の gpu= cam= audio= の値。無ければ $null
+function Get-PortFileValue([string]$kit, [string]$key) {
+    $f = Join-Path $kit 'android\port.txt'
+    if (-not (Test-Path -LiteralPath $f)) { return $null }
+    foreach ($l in [IO.File]::ReadAllLines($f)) { if ($l -match ('^' + $key + '=(\d+)\s*$')) { return [int]$Matches[1] } }
+    return $null
+}
+function Convert-RawUtf8([string]$out) {
+    $bytes = [Text.Encoding]::GetEncoding(28591).GetBytes($out)
+    try { return (New-Object Text.UTF8Encoding($false, $true)).GetString($bytes) }
+    catch { return [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage).GetString($bytes) }
+}
+
+# Fix-PocketGPU：PC の口が予約の範囲に入っている -> 聞いてから、範囲の外の口を選んで android\port.txt に覚える。直したあとの確かめはその口で行う
+function Scn-PortFix([string]$mode) {
+    $idle = @{ serial = 'EMU1'; dstate = 'device'; pids = '1111'; hash = '@local'; file = '1'; next = '7001' }
+    $k = New-AndroidKit "port-fix-$mode" $idle $false
+    # GPU の口とカメラの口が、予約の範囲に入っている
+    $ns = New-FakeNetsh (Split-Path -Parent $k.Kit) @(('{0}-{1}' -f ($k.Port - 3), ($k.Port + 3)), ('{0}-{1}' -f ($k.CamPort - 3), ($k.CamPort + 3)))
+    Use-Mode $mode $k.Kit
+    $r = Invoke-AndroidFix $k (Get-Mode $mode 'y,y') @() $ns
+    foreach ($id in (Get-FwdPids $k.State)) { $script:Spawned.Add($id) }
+    $new = Get-PortFileValue $k.Kit 'gpu'
+    $newCam = Get-PortFileValue $k.Kit 'cam'
+    $m = Get-FwdMap $k.State
+    Check 'android\port.txt に、予約の範囲の外の GPU の口（47300 から順）が覚えられる' (($null -ne $new) -and ($new -ne $k.Port) -and ($new -ge 47300) -and ($new -lt 47400))
+    Check 'android\port.txt に、予約の範囲の外のカメラの口（47400 から順）も覚えられる' (($null -ne $newCam) -and ($newCam -ne $k.CamPort) -and ($newCam -ge 47400) -and ($newCam -lt 47500))
+    Check '覚えた口に adb forward がつながり、受け手が応答する（実際につないで確認）' (($null -ne $new) -and ($m[[string]$new] -eq ('tcp:' + $new)) -and (Test-Hello $new))
+    Check '予約の範囲に入っていた口には、adb forward を作らない' (-not $m.ContainsKey([string]$k.Port)) 'safety'
+    $st = Get-AdbState $k.State
+    Check '受け手（スマートフォン側）には触れていない（PID・SHA がそのまま）' (($st.pids -eq '1111') -and ($st.hash -eq $k.LocalHash)) 'safety'
+    if ($mode -eq 'fix') {
+        Check 'まとめに「直った」と、別の口にしたことが出る・終わりのコード 0' (($r.Summary -match '\[直った\] Android') -and ($r.Summary -match [regex]::Escape([string]$k.Port + ' -> ' + $new)) -and $r.Exit -eq 0) 'safety'
+        Check '予約の範囲に入っていることと、予約の設定は変えないことを案内する' (($r.Log -match 'Windows の予約の範囲') -and ($r.Log -match 'netsh int ipv4 show excludedportrange') -and ($r.Log -match '予約の設定は、このツールでは変えません')) 'safety'
+        # 予約されていなければ、何も聞かず、port.txt も作らない
+        $k2 = New-AndroidKit 'port-fix-none' $idle $true
+        $ns2 = New-FakeNetsh (Split-Path -Parent $k2.Kit) @()
+        $r2 = Invoke-AndroidFix $k2 'n' @() $ns2
+        Check '予約されていなければ、問題なし・何も聞かない・android\port.txt も作らない' (($r2.Exit -eq 0) -and ($r2.Summary -match '問題なし 1') -and ($r2.Log -notmatch '予約') -and ($null -eq (Get-PortFileValue $k2.Kit 'gpu'))) 'safety'
+    } else {
+        Check '直していないので、終わりのコード 1・まとめは「直らなかった」' (($r.Exit -eq 1) -and ($r.Summary -match '\[直らなかった\] Android')) 'safety'
+        Check '直していないので、android\port.txt は作られない' (($null -eq $new) -and ($null -eq $newCam)) 'safety'
+    }
+}
+
+# 口を決める部品 tools\pgpu_port.ps1 そのもの：画面の文（日本語は UTF-8 で動かして読む）・47300 から順・使っている物を避ける・adb が使っている口は使ってよい
+function Scn-PortLib([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $kit = New-Kit 'port-lib'
+    $dir = Split-Path -Parent $kit
+    $lib = Join-Path $kit 'tools\pgpu_port.ps1'
+    $P = Get-FreePort
+    $C = Get-FreePort
+    $A = Get-FreePort
+    $ns = New-FakeNetsh $dir @(('{0}-{1}' -f ($P - 1), ($P + 1)), '47300-47309')
+    $e = Merge-Env @{ PGPU_PORT = $P; PGPU_CAM_PORT = $C; PGPU_AUDIO_PORT = $A } $ns
+    $script:RawOut = $true
+    try { $r = Invoke-Fix $kit @('"' + $lib + '"', 'gpu') $e '' (Join-Path $PSScriptRoot 'fakes\utf8-run.ps1') } finally { $script:RawOut = $false }
+    $ja = Convert-RawUtf8 ([string]$r.Out)
+    $new = Get-PortFileValue $kit 'gpu'
+    Check '日本語の画面：「ポート X は Windows に予約されているので、Y を使います」の 1 行を出す' (($ja -match ('ポート ' + $P + ' は Windows に予約されているので、(\d+) を使います')) -and ([int]$Matches[1] -eq $new)) 'safety'
+    Check '47300 から順に探し、予約の範囲（47300-47309）の外の 47310 以上を選んで、android\port.txt に覚える' (($null -ne $new) -and ($new -ge 47310) -and ($new -lt 47400))
+    Check 'カメラ・マイクの口は予約されていないので、そのまま（port.txt に書かない）' (($null -eq (Get-PortFileValue $kit 'cam')) -and ($null -eq (Get-PortFileValue $kit 'audio'))) 'safety'
+    # 英語の画面（PGPU_LANG=en）
+    $kit2 = New-Kit 'port-lib-en'
+    $ns2 = New-FakeNetsh $dir @(('{0}-{1}' -f ($P - 1), ($P + 1)))
+    $r2 = Invoke-Fix $kit2 @('gpu') (Merge-Env @{ PGPU_PORT = $P; PGPU_LANG = 'en' } $ns2) '' (Join-Path $kit2 'tools\pgpu_port.ps1')
+    $new2 = Get-PortFileValue $kit2 'gpu'
+    Check ('英語の画面：「Port ' + $P + ' is reserved by Windows, so port ' + $new2 + ' is used instead」の 1 行を出す') ($r2.Out -match ('Port ' + $P + ' is reserved by Windows, so port ' + $new2 + ' is used instead')) 'safety'
+    Check '予約の範囲の外の先頭の 47300 を選ぶ' ($new2 -eq 47300)
+    # 予約されていない口は、何も出さず、そのまま。port.txt も作らない
+    $kit3 = New-Kit 'port-lib-none'
+    $ns3 = New-FakeNetsh $dir @()
+    $r3 = Invoke-Fix $kit3 @('gpu') (Merge-Env @{ PGPU_PORT = $P; PGPU_LANG = 'en' } $ns3) '' (Join-Path $kit3 'tools\pgpu_port.ps1')
+    Check '予約されていなければ、画面に何も出さず、android\port.txt も作らない' (([string]$r3.Out).Trim() -eq '' -and ($null -eq (Get-PortFileValue $kit3 'gpu'))) 'safety'
+    # ほかのプログラムが使っている口は避ける（そのプログラムは止めない）
+    $B = Get-FreePort
+    $blocker = Start-Blocker $B
+    $kit4 = New-Kit 'port-lib-inuse'
+    $r4 = Invoke-Fix $kit4 @('gpu') (Merge-Env @{ PGPU_PORT = $B; PGPU_LANG = 'en' } $ns3) '' (Join-Path $kit4 'tools\pgpu_port.ps1')
+    $new4 = Get-PortFileValue $kit4 'gpu'
+    Check 'ほかのプログラムが使っている口は、使っていると画面に出して、別の口を選ぶ' (($r4.Out -match ('Port ' + $B + ' is used by another program, so port ' + $new4 + ' is used instead')) -and ($null -ne $new4) -and ($new4 -ne $B)) 'safety'
+    Check '使っていたプログラムは止めない' (Test-Alive $blocker.Id) 'safety'
+    # adb が使っている口（前に作った adb forward）は、使っているうちに入れない
+    $k = New-AndroidKit 'port-lib-adb' @{ serial = 'EMU1'; dstate = 'device'; pids = '1111'; hash = '@local'; file = '1'; next = '7001' } $true
+    $r5 = Invoke-Fix $k.Kit @('gpu') (Merge-Env @{ PGPU_PORT = $k.Port; PGPU_LANG = 'en' } $ns3) '' (Join-Path $k.Kit 'tools\pgpu_port.ps1')
+    Check 'adb が使っている口（前に作った adb forward）は、そのまま使う。画面に何も出さず、android\port.txt も作らない' ((([string]$r5.Out).Trim() -eq '') -and ($null -eq (Get-PortFileValue $k.Kit 'gpu')) -and (Test-Hello $k.Port)) 'safety'
+}
+
+# android\ の cmd：選んだ口を android\port.txt に覚え、あとから単体で動かした cmd や run.ps1 も同じ口を使う。stop_android.cmd は覚えた口の forward を外す
+# fix：本物の動き。sabotage：口を選ぶ部品 tools\pgpu_port.ps1 を外した物（効果の検査が偽になること）
+function Scn-PortCmd([string]$mode) {
+    if ($mode -eq 'decline') { return }
+    $idle = @{ serial = 'EMU1'; dstate = 'device'; pids = ''; hash = ''; file = '0'; next = '7001'; app = '0.1.4' }
+    $noEnv = @{ PGPU_PORT = $null; PGPU_CAM_PORT = $null; PGPU_AUDIO_PORT = $null }
+    $S = 'android\start_android.cmd'
+    # 1) 50300 が予約されている（この PC と同じ形：50167-51066）-> 別の口を選ぶ。そのあと別々に動かす cmd も、同じ口を使う
+    $k = New-AndroidKit 'portcmd-reserved' $idle $false
+    if ($mode -eq 'sabotage') { Remove-Item -LiteralPath (Join-Path $k.Kit 'tools\pgpu_port.ps1') }
+    $ns = New-FakeNetsh (Split-Path -Parent $k.Kit) @('50167-51066')
+    $r = Invoke-KitCmd $k $S '' (Merge-Env $noEnv $ns)
+    $gpu = Get-PortFileValue $k.Kit 'gpu'
+    $m = Get-FwdMap $k.State
+    $st = Get-AdbState $k.State
+    Check 'start_android.cmd：50300 が予約されているとき、「Port 50300 is reserved by Windows, so port N is used instead」の 1 行を出す' (($r.Out -match 'Port 50300 is reserved by Windows, so port (\d+) is used instead') -and ($null -ne $gpu) -and ([int]$Matches[1] -eq $gpu))
+    Check 'start_android.cmd：選ぶ口は予約の範囲（50167-51066）の外で、47300 から順の 47300 台' (($null -ne $gpu) -and ($gpu -ge 47300) -and ($gpu -lt 47400))
+    Check 'start_android.cmd：選んだ口で受け手を起動し（スマートフォンへ渡す口）、adb forward をつなぎ、受け手が応答する' (($null -ne $gpu) -and ($st.lport -eq [string]$gpu) -and ($m[[string]$gpu] -eq ('tcp:' + $gpu)) -and (Test-Hello $gpu) -and ($r.Exit -eq 0))
+    Check 'start_android.cmd：予約された 50300 には adb forward を作らない' (-not $m.ContainsKey('50300') -and ($null -ne $gpu))
+    if ($mode -eq 'fix') {
+        $g = $gpu
+        # pocketgpu_android.cmd：口を指定せずに単体で動かしても、覚えた口（IPHONE_VK=127.0.0.1:口）
+        $r = Invoke-KitCmd $k 'pocketgpu_android.cmd' 'cmd.exe /c set' $noEnv
+        Check 'pocketgpu_android.cmd：口を指定しなくても、覚えた口を IPHONE_VK に渡す' ($r.Out -match ('IPHONE_VK=127\.0\.0\.1:' + $g + '\b')) 'safety'
+        # check_android.cmd：vklist.exe の代わりに cmd.exe を置いて、環境変数を読む
+        Copy-Item $env:ComSpec (Join-Path $k.Kit 'vklist.exe') -Force
+        $r = Invoke-KitCmd $k 'check_android.cmd' '' $noEnv ("set IPHONE_VK`r`nexit`r`n")
+        Check 'check_android.cmd：口を指定しなくても、覚えた口を IPHONE_VK に渡す' ($r.Out -match ('IPHONE_VK=127\.0\.0\.1:' + $g + '\b')) 'safety'
+        # tools\run.ps1（Android の形）：IPHONE_VK を覚えた口にする
+        $root = Join-Path (Split-Path -Parent $k.Kit) 'games'
+        $game = New-Game $root 'vk' 'x64' @('kernel32.dll', 'vulkan-1.dll')
+        $rr = Invoke-RunDx $k.Kit $game (Merge-Env @{ PGPU_ANDROID = '1'; PGPU_PORT = $null } @{}) 'y,y'
+        Check 'tools\run.ps1（Android）：口を指定しなくても、覚えた口を IPHONE_VK に渡す' ($rr.Out -match ('DRYRUN set IPHONE_VK=127\.0\.0\.1:' + $g + '\b')) 'safety'
+        # android_app.cmd：覚えた口を使う（adb が使っている口なので選び直さない）。キットの受け手が動いているので GPU の口はそちらへ
+        $r = Invoke-KitCmd $k 'android\android_app.cmd' '' (Merge-Env @{ PGPU_PORT = $null; PGPU_CAM_PORT = $k.CamPort; PGPU_AUDIO_PORT = $k.AudioPort } $ns)
+        $m = Get-FwdMap $k.State
+        Check 'android_app.cmd：覚えた口を使う（GPU の口はキットの受け手 tcp:口・口は変わらない・選び直しの案内は出ない）' (($r.Exit -eq 0) -and ($m[[string]$g] -eq ('tcp:' + $g)) -and ($r.Out -match ('adb forward tcp:' + $g + ' tcp:' + $g)) -and ($r.Out -notmatch 'is reserved by Windows') -and ((Get-PortFileValue $k.Kit 'gpu') -eq $g)) 'safety'
+        # stop_android.cmd：このウィンドウに別の PGPU_PORT が残っていても、覚えた口の forward を外す。port.txt は残る
+        $r = Invoke-KitCmd $k 'android\stop_android.cmd' '' @{ PGPU_PORT = (Get-FreePort) }
+        $m = Get-FwdMap $k.State
+        Check 'stop_android.cmd：覚えた口の adb forward を外す（口も閉じる）。android\port.txt は残る' (($r.Exit -eq 0) -and (-not $m.ContainsKey([string]$g)) -and (Wait-Until { -not (Test-Port $g) } 4) -and ((Get-PortFileValue $k.Kit 'gpu') -eq $g))
+        Stop-Spawned
+        # 2) 予約されていない -> 50300 のまま（何も出さず、port.txt も作らない）。この PC では本当に 50300 が予約されていて adb forward は作れないので、forward の成否は見ない
+        $k = New-AndroidKit 'portcmd-none' $idle $false
+        $ns = New-FakeNetsh (Split-Path -Parent $k.Kit) @()
+        $r = Invoke-KitCmd $k $S '' (Merge-Env $noEnv $ns)
+        Check '予約されていなければ、start_android.cmd は 50300 のまま（Port: 50300）・案内は出ない・android\port.txt も作らない' (($r.Out -match 'Port: 50300') -and ($r.Out -notmatch 'is reserved by Windows') -and ($r.Out -notmatch 'used by another program') -and ($null -eq (Get-PortFileValue $k.Kit 'gpu'))) 'safety'
+        Stop-Spawned
+        # 3) 口を指定したのに予約の範囲に入っている -> 別の口を選ぶ。選んだ口は、指定が残っていても start_android.cmd のあとの cmd（Start-Android-GPU.cmd と同じ読み方）が使える
+        $k = New-AndroidKit 'portcmd-explicit' $idle $false
+        $p = $k.Port
+        $ns = New-FakeNetsh (Split-Path -Parent $k.Kit) @(('{0}-{1}' -f ($p - 2), ($p + 2)))
+        $r = Invoke-KitCmd $k $S '' (Merge-Env @{ PGPU_PORT = $p; PGPU_CAM_PORT = $null; PGPU_AUDIO_PORT = $null } $ns)
+        $gpu = Get-PortFileValue $k.Kit 'gpu'
+        $m = Get-FwdMap $k.State
+        Check '口を指定しても予約の範囲に入っていれば、別の口を選んで覚え、そこにつなぐ' (($r.Out -match ('Port ' + $p + ' is reserved by Windows, so port (\d+) is used instead')) -and ($null -ne $gpu) -and ($gpu -ne $p) -and ($m[[string]$gpu] -eq ('tcp:' + $gpu)) -and (-not $m.ContainsKey([string]$p)))
+        Stop-Spawned
+        # 4) 覚えた口が、あとから予約された -> 選び直す（47300 台も、既定の 50300 も予約されているので、47310 以上）
+        $k = New-AndroidKit 'portcmd-reserved-later' $idle $false
+        [IO.File]::WriteAllText((Join-Path $k.Kit 'android\port.txt'), "gpu=47300`r`n", [Text.Encoding]::ASCII)
+        $ns = New-FakeNetsh (Split-Path -Parent $k.Kit) @('47300-47309', '50167-51066')
+        $r = Invoke-KitCmd $k $S '' (Merge-Env $noEnv $ns)
+        $gpu = Get-PortFileValue $k.Kit 'gpu'
+        Check '覚えた口 47300 があとから予約されたら、選び直して覚え直す（47310 以上）' (($r.Out -match 'Port 47300 is reserved by Windows') -and ($null -ne $gpu) -and ($gpu -ge 47310) -and ($gpu -lt 47400) -and (Get-FwdMap $k.State)[[string]$gpu] -eq ('tcp:' + $gpu))
+        Stop-Spawned
+        # 5) 覚えた口が予約されていなければ、環境変数なしでも start_android.cmd がその口を使う
+        $k = New-AndroidKit 'portcmd-remembered' $idle $false
+        $F = Get-FreePort
+        [IO.File]::WriteAllText((Join-Path $k.Kit 'android\port.txt'), "gpu=$F`r`n", [Text.Encoding]::ASCII)
+        $ns = New-FakeNetsh (Split-Path -Parent $k.Kit) @('50167-51066')
+        $r = Invoke-KitCmd $k $S '' (Merge-Env $noEnv $ns)
+        Check '覚えた口が使えるなら、環境変数がなくても start_android.cmd はその口を使う（案内は出ない）' (($r.Out -match ('Port: ' + $F)) -and ($r.Out -notmatch 'is reserved') -and ((Get-FwdMap $k.State)[[string]$F] -eq ('tcp:' + $F)) -and ((Get-PortFileValue $k.Kit 'gpu') -eq $F)) 'safety'
+        Stop-Spawned
+    }
+    Stop-Spawned
+    # 6) PocketGPU アプリのカメラとマイクの口（既定 50064・50063）が予約されている -> 47400 台・47500 台。表示する webcam_rx.exe / ipaudio.exe の口もそれ
+    $s2 = $idle.Clone(); $s2.app = '0.1.2'
+    $k = New-AndroidKit 'portcmd-app' $s2 $false
+    if ($mode -eq 'sabotage') { Remove-Item -LiteralPath (Join-Path $k.Kit 'tools\pgpu_port.ps1') }
+    $ns = New-FakeNetsh (Split-Path -Parent $k.Kit) @('50060-50070')
+    $r = Invoke-KitCmd $k 'android\android_app.cmd' '' (Merge-Env @{ PGPU_PORT = $k.Port; PGPU_CAM_PORT = $null; PGPU_AUDIO_PORT = $null } $ns)
+    $cam = Get-PortFileValue $k.Kit 'cam'
+    $aud = Get-PortFileValue $k.Kit 'audio'
+    $m = Get-FwdMap $k.State
+    Check 'android_app.cmd：カメラ（50064）とマイク（50063）が予約されているとき、1 行ずつ出して 47400 台・47500 台を選び、android\port.txt に覚える' (($null -ne $cam) -and ($null -ne $aud) -and ($cam -ge 47400) -and ($cam -lt 47500) -and ($aud -ge 47500) -and ($aud -lt 47600) -and ($r.Out -match ('Port 50064 \(webcam\) is reserved by Windows, so port ' + $cam + ' is used instead')) -and ($r.Out -match ('Port 50063 \(audio\) is reserved by Windows, so port ' + $aud + ' is used instead')))
+    Check 'android_app.cmd：選んだ口に adb forward をつなぎ、アプリが応答し、使い方の表示もその口' (($null -ne $cam) -and ($m[[string]$cam] -eq $script:AppNew.Cam) -and ($m[[string]$aud] -eq $script:AppNew.Aud) -and ((Test-AppAnswer $cam) -eq 'webcam') -and ((Test-AppAnswer $aud) -eq 'audio') -and ($r.Out -match ('webcam_rx\.exe --addr 127\.0\.0\.1:' + $cam)) -and ($r.Out -match ('ipaudio\.exe --connect 127\.0\.0\.1:' + $aud)))
+    if ($mode -eq 'fix') {
+        $r = Invoke-KitCmd $k 'android\android_app.cmd' 'stop' (Merge-Env @{ PGPU_PORT = $k.Port; PGPU_CAM_PORT = $null; PGPU_AUDIO_PORT = $null } @{})
+        Check 'android_app.cmd stop：覚えたカメラとマイクの口の adb forward を外す' (($r.Exit -eq 0) -and ((Get-FwdMap $k.State).Count -eq 0)) 'safety'
+    }
 }
 
 # iPhone の GPU が見えない -> 原因の案内。ウイルス対策の気配
@@ -1156,6 +1358,9 @@ $scenarios = [ordered]@{
     'android-app-gpuusb-old' = { param($m) Scn-AndroidAppGpuUsbOnOld $m }
     'android-app-cmd'     = { param($m) Scn-AndroidAppCmd $m }
     'pristine-app'        = { param($m) Scn-PristineApp $m }
+    'port-fix'            = { param($m) Scn-PortFix $m }
+    'port-lib'            = { param($m) Scn-PortLib $m }
+    'port-cmd'            = { param($m) Scn-PortCmd $m }
     'gpu-av'        = { param($m) Scn-GpuAv $m }
     'checkonly'     = { param($m) Scn-CheckOnly $m }
     'privacy'       = { param($m) Scn-Privacy $m }

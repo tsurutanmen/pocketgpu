@@ -42,7 +42,7 @@ Options:
 | `apple` | Apple Mobile Device Service missing or stopped | Starts it, or opens Apple Devices | Administrator steps, Store page |
 | `tools` | The same tool running twice | Stops the older one | |
 | `iphone` | iPhone seen over USB, receiver answering | Stops the program holding the receiver | Reopen or reinstall the iPhone app |
-| `android` | Two receivers, old receiver, ports in use, adb forward. With the PocketGPU app: the camera and mic ports, in the form that fits the app version | Reinstalls, reconnects or stops. Reconnects the camera and mic ports in the right form | Permission and cable advice |
+| `android` | Two receivers, old receiver, ports in use, adb forward. A PC port inside a range that Windows reserved. With the PocketGPU app: the camera and mic ports, in the form that fits the app version | Reinstalls, reconnects or stops. Picks a free port outside the reserved ranges and saves it. Reconnects the camera and mic ports in the right form | Permission and cable advice |
 | `gpu` | The phone GPU seen through the driver | (fixed by the items above) | How to check your antivirus |
 
 ### Android app ports
@@ -64,6 +64,12 @@ The GPU port (50300 on the PC) also depends on the app version, when the app run
 | 0.1.3 and older | `adb forward tcp:50300 tcp:50060` |
 
 The 0.1.4 app does not need port 50060 on the phone to be free. If the version cannot be read, or adb refuses the first form, `android\android_app.cmd` uses `tcp:50060`. Set `PGPU_APP_GPU=usb` or `PGPU_APP_GPU=tcp` to choose yourself. When the kit receiver from `android\start_android.cmd` runs, the GPU port goes to it (`tcp:50300`) as before.
+
+### Ports reserved by Windows
+
+`adb forward` listens on a port of this PC (50300 for the GPU, 50064 for the webcam, 50063 for the audio). Some PCs reserve port ranges for Hyper-V or WSL (`netsh int ipv4 show excludedportrange protocol=tcp` shows them), and then adb cannot listen on a port inside a range. Only the Android part listens on the PC; the iPhone side connects to Apple's service and listens on nothing.
+
+The Android cmd files in `android\` check the port before they use it. If it is reserved, or another program uses it, `tools\pgpu_port.ps1` picks a free port outside the reserved ranges (47300 and up for the GPU, 47400 for the webcam, 47500 for the audio), prints one line such as `Port 50300 is reserved by Windows, so port 47300 is used instead`, and saves the port in `android\port.txt`. `pocketgpu_android.cmd`, `check_android.cmd`, `android_app.cmd`, `stop_android.cmd` and `tools\run.ps1` read that file, so they use the same port. The order is: the variable (`PGPU_PORT`, `PGPU_CAM_PORT`, `PGPU_AUDIO_PORT`), then `android\port.txt`, then the default. Delete `android\port.txt` to forget the saved ports. `Fix-PocketGPU.cmd` finds a port inside a reserved range, asks, and does the same. It never changes the Windows reservation.
 
 ## Linux: fix.sh
 
@@ -127,6 +133,12 @@ PocketGPU は、スマホを Windows の PC の 2 枚目の GPU・ウェブカ�
 - `Run-on-iPhone-GPU.cmd`：ゲームやアプリを iPhone の GPU で起動します
 
 直らないときは、`pocketgpu-fix-summary.txt` の中身を Discord か Issue に貼ってください。合言葉・ユーザー名・PC の名前・フォルダの場所は入っていません。
+
+### Android：Windows が予約している口
+
+`adb forward` は、この PC の口（GPU は 50300、ウェブカメラは 50064、音声は 50063）で待ちます。Hyper-V や WSL のために Windows が口の範囲を予約している PC があり（`netsh int ipv4 show excludedportrange protocol=tcp` で見えます）、範囲の中の口では adb が待てません。PC で待つのは Android の部分だけです。iPhone は Apple のサービスにつなぐだけで、PC では何も待ちません。
+
+`android\` の cmd は、使う前に口をチェックします。予約されている口や、ほかのプログラムが使っている口なら、`tools\pgpu_port.ps1` が、予約の範囲の外の空いている口（GPU は 47300、ウェブカメラは 47400、音声は 47500 から順）を選び、`ポート 50300 は Windows に予約されているので、47300 を使います` のような 1 行を出して、`android\port.txt` に覚えます。`pocketgpu_android.cmd`・`check_android.cmd`・`android_app.cmd`・`stop_android.cmd`・`tools\run.ps1` はそのファイルを読むので、同じ口を使います。決める順番は、環境変数（`PGPU_PORT`・`PGPU_CAM_PORT`・`PGPU_AUDIO_PORT`）、`android\port.txt`、既定の順です。覚えた口を消すには、`android\port.txt` を削除してください。`Fix-PocketGPU.cmd` は、予約の範囲に入っている口を見つけて、聞いてから、同じように直します。Windows の予約の設定は変えません。
 
 ### Linux：fix.sh
 

@@ -14,6 +14,9 @@ rem   If the version cannot be read it uses the new form. If adb refuses the new
 rem   To choose the form yourself:   set PGPU_APP_FORWARD=new   or   set PGPU_APP_FORWARD=old
 rem   The 0.1.2 app also takes the old form when "Also accept old PC tools" is on in the app settings. It is off by default.
 rem Other ports:   set PGPU_CAM_PORT=50064   set PGPU_AUDIO_PORT=50063   set PGPU_PORT=50300
+rem   Ports on this PC: if Windows reserved one of them (netsh int ipv4 show excludedportrange protocol=tcp) or another program uses it,
+rem   this file picks a free port outside the reserved ranges (47300, 47400 and 47500 and up), says so, and saves it in android\port.txt.
+rem   Use the numbers this file prints. stop and the other files in this kit read android\port.txt, so they use the same ports.
 rem GPU: if the kit receiver from android\start_android.cmd is running on the phone, the app does not start its own
 rem   receiver and port %PGPU_PORT% goes to the kit receiver (tcp:%PGPU_PORT%). Otherwise it goes to the receiver inside the app:
 rem   app 0.1.4 and newer:   adb forward tcp:50300 localabstract:pocketgpu-gpu   (no port number on the phone, so nothing else can be in the way)
@@ -22,6 +25,7 @@ rem   If the version cannot be read it uses tcp:50060 (the 0.1.4 app also listen
 rem   If adb refuses the localabstract form it uses tcp:50060.
 rem   To choose the GPU form yourself:   set PGPU_APP_GPU=usb   or   set PGPU_APP_GPU=tcp
 setlocal
+if /i not "%~1"=="stop" set "PGPU_PICK=gpu,cam,audio"
 call "%~dp0_common.cmd"
 if errorlevel 1 goto nodev
 set "PKG=com.tsurutanmen.pocketgpu"
@@ -144,8 +148,9 @@ echo ERROR: the PocketGPU app is not installed on the phone. Install it with:   
 goto fail
 :forward_failed
 echo.
-echo ERROR: could not open a port on this PC. Another program may be using %PGPU_CAM_PORT%, %PGPU_AUDIO_PORT% or %PGPU_PORT%.
-echo Run android\android_app.cmd stop, or use other ports (see the top of this file).
+echo ERROR: could not open a port on this PC. Another program may be using %PGPU_CAM_PORT%, %PGPU_AUDIO_PORT% or %PGPU_PORT%, or Windows reserved it.
+echo Run android\android_app.cmd stop and try again. To see what Windows reserved:   netsh int ipv4 show excludedportrange protocol=tcp
+echo To choose other ports (see the top of this file):   set PGPU_PORT=47301
 goto fail
 
 :fail

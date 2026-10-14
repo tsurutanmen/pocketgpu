@@ -5,7 +5,7 @@
 # 環境変数はこの起動にだけ付ける。レジストリには書かない。DXVK を置くのは、聞いて「はい」のときだけ
 # 試験：PGPU_DRYRUN=1 で、最後に起動せず、何を起動するかだけ出す（DXVK を置くのは本当に行う。試験は試験用のフォルダで）
 # Android（10/14）：PGPU_ANDROID=1 のときは、Android のスマートフォンの GPU で起動する。Start-Android-GPU.cmd が付けて呼ぶ。
-#   iPhone のアプリ（usbmuxd）に聞く代わりに、adb forward の口（IPHONE_VK=127.0.0.1:口。無ければ PGPU_PORT か 50300）の受け手にあいさつする。
+#   iPhone のアプリ（usbmuxd）に聞く代わりに、adb forward の口（IPHONE_VK=127.0.0.1:口。無ければ PGPU_PORT か android\port.txt の gpu= か 50300）の受け手にあいさつする。
 #   DirectX の見分けと DXVK の置き方は iPhone と同じ。DXVK にはスマートフォンの GPU を選ばせる（DXVK_FILTER_DEVICE_NAME=PocketGPU。GPU の名前は「PocketGPU phone (…)」）
 . (Join-Path $PSScriptRoot 'pgpu_common.ps1')
 
@@ -13,7 +13,14 @@ $DryRun = $env:PGPU_DRYRUN -eq '1'
 $Warned = $false
 $Android = $env:PGPU_ANDROID -eq '1'
 if ($Android) {
-    if (-not $env:IPHONE_VK) { $env:IPHONE_VK = '127.0.0.1:' + $(if ($env:PGPU_PORT) { $env:PGPU_PORT } else { '50300' }) }
+    # 口：環境変数 PGPU_PORT > android\port.txt に覚えた口（Windows が 50300 を予約しているとき、android\start_android.cmd が別の口を選んで覚える）> 50300
+    $gpuPort = '50300'
+    if ($env:PGPU_PORT) { $gpuPort = $env:PGPU_PORT }
+    else {
+        $pf = Join-Path $script:KitDir 'android\port.txt'
+        if (Test-Path -LiteralPath $pf) { foreach ($pl in [IO.File]::ReadAllLines($pf)) { if ($pl -match '^\s*gpu\s*=\s*(\d{1,5})\s*$') { $gpuPort = $Matches[1] } } }
+    }
+    if (-not $env:IPHONE_VK) { $env:IPHONE_VK = '127.0.0.1:' + $gpuPort }
     # 画面の文の「どの GPU か」と、Steam の起動オプションに書く入口
     $GJa = 'Android のスマートフォン'; $GEn = 'Android phone'; $Launcher = 'pocketgpu_android.cmd'
 } else {
