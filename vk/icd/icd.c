@@ -1170,6 +1170,27 @@ static size_t sock_avail(vr_sock s) {
 #endif
 }
 
+// 返事の本体（need バイト）がまだ全部は届いていないか（av：いま届いている量）。
+// Linux は socket の受け取り用の入れ物が SO_RCVBUF の 4 MB ではなく net.core.rmem_max（既定 212992）で頭打ちになり、unix socket（usbmuxd）は相手の
+// SO_SNDBUF で頭打ちになる。入れ物より大きい返事（窓の絵の数百 KB）は、読まない限り全部は届かず、待っても届く量が増えない。
+// 届く量が RX_STALL_MS のあいだ増えなければ「全部届いた」ことにして読み始める（読めば残りが流れ込む。前のやり方と同じで、錠を持ったまま残りを待つ）。
+// Windows は入れ物が 4 MB あるので今までどおり（全部届くまで読まない）
+#ifdef _WIN32
+static int rx_incomplete(size_t av, size_t need) { return av < need; }
+#else
+#define RX_STALL_MS 2
+static int rx_incomplete(size_t av, size_t need) {
+    static size_t seen = (size_t) -1; // g_lock の中でだけ呼ぶ
+    static double since;
+    if (av >= need) { seen = (size_t) -1; return 0; }
+    double tn = now_ms();
+    if (av != seen) { seen = av; since = tn; return 1; }
+    if (tn - since < RX_STALL_MS) return 1;
+    seen = (size_t) -1;
+    return 0;
+}
+#endif
+
 static int rx_head(uint32_t h[2], uint32_t op, int wait) {
     for (;;) {
         if (!wait) {
@@ -1179,12 +1200,12 @@ static int rx_head(uint32_t h[2], uint32_t op, int wait) {
             // その間 DXVK の命令を組む糸が命令を足せない（窓の絵の返事は数百 KB・USB で数 ms〜十数 ms）。1 MB を超える返事は待たずに読む
             {
                 size_t hd = 8 + ((g_ext_on && g_rx_seq >= g_rx_ext_from) ? VR_EXT_BYTES : 0), av = sock_avail(g_sock);
-                if (av != (size_t) -1) {
+                if (av != (size_t) -1 && av > 0) { // 0 で読めると言われたのは相手が閉じたとき：下で読んで切れたことを知る
                     uint8_t pk[8 + VR_EXT_BYTES];
                     uint32_t hl;
                     if (av < hd || recv(g_sock, (char *) pk, (int) hd, MSG_PEEK) != (int) hd) return 2;
                     memcpy(&hl, pk + 4, 4);
-                    if (hl <= (1u << 20) && av < hd + hl) return 2;
+                    if (hl <= (1u << 20) && rx_incomplete(av, hd + hl)) return 2;
                 }
             }
             if (!vr_recv_all(g_sock, h, 8)) { conn_lost("返事を読む所"); return 0; }
@@ -2087,7 +2108,7 @@ static int sparse_take(uint64_t size, const char *what, uint64_t app_size) {
         if (c <= 8 || (c & (c - 1)) == 0)
             fprintf(stderr, "[iphone-vk] sparse の %s（仮の大きさ %.1f MiB）を作らずに断った：ふつうのメモリで丸ごと持つと合計 %.1f MiB になり、"
                             "上限 %.0f MiB を超える（IPHONE_VK_SPARSE_MAX_MB で変えられる・%ld 回目）\n",
-                    what, app_size / 1048576.0, (double) (now) / 1048576.0, cap / 1048576.0, c);
+                    what, app_size / 1048576.0, (double) (now) / 1048576.0, cap / 1048576.0, (long) c);
         return 0;
     }
     say("sparse の %s（仮の大きさ %.1f MiB）を、ふつうのメモリ %.1f MiB で丸ごと持つ（合計 %.1f MiB／上限 %.0f MiB）", what, app_size / 1048576.0,
