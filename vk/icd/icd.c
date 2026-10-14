@@ -1500,7 +1500,7 @@ static vr_sock link_connect(const char *boot, char *host, size_t nhost, char *po
         }
         say("インターネット共有の口 %s:%s につながらないので、いつもの口でつなぐ", lh, lp);
     } else {
-        say("受け手がインターネット共有の口を教えない（共有が切れている・古い受け手）ので、いつもの口でつなぐ");
+        say("受け手がインターネット共有の口を教えない（共有が切れている・アプリの「インターネット共有でも接続を受け付ける」が切・古い受け手）ので、いつもの口でつなぐ");
     }
     if (b != INVALID_SOCKET) closesocket(b);
     if (boot && *boot) {

@@ -136,7 +136,7 @@ def ask_link(boot):
         recv_exact(s, n, body)
     s.close()
     if res != 0 or n != 28 or not struct.unpack("<I", body[:4])[0]:
-        raise ConnectionError("受け手がインターネット共有の口を教えない（共有が切れている・古い受け手）")
+        raise ConnectionError("受け手がインターネット共有の口を教えない（共有が切れている・アプリの「インターネット共有でも接続を受け付ける」が切・古い受け手）")
     token = bytes(body[4:20])
     ip = socket.inet_ntoa(bytes(body[20:24]))
     return ip, token
