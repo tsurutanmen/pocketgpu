@@ -833,7 +833,7 @@ static VkDevice g_dev;
 typedef struct { VkSemaphore s; uint64_t v; } tlv;
 // tw・ts：timeline の値の待ちと知らせ（8 を超えたら tl_over を立て、止まっているかを調べずに前のやり方で待つ）
 typedef struct { VkFence f; int own; uint64_t cbs[64]; uint32_t ncb; uint64_t *snap; uint32_t nsnap;
-                 VkQueue q; tlv tw[8], ts[8]; uint8_t ntw, nts, tl_over; uint64_t msg; } inflight; // msg：届いた VR_QUEUE_SUBMIT の番号 // snap：調べ用、submit した時点の set
+                 VkQueue q; tlv tw[8], ts[8]; uint8_t ntw, nts, tl_over; uint64_t msg; VkDevice dev; } inflight; // msg：届いた VR_QUEUE_SUBMIT の番号 // snap：調べ用、submit した時点の set // dev：fence と queue の持ち主の装置（DXVK は装置を 2 つ作る。g_dev は後に作った物なので、fence を待つ装置は仕事ごとに持つ）
 static inflight g_fl[256];
 static int g_nfl;
 static VkResult g_err;          // GPU を失ったなど。次に返事をするときに伝える
@@ -1098,14 +1098,25 @@ static void cbi_add_set(cbinfo *c, uint64_t set) {
     if (c->n == c->cap) { c->cap = c->cap ? c->cap * 2 : 16; c->sets = realloc(c->sets, c->cap * sizeof *c->sets); }
     c->sets[c->n++] = set;
 }
-static VkFence g_fpool[64]; // 使い回す自前の fence
+static struct { VkFence f; VkDevice d; } g_fpool[64]; // 使い回す自前の fence（装置ごと）
 static int g_nfpool;
 
-static VkFence own_fence(void) {
-    if (g_nfpool) return g_fpool[--g_nfpool];
+// その仕事の fence を待つ・調べる装置（無ければいまの装置）
+static VkDevice fl_dev(const inflight *e) { return e->dev ? e->dev : g_dev; }
+
+static void fpool_put(VkFence f, VkDevice d) {
+    if (g_nfpool < 64) { g_fpool[g_nfpool].f = f; g_fpool[g_nfpool++].d = d; }
+    else vkDestroyFence(d, f, NULL);
+}
+
+// 装置 d の上の自前の fence（d が NULL ならいまの装置）
+static VkFence own_fence(VkDevice d) {
+    if (!d) d = g_dev;
+    for (int i = g_nfpool - 1; i >= 0; i--)
+        if (g_fpool[i].d == d) { VkFence f = g_fpool[i].f; g_fpool[i] = g_fpool[--g_nfpool]; return f; }
     VkFenceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     VkFence f = VK_NULL_HANDLE;
-    vkCreateFence(g_dev, &ci, NULL, &f);
+    vkCreateFence(d, &ci, NULL, &f);
     return f;
 }
 
@@ -1128,7 +1139,7 @@ static void mark_blocked(uint8_t *blk) {
             for (int j = 0; j < nr; j++) if (reach[j].s == e->tw[k].s) { at = j; break; }
             if (at < 0) {
                 uint64_t now = 0;
-                if (vkGetSemaphoreCounterValue(g_dev, e->tw[k].s, &now) != VK_SUCCESS) now = UINT64_MAX; // 分からなければ前のやり方で待つ
+                if (vkGetSemaphoreCounterValue(fl_dev(e), e->tw[k].s, &now) != VK_SUCCESS) now = UINT64_MAX; // 分からなければ前のやり方で待つ
                 if (nr < 64) { reach[nr] = (tlv) { e->tw[k].s, now }; at = nr++; }
                 else if (now < e->tw[k].v) b = 1;
             }
@@ -1159,12 +1170,17 @@ static void drain_upto(int k) {
     int anytw = 0;
     for (int i = 0; i <= k && !anytw; i++) anytw = g_fl[i].ntw != 0;
     if (anytw) mark_blocked(blk);
-    VkFence fs[256];
-    uint32_t nf = 0;
-    for (int i = 0; i <= k; i++) if (!blk[i]) fs[nf++] = g_fl[i].f;
-    if (nf) {
+    // fence は持ち主の装置で待つ（別の装置の fence を g_dev で待つと、検証レイヤーは終わりを覚えられず、「まだ走っている」と誤る）
+    uint8_t seen[256] = { 0 };
+    for (int i = 0; i <= k; i++) {
+        if (blk[i] || seen[i]) continue;
+        VkFence fs[256];
+        uint32_t nf = 0;
+        VkDevice d = fl_dev(&g_fl[i]);
+        for (int j = i; j <= k; j++)
+            if (!blk[j] && !seen[j] && fl_dev(&g_fl[j]) == d) { fs[nf++] = g_fl[j].f; seen[j] = 1; }
         double t0 = t_ms();
-        VkResult r = vkWaitForFences(g_dev, nf, fs, VK_TRUE, UINT64_MAX);
+        VkResult r = vkWaitForFences(d, nf, fs, VK_TRUE, UINT64_MAX);
         double dt = t_ms() - t0;
         g_st.wait_ms += dt;
         g_st.waits++;
@@ -1181,9 +1197,8 @@ static void drain_upto(int k) {
         g_fl[i].snap = NULL;
         if (!g_fl[i].own) continue;
         watch_forget(g_fl[i].f);
-        vkResetFences(g_dev, 1, &g_fl[i].f);
-        if (g_nfpool < 64) g_fpool[g_nfpool++] = g_fl[i].f;
-        else vkDestroyFence(g_dev, g_fl[i].f, NULL);
+        vkResetFences(fl_dev(&g_fl[i]), 1, &g_fl[i].f);
+        fpool_put(g_fl[i].f, fl_dev(&g_fl[i]));
     }
     g_nfl = w;
 }
@@ -1215,7 +1230,7 @@ static int grave_add(VkDevice d, uint64_t h, uint32_t kind) {
 // 終わった submit の番号（その番号までの submit は全部終わっている）
 static uint64_t done_msg(void) {
     for (int i = 0; i < g_nfl; i++)
-        if (vkGetFenceStatus(g_dev, g_fl[i].f) != VK_SUCCESS) return g_fl[i].msg ? g_fl[i].msg - 1 : 0;
+        if (vkGetFenceStatus(fl_dev(&g_fl[i]), g_fl[i].f) != VK_SUCCESS) return g_fl[i].msg ? g_fl[i].msg - 1 : 0;
     return g_submit_msgs;
 }
 
@@ -1254,7 +1269,7 @@ static uint64_t done_now(void) {
     if (!g_dev) return g_nfl ? 0 : g_submit_msgs;
     int k = -1;
     for (int i = 0; i < g_nfl; i++) {
-        if (vkGetFenceStatus(g_dev, g_fl[i].f) != VK_SUCCESS) break;
+        if (vkGetFenceStatus(fl_dev(&g_fl[i]), g_fl[i].f) != VK_SUCCESS) break;
         k = i;
     }
     if (k >= 0) drain_upto(k);
@@ -1272,6 +1287,7 @@ static struct {
     vr_sock s;
     VkDevice dev;
     VkFence f[WATCH_RING]; // VK_NULL_HANDLE：主の糸が reset・消した（もう終わっている）
+    VkDevice d[WATCH_RING]; // fence の持ち主の装置
     uint64_t m[WATCH_RING];
     int head, n;
     VkFence cur;       // 見張りが錠の外で待っている fence
@@ -1326,11 +1342,12 @@ static void watch_loop(void) {
         while (g_watch.run && !g_watch.n) watch_wait();
         if (!g_watch.run) { watch_unlock(); return; }
         VkFence f = g_watch.f[g_watch.head];
+        VkDevice fd = g_watch.d[g_watch.head];
         VkResult w = VK_SUCCESS;
         if (f) {
             g_watch.cur = f;
             watch_unlock();
-            w = vkWaitForFences(g_watch.dev, 1, &f, VK_TRUE, 50000000ull);
+            w = vkWaitForFences(fd, 1, &f, VK_TRUE, 50000000ull);
             watch_lock();
             g_watch.cur = VK_NULL_HANDLE;
             watch_wake(); // watch_forget で待っている主の糸を起こす
@@ -1349,7 +1366,7 @@ static void watch_loop(void) {
         uint64_t done = 0;
         for (int first = 1; g_watch.n; first = 0) {
             VkFence hf = g_watch.f[g_watch.head];
-            if (!first && hf && vkGetFenceStatus(g_watch.dev, hf) != VK_SUCCESS) break;
+            if (!first && hf && vkGetFenceStatus(g_watch.d[g_watch.head], hf) != VK_SUCCESS) break;
             done = g_watch.m[g_watch.head];
             g_watch.head = (g_watch.head + 1) % WATCH_RING;
             g_watch.n--;
@@ -1416,6 +1433,7 @@ static int watch_start(vr_sock s) {
     // 残った仕事より先の番号を「終わった」と言ってしまう
     for (int i = 0; i < g_nfl && g_watch.n < WATCH_RING; i++) {
         g_watch.f[g_watch.n] = g_fl[i].f;
+        g_watch.d[g_watch.n] = fl_dev(&g_fl[i]);
         g_watch.m[g_watch.n++] = g_fl[i].msg;
     }
     g_watch.run = 1;
@@ -1438,7 +1456,7 @@ static int watch_start(vr_sock s) {
 
 // submit の番号 msg を fence f 付きで出したあとに呼ぶ
 // （fence が無い submit は無い：受け手が自前の物を付ける）
-static void watch_add(vr_sock s, VkFence f, uint64_t msg) {
+static void watch_add(vr_sock s, VkFence f, uint64_t msg, VkDevice dev) {
     if (!g_watch.on || !f) return;
     int st = watch_start(s);
     if (st != 1) return; // 起こしたばかりなら、この submit も一覧から積んである
@@ -1452,6 +1470,7 @@ static void watch_add(vr_sock s, VkFence f, uint64_t msg) {
     } else if (g_watch.run) {
         int at = (g_watch.head + g_watch.n) % WATCH_RING;
         g_watch.f[at] = f;
+        g_watch.d[at] = dev;
         g_watch.m[at] = msg;
         g_watch.n++;
         g_watch.adds++;
@@ -1470,9 +1489,9 @@ static int unblock_waits(void) {
     for (int i = 0; i < g_nfl; i++)
         for (int k = 0; k < g_fl[i].ntw; k++) {
             uint64_t now = 0;
-            if (vkGetSemaphoreCounterValue(g_dev, g_fl[i].tw[k].s, &now) != VK_SUCCESS || now >= g_fl[i].tw[k].v) continue;
+            if (vkGetSemaphoreCounterValue(fl_dev(&g_fl[i]), g_fl[i].tw[k].s, &now) != VK_SUCCESS || now >= g_fl[i].tw[k].v) continue;
             VkSemaphoreSignalInfo si = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g_fl[i].tw[k].s, .value = g_fl[i].tw[k].v };
-            if (vkSignalSemaphore(g_dev, &si) == VK_SUCCESS) n++;
+            if (vkSignalSemaphore(fl_dev(&g_fl[i]), &si) == VK_SUCCESS) n++;
         }
     return n;
 }
@@ -1496,12 +1515,15 @@ static int last_with_pool(uint64_t pool) {
 // その descriptor pool から取った set を、まだ走っている仕事が使っているか（set の aux は pool の id）
 // 10/14：handle の頭で、descriptor pool の reset の前に GPU の仕事を全部待っている（下の last_with_dpool で足りるはずなのに）。
 // GPU が重いと主の糸が毎コマ GPU を待つ（代役の 3060 で GPU を重くした試験で、1 コマ 7〜16 ms）。
-// ただし全部を待たないと検証レイヤーの指摘が増えたので、既定は全部を待つまま（VKR_DPOOL_FULL=0 は調べる用）
+// 10/15：全部を待たないと検証レイヤーの指摘が増えたのは、足りない待ちを隠していたのではなく、装置が 2 つあるときに
+// 別の装置の fence を g_dev で待っていた（検証レイヤーが終わりを覚えられず「まだ走っている」と誤る）せいだった。
+// fence を持ち主の装置（inflight.dev）で待つように直したら、全部を待たなくても指摘は増えない。既定は「その set を使う仕事までだけ待つ」。
+// VKR_DPOOL_FULL=1 で前のやり方（全部を待つ）に戻る
 static int fast_last(void);
 static int last_by_msg(uint64_t msg);
 static int dpool_full(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("VKR_DPOOL_FULL"); v = !(e && *e == '0'); }
+    if (v < 0) { const char *e = getenv("VKR_DPOOL_FULL"); v = e && *e == '1'; }
     return v;
 }
 static int last_with_dpool(uint64_t pool) {
@@ -1769,6 +1791,7 @@ static void gw_flush(void) {
     inflight *e = &g_fl[g_nfl++];
     memset(e, 0, sizeof *e);
     e->f = x->f;
+    e->dev = g_dev;
     e->own = 0; // fence は写し場の物（drain は返さない）
     e->ncb = 1;
     e->cbs[0] = GW_CB_BASE + (uint64_t) g_gw.cur;
@@ -1786,7 +1809,7 @@ static int gw_want(uint64_t mid, ent *e, int k, uint64_t need, VkQueue *qout) {
     if (!pend && gw_mode == 2 && k < 0 && g_nfl > 0) k = g_nfl - 1; // 試験用：走っている仕事の後に写す
     if (!pend) {
         if (k < 0) return 0;
-        if (gw_mode != 2 && vkGetFenceStatus(g_dev, g_fl[k].f) == VK_SUCCESS) return 0; // もう終わっている（待たずに CPU で書ける）
+        if (gw_mode != 2 && vkGetFenceStatus(fl_dev(&g_fl[k]), g_fl[k].f) == VK_SUCCESS) return 0; // もう終わっている（待たずに CPU で書ける）
     }
     for (int i = 0; i < g_nfl; i++) if (g_fl[i].ntw || g_fl[i].tl_over) return pend ? -1 : 0; // 合図を待つ仕事があるときは前のやり方
     VkQueue q = pend ? g_gw.s[g_gw.cur].q : g_fl[k].q;
@@ -1905,7 +1928,7 @@ static void vid_reset(void);
 static void helpers_free(VkDevice dev) {
     gw_free(dev);
     if (dev) {
-        for (int i = 0; i < g_nfpool; i++) vkDestroyFence(dev, g_fpool[i], NULL);
+        for (int i = 0; i < g_nfpool; i++) if (g_fpool[i].d == dev) vkDestroyFence(dev, g_fpool[i].f, NULL);
         for (int i = 0; i < 4; i++) if (g_chain[i]) vkDestroySemaphore(dev, g_chain[i], NULL);
         if (g_dummy_vb) vkDestroyBuffer(dev, g_dummy_vb, NULL);
         if (g_dummy_mem) vkFreeMemory(dev, g_dummy_mem, NULL);
@@ -1919,7 +1942,7 @@ static void helpers_free(VkDevice dev) {
     }
     memset(g_chain, 0, sizeof g_chain);
     g_chain_last = -1;
-    g_nfpool = 0;
+    { int w = 0; for (int i = 0; i < g_nfpool; i++) if (g_fpool[i].d != dev) g_fpool[w++] = g_fpool[i]; g_nfpool = w; } // 残る装置の分は残す
     g_dummy_img = VK_NULL_HANDLE;
     g_dummy_iview = VK_NULL_HANDLE;
     g_dummy_img_mem = VK_NULL_HANDLE;
@@ -2007,6 +2030,8 @@ static void cleanup(void) {
     g_ncbi = 0;
     if (g_err == VK_ERROR_DEVICE_LOST) g_lost = 1;
     g_err = VK_SUCCESS;
+    for (int i = 0; i < g_nfpool; i++) vkDestroyFence(g_fpool[i].d, g_fpool[i].f, NULL);
+    g_nfpool = 0;
     helpers_free(g_dev);
     g_dev = VK_NULL_HANDLE;
     // 装置ごとに、その装置の物を片づけてから装置を消す。持ち主の分からない物は最後の装置で片づける
@@ -4224,8 +4249,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     switch (op) {
     // （command buffer の記録し直し・command pool の reset・descriptor の書き換え・fence の reset は、
     //   それを使う仕事までしか待たない。それぞれの命令の中で待つ）
-    // （descriptor pool の reset・消す・set を返す：既定は今までどおり全部を待つ。VKR_DPOOL_FULL=0 で、その set を使う仕事までだけ待つ（試し）。
-    //   10/14 に 0 を試したら、検証レイヤーで「まだ走っている command buffer を記録し直す」が出た。全部を待つことが、ほかの所の待ちの足りなさを隠している）
+    // （descriptor pool の reset・消す・set を返す：その set を使う仕事までだけ待つ。それぞれの命令の中で待つ。
+    //   VKR_DPOOL_FULL=1 なら前のやり方で、ここで全部を待つ）
     case VR_RESET_DESCRIPTOR_POOL: case VR_FREE_DESCRIPTOR_SETS: case VR_DESTROY_DESCRIPTOR_POOL:
         if (dpool_full()) drain();
         break;
@@ -5320,12 +5345,12 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                         ent *oe = find(g_fl[q].snap[j]);
                         if (g_fl[q].snap[j] != sid && oe && (VkDescriptorSet) (uintptr_t) oe->h == hs) {
                             vlog(JE("取りこぼし（実物）：set %llu の実物は、%d 番目の仕事では set %llu として使われている（%s）", "Missed sync (real): the real set %llu is used by job #%d as set %llu (%s)"), (unsigned long long) sid, q,
-                                 (unsigned long long) g_fl[q].snap[j], vkGetFenceStatus(g_dev, g_fl[q].f) == VK_SUCCESS ? JE("もう終わっている", "already finished") : JE("まだ走っている", "still running"));
+                                 (unsigned long long) g_fl[q].snap[j], vkGetFenceStatus(fl_dev(&g_fl[q]), g_fl[q].f) == VK_SUCCESS ? JE("もう終わっている", "already finished") : JE("まだ走っている", "still running"));
                             break;
                         }
                     }
                 if (k2 > k1) {
-                    VkResult st = vkGetFenceStatus(g_dev, g_fl[k2].f);
+                    VkResult st = vkGetFenceStatus(fl_dev(&g_fl[k2]), g_fl[k2].f);
                     vlog(JE("取りこぼし：set %llu を書き換える。今の判定は %d 番目まで待つが、submit の時点では %d 番目（%s）が使っていた。その command buffer：%llu", "Missed sync: rewriting set %llu. The current check waits up to job #%d, but at submit time job #%d (%s) was using it. Its command buffer: %llu"),
                          (unsigned long long) sid, k1, k2, st == VK_SUCCESS ? JE("もう終わっている", "already finished") : JE("まだ走っている", "still running"),
                          (unsigned long long) (g_fl[k2].ncb ? g_fl[k2].cbs[0] : 0));
@@ -5562,7 +5587,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 int k = last_with_fence(f[i]);
                 if (k >= 0) {
                     for (int j = 0; j < g_nfl; j++) if (g_fl[j].f == f[i]) g_fl[j].own = 1;
-                    VkFence nf = own_fence();
+                    VkFence nf = own_fence(d);
                     if (nf) put(fid[i], (uint64_t) nf, K_FENCE);
                     else { drain_upto(k); watch_forget(f[i]); vkResetFences(d, 1, &f[i]); }
                 } else {
@@ -5616,7 +5641,10 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         // 届いた順の番号（ドライバも送った順に数える。query の結果を読むとき「何番の submit まで待つか」に使う）
         grave_sweep(VK_NULL_HANDLE);
         uint64_t my_msg = ++g_submit_msgs;
-        VkQueue q = (VkQueue) (uintptr_t) H(vr_ru64(r));
+        uint64_t qid = vr_ru64(r);
+        VkQueue q = (VkQueue) (uintptr_t) H(qid);
+        ent *qe0 = find(qid);
+        VkDevice qdev = qe0 && qe0->kind == K_QUEUE && qe0->dev ? (VkDevice) (uintptr_t) qe0->dev : g_dev; // queue の持ち主の装置
         uint32_t ns = vr_ru32(r);
         if (ns > r->n - r->at) return 1; // 1 つの submit は 12 バイト以上あるので、残りより多いことはない
         // 数どおりに確保して全部読む（上限で切って残りを読まずにいると、9 個目からの semaphore が次の項目として読まれ、
@@ -5733,7 +5761,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             }
         // 出した仕事は必ず fence で追う（アプリが付けていなければ自前の物を付ける）
         int own = 0;
-        if (!f) { f = own_fence(); own = 1; }
+        if (!f) { f = own_fence(qdev); own = 1; }
         if (g_nfl == 256) drain();
         if (g_nfl == 256) {
             // 合図を待つ仕事で一覧が埋まった。覚えきれないので、前のやり方で全部を待つ
@@ -5769,6 +5797,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (res == VK_SUCCESS) {
             inflight *e = &g_fl[g_nfl++];
             e->f = f;
+            e->dev = qdev;
             e->own = own;
             e->ncb = ncid;
             e->q = q;
@@ -5803,11 +5832,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     }
                     if (c->mems) for (uint32_t j = 0; j < c->mems->n; j++) { ent *me = find(c->mems->ids[j]); if (me) me->use_msg = my_msg; }
                 }
-            watch_add(s, f, my_msg); // 頼まれていれば、終わったら見張りの糸から知らせる
+            watch_add(s, f, my_msg, qdev); // 頼まれていれば、終わったら見張りの糸から知らせる
         } else {
             if (!g_err) vlog(JE("vkQueueSubmit 失敗 (%d)。この接続ではもう GPU を使えない", "vkQueueSubmit failed (%d). The GPU can no longer be used on this connection"), res);
             if (res < 0) g_err = res;
-            if (own && g_nfpool < 64) g_fpool[g_nfpool++] = f;
+            if (own) fpool_put(f, qdev);
         }
         // 64 本を超える command buffer は走っているかを覚えきれないので、終わるまで待つ（同じ物を走っている間に出し直さないため）
         if (res == VK_SUCCESS && ncb_all > 64) drain();
@@ -5865,7 +5894,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         // 終わった所までの仕事を一覧から外し（もう終わっているので待たない）、終わった submit の番号を返す
         int k = -1;
         for (int i = 0; i < g_nfl; i++) {
-            if (vkGetFenceStatus(g_dev, g_fl[i].f) != VK_SUCCESS) break;
+            if (vkGetFenceStatus(fl_dev(&g_fl[i]), g_fl[i].f) != VK_SUCCESS) break;
             k = i;
         }
         if (k >= 0) drain_upto(k);
