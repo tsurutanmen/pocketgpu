@@ -1618,6 +1618,25 @@ static int dxvk3(void) {
     return v;
 }
 static int vkd3d(void) { return g_engine_vkd3d && dxvk3(); }
+// アプリのエンジンが DXVK 1.x（Wine や Proton が持つ DXVK。DXVK-macOS の 1.10.3 を含む）
+static int g_engine_dxvk1;
+// 本家の DXVK 1.x は、geometry shader と cull distance を持たない GPU の装置を断る（D3D11CreateDevice が失敗する）。
+// DXVK-macOS はこの 2 つを要らなくした版で、Windows のキットはそれを置く。Linux のキットは DXVK を置かず、Wine や Proton の本家の DXVK が来るので、
+// Linux の版では DXVK 1.x にも DXVK 3 と同じ名乗りをする（geometry shader の pipeline はドライバが真似る）。
+// IPHONE_VK_DXVK1_CLAIM=1 で Windows でも名乗る・=0 で名乗らない
+static int dxvk1_claim(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("IPHONE_VK_DXVK1_CLAIM");
+#ifdef _WIN32
+        v = e && *e == '1';
+#else
+        v = e && *e ? *e == '1' : g_engine_dxvk1;
+#endif
+        if (v && g_engine_dxvk1) say("DXVK 1.x なので、geometry shader と cull distance を名乗る");
+    }
+    return v;
+}
 // transform feedback を名乗る相手。vkd3d-proton は持たないと装置を作らない。zink は持たないと OpenGL を 2.1 で止める
 // （stream output の数を 0 にするため）。IPHONE_VK_ZINK_XFB=0 で zink には名乗らない
 static int xfb_named(void) {
@@ -1788,7 +1807,7 @@ static void mask_features(VkPhysicalDeviceFeatures *f) {
     // geometry shader を使う pipeline は作らずに失敗を返す（DXVK はその描画を飛ばす）
     // zink には名乗らない。名乗ると zink は四角形（GL_QUADS）や頂点の順（provoking vertex）の真似に GS を作り、
     // それがドライバの GS の真似を通る（10/7 は PrimitiveId の出力で受け手の GPU が止まった）。名乗らなければ zink は GS を使わない道を通る
-    if (dxvk3() && !g_engine_zink) f->geometryShader = f->shaderCullDistance = VK_TRUE;
+    if ((dxvk3() || dxvk1_claim()) && !g_engine_zink) f->geometryShader = f->shaderCullDistance = VK_TRUE;
     // 中継していない機能は「無い」と答える
     f->sparseBinding = f->sparseResidencyBuffer = f->sparseResidencyImage2D = f->sparseResidencyImage3D = VK_FALSE;
     f->sparseResidency2Samples = f->sparseResidency4Samples = f->sparseResidency8Samples = f->sparseResidency16Samples = VK_FALSE;
@@ -3914,6 +3933,7 @@ static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *ci, const
         say("アプリのエンジン：%s %u.%u.%u", ai->pEngineName, major, (ai->engineVersion >> 12) & 0x3FF, ai->engineVersion & 0xFFF);
         if (!strcmp(ai->pEngineName, "DXVK") && major >= 2) g_engine_dxvk2 = 1;
         if (!strcmp(ai->pEngineName, "DXVK")) g_engine_dxvk_any = 1;
+        if (!strcmp(ai->pEngineName, "DXVK") && major == 1) g_engine_dxvk1 = 1;
         if (!strcmp(ai->pEngineName, "mesa zink")) g_engine_zink = 1;
         if (!strcmp(ai->pEngineName, "vkd3d")) g_engine_vkd3d = 1;
         // DirectX 12 の feature level 12_0 を名乗らせる。vkd3d-proton は tiled resources（sparse）が無いと 11_x までにするが、
