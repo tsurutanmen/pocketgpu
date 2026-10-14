@@ -4990,6 +4990,20 @@ static void brq_learn(uint32_t flags, uint32_t usage, VkDeviceSize size, const V
     ReleaseSRWLockExclusive(&g_brq_lock);
 }
 
+// 返事を待たずに作る（VR_CREATE_BUFFER_NR・VR_CREATE_IMAGE_NR）のは、この大きさ以下の物だけ（IPHONE_VK_ASYNC_CREATE_MAX_MB・既定 16）。
+// 返事を待たないと、受け手で作れなかった（GPU の上限を超えた・メモリが足りない）ことがアプリに伝わらず、空の handle を結ぶ所で受け手が落ちて、
+// 次の命令から全部 device lost になる（10/14 の Android の GZDoom）。大きな物は数が少ないので、返事を待っても遅くならない
+static VkDeviceSize async_create_max(void) {
+    static VkDeviceSize v = (VkDeviceSize) -1;
+    if (v == (VkDeviceSize) -1) {
+        const char *e = getenv("IPHONE_VK_ASYNC_CREATE_MAX_MB");
+        v = (VkDeviceSize) (e && *e ? strtoull(e, NULL, 0) : 16) << 20;
+    }
+    return v;
+}
+
+static VkDeviceSize req_size_of(const uint8_t *p) { VkMemoryRequirements q; memcpy(&q, p, sizeof q); return q.size; }
+
 static uint32_t gs_buffer_usage(uint32_t usage);
 static VkResult VKAPI_CALL bind_buffer(VkDevice dv, VkBuffer bb, VkDeviceMemory mm, VkDeviceSize off);
 static void VKAPI_CALL destroy_buffer(VkDevice dv, VkBuffer bb, const VkAllocationCallbacks *a);
@@ -5033,7 +5047,7 @@ static VkResult create_buffer_ex(VkDevice dv, const VkBufferCreateInfo *ci, VkBu
         if (x->sType == VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO) usage = (uint32_t) ((const VkBufferUsageFlags2CreateInfo *) x)->usage;
     usage = gs_buffer_usage(usage); // GS を真似る VS が storage buffer として読む
     vr_u32(&b, usage);
-    if ((g_hw.caps & VR_CAP_ASYNC_CREATE) && brq_find(flags, usage, ci->size, &bf->req)) {
+    if ((g_hw.caps & VR_CAP_ASYNC_CREATE) && ci->size <= async_create_max() && brq_find(flags, usage, ci->size, &bf->req)) {
         rpc_send(VR_CREATE_BUFFER_NR, &b);
         free(b.p);
     } else {
@@ -5216,7 +5230,8 @@ static VkResult create_image_ex(VkDevice dv, const VkImageCreateInfo *ci, VkImag
     uint8_t cached[64];
     uint32_t cn = 0;
     VkResult cr;
-    if ((g_hw.caps & VR_CAP_ASYNC_CREATE) && qc_get(key, &cr, cached, &cn) && cr == VK_SUCCESS && cn >= sizeof im->req) {
+    if ((g_hw.caps & VR_CAP_ASYNC_CREATE) && qc_get(key, &cr, cached, &cn) && cr == VK_SUCCESS && cn >= sizeof im->req &&
+        req_size_of(cached) <= async_create_max()) {
         memcpy(&im->req, cached, sizeof im->req);
         rpc_send(VR_CREATE_IMAGE_NR, &b);
         free(b.p);

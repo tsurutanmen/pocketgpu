@@ -843,6 +843,53 @@ static volatile int g_paused;   // アプリが前にいない間は 1（GPU に
 // アプリから呼ぶ：前にいないときは 1
 void vkr_set_paused(int on) { g_paused = on; }
 
+// ---- メモリの確保の失敗を、落ちずに「足りない」で返す（devlost1015） ----
+// Android：GPU と CPU が同じメモリを使う。端末に残っている量（/proc/meminfo の MemAvailable）から余裕（PGPU_MEM_MARGIN_MB・既定 256。0 で確かめない）を
+// 引いた量より大きな確保は断る。受け手は adb の shell から起こすので、OOM で殺されない印（oom_score_adj -1000）を持つことがあり、
+// 使い切るとほかのアプリが落ちたり端末ごと詰まったりする。64 MB 未満は確かめない（ファイルを読む手間を省く）
+static int mem_room_ok(uint64_t size) {
+#ifdef __ANDROID__
+    static long long margin = -1;
+    if (margin < 0) { const char *e = getenv("PGPU_MEM_MARGIN_MB"); margin = e && *e ? atoll(e) : 256; if (margin < 0) margin = 0; }
+    if (!margin || size < (64ull << 20)) return 1;
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 1;
+    char line[128];
+    long long avail_kb = -1;
+    while (fgets(line, sizeof line, f)) if (sscanf(line, "MemAvailable: %lld kB", &avail_kb) == 1) break;
+    fclose(f);
+    if (avail_kb < 0) return 1;
+    uint64_t avail = (uint64_t) avail_kb << 10, need = size + ((uint64_t) margin << 20);
+    if (need <= avail) return 1;
+    vlog(JE("メモリ %llu MB は確保しない（端末に残っているのは %llu MB・余裕 %lld MB）", "Not allocating %llu MB of memory (the phone has %llu MB available, margin %lld MB)"),
+         (unsigned long long) (size >> 20), (unsigned long long) (avail >> 20), margin);
+    return 0;
+#else
+    (void) size;
+    return 1;
+#endif
+}
+
+// vkAllocateMemory の失敗を記録に出す。GPU を失っていない（submit も待ちも失敗していない）のに device lost と答えたら、
+// 「足りない」に直す（vkAllocateMemory の答えに device lost は無い。アプリは「足りない」なら小さくして続けられる）
+static void alloc_fail_log(const VkMemoryAllocateInfo *mai, VkResult *res) {
+    vlog(JE("メモリ %llu MB（種類 %u）を確保できない (%d)", "Cannot allocate %llu MB of memory (type %u) (%d)"),
+         (unsigned long long) (mai->allocationSize >> 20), mai->memoryTypeIndex, *res);
+    if (*res == VK_ERROR_DEVICE_LOST && g_err == VK_SUCCESS) {
+        vlog(JE("GPU はまだ失っていないので、device lost を「足りない」（-2）に直して返す", "The GPU is not lost yet, so answering out of device memory (-2) instead of device lost"));
+        *res = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
+}
+
+// 作れていない物（空の handle）を結ぶ頼みを捨てたことを記録に出す（多すぎるときは 2 の累乗の回だけ）
+static void bind_skip_log(const char *what, uint64_t id, uint64_t mid, int no_obj, int no_mem) {
+    static unsigned n;
+    n++;
+    if (n <= 8 || (n & (n - 1)) == 0)
+        vlog(JE("%s %llu をメモリ %llu に結ばない（%s%s）。%u 回目", "Not binding %s %llu to memory %llu (%s%s), time %u"), what, (unsigned long long) id, (unsigned long long) mid,
+             no_obj ? JE("作れていない", "it was not created") : "", no_mem ? JE("・メモリが無い", ", no memory") : "", n);
+}
+
 // ---- インターネット共有の口（Backburner と同じく、USB を有線のネットワークとして使う道） ----
 // USB の口（iPhone の中の 127.0.0.1・usbmux）に加えて、インターネット共有の口でも待つ。
 // インターネット共有は Wi-Fi でも近くの人がつなげるので、最初に合言葉を出さない相手は断る。
@@ -4521,7 +4568,10 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         bci.usage = vr_ru32(r);
         bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         VkBuffer b;
-        VkResult res = vkCreateBuffer(d, &bci, NULL, &b);
+        // 調べ用：VKR_TEST_MAX_BUFFER_MB=数 で、これより大きな buffer を作らずに「足りない」と答える（GPU の上限を超えた物の真似。devlost1015）
+        static long long test_max_mb = -2;
+        if (test_max_mb == -2) { const char *e = getenv("VKR_TEST_MAX_BUFFER_MB"); test_max_mb = e && *e ? atoll(e) : -1; }
+        VkResult res = test_max_mb >= 0 && bci.size > ((uint64_t) test_max_mb << 20) ? VK_ERROR_OUT_OF_DEVICE_MEMORY : vkCreateBuffer(d, &bci, NULL, &b);
         VkMemoryRequirements req;
         memset(&req, 0, sizeof req);
         if (res == VK_SUCCESS) {
@@ -4530,9 +4580,13 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             req.memoryTypeBits = alias_bits(req.memoryTypeBits);
         }
         if (op == VR_CREATE_BUFFER_NR) {
-            if (res != VK_SUCCESS) vlog(JE("buffer を作れない (%d)", "Cannot create the buffer (%d)"), res);
+            if (res != VK_SUCCESS)
+                vlog(JE("buffer を作れない (%d)・%llu MB・使い道 0x%x（返事を待たずに作った物。PC には伝わらない）", "Cannot create the buffer (%d), %llu MB, usage 0x%x (created without a reply, so the PC does not know)"),
+                     res, (unsigned long long) (bci.size >> 20), bci.usage);
             return 1;
         }
+        if (res != VK_SUCCESS)
+            vlog(JE("buffer を作れない (%d)・%llu MB・使い道 0x%x", "Cannot create the buffer (%d), %llu MB, usage 0x%x"), res, (unsigned long long) (bci.size >> 20), bci.usage);
         vr_put(&g_out, &req, sizeof req);
         return reply(s, res);
     }
@@ -4565,6 +4619,18 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             }
         }
 #endif
+        {
+            // 種類の番号と装置を確かめる（範囲の外の番号で下の memoryTypes を読まない）
+            VkPhysicalDeviceMemoryProperties mp0;
+            vkGetPhysicalDeviceMemoryProperties(g_pd, &mp0);
+            if (!d || mai.memoryTypeIndex >= mp0.memoryTypeCount) {
+                vlog(JE("メモリを確保しない：装置が無いか、種類の番号 %u が範囲の外（種類は %u 個）", "Not allocating memory: no device, or memory type %u is out of range (%u types)"),
+                     mai.memoryTypeIndex, mp0.memoryTypeCount);
+                return reply(s, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+            }
+            // Android・Linux：端末に残っているメモリ（MemAvailable）より大きな物は、確保して端末ごと詰まらせる前に「足りない」と断る
+            if (!mem_room_ok(mai.allocationSize)) return reply(s, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        }
         VkDeviceMemory m;
         VkResult res = vkAllocateMemory(d, &mai, NULL, &m);
         if (res == VK_SUCCESS) {
@@ -4575,9 +4641,18 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             vkGetPhysicalDeviceMemoryProperties(g_pd, &mp);
             if (mp.memoryTypes[mai.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
                 void *p = NULL;
-                if (vkMapMemory(d, m, 0, VK_WHOLE_SIZE, 0, &p) == VK_SUCCESS) find(id)->map = p;
+                VkResult mr = vkMapMemory(d, m, 0, VK_WHOLE_SIZE, 0, &p);
+                if (mr == VK_SUCCESS && p) find(id)->map = p;
+                else {
+                    // 写せないメモリは、PC からの書き込みが全部捨てられる。放して「足りない」と答える（前は黙って続け、中身の無いまま GPU が使っていた）
+                    vlog(JE("CPU から見えるメモリ %llu MB を写せない (%d)。放して「足りない」と答える", "Cannot map %llu MB of host-visible memory (%d). Freeing it and answering out of memory"),
+                         (unsigned long long) (mai.allocationSize >> 20), mr);
+                    del(id);
+                    vkFreeMemory(d, m, NULL);
+                    res = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+                }
             }
-        }
+        } else alloc_fail_log(&mai, &res);
         return reply(s, res);
     }
     case VR_FREE_MEMORY: {
@@ -4596,7 +4671,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkDeviceMemory m = OBJ(VkDeviceMemory, mid);
         ent *be = find(bid);
         if (be) be->aux = mid;
-        vkBindBufferMemory(d, b, m, vr_ru64(r));
+        uint64_t boff = vr_ru64(r);
+        // buffer かメモリが作れていなかった（返事を待たずに作って失敗した・確保に失敗したのに結ぼうとした）。
+        // 空の handle を GPU のドライバに渡すと受け手ごと落ち、PC では次の命令から全部 device lost になる
+        if (!d || !b || !m) { bind_skip_log("buffer", bid, mid, !b, !m); return 1; }
+        vkBindBufferMemory(d, b, m, boff);
         return 1;
     }
     case VR_MEM_WRITE: {
@@ -5860,7 +5939,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             req.memoryTypeBits = alias_bits(req.memoryTypeBits);
         }
         if (op == VR_CREATE_IMAGE_NR) {
-            if (res != VK_SUCCESS) vlog(JE("image を作れない (%d)", "Cannot create the image (%d)"), res);
+            if (res != VK_SUCCESS)
+                vlog(JE("image を作れない (%d)・%ux%u・形式 %d（返事を待たずに作った物。PC には伝わらない）", "Cannot create the image (%d), %ux%u, format %d (created without a reply, so the PC does not know)"),
+                     res, ci.extent.width, ci.extent.height, (int) ci.format);
             return 1;
         }
         vr_put(&g_out, &req, sizeof req);
@@ -5893,7 +5974,10 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t off = vr_ru64(r);
         ent *ie = find(iid);
         if (ie) ie->aux = mid;
-        vkBindImageMemory(d, OBJ(VkImage, iid), OBJ(VkDeviceMemory, mid), off);
+        VkImage bim = OBJ(VkImage, iid);
+        VkDeviceMemory bm = OBJ(VkDeviceMemory, mid);
+        if (!d || !bim || !bm) { bind_skip_log("image", iid, mid, !bim, !bm); return 1; } // 上の buffer と同じ
+        vkBindImageMemory(d, bim, bm, off);
         return 1;
     }
     case VR_CREATE_IMAGE_VIEW: {
@@ -7273,6 +7357,42 @@ static void *hs_ticker(void *p) {
     return 0;
 }
 
+#ifdef __ANDROID__
+// Android の受け手が落ちたときに、記録（pgpu_server.log）の最後に、合図と処理していた命令を書く。
+// 前は何も書かずに消え、PC では次の命令から全部 device lost になるだけで、どこで落ちたか分からなかった（devlost1015）
+#include <signal.h>
+static void and_crash(int sig) {
+    char line[160];
+    int n = snprintf(line, sizeof line, lang_en() ? "Crashed: signal %d, command %u\n" : "落ちた：合図 %d・命令 %u\n", sig, g_cur_op);
+    if (n > 0) { ssize_t w = write(1, line, (size_t) n); (void) w; }
+    __android_log_print(ANDROID_LOG_ERROR, "iphone-rpc-vk", "%s", line);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+// 落ちたときの記録の支度と、OOM で殺されやすさ（oom_score_adj）・端末に残っているメモリを記録に書く
+static void and_crash_init(void) {
+    int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT };
+    for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) signal(sigs[i], and_crash);
+    char adj[32] = "?";
+    FILE *f = fopen("/proc/self/oom_score_adj", "r");
+    if (f) { if (!fgets(adj, sizeof adj, f)) snprintf(adj, sizeof adj, "?"); fclose(f); }
+    adj[strcspn(adj, "\r\n")] = 0;
+    long long avail_kb = -1, total_kb = -1;
+    char line[128];
+    f = fopen("/proc/meminfo", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            long long v;
+            if (sscanf(line, "MemTotal: %lld kB", &v) == 1) total_kb = v;
+            else if (sscanf(line, "MemAvailable: %lld kB", &v) == 1) avail_kb = v;
+        }
+        fclose(f);
+    }
+    vlog(JE("端末のメモリ：全部 %lld MB・残り %lld MB・受け手の oom_score_adj %s", "Phone memory: total %lld MB, available %lld MB, receiver oom_score_adj %s"),
+         total_kb >> 10, avail_kb >> 10, adj);
+}
+#endif
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     AddVectoredExceptionHandler(1, crash_handler);
@@ -7325,6 +7445,7 @@ int main(int argc, char **argv) {
         vlog(JE("試験用：1 秒ごとに共有の網の口を探す（VKR_HOTSPOT）", "Test: looking for the sharing network port every second (VKR_HOTSPOT)"));
     }
 #ifdef __ANDROID__
+    and_crash_init();
     // アプリが開けた口を受け取る（0.1.4）。Vulkan より先に（アプリは数秒しか待たない）
     const char *fds = getenv("PGPU_FD_SOCK");
     if (fds && *fds && !recv_given(fds)) return 4;
