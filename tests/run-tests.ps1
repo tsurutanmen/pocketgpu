@@ -160,6 +160,8 @@ function Invoke-Fix($kit, [string[]]$fixArgs, [hashtable]$envs, [string]$answers
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    # 画面の日本語を調べる場面では、受け取りを 1 バイト 1 文字にして、あとで正しく読み直す（子の出力の文字コードが UTF-8 か OEM かに左右されないため）
+    if ($script:RawOut) { $psi.StandardOutputEncoding = [Text.Encoding]::GetEncoding(28591) }
     $psi.WorkingDirectory = $Work
     foreach ($k in @($psi.EnvironmentVariables.Keys)) {
         if ($k -like 'PGPU_*' -or $k -like 'IPHONE_VK*' -or $k -in 'ADB', 'ANDROID_SERIAL', 'FAKE_ADB_STATE') { $psi.EnvironmentVariables.Remove($k) }
@@ -938,6 +940,192 @@ function Scn-KitDir([string]$mode) {
 }
 
 # =====================================================================
+# 「iPhone の GPU で起動」（tools\run.ps1）が、DirectX 9・10・11 を見分けて DXVK を置くこと
+# =====================================================================
+# 試験用の exe：取り込む DLL の名前だけを持つ最小の PE を書く。Machine は 0x14c（32 ビット）か 0x8664（64 ビット）。中身は動かさない
+function New-FakePe([string]$path, [string]$arch, [string[]]$imports) {
+    $x64 = $arch -eq 'x64'
+    $ms = New-Object IO.MemoryStream
+    $bw = New-Object IO.BinaryWriter($ms)
+    $bw.Write([uint16]0x5A4D); $bw.Write((New-Object byte[] 58)); $bw.Write([int32]0x40)    # DOS 見出し（e_lfanew = 0x40）
+    $bw.Write([uint32]0x4550)                                                           # PE
+    $optSize = $(if ($x64) { 240 } else { 224 })
+    $bw.Write([uint16]$(if ($x64) { 0x8664 } else { 0x14c })); $bw.Write([uint16]1)     # Machine・セクション 1 つ
+    $bw.Write([uint32]0); $bw.Write([uint32]0); $bw.Write([uint32]0)
+    $bw.Write([uint16]$optSize); $bw.Write([uint16]0x22)
+    $opt = New-Object byte[] $optSize
+    [BitConverter]::GetBytes([uint16]$(if ($x64) { 0x20b } else { 0x10b })).CopyTo($opt, 0)
+    $dd = $(if ($x64) { 112 } else { 96 })
+    [BitConverter]::GetBytes([uint32]0x1000).CopyTo($opt, $dd + 8)                      # 取り込み表の RVA
+    [BitConverter]::GetBytes([uint32](20 * ($imports.Count + 1))).CopyTo($opt, $dd + 12)
+    $bw.Write($opt)
+    $tab = 20 * ($imports.Count + 1)
+    $names = New-Object IO.MemoryStream
+    $rvas = @()
+    foreach ($n in $imports) { $rvas += (0x1000 + $tab + $names.Length); $b = [Text.Encoding]::ASCII.GetBytes($n + [char]0); $names.Write($b, 0, $b.Length) }
+    $body = New-Object byte[] ($tab + $names.Length)
+    for ($i = 0; $i -lt $imports.Count; $i++) { [BitConverter]::GetBytes([uint32]$rvas[$i]).CopyTo($body, 20 * $i + 12) }
+    $names.ToArray().CopyTo($body, $tab)
+    $raw = [int]([Math]::Ceiling($body.Length / 512.0) * 512)
+    $sec = New-Object byte[] 8; [Text.Encoding]::ASCII.GetBytes('.idata').CopyTo($sec, 0)
+    $bw.Write($sec); $bw.Write([uint32]$body.Length); $bw.Write([uint32]0x1000); $bw.Write([uint32]$raw); $bw.Write([uint32]0x200)
+    $bw.Write((New-Object byte[] 12)); $bw.Write([uint32]0x40000040)
+    while ($ms.Length -lt 0x200) { $bw.Write([byte]0) }
+    $bw.Write($body)
+    while (($ms.Length % 512) -ne 0) { $bw.Write([byte]0) }
+    [IO.File]::WriteAllBytes($path, $ms.ToArray())
+}
+# キットの dxvk\x64・x32 に、ファイルごとに中身が違う偽の DLL を置く（どの物がゲームの横に来たかを中身で見分けるため）
+function Add-FakeDxvk([string]$kit) {
+    foreach ($a in 'x64', 'x32') {
+        $d = Join-Path $kit ('dxvk\' + $a)
+        [void](New-Item -ItemType Directory -Path $d -Force)
+        foreach ($n in 'd3d9.dll', 'd3d10core.dll', 'd3d11.dll', 'dxgi.dll') {
+            [IO.File]::WriteAllBytes((Join-Path $d $n), [Text.Encoding]::ASCII.GetBytes('FAKE-DXVK-' + $a + '-' + $n))
+        }
+    }
+}
+# 配置の動作だけを何もしない物に差し替えた run.ps1（対照）
+function Make-SabotagedRun([string]$kit) {
+    $p = Join-Path $kit 'tools\run.ps1'
+    $t = [IO.File]::ReadAllText($p, [Text.Encoding]::UTF8)
+    $m = 'foreach ($n in $absent) { Copy-Item -LiteralPath (Join-Path $dxvkSrc $n) -Destination $dir }'
+    if (-not $t.Contains($m)) { throw 'run.ps1 copy line not found' }
+    [IO.File]::WriteAllText($p, $t.Replace($m, 'foreach ($n in $absent) { }'), (New-Object Text.UTF8Encoding($true)))
+}
+# ゲームのフォルダを作って exe を置く。置かれた DLL の名前と、その中身が kit のどの物かを返す
+function New-Game([string]$root, [string]$name, [string]$arch, [string[]]$imports) {
+    $d = Join-Path $root $name
+    [void](New-Item -ItemType Directory -Path $d -Force)
+    $exe = Join-Path $d 'game.exe'
+    New-FakePe $exe $arch $imports
+    return @{ Dir = $d; Exe = $exe }
+}
+function Get-Placed($g) {
+    $o = @{}
+    foreach ($n in 'd3d9.dll', 'd3d10.dll', 'd3d10_1.dll', 'd3d10core.dll', 'd3d11.dll', 'dxgi.dll') {
+        $f = Join-Path $g.Dir $n
+        if (Test-Path -LiteralPath $f) { $o[$n] = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($f)) }
+    }
+    return $o
+}
+function Test-Placed($g, [string]$arch, [string[]]$want) {
+    $p = Get-Placed $g
+    if ($p.Count -ne $want.Count) { return $false }
+    foreach ($n in $want) { if ($p[$n] -ne ('FAKE-DXVK-' + $arch + '-' + $n)) { return $false } }
+    return $true
+}
+function Invoke-RunDx($kit, $g, [hashtable]$envs, [string]$answers) {
+    $e = @{ PGPU_DRYRUN = '1' }
+    foreach ($k in $envs.Keys) { $e[$k] = $envs[$k] }
+    $script:RawOut = $true
+    try { $r = Invoke-Fix $kit @('"' + $g.Exe + '"') $e $answers (Join-Path $kit 'tools' | Join-Path -ChildPath 'run.ps1') } finally { $script:RawOut = $false }
+    $bytes = [Text.Encoding]::GetEncoding(28591).GetBytes([string]$r.Out)
+    try { $r.Out = (New-Object Text.UTF8Encoding($false, $true)).GetString($bytes) }
+    catch { $r.Out = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage).GetString($bytes) }
+    return $r
+}
+function Scn-RunDx([string]$mode) {
+    $kit = New-Kit "rundx-$mode"
+    Add-FakeDxvk $kit
+    if ($mode -eq 'sabotage') { Make-SabotagedRun $kit }
+    $root = Join-Path (Split-Path -Parent $kit) 'games'
+    $yes = $(if ($mode -eq 'decline') { 'n' } else { 'y' })
+    $mux = Get-FreePort
+    [void](Start-FakeMux $mux)
+    $ip = @{ IPHONE_VK_MUX = $mux }
+
+    # DirectX 9（32 ビット。Need for Speed Carbon と同じ形）-> dxvk\x32 の d3d9.dll だけ
+    $g = New-Game $root 'dx9-32' 'x32' @('kernel32.dll', 'user32.dll', 'd3d9.dll')
+    $r = Invoke-RunDx $kit $g $ip $yes
+    Check 'DirectX 9（32 ビット）のゲームに、dxvk\x32 の d3d9.dll が置かれる' (Test-Placed $g 'x32' @('d3d9.dll'))
+    Check 'DirectX 9 のゲームの横に、d3d9.dll 以外（d3d11.dll・dxgi.dll など）は置かない' (@((Get-Placed $g).Keys | Where-Object { $_ -ne 'd3d9.dll' }).Count -eq 0) 'safety'
+    Check 'DirectX 9 と見分けて、置く前に y/N で聞く' (($r.Out -match 'DirectX 9 のゲームのようです') -and ($r.Out -match 'DXVK を配置しますか') -and ($r.Out -match '元に戻すときは、そのフォルダの d3d9\.dll を削除') -and ($r.Out -notmatch 'まだ DirectX 9') ) 'safety'
+    Check 'iPhone の形で、起動の行（DRYRUN）まで進む' ($r.Out -match 'DRYRUN start') 'safety'
+
+    # DirectX 9（64 ビット）-> dxvk\x64
+    $g = New-Game $root 'dx9-64' 'x64' @('kernel32.dll', 'd3d9.dll')
+    [void](Invoke-RunDx $kit $g $ip $yes)
+    Check 'DirectX 9（64 ビット）のゲームに、dxvk\x64 の d3d9.dll が置かれる' (Test-Placed $g 'x64' @('d3d9.dll'))
+
+    # DirectX 10（d3d10.dll を取り込む）-> d3d10core.dll・d3d11.dll・dxgi.dll。d3d10.dll は置かない
+    $g = New-Game $root 'dx10' 'x64' @('kernel32.dll', 'd3d10.dll', 'dxgi.dll')
+    $r = Invoke-RunDx $kit $g $ip $yes
+    Check 'DirectX 10 のゲームに、dxvk\x64 の d3d10core.dll・d3d11.dll・dxgi.dll の 3 つが置かれる' (Test-Placed $g 'x64' @('d3d10core.dll', 'd3d11.dll', 'dxgi.dll'))
+    Check 'DirectX 10 のゲームの横に、d3d9.dll・d3d10.dll・d3d10_1.dll は置かない' (@((Get-Placed $g).Keys | Where-Object { $_ -in 'd3d9.dll', 'd3d10.dll', 'd3d10_1.dll' }).Count -eq 0) 'safety'
+    Check 'DirectX 10 と見分けて、3 つのファイルを置くと案内する' (($r.Out -match 'DirectX 10 のゲームのようです') -and ($r.Out -match 'DXVK の 3 つのファイル') -and ($r.Out -match 'd3d10core\.dll、d3d11\.dll と dxgi\.dll を削除')) 'safety'
+    foreach ($imp in 'd3d10_1.dll', 'd3d10core.dll') {
+        $g = New-Game $root ('dx10-' + $imp) 'x32' @('kernel32.dll', $imp)
+        [void](Invoke-RunDx $kit $g $ip $yes)
+        Check ($imp + ' を取り込むゲームも DirectX 10 と見分けて、dxvk\x32 の 3 つが置かれる') (Test-Placed $g 'x32' @('d3d10core.dll', 'd3d11.dll', 'dxgi.dll'))
+    }
+
+    # DirectX 11（今までどおり 2 つだけ）
+    $g = New-Game $root 'dx11' 'x64' @('kernel32.dll', 'd3d11.dll')
+    $r = Invoke-RunDx $kit $g $ip $yes
+    Check 'DirectX 11 のゲームに、d3d11.dll と dxgi.dll の 2 つだけが置かれる（今までと同じ）' (Test-Placed $g 'x64' @('d3d11.dll', 'dxgi.dll'))
+    Check 'DirectX 11 の案内は「2 つのファイル」と「d3d11.dll と dxgi.dll を削除」' (($r.Out -match 'DirectX 11 のゲームのようです') -and ($r.Out -match 'DXVK の 2 つのファイル') -and ($r.Out -match 'd3d11\.dll と dxgi\.dll を削除')) 'safety'
+
+    # DirectX 9 と DirectX 11 の両方を取り込む -> 別々に聞いて、両方置く（答えは 2 回）
+    $g = New-Game $root 'dx9-11' 'x64' @('kernel32.dll', 'd3d9.dll', 'd3d11.dll')
+    [void](Invoke-RunDx $kit $g $ip ($yes + ',' + $yes))
+    Check 'DirectX 9 と 11 の両方を取り込むゲームには、d3d9.dll・d3d11.dll・dxgi.dll が置かれる' (Test-Placed $g 'x64' @('d3d9.dll', 'd3d11.dll', 'dxgi.dll'))
+
+    # 同じ名前の別の dll（ReShade など）は上書きしない。聞きもしない
+    $g = New-Game $root 'dx9-other' 'x32' @('kernel32.dll', 'd3d9.dll')
+    [IO.File]::WriteAllBytes((Join-Path $g.Dir 'd3d9.dll'), [Text.Encoding]::ASCII.GetBytes('SOMEONE-ELSES-D3D9'))
+    $r = Invoke-RunDx $kit $g $ip 'y'
+    $p = Get-Placed $g
+    Check '別の d3d9.dll があるときは上書きしない（中身がそのまま）' (($p.Count -eq 1) -and ($p['d3d9.dll'] -eq 'SOMEONE-ELSES-D3D9')) 'safety'
+    Check '別の d3d9.dll があるときは、上書きしない理由を出して y/N は聞かない' (($r.Out -match '別の d3d9\.dll があります。上書きしない') -and ($r.Out -notmatch 'DXVK を配置しますか')) 'safety'
+    $g = New-Game $root 'dx10-other' 'x64' @('kernel32.dll', 'd3d10.dll')
+    [IO.File]::WriteAllBytes((Join-Path $g.Dir 'dxgi.dll'), [Text.Encoding]::ASCII.GetBytes('SOMEONE-ELSES-DXGI'))
+    $r = Invoke-RunDx $kit $g $ip 'y'
+    $p = Get-Placed $g
+    Check '別の dxgi.dll があるときは、DirectX 10 の 3 つのどれも置かない・上書きしない' (($p.Count -eq 1) -and ($p['dxgi.dll'] -eq 'SOMEONE-ELSES-DXGI')) 'safety'
+    # DirectX 9 と 11 で、d3d9.dll だけ別の物 -> 11 の分は置ける
+    $g = New-Game $root 'dx9-11-other' 'x64' @('kernel32.dll', 'd3d9.dll', 'd3d11.dll')
+    [IO.File]::WriteAllBytes((Join-Path $g.Dir 'd3d9.dll'), [Text.Encoding]::ASCII.GetBytes('SOMEONE-ELSES-D3D9'))
+    [void](Invoke-RunDx $kit $g $ip $yes)
+    $p = Get-Placed $g
+    Check '9 と 11 の両方を取り込み d3d9.dll が別の物なら、d3d9.dll はそのまま・11 の 2 つは置かれる' (($p['d3d9.dll'] -eq 'SOMEONE-ELSES-D3D9') -and ($p['d3d11.dll'] -eq 'FAKE-DXVK-x64-d3d11.dll') -and ($p['dxgi.dll'] -eq 'FAKE-DXVK-x64-dxgi.dll') -and ($p.Count -eq 3))
+
+    # すでに置いてある（キットと同じ中身）-> 聞かない
+    if ($mode -eq 'fix') {
+        $g = New-Game $root 'dx9-already' 'x32' @('kernel32.dll', 'd3d9.dll')
+        Copy-Item (Join-Path $kit 'dxvk\x32\d3d9.dll') $g.Dir
+        $r = Invoke-RunDx $kit $g $ip 'y'
+        Check 'すでにキットの d3d9.dll が横にあれば、聞かずに「配置されています」と出す' (($r.Out -match 'DXVK（DirectX 9）がゲームと同じフォルダに配置されています') -and ($r.Out -notmatch 'DXVK を配置しますか')) 'safety'
+        # キットに d3d9.dll が無い（古いキット）-> 更新を案内して、何も置かない
+        $kit2 = New-Kit 'rundx-oldkit'
+        Add-FakeDxvk $kit2
+        Remove-Item (Join-Path $kit2 'dxvk\x32\d3d9.dll')
+        $g = New-Game $root 'dx9-oldkit' 'x32' @('kernel32.dll', 'd3d9.dll')
+        $r = Invoke-RunDx $kit2 $g $ip 'y'
+        Check 'キットに d3d9.dll が無いときは、キットの更新を案内して何も置かない' (($r.Out -match 'Update-PocketGPU\.cmd') -and ((Get-Placed $g).Count -eq 0)) 'safety'
+    }
+
+    # 置かない物：DirectX 12・Vulkan のゲーム
+    $g = New-Game $root 'dx12' 'x64' @('kernel32.dll', 'd3d12.dll', 'd3d9.dll', 'dxgi.dll')
+    $r = Invoke-RunDx $kit $g $ip 'y'
+    Check 'DirectX 12 のゲームには何も置かず、まだ描画できないと出す' (((Get-Placed $g).Count -eq 0) -and ($r.Out -match 'DirectX 12 のゲームのようです')) 'safety'
+    $g = New-Game $root 'vulkan' 'x64' @('kernel32.dll', 'vulkan-1.dll', 'd3d9.dll')
+    [void](Invoke-RunDx $kit $g $ip 'y')
+    Check 'Vulkan を取り込むゲームには何も置かない' ((Get-Placed $g).Count -eq 0) 'safety'
+
+    # Android の形（PGPU_ANDROID=1）でも同じ。受け手がつながっていない（最初に「このまま起動しますか」と聞かれる）ので答えは 2 つ
+    $aport = Get-FreePort
+    $ae = @{ PGPU_ANDROID = '1'; PGPU_PORT = $aport }
+    $g = New-Game $root 'android-dx9' 'x32' @('kernel32.dll', 'd3d9.dll')
+    $r = Invoke-RunDx $kit $g $ae ('y,' + $yes)
+    Check 'Android の形でも、DirectX 9（32 ビット）のゲームに dxvk\x32 の d3d9.dll が置かれる' (Test-Placed $g 'x32' @('d3d9.dll'))
+    Check 'Android の形では DXVK にスマートフォンの GPU を選ばせる（DXVK_FILTER_DEVICE_NAME=PocketGPU）・案内は「Android のスマートフォン」' (($r.Out -match 'DRYRUN set DXVK_FILTER_DEVICE_NAME=PocketGPU') -and ($r.Out -match 'Android のスマートフォン の GPU で描画')) 'safety'
+    $g = New-Game $root 'android-dx10' 'x64' @('kernel32.dll', 'd3d10.dll')
+    [void](Invoke-RunDx $kit $g $ae ('y,' + $yes))
+    Check 'Android の形でも、DirectX 10 のゲームに 3 つが置かれる' (Test-Placed $g 'x64' @('d3d10core.dll', 'd3d11.dll', 'dxgi.dll'))
+}
+
+# =====================================================================
 $scenarios = [ordered]@{
     'loader'        = { param($m) Scn-Loader $m }
     'loader-ok'     = { param($m) Scn-LoaderOkLaunchers $m }
@@ -972,6 +1160,7 @@ $scenarios = [ordered]@{
     'english'       = { param($m) Scn-English $m }
     'pristine'      = { param($m) Scn-Pristine $m }
     'kitdir'        = { param($m) Scn-KitDir $m }
+    'run-dx'        = { param($m) Scn-RunDx $m }
     'elevated'      = { param($m) Scn-Elevated $m }
 }
 

@@ -2,7 +2,7 @@
 rem PocketGPU: run one app or game on the Android phone GPU. Run android\start_android.cmd first.
 rem   pocketgpu_android.cmd "C:\path\to\game.exe"
 rem Only the app started from this file sees the phone GPU. Nothing is written to the registry.
-rem DirectX 11 games also need DXVK next to the game. Start-Android-GPU.cmd puts it there for you (it asks first).
+rem DirectX 9, 10 and 11 games also need DXVK next to the game. Start-Android-GPU.cmd puts it there for you (it asks first).
 rem DXVK_FILTER_DEVICE_NAME=PocketGPU makes DXVK pick the phone GPU ("PocketGPU phone (...)").
 setlocal
 if "%~1"=="" (
