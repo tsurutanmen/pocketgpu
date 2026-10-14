@@ -4,6 +4,7 @@ import CoreImage
 import CoreMedia
 import CoreMotion
 import CoreVideo
+import Metal
 import Network
 import SwiftUI
 import UIKit
@@ -64,6 +65,19 @@ import VideoToolbox
 //   4. 下がったときは、頼まれたコマ数・下がった理由・その大きさの形の一覧を記録に出す。画面にも書く（pcNote）
 //   5. カメラが実際に受けているコマ数を、走らせる前に読み直して ACK に書く（iOS が直してしまったとき用）。走り始めて 2〜5 秒の実測も記録に出す
 //   6. エンコーダ：キーフレームの間隔を秒でも縛る。60 コマ/秒で作れなければ、30 コマ/秒に落として作り直す。1080p60 の画質の段を 20 Mbps に
+//
+// 10/15（work/camrot1015）4K60 で 60 コマ/秒に届かず 45〜50 になるのを軽くする（本物の iPhone では未確認。効き目は記録の「内訳」「内訳2」で見る）：
+//   1. 回転と反転：AVCaptureConnection の videoRotationAngle・isVideoMirrored は、毎コマ iOS が絵を物理的に作り直す（Apple の資料）。
+//      180 度と左右・上下の反転（縦横が変わらない物）は、接続では行わず、
+//        PC が WC_HELLO_ROT180（32）を立て、回転が 180 度だけのとき：回さずに送り、ACK に WC_ACK_PC_ROT180（128）を立てる。PC が 180 度回す。iPhone は何もしない
+//        そうでないとき：Metal の compute で、カメラの絵を送る大きさの入れ物へ 1 回で写す（FrameFlipper。CVMetalTextureCache でコピーなし）
+//      印を知らない PC（古い webcam_rx）は WC_HELLO_ROT180 を立てないので、今までどおり iPhone が回した絵を受ける。
+//      90 度・270 度と、切り抜き・水平を保つ（Core Image が回す）ときは、前のとおり接続で回す
+//   2. 中央の切り抜き：水平を保たず、位置が中央なら、Core Image で毎コマ切り出さず、カメラの倍率（videoZoomFactor）に切り抜きの倍率を掛ける（camCrop）
+//   3. 記録に出す物：カメラから来たコマ・エンコーダから出たコマ・エンコーダが落とした数（camfix1015）に、iOS が捨てたコマ（遅れ・入れ物不足）・
+//      VTCompressionSessionEncodeFrame の呼び出しの時間・回す処理の時間・エンコーダの実際の設定（ハード・RealTime・MaxFrameDelayCount）を足した
+//   4. 隠しスイッチ UserDefaults "webcamDebug"（起動引数 -webcamDebug 4 でも入る）：1 低遅延のレート制御を使わない・2 DataRateLimits を付けない・
+//      4 回転と反転を前のとおり接続で行う・8 中央の切り抜きを前のとおり Core Image で行う。ふだんは 0。本物で効き目を比べるため
 final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureMetadataOutputObjectsDelegate {
     static let shared = CameraBridge()
     static let port: UInt16 = 50064
@@ -80,6 +94,8 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private enum Flag {
         static let mirror: UInt32 = 1, cameraSet: UInt32 = 2, live: UInt32 = 4
         static let fit: UInt32 = 16        // camgpu1015：HELLO。PC が使える大きさの上限（max_w・max_h）がある
+        static let pcRot180: UInt32 = 32   // camrot1015：HELLO。PC は ACK の PC_ROT180 を見て、受けた絵を自分で 180 度回せる（PC が立てる印。立てない PC には iPhone が回して送る）
+        static let ackPcRot180: UInt32 = 128 // camrot1015：ACK。この絵は 180 度回していない。PC が回す（pcRot180 を立てた PC にだけ立つ）
         static let ackAppSettings: UInt32 = 1, ackAppPriority: UInt32 = 2, ackLive: UInt32 = 4, ackChanged: UInt32 = 8
         static let ackFit: UInt32 = 64     // camgpu1015：ACK。この iPhone は上限を守った（FIT を名乗った PC にだけ立てる）
         static let ackThermal: UInt32 = 16 // camctl：熱のためにコマ数を下げた（work/camctl/PROTOCOL.md の案。古い PC は見ない）
@@ -121,7 +137,10 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         static let level = "webcamLevel"             // 水平を保つ（背面のカメラだけ）
         static let screenWarm = "webcamScreenWarm"   // 画面のライトを暖かい色にする
         static let thermalFps = "webcamThermalFps"   // iPhone が熱いときはフレームレートを下げる
+        static let debug = "webcamDebug"             // camrot1015：本物で効き目を比べる隠しスイッチ（ビット。上の説明の 4）。画面には出さない
     }
+    // camrot1015：隠しスイッチ。1 低遅延のレート制御を使わない・2 DataRateLimits を付けない・4 回転と反転を接続で行う・8 中央の切り抜きを Core Image で行う
+    private static var debugBits: Int { UserDefaults.standard.integer(forKey: Key.debug) }
     // 初めの値（画面の @AppStorage の初めの値と同じにしておく）
     static let defaultCamera = 0, defaultHeight = 1080, defaultFps = 30, defaultQuality = 2, defaultPreferPC = true
 
@@ -176,6 +195,8 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         var fitStage = false     // camgpu1015：箱に収まる形が無いので、大きく撮ってエンコーダの前で縮める（stage を使う）
         var askedFps = 0         // cam60：PC（か画面）が決めたコマ数。シネマティックなどで下げる前の値
         var cineDropped = false  // cam60：PC がコマ数を頼んだので、シネマティックを止めた
+        var camCrop = false      // camrot1015：中央の切り抜きだけ（水平を保たない・顔に合わせない）。Core Image を使わず、カメラの倍率に切り抜きの倍率を掛ける
+        var pcRot = false        // camrot1015：回転が 180 度だけで、PC が回せる。回さずに送り、ACK の ackPcRot180 で知らせる
     }
 
     // cam60：決めたコマ数から下がった理由
@@ -272,6 +293,19 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private var seq: UInt32 = 0
     private var sent: UInt64 = 0
     private var dropped: UInt64 = 0
+    private var capCalls: UInt64 = 0   // camfix1015：カメラから来たコマの数（実測の記録用）
+    private var encDone: UInt64 = 0    // camfix1015：エンコーダから出てきたコマの数
+    private var vtDropped: UInt64 = 0  // camfix1015：エンコーダが落としたコマの数
+    private var capBusyUs: UInt64 = 0  // camfix1015：captureOutput の中にいた時間の合計（µs）
+    private var lateDrops: UInt64 = 0  // camrot1015：iOS が「遅れた」として捨てたコマ（alwaysDiscardsLateVideoFrames。captureOutput(didDrop:)）
+    private var bufDrops: UInt64 = 0   // camrot1015：iOS が入れ物の不足で捨てたコマ
+    private var otherDrops: UInt64 = 0 // camrot1015：iOS が別の理由で捨てたコマ（途切れなど）
+    private var encCallUs: UInt64 = 0  // camrot1015：VTCompressionSessionEncodeFrame を呼んで返るまでの時間の合計（µs）
+    private var encCalls: UInt64 = 0   // camrot1015：その呼び出しの数
+    private var flipUs: UInt64 = 0     // camrot1015：Metal で回した時間の合計（µs。GPU が終わるまで待つ時間を含む）
+    private var flipCalls: UInt64 = 0  // camrot1015：Metal で回したコマの数
+    private var flipFails: UInt64 = 0  // camrot1015：Metal で回せなかったコマの数（このつなぎの間。回せないコマは送らない）
+    private var flipCopy: FrameFlipper? // camrot1015：180 度・反転を Metal で行うとき（なければ nil）
     private var sessionGen: UInt64 = 0  // カメラを作り直すたびに増やす。前のカメラのコマを、新しい形の後ろに送らないため
     private let maxInflight = 4         // これより溜まったら、カメラの絵を捨てて追いつく（USB が詰まったとき、古いコマを送り続けない）
     // camctl：lock で守る
@@ -802,7 +836,10 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         if r.cinematic { r.fps = min(r.fps, 30) }
         let cropOn = d.bool(forKey: Key.crop)
         let levelOn = d.bool(forKey: Key.level) && Self.levelAvailable(r.cinematic ? Self.cinematicDevice(cam) : Self.device(cam))
-        r.stage = cropOn || levelOn
+        // camrot1015：位置が中央の切り抜きだけ（水平を保たない）なら、Core Image で毎コマ切り出さず、カメラの倍率で済ませる（applyZoom）。
+        // 切り抜く枠は中央で動かないので、カメラの中央を拡大するのと同じ絵になる
+        r.camCrop = cropOn && !levelOn && d.integer(forKey: Key.cropPos) == 0 && Self.debugBits & 8 == 0
+        r.stage = (cropOn && !r.camCrop) || levelOn
         r.face = cropOn && d.integer(forKey: Key.cropPos) == 3
         if r.stage {
             let s = Self.stageScale(crop: cropOn ? d.double(forKey: Key.cropSize) : 1, level: levelOn, w: r.w, h: r.h)
@@ -821,6 +858,12 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                 r.fitStage = true
                 r.capH = fh
             }
+        }
+        // camrot1015：回転が 180 度だけ（反転なし・切り抜きなし）で、PC が回せるなら、iPhone は回さずに送る。
+        // 回すのが無料になる。印を立てない PC（古い webcam_rx）には立てず、前どおり iPhone が回す
+        if hi.flags & Flag.pcRot180 != 0 && r.rot == 180 && !r.connMirror && !r.stage && Self.debugBits & 4 == 0 {
+            r.pcRot = true
+            r.ackFlags |= Flag.ackPcRot180
         }
         return r
     }
@@ -998,6 +1041,25 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let dev = p.dev, fmt = p.fmt
         var fr = p.fps
         var fpsWhy = p.why
+        // camrot1015：回転と反転を接続でなく、PC（ackPcRot180）か Metal に任せるか。縦横が変わらない物（0 度・180 度＋左右反転）だけ。
+        // 切り抜き・水平（stage）のときは、Core Image が回した絵を前提に枠を決めているので、前のとおり接続で回す
+        var connRot = r.rot, connMirror = r.connMirror
+        var flipper: FrameFlipper?
+        var rotHow = r.rot == 0 && !r.connMirror ? "なし" : "接続"
+        if r.pcRot {
+            connRot = 0
+            rotHow = "PC"
+        } else if !r.stage && r.rot % 180 == 0 && (r.rot == 180 || r.connMirror) && Self.debugBits & 4 == 0 {
+            // 先に左右を反転する向き：180 度は上下も左右も逆。回してから左右反転するので、左右は「180 度か」と「反転か」が違うときだけ反転
+            flipper = FrameFlipper(w: p.outW, h: p.outH, flipX: (r.rot == 180) != r.connMirror, flipY: r.rot == 180)
+            if flipper != nil {
+                connRot = 0
+                connMirror = false
+                rotHow = "Metal"
+            } else {
+                log("ウェブカメラ：Metal で回す準備ができない（\(FrameFlipper.buildError)）。前のとおり接続で回す")
+            }
+        }
         let s = AVCaptureSession()
         s.beginConfiguration()
         s.sessionPreset = .inputPriority // 形は device.activeFormat で決める（プリセットだと 1080p は 30 コマまでのことがある）
@@ -1025,10 +1087,10 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             if let cn = out.connection(with: .video) {
                 // 向き：初めは iPhone の持ち方に関わらず、横長（センサーの向き）で固定する。画面の「回転」で 90 度ずつ回す。
                 // 回すのは接続で（ハードウェアで回る。エンコーダの前で回すより CPU を使わない）。回してから左右反転する
-                rotated = Self.orient(cn, angle: r.rot)
+                rotated = Self.orient(cn, angle: connRot) // camrot1015：PC か Metal に任せるときは 0 度（回すのは接続ではない）
                 if cn.isVideoMirroringSupported {
                     cn.automaticallyAdjustsVideoMirroring = false
-                    cn.isVideoMirrored = r.connMirror // ふつうは反転しない。鏡のように見せるのは使う側のアプリ
+                    cn.isVideoMirrored = connMirror // ふつうは反転しない。鏡のように見せるのは使う側のアプリ
                 }
                 // 手ぶれ補正。オフ以外は写る範囲が狭くなる。標準とシネマティックは遅れが増える
                 if cn.isVideoStabilizationSupported { cn.preferredVideoStabilizationMode = Self.stabMode(r.stab) }
@@ -1111,6 +1173,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         lock.lock()
         sendConn = c; encCopy = enc; fpsCopy = fr; wCopy = aw; hCopy = ah; forceKey = true; inflight = 0; if !changed { seq = 0; sent = 0; dropped = 0 }
         poolCopy = pool; devCopy = dev; videoOutCopy = out; cineCopy = cineOn; faceTarget = nil
+        flipCopy = flipper; flipFails = 0
         lock.unlock()
         observeSession(s)
         // ピント・明るさ・色・ズーム・ライト・切り抜きの値を、走らせる前に当てる
@@ -1135,7 +1198,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             if r.fitShrunk { fitText += "に収めた" }
             if r.fitStage { fitText += "（その大きさの形が無いので、大きく撮ってエンコーダの前で縮める）" }
         }
-        log("ウェブカメラ：\(changed ? "切り替えた" : "始める") \(aw)×\(ah)・\(fr) コマ/秒・\(kb) kbps・カメラ \(r.camera)（\(dev.localizedName)）・回転 \(r.rot)・反転 \(r.connMirror ? 1 : 0)・切り抜き \(pool != nil ? 1 : 0)・手ぶれ補正 \(r.stab)・シネマティック \(cineOn ? 1 : 0)・ACK flags \(ackFlags)・PC の上限 \(fitText)")
+        log("ウェブカメラ：\(changed ? "切り替えた" : "始める") \(aw)×\(ah)・\(fr) コマ/秒・\(kb) kbps・カメラ \(r.camera)（\(dev.localizedName)）・回転 \(r.rot)・反転 \(r.connMirror ? 1 : 0)（回し方 \(rotHow)）・切り抜き \(pool != nil ? 1 : 0)（カメラの倍率で \(r.camCrop ? 1 : 0)）・隠しスイッチ \(Self.debugBits)・手ぶれ補正 \(r.stab)・シネマティック \(cineOn ? 1 : 0)・ACK flags \(ackFlags)・PC の上限 \(fitText)")
         // cam60：頼まれたコマ数から下がったときは、理由と、その大きさの形の一覧を記録に出す（本物で何が撮れるかが、ここで分かる）
         let askedFps = r.askedFps
         let whyJa = fpsWhy.map { $0.ja }.joined(separator: "、")
@@ -1158,17 +1221,25 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let ackFps = fr
         q.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, self.session === s else { return }
-            self.lock.lock(); let n0 = self.sent; self.lock.unlock()
+            self.lock.lock(); let n0 = self.sent; let c0 = self.capCalls; let e0 = self.encDone; let v0 = self.vtDropped; let b0 = self.capBusyUs; self.lock.unlock()
             let t0 = Date()
             self.q.asyncAfter(deadline: .now() + 3.0) { [weak self] in
                 guard let self, self.session === s else { return }
-                self.lock.lock(); let n1 = self.sent; let drop = self.dropped; self.lock.unlock()
+                self.lock.lock(); let n1 = self.sent; let drop = self.dropped; let c1 = self.capCalls; let e1 = self.encDone; let v1 = self.vtDropped; let b1 = self.capBusyUs; self.lock.unlock()
                 let secs = Date().timeIntervalSince(t0)
                 let rate = (secs > 0 && n1 >= n0) ? Double(n1 - n0) / secs : 0
+                let capRate = (secs > 0 && c1 >= c0) ? Double(c1 - c0) / secs : 0
+                let encRate = (secs > 0 && e1 >= e0) ? Double(e1 - e0) / secs : 0
+                let vtDrop = v1 >= v0 ? v1 - v0 : 0
+                let busyMs = (c1 > c0 && b1 >= b0) ? Double(b1 - b0) / Double(c1 - c0) / 1000 : 0
+                self.log("ウェブカメラ：内訳 カメラから \(String(format: "%.1f", capRate)) コマ/秒・エンコーダから出た \(String(format: "%.1f", encRate)) コマ/秒・エンコーダが落とした \(vtDrop)・カメラの受け口の1コマの時間 \(String(format: "%.1f", busyMs)) ms")
                 let camFps = Self.fpsOf(dev.activeVideoMinFrameDuration)
                 self.log("ウェブカメラ：実測 \(String(format: "%.1f", rate)) コマ/秒（ACK \(ackFps)・頼み \(askedFps)・カメラの設定 \(camFps)・捨てたコマ \(drop)・熱 \(ProcessInfo.processInfo.thermalState.rawValue)）")
             }
         }
+        // camrot1015：iOS が捨てたコマ・エンコーダの呼び出しの時間・回す処理の時間。始めた直後と、落ち着いた 22 秒後の 2 回（始めた直後はエンコーダの立ち上がりで遅い）
+        logBreakdown2(s, after: 2.0, label: "始めて 2 秒後・回し方 \(rotHow)")
+        logBreakdown2(s, after: 22.0, label: "22 秒後・回し方 \(rotHow)")
         let name = Self.cameraName(r.camera)
         var noteText = Self.pcNoteText(r, w: aw, h: ah, fps: fr)
         if fr < askedFps {
@@ -1190,6 +1261,38 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             self?.rotSkipped = skipped
             self?.thermalNote = hotNote
             self?.pcControl = ctlOn
+        }
+    }
+
+    // camrot1015：数えている物の写し（lock の中で読む。q の上から呼ぶ）
+    private struct CamCounters {
+        var late: UInt64, buf: UInt64, other: UInt64, encUs: UInt64, encCalls: UInt64, flipUs: UInt64, flipCalls: UInt64, flipFails: UInt64
+    }
+    private func counters() -> CamCounters {
+        lock.lock(); defer { lock.unlock() }
+        return CamCounters(late: lateDrops, buf: bufDrops, other: otherDrops, encUs: encCallUs, encCalls: encCalls,
+                           flipUs: flipUs, flipCalls: flipCalls, flipFails: flipFails)
+    }
+    private static func delta(_ a: UInt64, _ b: UInt64) -> UInt64 { a >= b ? a - b : 0 }
+
+    // camrot1015：delay 秒後から 3 秒の間の、iOS が捨てたコマ・エンコーダの呼び出しの時間・回す処理の時間を記録に出す（q の上）
+    private func logBreakdown2(_ s: AVCaptureSession, after delay: Double, label: String) {
+        q.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.session === s else { return }
+            let k0 = self.counters()
+            let t0 = Date()
+            self.q.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                guard let self, self.session === s else { return }
+                let k1 = self.counters()
+                let secs = Date().timeIntervalSince(t0)
+                guard secs > 0 else { return }
+                let late = Self.delta(k1.late, k0.late), buf = Self.delta(k1.buf, k0.buf), other = Self.delta(k1.other, k0.other)
+                let ec = Self.delta(k1.encCalls, k0.encCalls), eu = Self.delta(k1.encUs, k0.encUs)
+                let fc = Self.delta(k1.flipCalls, k0.flipCalls), fu = Self.delta(k1.flipUs, k0.flipUs), ff = Self.delta(k1.flipFails, k0.flipFails)
+                let encMs = ec > 0 ? Double(eu) / Double(ec) / 1000 : 0
+                let flipMs = fc > 0 ? Double(fu) / Double(fc) / 1000 : 0
+                self.log("ウェブカメラ：内訳2（\(label)）\(String(format: "%.1f", secs)) 秒間・iOS が捨てたコマ 遅れ \(late)・入れ物不足 \(buf)・その他 \(other)・エンコーダの呼び出し 1 コマ \(String(format: "%.2f", encMs)) ms（\(ec) コマ）・Metal で回す 1 コマ \(String(format: "%.2f", flipMs)) ms（\(fc) コマ・失敗 \(ff)）")
+            }
         }
     }
 
@@ -1670,15 +1773,18 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     // ---- エンコーダ（VideoToolbox・server.c の vid_open と同じ設定） ----
 
     // cam60：lowLatency を false にすると、低遅延の方式を使わずに作る（60 コマ/秒で低遅延の方式が使えないときの、作り直し用）
-    private func makeEncoder(w: Int, h: Int, fps: Int, kbps: Int, gop: Int, lowLatency: Bool = true) -> VTCompressionSession? {
+    private func makeEncoder(w: Int, h: Int, fps: Int, kbps: Int, gop: Int, lowLatency lowLatencyWanted: Bool = true) -> VTCompressionSession? {
         var s: VTCompressionSession?
+        let lowLatency = lowLatencyWanted && Self.debugBits & 1 == 0 // camrot1015：隠しスイッチ。低遅延のレート制御を使わない
         let spec: CFDictionary? = lowLatency ? ([kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String: true] as CFDictionary) : nil
+        var llUsed = lowLatency // camrot1015：実際に低遅延で作れたか（記録用）
         var st = VTCompressionSessionCreate(allocator: nil, width: Int32(w), height: Int32(h), codecType: kCMVideoCodecType_H264, encoderSpecification: spec,
                                             imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &s)
         if st != noErr || s == nil {
             // 低遅延のモードを持つエンコーダが無いとき（古い iPhone の軽いアプリ PocketCam のため）は、ふつうのエンコーダで作り直す。
             // 低遅延で作れる機種ではここを通らないので、動きは前と同じ
             log("ウェブカメラ：低遅延のエンコーダを作れない（\(st)）。ふつうのエンコーダで作る")
+            llUsed = false
             s = nil
             st = VTCompressionSessionCreate(allocator: nil, width: Int32(w), height: Int32(h), codecType: kCMVideoCodecType_H264, encoderSpecification: nil,
                                             imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &s)
@@ -1705,11 +1811,23 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             VTCompressionSessionInvalidate(s)
             return nil
         }
+        // camrot1015：エンコーダが実際に持っている設定を読み直して記録に出す（ハードで動いているか・出力を詰まらせる上限が付いていないか）
+        log("ウェブカメラ：エンコーダ \(w)×\(h)・\(fps) コマ/秒・\(kbps) kbps・準備 \(ps)・低遅延 \(llUsed ? 1 : 0)・ハード \(Self.propText(s, Self.hwKey))・RealTime \(Self.propText(s, kVTCompressionPropertyKey_RealTime))・MaxFrameDelayCount \(Self.propText(s, kVTCompressionPropertyKey_MaxFrameDelayCount))・隠しスイッチ \(Self.debugBits)")
         return s
+    }
+
+    // camrot1015：エンコーダの設定を読んで文字にする（読めなければ「不明」とエラー番号）
+    private static let hwKey: CFString = "UsingHardwareAcceleratedVideoEncoder" as CFString // kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder の値（SDK の版で名前が無いことがあるので文字で持つ）
+    private static func propText(_ s: VTCompressionSession, _ key: CFString) -> String {
+        var v: CFTypeRef?
+        let st = VTSessionCopyProperty(s, key: key, allocator: kCFAllocatorDefault, valueOut: &v)
+        guard st == noErr, let v else { return "不明(\(st))" }
+        return "\(v)"
     }
 
     // 1 秒あたりの上限を平均の 1.5 倍に（動きの多い場面で USB が詰まらないように）。エンコーダが受けなければ、そのまま（返り値は見ない）
     private func setPeak(_ s: VTCompressionSession, _ kbps: Int) {
+        if Self.debugBits & 2 != 0 { return } // camrot1015：隠しスイッチ。DataRateLimits を付けない（付けると 4K60 で詰まるかを本物で比べる）
         let bytesPerSec = kbps * 1000 / 8 * 3 / 2
         _ = VTSessionSetProperty(s, key: kVTCompressionPropertyKey_DataRateLimits, value: [NSNumber(value: bytesPerSec), NSNumber(value: 1)] as CFArray)
     }
@@ -1852,6 +1970,9 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         // camctl2：そのときは、PC が CTRL で選んだ倍率を使う（このつなぎの間だけ。画面の倍率は別のレンズの物なので書かない）
         if !stored, let z = ctlZoom { want = z / m }
         if want <= 0 { want = 1 / m }
+        // camrot1015：中央の切り抜きは、カメラの倍率に切り抜きの倍率を掛けて済ませる（Core Image で毎コマ切り出さない）。
+        // カメラが出せる倍率の上限（下の hi）で止まるので、そのときは切り抜きが浅くなる
+        if r.camCrop { want *= 1 / CGFloat(min(max(d.double(forKey: Key.cropSize), 0.3), 1)) }
         if extra > 1.001 { want = max(Self.lensFloor(dev, for: want), want / extra) }
         let lo = max(1, dev.minAvailableVideoZoomFactor)
         let hi = max(lo, min(dev.maxAvailableVideoZoomFactor, dev.activeFormat.videoMaxZoomFactor))
@@ -1892,7 +2013,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         var p = StageParams()
         guard r.stage, let input = deviceInput else { return p }
         let d = UserDefaults.standard
-        let cropOn = d.bool(forKey: Key.crop)
+        let cropOn = d.bool(forKey: Key.crop) && !r.camCrop // camrot1015：camCrop の切り抜きはカメラの倍率で済んでいる。ここでは切らない
         let c: CGFloat = cropOn ? 1 / CGFloat(min(max(d.double(forKey: Key.cropSize), 0.3), 1)) : 1
         p.on = true
         p.outW = curW; p.outH = curH
@@ -1938,7 +2059,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private func stopCapture() {
         lock.lock()
         sendConn = nil; encCopy = nil; sessionGen &+= 1
-        stage = StageParams(); poolCopy = nil; devCopy = nil; videoOutCopy = nil; faceTarget = nil; cineCopy = false; levelShown = 0
+        stage = StageParams(); poolCopy = nil; devCopy = nil; videoOutCopy = nil; faceTarget = nil; cineCopy = false; levelShown = 0; flipCopy = nil
         lock.unlock()
         curReq = nil
         baseFps = 0
@@ -1993,7 +2114,13 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     // ---- カメラの糸：1 コマ来るたびに、エンコーダへ ----
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        let enterNs = DispatchTime.now().uptimeNanoseconds
+        defer {
+            let us = (DispatchTime.now().uptimeNanoseconds &- enterNs) / 1000
+            lock.lock(); capBusyUs &+= us; lock.unlock()
+        }
         lock.lock()
+        capCalls &+= 1
         let busy = inflight >= maxInflight
         let live = sendConn != nil
         if busy && live { dropped += 1; forceKey = true } // 捨てたあとの次のコマは、参照が切れているので、キーフレームにする
@@ -2004,6 +2131,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let gen = sessionGen
         let stg = stage
         let pool = poolCopy
+        let flip = flipCopy
         lock.unlock()
         guard live, !busy, let enc = encoderForCallback(), let src = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -2012,14 +2140,44 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         if stg.on {
             guard let pool, let cut = renderStage(src, stg, pool, pts: pts) else { lock.lock(); forceKey = true; lock.unlock(); return }
             pb = cut
+        } else if let flip {
+            // camrot1015：180 度・反転を Metal で 1 回写して行う（接続で回すより軽い見込み）。回せないコマは送らない（回していない絵を送ると、向きが 1 コマだけ違って見える）
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            let flipped = flip.flip(src)
+            let us = (DispatchTime.now().uptimeNanoseconds &- t0) / 1000
+            lock.lock()
+            flipUs &+= us
+            flipCalls &+= 1
+            if flipped == nil { flipFails &+= 1; forceKey = true }
+            let fails = flipFails
+            lock.unlock()
+            guard let out = flipped else {
+                if fails == 1 || fails % 600 == 0 { log("ウェブカメラ：Metal で回せないコマがある（\(fails) 回目）：\(flip.lastError)") }
+                return
+            }
+            pb = out
         }
         let capUs = UInt64(max(0, CMTimeGetSeconds(pts)) * 1_000_000) // ホストの時計（単調）。PING の PONG と同じ時計
         let props = key ? ([kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary) : nil
         var info = VTEncodeInfoFlags()
+        let encT0 = DispatchTime.now().uptimeNanoseconds
         let st = VTCompressionSessionEncodeFrame(enc, imageBuffer: pb, presentationTimeStamp: pts, duration: CMTime(value: 1, timescale: CMTimeScale(curFpsForCallback())), frameProperties: props, infoFlagsOut: &info) { [weak self] status, flags, sb in
             self?.encoded(status, flags, sb, capUs, n, gen)
         }
-        if st != noErr { lock.lock(); forceKey = true; lock.unlock() }
+        let encUs = (DispatchTime.now().uptimeNanoseconds &- encT0) / 1000
+        lock.lock()
+        encCallUs &+= encUs; encCalls &+= 1 // camrot1015：呼び出しが返るまでの時間。エンコーダが詰まると、ここが伸びる
+        if st != noErr { forceKey = true }
+        lock.unlock()
+    }
+
+    // camrot1015：iOS が捨てたコマの数と理由（alwaysDiscardsLateVideoFrames が true なので、captureOutput が遅いと「遅れ」で捨てられる）
+    func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        var why = ""
+        if let v = CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_DroppedFrameReason, attachmentModeOut: nil) { why = "\(v)" }
+        lock.lock()
+        if why.contains("OutOfBuffers") { bufDrops &+= 1 } else if why.contains("FrameWasLate") { lateDrops &+= 1 } else { otherDrops &+= 1 }
+        lock.unlock()
     }
 
     // ---- camctl：カメラの糸。切り抜き・拡大・水平の回転を Core Image で 1 回で ----
@@ -2102,7 +2260,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
 
     private func encoded(_ status: OSStatus, _ info: VTEncodeInfoFlags, _ sb: CMSampleBuffer?, _ capUs: UInt64, _ seq: UInt32, _ gen: UInt64) {
         guard status == noErr, let sb, !info.contains(.frameDropped), let bb = CMSampleBufferGetDataBuffer(sb) else {
-            lock.lock(); forceKey = true; lock.unlock() // 落とされた。次をキーフレームにする
+            lock.lock(); forceKey = true; if info.contains(.frameDropped) { vtDropped &+= 1 }; lock.unlock() // 落とされた。次をキーフレームにする
             return
         }
         var key = true
@@ -2151,6 +2309,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let nowUs = Self.nowUs()
         // カメラを作り直したあとに、前のカメラのコマを送らない（新しい形の ACK の後ろに、古い大きさのコマが並ばないように）
         lock.lock(); let conn = sendConn; let cw = wCopy, ch = hCopy; let same = gen == sessionGen
+        encDone &+= 1
         if conn != nil && same { inflight += 1 }
         lock.unlock()
         guard let conn, same else { return }
@@ -3275,5 +3434,127 @@ struct ScreenLightView: View {
         .onTapGesture { dismiss() }
         .statusBar(hidden: true)
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in dismiss() }
+    }
+}
+
+// camrot1015：NV12 の絵を、縦横を変えずに左右・上下に反転して、別の入れ物へ写す。180 度の回転は上下と左右の両方、左右反転は X だけ、上下反転は Y だけ。
+// AVCaptureConnection の videoRotationAngle・isVideoMirrored は、毎コマ iOS が絵を物理的に作り直す（Apple の資料）。その代わりに、Metal の compute で
+// Y の面（R8）と CbCr の面（RG8）を 1 回ずつ写す。カメラの絵は CVMetalTextureCache で、写し先は IOSurface から直接 Metal の物にするので、CPU のコピーは無い。
+// 4K の NV12 は 1 コマ約 12 MB。読みと書きで約 24 MB の GPU メモリの往復（60 コマ/秒で約 1.5 GB/秒）。
+// captureQueue（直列）だけから呼ぶ。GPU が終わるまで待ってから返す（そのあとエンコーダが読む）
+final class FrameFlipper {
+    static var buildError = ""
+    private static let kernelSource = """
+    #include <metal_stdlib>
+    using namespace metal;
+    kernel void flipPlane(texture2d<float, access::read> src [[texture(0)]],
+                          texture2d<float, access::write> dst [[texture(1)]],
+                          constant uint2 &fl [[buffer(0)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+        uint w = dst.get_width();
+        uint h = dst.get_height();
+        if (gid.x >= w || gid.y >= h) { return; }
+        uint sx = fl.x != 0 ? (w - 1 - gid.x) : gid.x;
+        uint sy = fl.y != 0 ? (h - 1 - gid.y) : gid.y;
+        dst.write(src.read(uint2(sx, sy)), gid);
+    }
+    """
+    // GPU・命令の列・計算の用意は、つなぎ直しても使い回す（初めての 1 回だけ Metal の言葉を組む）
+    private static let gpu: (device: MTLDevice, queue: MTLCommandQueue, pso: MTLComputePipelineState)? = {
+        guard let dev = MTLCreateSystemDefaultDevice() else { FrameFlipper.buildError = "Metal の GPU が無い"; return nil }
+        guard let q = dev.makeCommandQueue() else { FrameFlipper.buildError = "命令の列を作れない"; return nil }
+        do {
+            let lib = try dev.makeLibrary(source: FrameFlipper.kernelSource, options: nil)
+            guard let fn = lib.makeFunction(name: "flipPlane") else { FrameFlipper.buildError = "flipPlane が無い"; return nil }
+            let pso = try dev.makeComputePipelineState(function: fn)
+            return (dev, q, pso)
+        } catch {
+            FrameFlipper.buildError = "Metal の言葉を組めない：\(error)"
+            return nil
+        }
+    }()
+
+    let w: Int, h: Int
+    let flipX: Bool, flipY: Bool
+    private(set) var lastError = ""
+    private let device: MTLDevice
+    private let queue: MTLCommandQueue
+    private let pso: MTLComputePipelineState
+    private let texCache: CVMetalTextureCache
+    private let pool: CVPixelBufferPool
+
+    init?(w: Int, h: Int, flipX: Bool, flipY: Bool) {
+        guard w >= 2, h >= 2, w % 2 == 0, h % 2 == 0 else { FrameFlipper.buildError = "大きさが変（\(w)×\(h)）"; return nil }
+        guard let g = FrameFlipper.gpu else { return nil }
+        var cache: CVMetalTextureCache?
+        guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, g.device, nil, &cache) == kCVReturnSuccess, let cache else {
+            FrameFlipper.buildError = "テクスチャの入れ物を作れない"
+            return nil
+        }
+        // 写し先の入れ物（エンコーダに渡す物。IOSurface で、Metal からも書ける）
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferWidthKey as String: w,
+            kCVPixelBufferHeightKey as String: h,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+        ]
+        var pl: CVPixelBufferPool?
+        guard CVPixelBufferPoolCreate(nil, nil, attrs as CFDictionary, &pl) == kCVReturnSuccess, let pl else {
+            FrameFlipper.buildError = "絵の入れ物を作れない"
+            return nil
+        }
+        self.w = w; self.h = h; self.flipX = flipX; self.flipY = flipY
+        self.device = g.device; self.queue = g.queue; self.pso = g.pso
+        self.texCache = cache; self.pool = pl
+    }
+
+    // src を反転して、新しい入れ物に写して返す。できなければ nil（lastError に理由）
+    func flip(_ src: CVPixelBuffer) -> CVPixelBuffer? {
+        guard CVPixelBufferGetWidth(src) == w, CVPixelBufferGetHeight(src) == h, CVPixelBufferGetPlaneCount(src) == 2 else {
+            lastError = "カメラの絵が想定と違う（\(CVPixelBufferGetWidth(src))×\(CVPixelBufferGetHeight(src))・面 \(CVPixelBufferGetPlaneCount(src))・形式 \(CVPixelBufferGetPixelFormatType(src))。想定 \(w)×\(h)）"
+            return nil
+        }
+        var made: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &made) == kCVReturnSuccess, let out = made else { lastError = "写し先の入れ物が取れない"; return nil }
+        CVBufferPropagateAttachments(src, out) // 色の決まり（BT.709 など）を写す。エンコーダが映像の印に書く
+        guard let surface = CVPixelBufferGetIOSurface(out)?.takeUnretainedValue() else { lastError = "写し先が IOSurface ではない"; return nil }
+        guard let cb = queue.makeCommandBuffer(), let ce = cb.makeComputeCommandEncoder() else { lastError = "命令を作れない"; return nil }
+        ce.setComputePipelineState(pso)
+        var fl = SIMD2<UInt32>(flipX ? 1 : 0, flipY ? 1 : 0)
+        ce.setBytes(&fl, length: MemoryLayout<SIMD2<UInt32>>.size, index: 0)
+        let tw = pso.threadExecutionWidth
+        let th = max(1, pso.maxTotalThreadsPerThreadgroup / tw)
+        var holds: [CVMetalTexture] = [] // GPU が終わるまで、カメラの絵のテクスチャを手放さない
+        for plane in 0..<2 {
+            let fmt: MTLPixelFormat = plane == 0 ? .r8Unorm : .rg8Unorm
+            let pw = CVPixelBufferGetWidthOfPlane(src, plane), ph = CVPixelBufferGetHeightOfPlane(src, plane)
+            var cvTex: CVMetalTexture?
+            guard CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, texCache, src, nil, fmt, pw, ph, plane, &cvTex) == kCVReturnSuccess,
+                  let ct = cvTex, let srcTex = CVMetalTextureGetTexture(ct) else {
+                ce.endEncoding()
+                lastError = "カメラの絵をテクスチャにできない（面 \(plane)）"
+                return nil
+            }
+            holds.append(ct)
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: fmt, width: pw, height: ph, mipmapped: false)
+            desc.usage = .shaderWrite
+            guard let dstTex = device.makeTexture(descriptor: desc, iosurface: surface, plane: plane) else {
+                ce.endEncoding()
+                lastError = "写し先をテクスチャにできない（面 \(plane)）"
+                return nil
+            }
+            ce.setTexture(srcTex, index: 0)
+            ce.setTexture(dstTex, index: 1)
+            ce.dispatchThreadgroups(MTLSize(width: (pw + tw - 1) / tw, height: (ph + th - 1) / th, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: tw, height: th, depth: 1))
+        }
+        ce.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+        withExtendedLifetime(holds) {}
+        CVMetalTextureCacheFlush(texCache, 0)
+        guard cb.status == .completed else { lastError = "GPU の処理が終わらなかった（状態 \(cb.status.rawValue)・\(String(describing: cb.error))）"; return nil }
+        return out
     }
 }
