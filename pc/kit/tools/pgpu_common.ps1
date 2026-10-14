@@ -5,7 +5,8 @@
 # 試す人は使わない、試験用の差し替え：
 #   IPHONE_VK_MUX=番号         Apple のサービス（127.0.0.1:27015）の代わりにこの番号へ（ドライバと同じ名前）
 #   PGPU_VKLIST=パス            vklist.exe の代わり（GPU を使わずに試すため）
-#   PGPU_TEST_ELEVATED=1        管理者で動いていることにする
+#   PGPU_TEST_ELEVATED=1|0      管理者で動いていることにする・していないことにする（0 は管理者で動く試験の機械用）
+#   PGPU_TEST_VK_LOADER=版|none  Vulkan のローダーの版をこれにする（古いローダーのふり。none は vulkan-1.dll が無い）
 #   PGPU_TEST_APPLE_SW=none|devices|itunes|service  入っている Apple のソフトをこれにする（devices は Apple Devices・itunes はストアの iTunes・service は iTunes の Windows のサービス）
 #   PGPU_SHORTCUT_DIR=フォルダ   スタートメニューと「送る」の代わりに、ここへ入口を作る
 #   PGPU_NOPROMPT=1             聞かずに「いいえ」で進み、最後に止まらない
@@ -83,6 +84,7 @@ function Save-Log([string]$name) {
 # ---- この PC ----
 function Test-Elevated {
     if ($env:PGPU_TEST_ELEVATED -eq '1') { return $true }
+    if ($env:PGPU_TEST_ELEVATED -eq '0') { return $false }
     $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
@@ -95,6 +97,11 @@ function Test-AnsiPath([string]$p) {
     return $enc.GetString($enc.GetBytes($p)) -eq $p
 }
 function Get-VulkanLoaderVersion {
+    # 試験用：古いローダーのふり。PGPU_TEST_VK_LOADER=1.3.204（版）か none（vulkan-1.dll が無い）
+    if ($env:PGPU_TEST_VK_LOADER) {
+        if ($env:PGPU_TEST_VK_LOADER -eq 'none') { return $null }
+        return [Version]$env:PGPU_TEST_VK_LOADER
+    }
     $dll = Join-Path $env:WINDIR 'System32\vulkan-1.dll'
     if (-not (Test-Path $dll)) { return $null }
     $v = (Get-Item $dll).VersionInfo

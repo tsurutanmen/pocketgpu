@@ -93,6 +93,12 @@ What you need
 - Apple Devices from the Microsoft Store, or iTunes. Windows needs one of them to talk to the iPhone over USB.
 - A free tool to install the iPhone app with your own Apple ID, such as AltStore or Sideloadly
 
+Easiest way
+Extract the zip (step 1), then double-click Setup-PocketGPU.cmd (do not use "Run as administrator").
+It checks this PC, installs what is missing with winget after asking y/N (one UAC prompt for everything that needs administrator rights),
+shows how to put the app on the iPhone, and ends with the same check as Start-PocketGPU.cmd. It never types your Apple ID for you.
+The steps below are the same thing by hand.
+
 Steps
 1. Extract the whole zip: right-click it and choose "Extract All...".
 2. Install the iPhone app: open RpcServer-*.ipa with AltStore or Sideloadly and sign in with your Apple ID.
@@ -129,7 +135,7 @@ Good to know
 
 Reporting
 - In the iPhone app, tap "Send logs" and send the text to us on Discord or by email.
-- On the PC, send pocketgpu-start-log.txt, which Start-PocketGPU.cmd writes.
+- On the PC, send pocketgpu-start-log.txt, which Start-PocketGPU.cmd writes. If you used Setup-PocketGPU.cmd, also send pocketgpu-setup-summary.txt.
   Also double-click report.cmd and send pocketgpu-report.txt. Neither has your user name, PC name or IP.
 - For the webcam and microphone, also send pocketgpu-miccam-log.txt, which Start-Mic-Camera.cmd writes.
 - Please also tell us the PC, the app or game, the resolution, and what happened.
@@ -155,6 +161,12 @@ iPhone ではなく Android のスマートフォンを使う場合は、以下�
   iPhone に付属のケーブルは USB 2 です。USB 3 に対応しているのは、iPhone 15 Pro 以降の Pro モデルだけです
 - Microsoft Store の Apple Devices または iTunes。Windows が USB で iPhone と通信するために、どちらかが必要です
 - 自分の Apple ID で iPhone にアプリをインストールするための無料のツール。AltStore や Sideloadly など
+
+いちばん簡単な方法
+zip を展開（手順 1）したら、Setup-PocketGPU.cmd をダブルクリックしてください（「管理者として実行」は使わないでください）。
+この PC をチェックして、足りない物を y/N で聞いてから winget でインストールします（管理者権限が必要な物は、まとめて UAC の確認が 1 回だけです）。
+iPhone へのアプリの入れ方を案内して、最後に Start-PocketGPU.cmd と同じチェックまで行います。Apple ID を代わりに入力することはありません。
+以下の手順は、同じことを手作業で行う方法です。
 
 手順
 1. zip ファイルを右クリックして「すべて展開」を選び、すべてのファイルを展開してください
@@ -192,7 +204,7 @@ iPhone ではなく Android のスマートフォンを使う場合は、以下�
 
 報告
 - iPhone のアプリの「ログを送信」をタップして、そのテキストを Discord かメールで送ってください
-- PC では、Start-PocketGPU.cmd が作成する pocketgpu-start-log.txt を送ってください。
+- PC では、Start-PocketGPU.cmd が作成する pocketgpu-start-log.txt を送ってください。Setup-PocketGPU.cmd を使ったときは、pocketgpu-setup-summary.txt も送ってください。
   report.cmd をダブルクリックして作成される pocketgpu-report.txt も送ってください。どちらのファイルにも、ユーザー名・PC 名・IP アドレスは含まれません
 - ウェブカメラとマイクについては、Start-Mic-Camera.cmd が作成する pocketgpu-miccam-log.txt も送ってください
 - PC、アプリやゲームの名前、解像度、何が起きたかも書いてください
@@ -1096,10 +1108,10 @@ def main():
         open(os.path.join(kit, name), 'w', encoding='ascii', newline='\r\n').write(text)
     # 入口 2 つと、その中身（PowerShell）。前の check.cmd は Start-PocketGPU.cmd の 7 番目が代わる
     # Update-PocketGPU.cmd と tools\update.ps1 は更新の入口（10/12）
-    for name in ('Start-PocketGPU.cmd', 'Run-on-iPhone-GPU.cmd', 'Update-PocketGPU.cmd'):
+    for name in ('Start-PocketGPU.cmd', 'Setup-PocketGPU.cmd', 'Run-on-iPhone-GPU.cmd', 'Update-PocketGPU.cmd'):
         shutil.copy2(os.path.join(HERE, 'kit', name), os.path.join(kit, name))
     os.makedirs(os.path.join(kit, 'tools'), exist_ok=True)
-    for name in ('pgpu_common.ps1', 'pgpu_port.ps1', 'start.ps1', 'run.ps1', 'update.ps1'):
+    for name in ('pgpu_common.ps1', 'pgpu_port.ps1', 'start.ps1', 'setup.ps1', 'setup-admin.ps1', 'run.ps1', 'update.ps1'):
         shutil.copy2(os.path.join(HERE, 'kit', 'tools', name), os.path.join(kit, 'tools', name))
     # 更新を聞く先と、その人の合言葉。人ごとの物なので更新では差し替えない。ひな形には入れない
     if not a.template:

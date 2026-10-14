@@ -221,6 +221,8 @@ function Invoke-Get([string]$url, [string]$outFile = '') {
 # ---- キットのフォルダ ----
 function Test-KitDir([string]$d) {
     if (-not $d) { return $false }
+    # iphone_icd.dll が欠けていても（ウイルス対策ソフトが隔離したときなど）、更新用の情報（tools\update.ini）があればキットとして扱う。欠けた物を取り直すため
+    if (Test-Path -LiteralPath (Join-Path $d 'tools\update.ini')) { return $true }
     return (Test-Path -LiteralPath (Join-Path $d 'Start-PocketGPU.cmd')) -and (Test-Path -LiteralPath (Join-Path $d 'iphone_icd.dll'))
 }
 # 更新の道具だけを展開したとき：近くと、ダウンロード・デスクトップ・ドキュメントの PocketGPU-* を 2 段まで探す
@@ -254,14 +256,30 @@ function Select-Folder {
 }
 
 # ---- 動いている道具 ----
+# このプロセスを呼び出した側（Fix-PocketGPU.cmd の PowerShell など）の PID。止める相手に入れない
+function Get-AncestorPids {
+    $set = New-Object System.Collections.Generic.HashSet[int]
+    try {
+        $all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+        $cur = $PID
+        for ($i = 0; $i -lt 12; $i++) {
+            $row = $all | Where-Object { $_.ProcessId -eq $cur } | Select-Object -First 1
+            if (-not $row -or -not $row.ParentProcessId -or $row.ParentProcessId -eq 0) { break }
+            [void]$set.Add([int]$row.ParentProcessId)
+            $cur = [int]$row.ParentProcessId
+        }
+    } catch { }
+    return $set
+}
 function Get-KitProcesses {
     $root = $script:KitRoot.TrimEnd('\') + '\'
     $list = @()
+    $anc = Get-AncestorPids
     foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
         if ($p.ProcessId -eq $PID) { continue }
         $exe = $p.ExecutablePath
         if ($exe -and $exe.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { $list += $p; continue }
-        if ($p.Name -match '^(powershell|pwsh)\.exe$' -and $p.CommandLine -and
+        if ($p.Name -match '^(powershell|pwsh)\.exe$' -and $p.CommandLine -and -not $anc.Contains([int]$p.ProcessId) -and
             $p.CommandLine.IndexOf($root + 'tools\', [StringComparison]::OrdinalIgnoreCase) -ge 0) { $list += $p }
     }
     return $list
