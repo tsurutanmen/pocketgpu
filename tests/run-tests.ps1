@@ -971,9 +971,15 @@ function Scn-PortCmd([string]$mode) {
         # pocketgpu_android.cmd：口を指定せずに単体で動かしても、覚えた口（IPHONE_VK=127.0.0.1:口）
         $r = Invoke-KitCmd $k 'pocketgpu_android.cmd' 'cmd.exe /c set' $noEnv
         Check 'pocketgpu_android.cmd：口を指定しなくても、覚えた口を IPHONE_VK に渡す' ($r.Out -match ('IPHONE_VK=127\.0\.0\.1:' + $g + '\b')) 'safety'
-        # check_android.cmd：vklist.exe の代わりに cmd.exe を置いて、環境変数を読む
-        Copy-Item $env:ComSpec (Join-Path $k.Kit 'vklist.exe') -Force
-        $r = Invoke-KitCmd $k 'check_android.cmd' '' $noEnv ("set IPHONE_VK`r`nexit`r`n")
+        # check_android.cmd：vklist.exe の代わりに、IPHONE_VK を出すだけの小さな exe を置く
+        # （cmd.exe の写しに標準入力で打たせる形は、GitHub の試験機では IPHONE_VK を出さなかった）
+        $envExe = Join-Path $Work 'fakeenv\printenv.exe'
+        if (-not (Test-Path $envExe)) {
+            [void](New-Item -ItemType Directory -Path (Split-Path -Parent $envExe) -Force)
+            Add-Type -TypeDefinition 'public static class PrintEnv { public static void Main() { System.Console.WriteLine("IPHONE_VK=" + System.Environment.GetEnvironmentVariable("IPHONE_VK")); } }' -OutputAssembly $envExe -OutputType ConsoleApplication
+        }
+        Copy-Item $envExe (Join-Path $k.Kit 'vklist.exe') -Force
+        $r = Invoke-KitCmd $k 'check_android.cmd' '' $noEnv
         Check 'check_android.cmd：口を指定しなくても、覚えた口を IPHONE_VK に渡す' ($r.Out -match ('IPHONE_VK=127\.0\.0\.1:' + $g + '\b')) 'safety'
         # tools\run.ps1（Android の形）：IPHONE_VK を覚えた口にする
         $root = Join-Path (Split-Path -Parent $k.Kit) 'games'
