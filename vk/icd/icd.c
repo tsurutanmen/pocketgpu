@@ -1703,6 +1703,106 @@ static vr_sock usb_connect(int port) {
     return s;
 }
 
+// ---- muxwarm1015：USB の道を温める流れ（既定は切） ----
+// usbmuxd の道は、間をあけて流すと、ときどき数百 ms〜数秒止まり、そのあと一気に届く（10/14 の測定。休みなく往復を流すと止まりがほぼ消えた）。
+// IPHONE_VK_WARM=間隔ms を立てると、別の usbmux のつなぎを iPhone の 50058 番（速さを測る口。USB では合言葉なし・0.7.10 から）に張り、
+// [u32 0][u64 N] を送って N バイト返してもらう往復を、その間隔で繰り返す（0 は休みなし）。GPU のつなぎ（50060）には何も足さない。
+//   IPHONE_VK_WARM_BYTES=N（返してもらう数。既定 64）・IPHONE_VK_WARM_PORT=番号（既定 50058）
+// インターネット共有の口（IPHONE_VK=link）は usbmuxd を通らないので温めない。つながらなければ 2 秒から 30 秒まで間をのばして試し直す
+static struct {
+    int ms, bytes, port, started;
+    volatile long n, fails;
+    double max_ms;
+} g_warm;
+static void warm_sleep_us(void *tm, int us) {
+    if (us <= 0) return;
+#ifdef _WIN32
+    if (tm) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG) us * 10; // 100 ns 単位
+        if (SetWaitableTimer((HANDLE) tm, &due, 0, NULL, NULL, FALSE)) { WaitForSingleObject((HANDLE) tm, (DWORD) (us / 1000) + 50); return; }
+    }
+    Sleep((DWORD) ((us + 999) / 1000));
+#else
+    (void) tm;
+    struct timespec ts = { us / 1000000, (long) (us % 1000000) * 1000 };
+    nanosleep(&ts, NULL);
+#endif
+}
+static DWORD WINAPI warm_thread(LPVOID p) {
+    (void) p;
+    void *tm = NULL;
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    tm = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!tm) tm = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+#endif
+    const uint32_t nb = (uint32_t) g_warm.bytes;
+    uint8_t *buf = calloc(1, nb + 16);
+    vr_sock ws = INVALID_SOCKET;
+    int backoff = 2000, said = 0;
+    double last_note = now_ms();
+    long n_note = 0;
+    while (buf) {
+        if (ws == INVALID_SOCKET) {
+            ws = usb_connect(g_warm.port);
+            if (ws == INVALID_SOCKET) {
+                g_warm.fails++;
+                if (!said) say("温める流れ：iPhone の %d 番につながらない。間をのばして試し直す", g_warm.port);
+                said = 1;
+                Sleep((DWORD) backoff);
+                backoff = backoff * 2 > 30000 ? 30000 : backoff * 2;
+                continue;
+            }
+            vr_nodelay(ws);
+            sock_rcvtimeo(ws, 15000); // 道が数秒止まっても切らない
+            say("温める流れ：iPhone の %d 番に別のつなぎを張った（%d ms ごとに %u バイトの往復）", g_warm.port, g_warm.ms, nb);
+            backoff = 2000, said = 0;
+        }
+        uint8_t req[12];
+        uint32_t dir = 0;
+        uint64_t n64 = nb;
+        memcpy(req, &dir, 4);
+        memcpy(req + 4, &n64, 8);
+        double t0 = now_ms();
+        if (!vr_send_all(ws, req, sizeof req) || !vr_recv_all(ws, buf, nb)) {
+            closesocket(ws);
+            ws = INVALID_SOCKET;
+            g_warm.fails++;
+            Sleep(1000);
+            continue;
+        }
+        double t1 = now_ms(), ms = t1 - t0;
+        g_warm.n++;
+        if (ms > g_warm.max_ms) g_warm.max_ms = ms;
+        if (ms > 200) say("温める流れ：往復が %.0f ms かかった（道が止まっていた）", ms);
+        // 60 秒ごとに 1 行（IPHONE_VK_LOG=1 のとき）
+        if (t1 - last_note >= 60000) {
+            say("温める流れ：直近 %.0f 秒で %ld 回の往復・つなぎ直し %ld 回・いちばん長い往復 %.1f ms", (t1 - last_note) / 1000, g_warm.n - n_note, g_warm.fails, g_warm.max_ms);
+            last_note = t1, n_note = g_warm.n, g_warm.max_ms = 0;
+        }
+        warm_sleep_us(tm, g_warm.ms * 1000);
+    }
+    return 0;
+}
+// connect_locked から呼ぶ（g_lock を持っている）。1 つのプロセスで糸は 1 本だけ
+static void warm_maybe_start(int is_link) {
+    if (g_warm.started) return;
+    const char *e = getenv("IPHONE_VK_WARM");
+    if (!e || !*e || *e < '0' || *e > '9') return; // 既定は切（空・off・-1 も切）
+    if (is_link) { say("温める流れ：インターネット共有の口では温めない（usbmuxd を通らない）"); g_warm.started = 1; return; }
+    g_warm.ms = atoi(e);
+    const char *b = getenv("IPHONE_VK_WARM_BYTES"), *pp = getenv("IPHONE_VK_WARM_PORT");
+    g_warm.bytes = b && atoi(b) > 0 && atoi(b) <= (1 << 20) ? atoi(b) : 64;
+    g_warm.port = pp && atoi(pp) > 0 && atoi(pp) < 65536 ? atoi(pp) : 50058;
+    g_warm.started = 1;
+    HANDLE t = CreateThread(NULL, 0, warm_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+    say("温める流れ：入（%d ms ごと%s・%d バイト・%d 番）", g_warm.ms, g_warm.ms == 0 ? "＝休みなし" : "", g_warm.bytes, g_warm.port);
+}
+
 // ---- インターネット共有の口（Backburner と同じく、USB を有線のネットワークとして使う道） ----
 // まず USB の口（usbmux）か host:port につなぎ、VR_GET_LINK で「インターネット共有の口の住所と合言葉」を聞く。
 // 聞けたら、その口に TCP でつなぎ直し、最初に "VKRA" と合言葉を送る。だめなら、いつもの口でつなぐ
@@ -1816,6 +1916,7 @@ static int connect_locked(void) {
     sock_rcvtimeo(s, 5000); // 最初のあいさつだけは 5 秒で諦める
     g_sock = s;
     say("%s:%s につないだ", host, port);
+    warm_maybe_start(e && !strncmp(e, "link", 4) && (e[4] == 0 || e[4] == ':')); // muxwarm1015：IPHONE_VK_WARM のときだけ
     // つないだら、このドライバの DLL をプロセスが終わるまで外させない。最後の instance を壊すとローダーが DLL を外して読み直すが、
     // 外れるときにつながりを閉じないので古いつながりが残り、受け手（一度に 1 人の相手）が 2 本目のあいさつに答えず固まった（CTS で見つかった）
 #ifdef _WIN32
