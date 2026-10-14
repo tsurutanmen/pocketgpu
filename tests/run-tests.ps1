@@ -1019,7 +1019,9 @@ function Invoke-RunDx($kit, $g, [hashtable]$envs, [string]$answers) {
     $e = @{ PGPU_DRYRUN = '1' }
     foreach ($k in $envs.Keys) { $e[$k] = $envs[$k] }
     $script:RawOut = $true
-    try { $r = Invoke-Fix $kit @('"' + $g.Exe + '"') $e $answers (Join-Path $kit 'tools' | Join-Path -ChildPath 'run.ps1') } finally { $script:RawOut = $false }
+    # run.ps1 は画面の文を Windows の既定の文字コードで出すので、英語の Windows（GitHub の試験機）では日本語が化ける。試験では UTF-8 にしてから動かす
+    $run = Join-Path $kit 'tools' | Join-Path -ChildPath 'run.ps1'
+    try { $r = Invoke-Fix $kit @('"' + $run + '"', '"' + $g.Exe + '"') $e $answers (Join-Path $PSScriptRoot 'fakes\utf8-run.ps1') } finally { $script:RawOut = $false }
     $bytes = [Text.Encoding]::GetEncoding(28591).GetBytes([string]$r.Out)
     try { $r.Out = (New-Object Text.UTF8Encoding($false, $true)).GetString($bytes) }
     catch { $r.Out = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage).GetString($bytes) }
