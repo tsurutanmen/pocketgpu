@@ -12,6 +12,7 @@
 #define BW_CLOSE closesocket
 #else
 #include <pthread.h>
+#include <poll.h>
 #define BW_CLOSE close
 #endif
 
@@ -68,7 +69,7 @@ static void *bw_thread(void *p) { bw_client((vr_sock) (intptr_t) p); return NULL
 static uint8_t g_bw_token[16];
 static int g_bw_token_ok;
 static char g_bw_extra[64];
-static vr_sock g_bw_extra_ls = VR_BAD_SOCK;
+static volatile vr_sock g_bw_extra_ls = VR_BAD_SOCK;
 void vkr_bw_set_token(const char *hex) { g_bw_token_ok = vr_token_parse(hex, g_bw_token); }
 
 #ifdef _WIN32
@@ -78,8 +79,23 @@ static void *bw_extra_thread(void *p) {
 #endif
     vr_sock ls = (vr_sock) (uintptr_t) p;
     for (;;) {
+#ifndef _WIN32
+        // 口を替えた・閉じたときは、この糸が自分の口を閉じて終わる（別の糸が close しても accept が戻らず、口が bind されたまま残ることがあるので、0.5 秒ごとの poll で見る）
+        if (ls != g_bw_extra_ls) {
+            BW_CLOSE(ls);
+            break;
+        }
+        struct pollfd pf = { .fd = ls, .events = POLLIN, .revents = 0 };
+        if (poll(&pf, 1, 500) <= 0) continue;
+#endif
         vr_sock c = accept(ls, NULL, NULL);
-        if (c == VR_BAD_SOCK) break;
+        if (c == VR_BAD_SOCK) {
+#ifdef _WIN32
+            break;
+#else
+            continue;
+#endif
+        }
         if (!g_bw_token_ok || !vr_link_auth(c, g_bw_token)) { BW_CLOSE(c); continue; }
 #ifdef _WIN32
         HANDLE t = CreateThread(NULL, 0, bw_thread, (LPVOID) (uintptr_t) c, 0, NULL);
@@ -95,14 +111,20 @@ static void *bw_extra_thread(void *p) {
 // インターネット共有の口（host）でも待ち始める。同じ口なら何もしない。空の住所なら口を閉じる
 int vkr_bw_listen_extra(const char *host, int port) {
     if (!host || !*host) {
+#ifdef _WIN32
         if (g_bw_extra_ls != VR_BAD_SOCK) BW_CLOSE(g_bw_extra_ls);
+#endif
+        // Windows 以外は、待っている糸が気づいて口を閉じる
         g_bw_extra_ls = VR_BAD_SOCK;
         g_bw_extra[0] = 0;
         return 0;
     }
     if (!strcmp(host, g_bw_extra)) return 0;
+#ifdef _WIN32
     if (g_bw_extra_ls != VR_BAD_SOCK) BW_CLOSE(g_bw_extra_ls);
+#endif
     g_bw_extra_ls = VR_BAD_SOCK;
+    g_bw_extra[0] = 0;
     vr_sock ls = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, sizeof one);
@@ -117,7 +139,14 @@ int vkr_bw_listen_extra(const char *host, int port) {
     if (t) CloseHandle(t);
 #else
     pthread_t t;
-    if (pthread_create(&t, NULL, bw_extra_thread, (void *) (uintptr_t) ls) == 0) pthread_detach(t);
+    if (pthread_create(&t, NULL, bw_extra_thread, (void *) (uintptr_t) ls) == 0) {
+        pthread_detach(t);
+    } else {
+        BW_CLOSE(ls);
+        g_bw_extra_ls = VR_BAD_SOCK;
+        g_bw_extra[0] = 0;
+        return 1;
+    }
 #endif
     return 0;
 }

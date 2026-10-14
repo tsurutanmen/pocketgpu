@@ -144,8 +144,8 @@ struct ContentView: View {
     @AppStorage("metalTensor") private var metalTensor = true
     // 試す用の IPA だけ：MoltenVK のレイトレーシング（作りかけ）を有効にする。初めは切り。読むのは RpcServerApp.init
     @AppStorage("rtExperimental") private var rtExperimental = false
-    // インターネット共有を USB でつないだ有線の網でも Vulkan と速さを測る口を待つ。初めは切り。合言葉は USB の口で PC に渡す
-    @AppStorage("hotspotListen") private var hotspotListen = false
+    // インターネット共有を USB でつないだ有線の網でも Vulkan と速さを測る口を待つ。初めは入り（共有が出ていなければ何も待たない）。合言葉は USB の口で PC に渡す
+    @AppStorage("hotspotListen") private var hotspotListen = true
     @State private var onCPU = false
     @State private var vkStarted = false
     @State private var vkFailed = false
@@ -237,10 +237,9 @@ struct ContentView: View {
                 // 2 は Vulkan がまだ起きていない。次の 1 秒でもう一度
                 if vkr_hotspot_tick(hotspotListen ? 1 : 0, &buf, Int32(cap)) != 2 {
                     let h = String(cString: buf)
-                    if h != linkHost {
-                        linkHost = h
-                        h.withCString { _ = vkr_bw_listen_extra($0, 50058) }
-                    }
+                    if h != linkHost { linkHost = h }
+                    // 速さを測る口は、開けなかったときのために毎回呼ぶ（同じ住所で開いていれば何もしない）
+                    h.withCString { _ = vkr_bw_listen_extra($0, 50058) }
                 }
             }
             log = readBridge { rpc_bridge_log($0, $1) }

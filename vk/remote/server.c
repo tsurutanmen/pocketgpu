@@ -40,6 +40,7 @@
 #include <unistd.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <poll.h>
 #endif
 #ifdef __APPLE__
 #include <pthread/qos.h>
@@ -899,7 +900,7 @@ static int g_token_ok;
 static char g_extra_host[64];
 static int g_main_port = VR_DEFAULT_PORT;
 static volatile int g_cur_remote; // いま相手をしているのがインターネット共有の口から来た人なら 1
-static vr_sock g_extra_ls = VR_BAD_SOCK;
+static volatile vr_sock g_extra_ls = VR_BAD_SOCK;
 static const char *g_extra_env; // PC の代役の調べ用（VKR_EXTRA_LISTEN）
 #ifdef _WIN32
 static SRWLOCK g_serve_lk = SRWLOCK_INIT;
@@ -6873,9 +6874,22 @@ static void *extra_thread(void *p) {
     qos_hi();
     vr_sock ls = (vr_sock) (uintptr_t) p;
     for (;;) {
+#ifndef _WIN32
+        // 口を替えた・閉じたときは、この糸が自分の口を閉じて終わる。
+        // 別の糸が close しても、待っている accept が戻らず口が bind されたまま残ることがある（共有をまた入れたときに同じ住所で待てなくなる）ので、
+        // accept の前に 0.5 秒ごとの poll で口の持ち主が変わっていないか見る
+        if (ls != g_extra_ls) {
+            close(ls);
+            break;
+        }
+        struct pollfd pf = { .fd = ls, .events = POLLIN, .revents = 0 };
+        if (poll(&pf, 1, 500) <= 0) continue;
+#endif
         vr_sock c = accept(ls, NULL, NULL);
         if (c == VR_BAD_SOCK) {
+#ifdef _WIN32
             if (ls != g_extra_ls) break; // 口を替えたので終わる
+#endif
             sleep_ms(100);
             continue;
         }
@@ -6907,9 +6921,8 @@ int vkr_listen_extra(const char *host) {
         if (old != VR_BAD_SOCK) {
 #ifdef _WIN32
             closesocket(old);
-#else
-            close(old);
 #endif
+            // Windows 以外は、待っている糸が 0.5 秒以内に気づいて口を閉じる（extra_thread）
             vlog(JE("インターネット共有の口を閉じた", "Closed the internet sharing port"));
         }
         return 0;
@@ -6934,51 +6947,70 @@ int vkr_listen_extra(const char *host) {
 #endif
         return 1;
     }
+#ifdef _WIN32
     vr_sock old = g_extra_ls;
+#endif
     g_extra_ls = ls;
     snprintf(g_extra_host, sizeof g_extra_host, "%s", host);
-    if (old != VR_BAD_SOCK) {
 #ifdef _WIN32
-        closesocket(old);
-#else
-        close(old);
-#endif
-    }
-#ifdef _WIN32
+    if (old != VR_BAD_SOCK) closesocket(old);
     HANDLE t = CreateThread(NULL, 0, extra_thread, (LPVOID) (uintptr_t) ls, 0, NULL);
     if (t) CloseHandle(t);
 #else
+    // 前の口は、待っている糸が気づいて閉じる
     pthread_t t;
-    if (pthread_create(&t, NULL, extra_thread, (void *) (uintptr_t) ls) == 0) pthread_detach(t);
+    if (pthread_create(&t, NULL, extra_thread, (void *) (uintptr_t) ls) == 0) {
+        pthread_detach(t);
+    } else {
+        close(ls);
+        g_extra_ls = VR_BAD_SOCK;
+        g_extra_host[0] = 0;
+        vlog(JE("インターネット共有の口：待つ糸を作れない", "Internet sharing port: cannot create the listener thread"));
+        return 1;
+    }
 #endif
     vlog(JE("インターネット共有の口：%s:%d でも待つ（合言葉つき）", "Internet sharing port: also listening on %s:%d (token required)"), host, g_main_port);
     return 0;
 }
 
 // ---- インターネット共有の網の口を選んで待つ（アプリの設定で入り切り） ----
-// 待つのは、名前が bridge で始まり（iOS のインターネット共有は bridge100 など）、IPv4 が 172.20.10.0/28 の口だけ。
+// 待つのは、IPv4 が 172.20.10.0/28 の中にあって、次のどちらかの口だけ。
+//   ・住所が 172.20.10.1（共有を出している側の iPhone の住所。口の名前は問わない）
+//   ・名前が bridge で始まる口（iOS のインターネット共有は bridge100 など）
 // 0.0.0.0 では待たない（Wi-Fi の en0 で、同じネットワークのほかの人からも届いてしまう）。
-// この iPhone がほかの iPhone の共有に Wi-Fi でつないでいて en0 が 172.20.10.x でも、名前が bridge でないので待たない。
+// この iPhone がほかの iPhone の共有に Wi-Fi でつないでいて en0 が 172.20.10.2 以降になっていても、名前が bridge でなく .1 でもないので待たない。
 // bridge の口には、インターネット共有に Wi-Fi でつないだ人も来るので、合言葉は外さない
 static uint32_t g_hs_net = 0xAC140A00u, g_hs_mask = 0xFFFFFFF0u; // 172.20.10.0/28（ホストの並び）
-static int hs_match(const char *name, uint32_t ip) { return name && !strncmp(name, "bridge", 6) && (ip & g_hs_mask) == g_hs_net; }
+static int hs_match(const char *name, uint32_t ip) {
+    if ((ip & g_hs_mask) != g_hs_net) return 0;
+    if (ip == g_hs_net + 1u) return 1;
+    return name && !strncmp(name, "bridge", 6);
+}
+
+// 見つからなかったときに記録へ残す「いまの IPv4 の口の一覧」（lo 以外。name=住所 を空白でつなぐ）に、1 つ足す
+static void hs_seen_add(char *seen, size_t scap, const char *name, const char *ip) {
+    size_t n = strlen(seen);
+    if (n + 2 < scap) snprintf(seen + n, scap - n, "%s%s=%s", n ? " " : "", name, ip);
+}
 
 #ifdef _WIN32
 // PC の代役の試験用：VKR_HOTSPOT_FAKE_FILE に「名前 住所」を 1 行ずつ書くと、それをインターフェースの一覧として読む（呼ばれるたびに読み直す）。
 // 「off」で始まる行があれば、アプリの設定を切ったのと同じ。網は VKR_HOTSPOT_NET（main で読む）で 127.0.0.0/8 などに替える
-static int hs_pick(char *out, size_t cap, int *off) {
+static int hs_pick(char *out, size_t cap, int *off, char *seen, size_t scap) {
     *off = 0;
+    seen[0] = 0;
     const char *f = getenv("VKR_HOTSPOT_FAKE_FILE");
     FILE *fp = f && *f ? fopen(f, "r") : NULL;
     if (!fp) return 0;
     char line[200];
     int found = 0;
-    while (!found && fgets(line, sizeof line, fp)) {
+    while (fgets(line, sizeof line, fp)) {
         char name[64], ip[64];
         struct in_addr ia;
         if (!strncmp(line, "off", 3)) { *off = 1; break; }
         if (sscanf(line, "%63s %63s", name, ip) != 2 || inet_pton(AF_INET, ip, &ia) != 1) continue;
-        if (!hs_match(name, ntohl(ia.s_addr))) continue;
+        hs_seen_add(seen, scap, name, ip);
+        if (found || !hs_match(name, ntohl(ia.s_addr))) continue;
         snprintf(out, cap, "%s", ip);
         found = 1;
     }
@@ -6986,16 +7018,21 @@ static int hs_pick(char *out, size_t cap, int *off) {
     return found;
 }
 #else
-static int hs_pick(char *out, size_t cap, int *off) {
+static int hs_pick(char *out, size_t cap, int *off, char *seen, size_t scap) {
     struct ifaddrs *head = NULL;
     int found = 0;
     *off = 0;
+    seen[0] = 0;
     if (getifaddrs(&head) != 0) return 0;
-    for (struct ifaddrs *p = head; p && !found; p = p->ifa_next) {
-        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET || !(p->ifa_flags & IFF_UP)) continue;
+    for (struct ifaddrs *p = head; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET || !(p->ifa_flags & IFF_UP) || (p->ifa_flags & IFF_LOOPBACK)) continue;
         struct in_addr ia = ((struct sockaddr_in *) (void *) p->ifa_addr)->sin_addr;
-        if (!hs_match(p->ifa_name, ntohl(ia.s_addr))) continue;
-        found = inet_ntop(AF_INET, &ia, out, (socklen_t) cap) != NULL;
+        char ipt[INET_ADDRSTRLEN];
+        if (!inet_ntop(AF_INET, &ia, ipt, sizeof ipt)) continue;
+        hs_seen_add(seen, scap, p->ifa_name, ipt);
+        if (found || !hs_match(p->ifa_name, ntohl(ia.s_addr))) continue;
+        snprintf(out, cap, "%s", ipt);
+        found = 1;
     }
     freeifaddrs(head);
     return found;
@@ -7008,10 +7045,24 @@ static int hs_pick(char *out, size_t cap, int *off) {
 int vkr_hotspot_tick(int on, char *out, int cap) {
     static char failed[64];
     static double retry_at;
-    char want[64] = "";
+    static int on_logged = -1, none_logged;
+    static char seen_logged[256];
+    char want[64] = "", seen[256] = "";
     int off = 0, r = 0;
-    if (on && !hs_pick(want, sizeof want, &off)) want[0] = 0;
+    if (on != on_logged) {
+        on_logged = on;
+        vlog(on ? JE("インターネット共有の口を探す：入", "Looking for the internet sharing port: on") : JE("インターネット共有の口を探す：切", "Looking for the internet sharing port: off"));
+    }
+    if (on && !hs_pick(want, sizeof want, &off, seen, sizeof seen)) want[0] = 0;
     if (off) want[0] = 0;
+    if (want[0]) {
+        none_logged = 0;
+    } else if (on && !off && (!none_logged || strcmp(seen, seen_logged))) {
+        // 共有の口が無い間は、IPv4 の口の一覧が変わったときだけ記録に残す（どの名前・住所で見つからなかったかが分かる）
+        none_logged = 1;
+        snprintf(seen_logged, sizeof seen_logged, "%s", seen);
+        vlog(JE("インターネット共有の口が見つからない。いまの IPv4 の口：%s", "No internet sharing port found. Current IPv4 interfaces: %s"), seen[0] ? seen : "(none)");
+    }
     if (strcmp(want, g_extra_host)) {
         if (!want[0]) {
             vkr_listen_extra("");
