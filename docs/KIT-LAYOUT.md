@@ -5,6 +5,7 @@
 | このリポジトリ | キットの中 | 中身 |
 | --- | --- | --- |
 | `kit/Start-PocketGPU.cmd` | 同じ場所 | 自動セットアップの入口 |
+| `kit/Setup-PocketGPU.cmd` | 同じ場所 | 全部入れる・設定する入口（見る → 聞いて入れる → iPhone のアプリの案内 → 最後のチェック） |
 | `kit/Run-on-iPhone-GPU.cmd` | 同じ場所 | アプリを GPU を指定して起動する入口 |
 | `kit/Update-PocketGPU.cmd` | 同じ場所 | 更新の入口 |
 | `kit/Fix-PocketGPU.cmd` | 同じ場所 | 自動修復の入口 |
@@ -13,6 +14,7 @@
 | `kit/pocketgpu_android.cmd`・`kit/check_android.cmd` | 同じ場所 | Android 用の入口 |
 | `kit/android/*.cmd` | `android\` | Android の受け手を入れる・止める。`android_app.cmd` は PocketGPU アプリ用（カメラ・マイク・スピーカー・GPU の口をつなぐ） |
 | `kit/tools/*.ps1` | `tools\` | 上の入口の中身（Windows PowerShell 5.1）。`pgpu_port.ps1` は Android の PC 側の口を選んで `android\port.txt` に覚える |
+| `kit/tools/setup.ps1`・`kit/tools/setup-admin.ps1` | `tools\` | `Setup-PocketGPU.cmd` の中身。`setup-admin.ps1` は管理者権限が要る物（winget の iTunes・Vulkan Runtime・Visual C++・Apple のサービスの開始）を、UAC 1 回でまとめて受け取る小さな部分で、`setup.ps1` からだけ起動する。受け取るのは決まった名前だけ |
 | `kit/tools/fix-data/*.cmd` | `tools\fix-data\` | Fix-PocketGPU.cmd が、古い入口と入れ替える新しい物 |
 
 ## 守ること / Rules

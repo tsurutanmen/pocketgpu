@@ -11,6 +11,7 @@ This repository has only the scripts that install, check and repair a PocketGPU 
 
 ## What is in here
 
+- `Setup-PocketGPU.cmd`: one double-click: checks this PC, installs what is missing (after y/N), shows how to put the app on the iPhone, ends with the same check as `Start-PocketGPU.cmd`
 - `Start-PocketGPU.cmd`: checks the PC and the phone step by step
 - `Fix-PocketGPU.cmd`: finds problems and fixes the ones it can
 - `Update-PocketGPU.cmd`: downloads only the files that changed
@@ -19,6 +20,28 @@ This repository has only the scripts that install, check and repair a PocketGPU 
 - Tests in `tests/`
 
 Not in here: the GPU driver (`iphone_icd.dll`), the iPhone and Android apps, the webcam and audio tools, and `PocketGPU.exe`.
+
+## Setup-PocketGPU
+
+Double-click `Setup-PocketGPU.cmd` in your kit folder. Do not use "Run as administrator".
+
+1. It checks: Windows, winget, Apple Devices or iTunes, the Apple service (port 27015), the Apple USB and Ethernet drivers, the Vulkan loader, the Visual C++ runtime, the virtual camera, DXVK, the kit version, the iPhone app and AltServer.
+2. It asks `y/N` before each install. Things that need administrator rights go to one small administrator window (`tools\setup-admin.ps1`), so Windows asks UAC **once**. It only receives names from a fixed list. The commands are in that file.
+3. It shows the `.ipa` and the steps for AltServer ("Sideload .ipa"). It never installs AltServer and never types your Apple ID.
+4. It runs the same check as `Start-PocketGPU.cmd` and writes `pocketgpu-setup-summary.txt`. You can paste it in Discord. It has no user names, PC names or folder paths.
+
+| What | Installed with | Administrator |
+| --- | --- | --- |
+| Apple Devices (Microsoft Store) | `winget install --id 9NP83LWLPZ9K --source msstore` | no |
+| iTunes (if Apple Devices cannot be installed) | `winget install --id Apple.iTunes` | yes |
+| Vulkan loader missing | `winget install --id KhronosGroup.VulkanRT` (LunarG) | yes |
+| Vulkan loader older than 1.3.234 | nothing: the kit passes the driver with `VK_ICD_FILENAMES`, so an old loader works. Asks only if you want the newer one | yes |
+| Visual C++ Redistributable | `winget install --id Microsoft.VCRedist.2015+.x64` (and `.x86`), only if a kit file imports a `vcruntime14x` / `msvcp14x` DLL that this PC does not have. The current kit does not | yes |
+| Apple service stopped (iTunes) | starts `Apple Mobile Device Service` | yes |
+| Virtual camera | `camera_setup.exe install` (this user only, HKCU) | no |
+| New kit version | `update.ps1` | no |
+
+Options: `-CheckOnly` (check only, change nothing), `-Yes` (answer yes to every question). Without winget, it only shows the pages to open.
 
 ## Fix-PocketGPU
 
@@ -127,6 +150,7 @@ PocketGPU は、スマホを Windows の PC の 2 枚目の GPU・ウェブカ�
 
 ### 使い方
 
+- `Setup-PocketGPU.cmd`：ダブルクリック 1 回で、この PC をチェックして、足りない物を（`y/N` で聞いてから）インストールし、iPhone へのアプリの入れ方を案内して、最後に `Start-PocketGPU.cmd` と同じチェックまで行います。管理者権限が必要な物は、UAC の確認が 1 回だけです。AltServer と Apple ID は自動にしません。結果は `pocketgpu-setup-summary.txt` に書きます
 - `Start-PocketGPU.cmd`：PC とスマホを順にチェックします
 - `Fix-PocketGPU.cmd`：問題を探して、直せる物を直します。直す前に 1 つずつ `y/N` で聞きます。何も消しません。入れ替えた物は `fix-backup\` に残します
 - `Update-PocketGPU.cmd`：変わったファイルだけをダウンロードします

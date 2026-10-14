@@ -110,7 +110,7 @@ function New-Kit([string]$name) {
 }
 function Get-Sha([string]$p) { return (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash }
 function Get-TreeHash([string]$root) {
-    $skip = '\\(update-backup|fix-backup)\\|pocketgpu-(fix|update|start)-(log|summary)\.txt$'
+    $skip = '\\(update-backup|fix-backup)\\|pocketgpu-(fix|update|start|setup)-(log|summary)\.txt$'
     $lines = foreach ($f in (Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object { $_.FullName -notmatch $skip } | Sort-Object FullName)) {
         $f.FullName.Substring($root.Length) + ' ' + (Get-Sha $f.FullName)
     }
@@ -266,6 +266,86 @@ function Get-Mode([string]$mode, [string]$fixAnswers) {
     return $fixAnswers
 }
 function Use-Mode([string]$mode, $kit) { if ($mode -eq 'sabotage') { Make-Sabotaged $kit } }
+
+# =====================================================================
+# Setup-PocketGPU.cmd（tools\setup.ps1）の試験の道具。偽の winget（入れた印だけを置く）・偽の camera_setup.exe（レジストリに触らない）・
+# UAC の代わりの記録。この PC に何も入れず、HKLM・HKCU・サービス・ドライバ・ネットワークを変えない
+# =====================================================================
+function Get-StateDir($kit) { return (Join-Path (Split-Path -Parent $kit) 'state') }
+function New-SetupEnv($kit) {
+    $root = Split-Path -Parent $kit
+    [void](New-Item -ItemType Directory -Path (Get-StateDir $kit) -Force)
+    return @{
+        PGPU_WINGET = (Join-Path $PSScriptRoot 'fakes\fake_winget.cmd')
+        PGPU_TEST_STATE_DIR = (Get-StateDir $kit)
+        PGPU_TEST_WINGET_LOG = (Join-Path $root 'winget.log')
+        PGPU_TEST_ELEVATE_LOG = (Join-Path $root 'uac.log')
+        PGPU_TEST_APPLE_DRIVERS = 'usb,eth'
+        PGPU_TEST_CAMERA_REG = (Join-Path $root 'camera-reg.txt')
+        PGPU_CAMERA_DIR = (Join-Path $root 'camera-dir')
+        PGPU_TEST_ALTSERVER = 'none'
+        PGPU_TEST_FINAL_ANSWERS = 'n,n'
+        PGPU_SHORTCUT_DIR = (Join-Path $root 'shortcuts')
+    }
+}
+# setup.ps1 を動かす。-Utf8：画面の日本語を調べる場面。utf8-run.ps1 を通して、受け取りを 1 バイト 1 文字にして読み直す（英語の Windows でも日本語を比べられる）
+function Invoke-Setup($kit, [string[]]$setupArgs, [hashtable]$envs, [string]$answers, [switch]$Utf8) {
+    $e = New-SetupEnv $kit
+    foreach ($k in $envs.Keys) { $e[$k] = $envs[$k] }
+    $scr = Join-Path $kit 'tools\setup.ps1'
+    if ($Utf8) {
+        $script:RawOut = $true
+        try { $r = Invoke-Fix $kit (@('"' + $scr + '"') + $setupArgs) $e $answers (Join-Path $PSScriptRoot 'fakes\utf8-run.ps1') } finally { $script:RawOut = $false }
+        $bytes = [Text.Encoding]::GetEncoding(28591).GetBytes([string]$r.Out)
+        try { $r.Out = (New-Object Text.UTF8Encoding($false, $true)).GetString($bytes) }
+        catch { $r.Out = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage).GetString($bytes) }
+    } else {
+        $r = Invoke-Fix $kit $setupArgs $e $answers $scr
+    }
+    $r.SetupLog = ''; $r.Summary = ''; $r.StartLog = ''
+    $f = Join-Path $kit 'pocketgpu-setup-log.txt'; if (Test-Path $f) { $r.SetupLog = [IO.File]::ReadAllText($f) }
+    $f = Join-Path $kit 'pocketgpu-setup-summary.txt'; if (Test-Path $f) { $r.Summary = [IO.File]::ReadAllText($f) }
+    $f = Join-Path $kit 'pocketgpu-start-log.txt'; if (Test-Path $f) { $r.StartLog = [IO.File]::ReadAllText($f) }
+    return $r
+}
+function Get-WingetLog($kit) { $f = Join-Path (Split-Path -Parent $kit) 'winget.log'; if (Test-Path $f) { return [IO.File]::ReadAllText($f) } else { return '' } }
+function Get-UacLines($kit) { $f = Join-Path (Split-Path -Parent $kit) 'uac.log'; if (Test-Path $f) { return @([IO.File]::ReadAllLines($f) | Where-Object { $_ }) } else { return @() } }
+function New-FakeCamSetup {
+    $dir = Join-Path $Work 'fakecam'
+    $exe = Join-Path $dir 'camera_setup.exe'
+    if (Test-Path $exe) { return $exe }
+    [void](New-Item -ItemType Directory -Path $dir -Force)
+    $src = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'fakes\FakeCamSetup.cs'))
+    Add-Type -TypeDefinition $src -OutputAssembly $exe -OutputType ConsoleApplication -ReferencedAssemblies 'System.dll'
+    return $exe
+}
+# キットに、仮想カメラの道具（偽）を置く：extras\camera_setup.exe（偽）・dshow_cam64.dll・dshow_cam32.dll
+function Add-FakeCameraTools($kit) {
+    $d = Join-Path $kit 'extras'
+    [void](New-Item -ItemType Directory -Path $d -Force)
+    Copy-Item (New-FakeCamSetup) (Join-Path $d 'camera_setup.exe')
+    [IO.File]::WriteAllBytes((Join-Path $d 'dshow_cam64.dll'), [Text.Encoding]::ASCII.GetBytes('FAKE-DSHOW-64'))
+    [IO.File]::WriteAllBytes((Join-Path $d 'dshow_cam32.dll'), [Text.Encoding]::ASCII.GetBytes('FAKE-DSHOW-32'))
+}
+# 入れる動作だけを何もしない物に差し替えた setup.ps1（対照）。読むだけの動作は本物のまま。「入れた」と答えるが、何も起きない
+function Make-SabotagedSetup($kit) {
+    $p = Join-Path $kit 'tools\setup.ps1'
+    $t = [IO.File]::ReadAllText($p, [Text.Encoding]::UTF8)
+    $marker = '# ==================================================================== ここから'
+    if (-not $t.Contains($marker)) { throw 'setup marker not found' }
+    $over = @'
+function Invoke-WingetInstall([string]$id, [string]$source) { return $true }
+function Invoke-AdminBatch([string[]]$actions) { return 0 }
+function Install-Camera { return $true }
+function Invoke-KitUpdate { return 0 }
+function Invoke-Launch([string]$kind, [string]$target) { return $true }
+
+'@
+    [IO.File]::WriteAllText($p, $t.Replace($marker, $over + $marker), (New-Object Text.UTF8Encoding($true)))
+}
+function Use-SetupMode([string]$mode, $kit) { if ($mode -eq 'sabotage') { Make-SabotagedSetup $kit } }
+# レジストリの本物のカメラの登録を、読むだけで調べる（この試験が書き換えていないことの見張り）
+function Get-RealCameraRegState { return (Test-Path -LiteralPath 'HKCU:\Software\Classes\CLSID\{82069F97-3CA9-4626-AD74-D2AA50BBD618}\InprocServer32') }
 
 # =====================================================================
 # 場面
@@ -1336,7 +1416,264 @@ function Scn-RunDx([string]$mode) {
 }
 
 # =====================================================================
+# Setup-PocketGPU.cmd（tools\setup.ps1）
+#   偽の winget は「入れた」印とログを残すだけ。UAC の代わりに、管理者の部分を管理者なしで動かして、頼みを 1 行ずつ記録する。
+#   fix は y・decline は n・sabotage は「入れる動作を何もしない物」に差し替えた setup.ps1 で、効果が出ないことを確かめる
+# =====================================================================
+
+# 全部そろっている PC：聞かない・入れない・UAC を出さない・最後まで通る（y を並べても何も入らない = 要らない物を入れない）
+function Scn-SetupOk([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $kit = New-Kit 'setup-ok'
+    Add-FakeDxvk $kit
+    $mux = Get-FreePort
+    [void](Start-FakeMux $mux)
+    Wait-Until { Test-Port $mux } 10 | Out-Null
+    $before = Get-TreeHash $kit
+    $regBefore = Get-RealCameraRegState
+    $r = Invoke-Setup $kit @() @{ IPHONE_VK_MUX = $mux } 'y,y,y,y,y,y,y,y'
+    Check '全部そろっている PC では、y と答える設定でも何も入れない（偽の winget が呼ばれない）・UAC を出さない・終わりのコード 0' (((Get-WingetLog $kit) -eq '') -and ((Get-UacLines $kit).Count -eq 0) -and $r.Exit -eq 0) 'safety'
+    Check '最後のチェックまで通って、まとめに iPhone の GPU の名前が出る' (($r.Summary -match 'iPhone GPU: seen') -and ($r.SetupLog -match 'Apple A19 Pro GPU \(fake\)')) 'safety'
+    Check 'キットのファイルは何も変わらない・ショートカットも作らない' (((Get-TreeHash $kit) -eq $before) -and -not (Test-Path (Join-Path (Split-Path -Parent $kit) 'shortcuts'))) 'safety'
+    Check 'Visual C++ の再頒布は、exe の取り込む DLL を読んで「不要」と出し、聞かない' (($r.SetupLog -match 'Visual C\+\+ の再頒布：不要') -and ($r.SetupLog -notmatch 'インストールしますか')) 'safety'
+    Check 'まとめに、ユーザー名・PC 名・キットの場所・ドライブの場所が出ていない' (-not (($env:USERNAME.Length -ge 3 -and $r.Summary -match [regex]::Escape($env:USERNAME)) -or ($r.Summary -match [regex]::Escape($env:COMPUTERNAME)) -or ($r.Summary -match [regex]::Escape($kit)) -or ($r.Summary -match '[A-Za-z]:\\'))) 'safety'
+    Check '本物のレジストリのカメラの登録を変えていない（読むだけで比べた）' ((Get-RealCameraRegState) -eq $regBefore) 'safety'
+}
+
+# Apple の部品が無い -> winget（Microsoft Store の Apple Devices）で入れる。管理者は要らない
+function Scn-SetupApple([string]$mode) {
+    $kit = New-Kit "setup-apple-$mode"
+    $mark = Join-Path (Get-StateDir $kit) '9NP83LWLPZ9K.installed'
+    [void](New-Item -ItemType Directory -Path (Get-StateDir $kit) -Force)
+    $mux = Get-FreePort
+    [void](Start-FakeMux $mux @('--listen-after', ('"' + $mark + '"')))
+    Use-SetupMode $mode $kit
+    $r = Invoke-Setup $kit @() @{ PGPU_TEST_APPLE_SW = 'none'; IPHONE_VK_MUX = $mux } (Get-Mode $mode 'y')
+    $wl = Get-WingetLog $kit
+    Check 'winget に、Apple Devices（9NP83LWLPZ9K）を msstore から入れる頼みが出る' ($wl -match '(?m)^install 9NP83LWLPZ9K msstore\s*$')
+    Check '入った印ができて、Apple のサービス（偽）が口で待ち始める' ((Test-Path $mark) -and (Wait-Until { Test-Port $mux } 3))
+    Check 'まとめに「入れた Apple Devices」・最後のチェックで iPhone の GPU が見える・終わりのコード 0' (($r.Summary -match '\[入れた\] Apple Devices') -and ($r.Summary -match 'iPhone GPU: seen') -and $r.Exit -eq 0)
+    Check 'Apple Devices は管理者が要らないので、UAC の頼みは 0 回' ((Get-UacLines $kit).Count -eq 0) 'safety'
+    Check '入れた物は Apple Devices の 1 つだけ（勝手に iTunes などを足さない）' (@($wl -split "`r?`n" | Where-Object { $_ }).Count -le 1) 'safety'
+    if ($mode -eq 'decline') { Check 'n と答えたので、何も入れない・終わりのコード 1・まとめは「しなかった」' (($wl -eq '') -and $r.Exit -eq 1 -and ($r.Summary -match '\[しなかった\] Apple Devices')) 'safety' }
+}
+
+# winget が無い -> 入れられない。案内（Store のページ）だけ。聞いてから開く
+function Scn-SetupNoWinget([string]$mode) {
+    $kit = New-Kit "setup-nowinget-$mode"
+    Use-SetupMode $mode $kit
+    $e = @{ PGPU_WINGET = (Join-Path $Work 'no-such-winget.cmd'); PGPU_TEST_APPLE_SW = 'none'; IPHONE_VK_MUX = (Get-FreePort) }
+    $r = Invoke-Setup $kit @() $e (Get-Mode $mode 'y,n')
+    Check 'winget が無いときの案内：y と答えたので「アプリ インストーラー」のページを開く' ((Get-Launch $kit) -match '(?m)^url ms-windows-store://pdp/\?ProductId=9NBLGGH4NNS1\s*$')
+    Check 'winget が無くても、何も入れようとしない・UAC を出さない・n と答えた Apple Devices のページは開かない' (((Get-WingetLog $kit) -eq '') -and ((Get-UacLines $kit).Count -eq 0) -and ((Get-Launch $kit) -notmatch '9NP83LWLPZ9K')) 'safety'
+    Check '終わりのコード 1・まとめに「足りない winget」・本物の winget を探しにいっていない' (($r.Exit -eq 1) -and ($r.Summary -match '\[足りない\] winget') -and ($r.SetupLog -match 'winget がありません')) 'safety'
+    if ($mode -eq 'fix') {
+        $kit2 = New-Kit 'setup-nowinget-store'
+        $r2 = Invoke-Setup $kit2 @() $e 'n,y'
+        Check 'Apple のソフトが無いとき、y と答えれば Apple Devices の Store のページを開く（n の方は開かない）' (((Get-Launch $kit2) -match '(?m)^url ms-windows-store://pdp/\?ProductId=9NP83LWLPZ9K\s*$') -and ((Get-Launch $kit2) -notmatch '9NBLGGH4NNS1')) 'safety'
+    }
+}
+
+# Vulkan のローダーが無い -> LunarG の Vulkan Runtime を winget で（管理者が要る = UAC を 1 回）
+function Scn-SetupVulkan([string]$mode) {
+    $kit = New-Kit "setup-vulkan-$mode"
+    $mux = Get-FreePort
+    [void](Start-FakeMux $mux)
+    Wait-Until { Test-Port $mux } 10 | Out-Null
+    Use-SetupMode $mode $kit
+    $r = Invoke-Setup $kit @() @{ PGPU_TEST_VK_LOADER = 'none'; IPHONE_VK_MUX = $mux } (Get-Mode $mode 'y')
+    $uac = @(Get-UacLines $kit)
+    Check 'winget に KhronosGroup.VulkanRT を入れる頼みが出る・管理者の部分への頼みは vulkan-runtime の 1 行' (((Get-WingetLog $kit) -match '(?m)^install KhronosGroup\.VulkanRT winget\s*$') -and $uac.Count -eq 1 -and $uac[0] -eq 'UAC vulkan-runtime')
+    Check '入れたあとは、最後のチェックで iPhone の GPU が見える（ローダーが入ったことになっている）・終わりのコード 0' (($r.Exit -eq 0) -and ($r.Summary -match '\[入れた\] Vulkan Runtime') -and ($r.Summary -match 'iPhone GPU: seen'))
+    Check 'UAC の頼みは多くて 1 回' ($uac.Count -le 1) 'safety'
+    if ($mode -eq 'decline') { Check 'n と答えたので何も入れない・UAC も出さない・終わりのコード 1' (((Get-WingetLog $kit) -eq '') -and $uac.Count -eq 0 -and $r.Exit -eq 1) 'safety' }
+}
+# Vulkan のローダーが古い（1.3.204）-> キットの道（VK_ICD_FILENAMES）で足りるので、ふつうは入れない。y と答えたときだけ入れる
+function Scn-SetupVulkanOld([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $kit = New-Kit 'setup-vulkan-old'
+    $mux = Get-FreePort
+    [void](Start-FakeMux $mux)
+    Wait-Until { Test-Port $mux } 10 | Out-Null
+    $r = Invoke-Setup $kit @() @{ PGPU_TEST_VK_LOADER = '1.3.204'; IPHONE_VK_MUX = $mux } 'n'
+    Check 'ローダーが古くても、n なら何も入れず UAC も出さず、キットの道で最後まで通る' (((Get-WingetLog $kit) -eq '') -and ((Get-UacLines $kit).Count -eq 0) -and $r.Exit -eq 0 -and ($r.Summary -match 'iPhone GPU: seen')) 'safety'
+    Check '「古いままでも動きます」と理由を出し、まとめには気をつけたい（old）として載る' (($r.SetupLog -match 'VK_ICD_FILENAMES でドライバを渡すので、古いままでも動きます') -and ($r.Summary -match '\[気をつけたい\] Vulkan loader - old \(1\.3\.204\)')) 'safety'
+    $kit2 = New-Kit 'setup-vulkan-old-yes'
+    $r2 = Invoke-Setup $kit2 @() @{ PGPU_TEST_VK_LOADER = '1.3.204'; IPHONE_VK_MUX = $mux } 'y'
+    $uac2 = @(Get-UacLines $kit2)
+    Check '古くても y と答えたときだけ、Vulkan Runtime を入れる（管理者の部分への頼みは 1 行）' (((Get-WingetLog $kit2) -match 'install KhronosGroup\.VulkanRT') -and $uac2.Count -eq 1) 'safety'
+}
+
+# y と N：Apple は y・Vulkan は N -> Apple Devices だけが入る
+function Scn-SetupYesNo([string]$mode) {
+    $kit = New-Kit "setup-yn-$mode"
+    $mark = Join-Path (Get-StateDir $kit) '9NP83LWLPZ9K.installed'
+    [void](New-Item -ItemType Directory -Path (Get-StateDir $kit) -Force)
+    $mux = Get-FreePort
+    [void](Start-FakeMux $mux @('--listen-after', ('"' + $mark + '"')))
+    Use-SetupMode $mode $kit
+    $r = Invoke-Setup $kit @() @{ PGPU_TEST_APPLE_SW = 'none'; PGPU_TEST_VK_LOADER = 'none'; IPHONE_VK_MUX = $mux } (Get-Mode $mode 'y,n')
+    $wl = Get-WingetLog $kit
+    Check 'y と答えた Apple Devices だけが入る（winget の頼み）・まとめに「入れた」' (($wl -match '(?m)^install 9NP83LWLPZ9K msstore\s*$') -and ($r.Summary -match '\[入れた\] Apple Devices'))
+    Check 'N と答えた Vulkan Runtime は入れない・UAC も出さない・まとめに「しなかった」' (($wl -notmatch 'VulkanRT') -and ((Get-UacLines $kit).Count -eq 0) -and ($r.Summary -match '\[しなかった\] Vulkan Runtime')) 'safety'
+    Check 'ローダーが無いままなので、最後のチェックは手順 7 で止まり、終わりのコード 1' (($r.Exit -eq 1) -and ($r.Summary -match 'iPhone GPU: not seen yet')) 'safety'
+}
+
+# 管理者が要る物が 3 つ（iTunes・Vulkan Runtime・Visual C++）+ ふつうの権限の仮想カメラ -> UAC の頼みは 1 回だけ
+#   Apple Devices の入れ方が失敗する（偽の winget が断る）-> 代わりに iTunes を管理者の部分に足す
+function Scn-SetupUac([string]$mode) {
+    $kit = New-Kit "setup-uac-$mode"
+    Add-FakeCameraTools $kit
+    New-FakePe (Join-Path $kit 'extras\webcam_rx.exe') 'x64' @('kernel32.dll', 'vcruntime199.dll')
+    $mark = Join-Path (Get-StateDir $kit) 'Apple.iTunes.installed'
+    [void](New-Item -ItemType Directory -Path (Get-StateDir $kit) -Force)
+    $mux = Get-FreePort
+    [void](Start-FakeMux $mux @('--listen-after', ('"' + $mark + '"')))
+    Use-SetupMode $mode $kit
+    $regBefore = Get-RealCameraRegState
+    $e = @{ PGPU_TEST_APPLE_SW = 'none'; PGPU_TEST_VK_LOADER = 'none'; PGPU_TEST_WINGET_FAIL = '9NP83LWLPZ9K'; IPHONE_VK_MUX = $mux }
+    $r = Invoke-Setup $kit @() $e (Get-Mode $mode 'y,y,y,y,y')
+    $wl = Get-WingetLog $kit
+    $uac = @(Get-UacLines $kit)
+    $camDir = Join-Path (Split-Path -Parent $kit) 'camera-dir'
+    Check 'UAC の頼みが 1 回だけで、iTunes・Vulkan Runtime・Visual C++ x64 の 3 つがその 1 行にまとまっている' ($uac.Count -eq 1 -and $uac[0] -match 'apple-itunes' -and $uac[0] -match 'vulkan-runtime' -and $uac[0] -match 'vcredist-x64')
+    Check 'winget に 4 つの頼みが出る（Apple Devices は断られ、iTunes・Vulkan Runtime・Visual C++ x64 が入る）' (($wl -match 'install 9NP83LWLPZ9K msstore') -and ($wl -match 'install Apple\.iTunes winget') -and ($wl -match 'install KhronosGroup\.VulkanRT winget') -and ($wl -match 'install Microsoft\.VCRedist\.2015\+\.x64 winget'))
+    Check 'Store 版が失敗したことを、失敗として出す（winget の終わりのコード 1 を成功と取り違えない）' (($r.SetupLog -match 'Apple Devices をインストールできませんでした') -and ($r.SetupLog -notmatch 'winget は成功と答えましたが'))
+    Check '仮想カメラは管理者ではなくふつうの権限で登録される（管理者の頼みに camera が無い・登録の印は PGPU_CAMERA_DIR の camera_setup.exe を指す・3 つのファイルが写る）' (($uac.Count -gt 0 -and $uac[0] -notmatch 'camera') -and ((Get-Content -Raw (Join-Path (Split-Path -Parent $kit) 'camera-reg.txt') -ErrorAction SilentlyContinue) -match [regex]::Escape((Join-Path $camDir 'camera_setup.exe'))) -and (Test-Path (Join-Path $camDir 'dshow_cam64.dll')) -and (Test-Path (Join-Path $camDir 'dshow_cam32.dll')))
+    Check '入れたあとは、最後のチェックで iPhone の GPU が見える・終わりのコード 0・まとめに「入れた」が並ぶ' (($r.Exit -eq 0) -and ($r.Summary -match 'iPhone GPU: seen') -and ($r.Summary -match '\[入れた\] iTunes') -and ($r.Summary -match '\[入れた\] Vulkan Runtime') -and ($r.Summary -match '\[入れた\] Visual C\+\+') -and ($r.Summary -match '\[入れた\] Virtual camera'))
+    Check 'UAC の頼みは多くて 1 回' ($uac.Count -le 1) 'safety'
+    Check '本物のレジストリのカメラの登録を変えていない' ((Get-RealCameraRegState) -eq $regBefore) 'safety'
+    if ($mode -eq 'decline') { Check '全部 n：何も入れない・UAC も出さない・カメラも登録しない' (($wl -eq '') -and $uac.Count -eq 0 -and -not (Test-Path (Join-Path (Split-Path -Parent $kit) 'camera-reg.txt'))) 'safety' }
+}
+
+# 仮想カメラだけ（管理者なし）
+function Scn-SetupCamera([string]$mode) {
+    $kit = New-Kit "setup-camera-$mode"
+    Add-FakeCameraTools $kit
+    $mux = Get-FreePort
+    [void](Start-FakeMux $mux)
+    Wait-Until { Test-Port $mux } 10 | Out-Null
+    Use-SetupMode $mode $kit
+    $regBefore = Get-RealCameraRegState
+    $r = Invoke-Setup $kit @() @{ IPHONE_VK_MUX = $mux } (Get-Mode $mode 'y')
+    $reg = Join-Path (Split-Path -Parent $kit) 'camera-reg.txt'
+    $camDir = Join-Path (Split-Path -Parent $kit) 'camera-dir'
+    Check '仮想カメラの登録の印ができて、camera_setup.exe は動かない場所（PGPU_CAMERA_DIR）の写しから動いている' ((Test-Path $reg) -and ([IO.File]::ReadAllText($reg).Trim() -eq (Join-Path $camDir 'camera_setup.exe')) -and (Test-Path (Join-Path $camDir 'dshow_cam32.dll')))
+    Check 'まとめに「入れた Virtual camera」' ($r.Summary -match '\[入れた\] Virtual camera')
+    Check '仮想カメラは winget も UAC も使わない・本物のレジストリは変えない' (((Get-WingetLog $kit) -eq '') -and ((Get-UacLines $kit).Count -eq 0) -and ((Get-RealCameraRegState) -eq $regBefore)) 'safety'
+    if ($mode -eq 'decline') { Check 'n と答えたので登録しない（印も写しも無い）' (-not (Test-Path $reg) -and -not (Test-Path $camDir) -and ($r.Summary -match '\[しなかった\] Virtual camera')) 'safety' }
+}
+
+# iTunes の Windows サービスが止まっている -> 管理者の部分で開始する（UAC は 1 回）
+function Scn-SetupService([string]$mode) {
+    $kit = New-Kit "setup-service-$mode"
+    $flag = Join-Path (Split-Path -Parent $kit) 'service-started.flag'
+    $hook = Join-Path (Split-Path -Parent $kit) 'start-service.cmd'
+    [IO.File]::WriteAllText($hook, "@echo off`r`necho started> `"$flag`"`r`n", [Text.Encoding]::ASCII)
+    $mux = Get-FreePort
+    [void](Start-FakeMux $mux @('--listen-after', ('"' + $flag + '"')))
+    Use-SetupMode $mode $kit
+    $r = Invoke-Setup $kit @() @{ PGPU_TEST_APPLE_SW = 'service'; PGPU_TEST_SERVICE_START = $hook; IPHONE_VK_MUX = $mux } (Get-Mode $mode 'y')
+    $uac = @(Get-UacLines $kit)
+    Check '管理者の部分への頼みが apple-service の 1 行で、Apple のサービス（偽）が口で待ち始める' ($uac.Count -eq 1 -and $uac[0] -eq 'UAC apple-service' -and (Wait-Until { Test-Port $mux } 3))
+    Check 'まとめに「入れた」・最後のチェックで iPhone の GPU が見える・終わりのコード 0' (($r.Summary -match '\[入れた\] Apple Mobile Device Service') -and ($r.Summary -match 'iPhone GPU: seen') -and $r.Exit -eq 0)
+    Check '開始するだけで、winget は使わない' ((Get-WingetLog $kit) -eq '') 'safety'
+    if ($mode -eq 'decline') { Check 'n と答えたので UAC を出さない・終わりのコード 1' (($uac.Count -eq 0) -and $r.Exit -eq 1) 'safety' }
+}
+
+# iPhone のアプリ：AltServer があるとき（手順・起動・.ipa のフォルダ）と、無いとき（案内だけ・自動で入れない）
+function Scn-SetupIpa([string]$mode) {
+    $mux = Get-FreePort
+    [void](Start-FakeMux $mux @('--recv', 'refuse'))
+    Wait-Until { Test-Port $mux } 10 | Out-Null
+    $kitA = New-Kit "setup-ipa-a-$mode"
+    [IO.File]::WriteAllBytes((Join-Path $kitA 'RpcServer-0.7.58.ipa'), [byte[]](1, 2, 3, 4))
+    $alt = Join-Path (Split-Path -Parent $kitA) 'AltServer.exe'
+    [IO.File]::WriteAllBytes($alt, [byte[]](1, 2, 3, 4))
+    Use-SetupMode $mode $kitA
+    $rA = Invoke-Setup $kitA @() @{ PGPU_TEST_ALTSERVER = $alt; IPHONE_VK_MUX = $mux } (Get-Mode $mode 'y,y')
+    $la = Get-Launch $kitA
+    Check 'AltServer があるとき、y と答えれば AltServer を起動し、.ipa のフォルダを開く' (($la -match '(?m)^exe .*AltServer\.exe\s*$') -and ($la -match '(?m)^folder .*RpcServer-0\.7\.58\.ipa\s*$'))
+    Check 'AltServer があるとき、.ipa の名前と「Sideload .ipa」の手順を出す・Apple ID は入力しないと書く' (($rA.SetupLog -match 'RpcServer-0\.7\.58\.ipa') -and ($rA.SetupLog -match 'Sideload \.ipa') -and ($rA.SetupLog -match 'Apple ID とパスワードを、AltServer の画面に入力します（このセットアップは入力しません）')) 'safety'
+    Check '何も入れない・UAC を出さない・iPhone のアプリが答えないので終わりのコード 1' (((Get-WingetLog $kitA) -eq '') -and ((Get-UacLines $kitA).Count -eq 0) -and $rA.Exit -eq 1) 'safety'
+    $kitB = New-Kit "setup-ipa-b-$mode"
+    [IO.File]::WriteAllBytes((Join-Path $kitB 'RpcServer-0.7.58.ipa'), [byte[]](1, 2, 3, 4))
+    Use-SetupMode $mode $kitB
+    $rB = Invoke-Setup $kitB @() @{ PGPU_TEST_ALTSERVER = 'none'; IPHONE_VK_MUX = $mux } (Get-Mode $mode 'y')
+    Check 'AltServer が無いとき、y と答えれば AltStore のページを開く' ((Get-Launch $kitB) -match '(?m)^url https://altstore\.io\s*$')
+    Check 'AltServer が無いとき、入れ方（winget の行）を文字で出すだけで、自動では入れない（偽の winget が呼ばれない）' (($rB.SetupLog -match 'winget install --id RileyTestut\.AltServer') -and ((Get-WingetLog $kitB) -eq '') -and ((Get-UacLines $kitB).Count -eq 0)) 'safety'
+}
+
+# キットの更新：新しい版があれば、y と答えたときだけ update.ps1 で取り直す
+function Scn-SetupUpdate([string]$mode) {
+    $kit = New-Kit "setup-update-$mode"
+    $pristine = Initialize-Pristine
+    $port = Get-FreePort
+    $token = 'TESTTOKENabcdefghijklmnop123'  # pgpu-allow-secret: 試験用の偽の値
+    [IO.File]::WriteAllText((Join-Path $kit 'tools\update.ini'), "url=http://127.0.0.1:$port`r`ntoken=$token`r`n", [Text.Encoding]::ASCII)
+    [void](Start-FakeUpdate $port $pristine $token)
+    $run = Join-Path $kit 'tools\run.ps1'
+    [IO.File]::AppendAllText($run, "`r`n# local edit`r`n", (New-Object Text.UTF8Encoding($false)))
+    $mux = Get-FreePort
+    [void](Start-FakeMux $mux)
+    Wait-Until { Test-Port $mux } 10 | Out-Null
+    Use-SetupMode $mode $kit
+    $r = Invoke-Setup $kit @() @{ IPHONE_VK_MUX = $mux } (Get-Mode $mode 'y')
+    Check '新しい版があると出して、y と答えたので、変わっていた tools\run.ps1 が正しいキットと同じ SHA-256 に戻る' ((Get-Sha $run) -eq (Get-Sha (Join-Path $pristine 'tools\run.ps1')))
+    Check '合言葉が、画面・ログ・まとめに出ていない' (-not (($r.Out + $r.SetupLog + $r.Summary) -match $token)) 'safety'
+    if ($mode -eq 'fix') {
+        $bk = @(Get-ChildItem (Join-Path $kit 'update-backup') -Recurse -File -Filter 'run.ps1' -ErrorAction SilentlyContinue)
+        Check '古い run.ps1 が update-backup に残っている（捨てていない）・終わりのコード 0' (($bk.Count -ge 1) -and $r.Exit -eq 0) 'safety'
+    } else {
+        Check 'n と答えたので update-backup も作らない' (-not (Test-Path (Join-Path $kit 'update-backup'))) 'safety'
+    }
+}
+
+# 管理者で動いている（ふり）-> 始めない。何も入れない
+function Scn-SetupElevated([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $kit = New-Kit 'setup-elevated'
+    $r = Invoke-Setup $kit @() @{ PGPU_TEST_ELEVATED = '1'; PGPU_TEST_APPLE_SW = 'none' } 'y,y,y'
+    Check '管理者権限で動いているときは、開き直す案内を出して、何も入れずに終わりのコード 2' (($r.SetupLog -match '管理者権限で実行されています') -and ((Get-WingetLog $kit) -eq '') -and ((Get-UacLines $kit).Count -eq 0) -and $r.Exit -eq 2) 'safety'
+}
+# -CheckOnly：y と答える設定でも、何も入れない・何も変えない
+function Scn-SetupCheckOnly([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $kit = New-Kit 'setup-checkonly'
+    Add-FakeCameraTools $kit
+    $before = Get-TreeHash $kit
+    $r = Invoke-Setup $kit @('-CheckOnly') @{ PGPU_TEST_APPLE_SW = 'none'; PGPU_TEST_VK_LOADER = 'none' } 'y,y,y,y,y,y'
+    Check '-CheckOnly は、足りない物があっても何も入れない・UAC を出さない・カメラも登録しない・ファイルも変えない' (((Get-WingetLog $kit) -eq '') -and ((Get-UacLines $kit).Count -eq 0) -and -not (Test-Path (Join-Path (Split-Path -Parent $kit) 'camera-reg.txt')) -and ((Get-TreeHash $kit) -eq $before)) 'safety'
+    Check '-CheckOnly は、足りない物を一覧にして、終わりのコード 1' (($r.SetupLog -match 'Apple Devices') -and ($r.SetupLog -match 'Vulkan loader') -and $r.Exit -eq 1) 'safety'
+}
+# 画面の日本語・英語（日本語は utf8-run.ps1 を通して画面そのものを比べる）
+function Scn-SetupLang([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $kit = New-Kit 'setup-lang'
+    $r = Invoke-Setup $kit @() @{ PGPU_TEST_VK_LOADER = 'none'; IPHONE_VK_MUX = (Get-FreePort) } 'n' -Utf8
+    Check '日本語の画面：見出し・Vulkan の表示・y/N の問い・UAC の説明が出る' (($r.Out -match 'PocketGPU をセットアップします') -and ($r.Out -match 'Vulkan ローダー（vulkan-1\.dll）：ありません。') -and ($r.Out -match 'LunarG の Vulkan Runtime をインストールしますか？（管理者権限が必要）') -and ($r.Out -match 'UAC の確認を 1 回だけ行います')) 'safety'
+    Check '日本語の画面の各見出しに [n/4] が付く' (($r.Out -match '\[1/4\] この PC をチェック') -and ($r.Out -match '\[4/4\] 最後のチェック')) 'safety'
+    $kit2 = New-Kit 'setup-lang-en'
+    $r2 = Invoke-Setup $kit2 @() @{ PGPU_LANG = 'en'; PGPU_TEST_VK_LOADER = 'none'; IPHONE_VK_MUX = (Get-FreePort) } 'n'
+    Check '英語の画面（PGPU_LANG=en）：見出し・Vulkan の問い・まとめ' (($r2.Out -match 'Set up PocketGPU') -and ($r2.Out -match 'Install the LunarG Vulkan Runtime\? \(needs administrator rights\)') -and ($r2.Summary -match 'Result: installed 0') -and ($r2.Summary -match '\[skipped\] Vulkan Runtime')) 'safety'
+}
+
+# =====================================================================
 $scenarios = [ordered]@{
+    'setup-ok'          = { param($m) Scn-SetupOk $m }
+    'setup-apple'       = { param($m) Scn-SetupApple $m }
+    'setup-nowinget'    = { param($m) Scn-SetupNoWinget $m }
+    'setup-vulkan'      = { param($m) Scn-SetupVulkan $m }
+    'setup-vulkan-old'  = { param($m) Scn-SetupVulkanOld $m }
+    'setup-yn'          = { param($m) Scn-SetupYesNo $m }
+    'setup-uac'         = { param($m) Scn-SetupUac $m }
+    'setup-camera'      = { param($m) Scn-SetupCamera $m }
+    'setup-service'     = { param($m) Scn-SetupService $m }
+    'setup-ipa'         = { param($m) Scn-SetupIpa $m }
+    'setup-update'      = { param($m) Scn-SetupUpdate $m }
+    'setup-elevated'    = { param($m) Scn-SetupElevated $m }
+    'setup-checkonly'   = { param($m) Scn-SetupCheckOnly $m }
+    'setup-lang'        = { param($m) Scn-SetupLang $m }
     'loader'        = { param($m) Scn-Loader $m }
     'loader-ok'     = { param($m) Scn-LoaderOkLaunchers $m }
     'loader-none'   = { param($m) Scn-LoaderNone $m }
