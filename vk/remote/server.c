@@ -392,8 +392,10 @@ static int g_fmt3;                     // VkFormatProperties3 を答えられる
 // aux：バッファならつないだメモリの番号。list：descriptor set なら中のバッファの番号の並び
 typedef struct { uint64_t *ids; uint32_t n, cap; } idlist;
 typedef struct { uint64_t id, h; uint32_t kind; void *map; uint64_t size; uint64_t aux; idlist *list;
-                 uint8_t *last; uint64_t dev; } ent; // last：ドライバが持っているはずの中身。VR_MEM_READ_DELTA で使う
+                 uint8_t *last; uint64_t dev; uint64_t mark, use_msg; uint64_t gwb, gwsz; } ent; // last：ドライバが持っているはずの中身。VR_MEM_READ_DELTA で使う
                                                     // dev：持ち主の装置（装置ならそれ自身）
+                                                    // gwb・gwsz：書き込みを GPU で写すときの、メモリ全体に重ねた buffer とその大きさ（gw_*）
+                                                    // mark：記録中の command buffer に足し済みの印（cbinfo の serial）・use_msg：これを使う最後の submit の番号（set とメモリ）
 
 static void idlist_add(idlist **l, uint64_t id) {
     if (!*l) *l = calloc(1, sizeof **l);
@@ -439,7 +441,7 @@ static void put(uint64_t id, uint64_t h, uint32_t kind) {
     while (g_tab[s].id && g_tab[s].id != id) s = (s + 1) & (g_cap - 1);
     if (!g_tab[s].id) g_cnt++;
     if (g_tab[s].id == id) { idlist_free(&g_tab[s].list); free(g_tab[s].last); }
-    g_tab[s] = (ent) { id, h, kind, NULL, 0, 0, NULL, NULL, kind == K_DEVICE ? h : g_last_dev };
+    g_tab[s] = (ent) { id, h, kind, NULL, 0, 0, NULL, NULL, kind == K_DEVICE ? h : g_last_dev, 0, 0, 0, 0 };
 }
 
 static ent *find(uint64_t id) {
@@ -901,6 +903,10 @@ static struct { uint64_t n, in, out; double ms; } g_pcs; // 縮めた平面を�
 static struct { uint64_t memw, spans_msgs, spans, uds_msgs, uds_writes, uds_calls; } g_bst;
 // 命令ごとの処理の時間（この接続・主の糸）：通数・かかった ms・そのうち GPU を待った ms。いつも数える（1 通に 2 回時計を読むだけ）
 static struct { uint64_t n[128]; double ms[128], wait[128]; } g_opt;
+// 主の糸の 1 コマの内訳（VKR_PROF_EVERY 秒ごとに記録に出す。既定 10・0 で出さない）：PC からの命令を待った（線が空いていた）・
+// LZ4 をほどいた・命令の処理（GPU を待った時間は除く）・GPU を待った。コマは窓の絵を頼まれた回数（READ_JPEG・READ_JPEG_PIPE・READ_H264）で数える。
+// 本物の iPhone では、アプリの記録（iphone_applog.py）にこの行が出る
+static struct { double t0, idle, lz4; uint64_t frames, msgs; uint64_t n[128]; double ms[128], wait[128]; } g_pf;
 // アプリの画面のファンを回すための数。アプリが少しずつ読んで、増えた速さで回す
 static volatile uint64_t g_ops_total;
 static volatile int g_clients;
@@ -975,7 +981,17 @@ int vkr_latest_frame(uint8_t *buf, int cap, uint64_t *serial) {
 void vkr_note(const char *line) { if (line) vlog("%s", line); }
 
 // command buffer ごとに、どの command pool の物か・記録した中でどの descriptor set を使うか
-typedef struct { uint64_t cb, pool; uint64_t *sets; uint32_t n, cap; idlist *mems; } cbinfo;
+typedef struct { uint64_t cb, pool; uint64_t *sets; uint32_t n, cap; idlist *mems; uint64_t serial; } cbinfo; // serial：記録ごとの通し番号
+static uint64_t g_rec_serial;
+// 帳簿を速く引く（VKR_FASTBOOK=0 で前のやり方）。10/14：KSP の飛行では 1 コマに descriptor の書き込みが数千あり、書き込みのたびに
+// 走っている仕事の command buffer が使う set の並びを全部なめていた（last_with_set）。記録のときも、set とメモリを足すたびに
+// それまでに足した並びをなめていた（cbi_add_set・idlist_add）。どちらも 1 コマの数の 2 乗になる。
+// いまは表の行に「記録中の command buffer に足し済み」の印と「これを使う最後の submit の番号」を持たせ、1 回引くだけにする
+static int fast_book(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VKR_FASTBOOK"); v = !(e && *e == '0'); }
+    return v;
+}
 static cbinfo *g_cbi;
 static size_t g_ncbi, g_capcbi;
 
@@ -1021,12 +1037,17 @@ static cbinfo *cbi(uint64_t cb, int create) {
     for (size_t i = 0; i < g_ncbi; i++) if (g_cbi[i].cb == cb) return &g_cbi[i];
     if (!create) return NULL;
     if (g_ncbi == g_capcbi) { g_capcbi = g_capcbi ? g_capcbi * 2 : 64; g_cbi = realloc(g_cbi, g_capcbi * sizeof *g_cbi); }
-    g_cbi[g_ncbi] = (cbinfo) { cb, 0, NULL, 0, 0, NULL };
+    g_cbi[g_ncbi] = (cbinfo) { cb, 0, NULL, 0, 0, NULL, 0 };
     return &g_cbi[g_ncbi++];
 }
 
 static void cbi_add_set(cbinfo *c, uint64_t set) {
-    for (uint32_t i = 0; i < c->n; i++) if (c->sets[i] == set) return;
+    ent *e = fast_book() && c->serial ? find(set) : NULL;
+    if (e) {
+        if (e->mark == c->serial) return; // この記録で足し済み
+        e->mark = c->serial;
+    } else
+        for (uint32_t i = 0; i < c->n; i++) if (c->sets[i] == set) return;
     if (c->n == c->cap) { c->cap = c->cap ? c->cap * 2 : 16; c->sets = realloc(c->sets, c->cap * sizeof *c->sets); }
     c->sets[c->n++] = set;
 }
@@ -1426,7 +1447,18 @@ static int last_with_pool(uint64_t pool) {
 }
 
 // その descriptor pool から取った set を、まだ走っている仕事が使っているか（set の aux は pool の id）
+// 10/14：handle の頭で、descriptor pool の reset の前に GPU の仕事を全部待っている（下の last_with_dpool で足りるはずなのに）。
+// GPU が重いと主の糸が毎コマ GPU を待つ（代役の 3060 で GPU を重くした試験で、1 コマ 7〜16 ms）。
+// ただし全部を待たないと検証レイヤーの指摘が増えたので、既定は全部を待つまま（VKR_DPOOL_FULL=0 は調べる用）
+static int fast_last(void);
+static int last_by_msg(uint64_t msg);
+static int dpool_full(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VKR_DPOOL_FULL"); v = !(e && *e == '0'); }
+    return v;
+}
 static int last_with_dpool(uint64_t pool) {
+    if (fast_last()) { ent *e = find(pool); if (e && e->kind == K_DPOOL) return last_by_msg(e->use_msg); }
     for (int i = g_nfl - 1; i >= 0; i--)
         for (uint32_t k = 0; k < g_fl[i].ncb; k++) {
             cbinfo *c = cbi(g_fl[i].cbs[k], 0);
@@ -1441,6 +1473,22 @@ static int last_with_dpool(uint64_t pool) {
 
 // pool を空にしたり消したりしたら、そこから取った set の表の行も消す
 static void drop_sets_of_pool(uint64_t pool) {
+    ent *pe = fast_book() ? find(pool) : NULL;
+    if (pe && pe->kind == K_DPOOL) {
+        if (!pe->list) return; // この pool から取った set は無い（取るたびに list に足すので）
+        // 取った set の番号の並びから消す（表の全部はなめない）。返した・別の pool に取り直した番号は飛ばす
+        idlist *x = pe->list;
+        pe->list = NULL;
+        for (uint32_t i = 0; i < x->n; i++) {
+            ent *e = find(x->ids[i]);
+            if (!e || e->kind != K_DSET || e->aux != pool) continue;
+            idlist_free(&e->list);
+            del(x->ids[i]);
+        }
+        free(x->ids);
+        free(x);
+        return;
+    }
     size_t n = 0, cap = 0;
     uint64_t *ids = NULL;
     for (size_t i = 0; i < g_cap; i++)
@@ -1456,7 +1504,24 @@ static void drop_sets_of_pool(uint64_t pool) {
     free(ids);
 }
 
+// 速い引き方が使えるか：合図を待って止まっている仕事が無いとき（drain_upto は k 番目までを全部外すので、
+// 最後に使った submit が外れていれば、それより前で使った仕事も残っていない）
+static int fast_last(void) {
+    if (!fast_book()) return 0;
+    for (int i = 0; i < g_nfl; i++) if (g_fl[i].ntw || g_fl[i].tl_over) return 0;
+    return 1;
+}
+static int last_by_msg(uint64_t msg) {
+    if (!msg) return -1;
+    for (int i = g_nfl - 1; i >= 0; i--) {
+        if (g_fl[i].msg == msg) return i;
+        if (g_fl[i].msg < msg) break;
+    }
+    return -1;
+}
+
 static int last_with_set(uint64_t set) {
+    if (fast_last()) { ent *e = find(set); if (e && e->kind == K_DSET) return last_by_msg(e->use_msg); }
     for (int i = g_nfl - 1; i >= 0; i--)
         for (uint32_t k = 0; k < g_fl[i].ncb; k++) {
             cbinfo *c = cbi(g_fl[i].cbs[k], 0);
@@ -1467,6 +1532,7 @@ static int last_with_set(uint64_t set) {
 }
 
 static int last_with_mem(uint64_t mem) {
+    if (fast_last()) { ent *e = find(mem); if (e && e->kind == K_MEMORY) return last_by_msg(e->use_msg); }
     for (int i = g_nfl - 1; i >= 0; i--)
         for (uint32_t k = 0; k < g_fl[i].ncb; k++) {
             cbinfo *c = cbi(g_fl[i].cbs[k], 0);
@@ -1476,15 +1542,30 @@ static int last_with_mem(uint64_t mem) {
     return -1;
 }
 
+// 記録中の command buffer の「使うメモリ」に足す。印のある行は 1 回だけ（並びをなめない）
+static void cb_add_mem(cbinfo *ci, uint64_t mem) {
+    ent *e = fast_book() && ci->serial ? find(mem) : NULL;
+    if (e) {
+        if (e->mark == ci->serial) return;
+        e->mark = ci->serial;
+        idlist *x = ci->mems;
+        if (!x) x = ci->mems = calloc(1, sizeof *x);
+        if (x->n == x->cap) { x->cap = x->cap ? x->cap * 2 : 8; x->ids = realloc(x->ids, x->cap * sizeof *x->ids); }
+        x->ids[x->n++] = mem;
+        return;
+    }
+    idlist_add(&ci->mems, mem);
+}
+
 static void use_buffer_mem(cbinfo *ci, uint64_t mem) {
-    if (ci && mem) idlist_add(&ci->mems, mem);
+    if (ci && mem) cb_add_mem(ci, mem);
 }
 
 // バッファの番号 → それがつながっているメモリを、記録の「使うメモリ」に足す
 static void use_buffer(cbinfo *ci, uint64_t buf) {
     if (!ci) return;
     ent *e = find(buf);
-    if (e && e->aux) idlist_add(&ci->mems, e->aux);
+    if (e && e->aux) cb_add_mem(ci, e->aux);
 }
 
 static int last_with_fence(VkFence f) {
@@ -1519,10 +1600,263 @@ static int chain_ready(void) {
 }
 
 // ---- 1 つの接続の間に作った物を、切れたときに片づける ----
+// ---- 書き込みを GPU の上で順に写す（VKR_GPU_WRITE=0 で前のやり方） ----
+// 10/14：KSP の飛行では、次のコマの MEM_WRITE_SPANS が、前の submit がまだ使っているメモリ（DXVK の大きな塊）に来る。
+// 前は主の糸がその submit の終わりを CPU で待ってから書いたので、GPU と主の糸が交互にしか動かなかった。
+// いまは、まだ走っている仕事が使うメモリへの書き込みは、中身を写し場（CPU から見えるメモリ）に置き、
+// 「前の仕事の後で写し場から写す」小さな command buffer を同じキューに出す（キューの順と barrier で、前の仕事の後・次の仕事の前に入る）。
+// 主の糸は待たずに次の命令へ進む。写す仕事も走っている仕事の一覧（g_fl）に入るので、あとでそのメモリを読む・書く命令は今までどおりそれを待つ。
+// 写す command buffer は、書き込み・descriptor・記録の命令が続く間はためて、ほかの命令の前にまとめて出す
+#define GW_SLOTS 8
+#define GW_CB_BASE 0xFEDC000000000000ull // 写す仕事の command buffer の番号（ドライバの番号と重ならない所）
+typedef struct { VkCommandBuffer cb; VkFence f; VkBuffer sb; VkDeviceMemory sm; uint8_t *map; uint64_t cap, used; int state; VkQueue q; } gwslot; // state 0 空き・1 ためている・2 出した
+static struct {
+    VkDevice d; VkCommandPool pool; uint32_t fam; int ready, broken, cur;
+    gwslot s[GW_SLOTS];
+    VkBufferCopy *rg; uint32_t nrg, crg;     // いま足している書き込みの範囲
+    uint64_t copies, bytes, flushes, waits; // 数え（記録用）
+} g_gw;
+static int gw_mode = -1; // 0 使わない・1 待つはずの書き込みだけ・2 試験用：走っている仕事があれば全部の書き込みを GPU で写す（順の守りを確かめる）
+static int gw_on(void) {
+    if (gw_mode < 0) { const char *e = getenv("VKR_GPU_WRITE"); gw_mode = e && *e == '0' ? 0 : e && *e == '2' ? 2 : 1; }
+    return gw_mode && fast_book();
+}
+static void gw_forget_mem(VkDevice d, ent *e) {
+    if (e && e->gwb && d) vkDestroyBuffer(d, (VkBuffer) (uintptr_t) e->gwb, NULL);
+    if (e) e->gwb = 0, e->gwsz = 0;
+}
+static void gw_free(VkDevice d) {
+    if (d && g_gw.d == d) {
+        for (int i = 0; i < GW_SLOTS; i++) {
+            gwslot *x = &g_gw.s[i];
+            if (x->f) vkDestroyFence(d, x->f, NULL);
+            if (x->sb) vkDestroyBuffer(d, x->sb, NULL);
+            if (x->sm) vkFreeMemory(d, x->sm, NULL);
+        }
+        if (g_gw.pool) vkDestroyCommandPool(d, g_gw.pool, NULL);
+    }
+    if (g_gw.copies)
+        vlog(JE("書き込みを GPU で写した：%llu 通・%.1f MB・%llu 回出した（写し場が空くのを待った %llu 回）", "Writes copied on the GPU: %llu messages, %.1f MB, %llu submits (waited for a free staging slot %llu times)"),
+             (unsigned long long) g_gw.copies, g_gw.bytes / 1e6, (unsigned long long) g_gw.flushes, (unsigned long long) g_gw.waits);
+    free(g_gw.rg);
+    memset(&g_gw, 0, sizeof g_gw);
+}
+// 写す command pool を作る（最初に要ったときのキューの家族で）
+static int gw_setup(uint32_t fam) {
+    if (g_gw.broken) return 0;
+    if (g_gw.ready) return g_gw.d == g_dev && g_gw.fam == fam;
+    VkCommandPoolCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = fam };
+    g_gw.d = g_dev;
+    g_gw.fam = fam;
+    g_gw.ready = 1;
+    if (vkCreateCommandPool(g_dev, &ci, NULL, &g_gw.pool) != VK_SUCCESS) g_gw.broken = 1;
+    for (int i = 0; i < GW_SLOTS && !g_gw.broken; i++) {
+        VkCommandBufferAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = g_gw.pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
+        VkFenceCreateInfo fi = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        if (vkAllocateCommandBuffers(g_dev, &ai, &g_gw.s[i].cb) != VK_SUCCESS || vkCreateFence(g_dev, &fi, NULL, &g_gw.s[i].f) != VK_SUCCESS) { g_gw.broken = 1; break; }
+        cbi(GW_CB_BASE + (uint64_t) i, 1);
+    }
+    if (g_gw.broken) { vlog(JE("書き込みを GPU で写す支度ができない。前のやり方（CPU で待って書く）にする", "Cannot set up GPU-side write copies. Using the old way (wait on the CPU, then write)")); return 0; }
+    vlog(JE("まだ走っている仕事が使うメモリへの書き込みは、GPU の上で順に写す（VKR_GPU_WRITE=0 で前のやり方）", "Writes to memory that running work still uses are copied in order on the GPU (VKR_GPU_WRITE=0 for the old way)"));
+    return 1;
+}
+// メモリ全体に重ねた buffer（写し先）。作れなければ 0
+static VkBuffer gw_dst(ent *e) {
+    if (e->gwb) return (VkBuffer) (uintptr_t) e->gwb;
+    VkBufferCreateInfo bi = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = e->size, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkBuffer b;
+    if (!e->size || vkCreateBuffer(g_dev, &bi, NULL, &b) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(g_dev, b, &mr);
+    if (e->aux >= 32 || !(mr.memoryTypeBits & (1u << (uint32_t) e->aux)) || mr.size > e->size ||
+        vkBindBufferMemory(g_dev, b, (VkDeviceMemory) (uintptr_t) e->h, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(g_dev, b, NULL);
+        return VK_NULL_HANDLE;
+    }
+    e->gwb = (uint64_t) (uintptr_t) b;
+    e->gwsz = e->size;
+    return b;
+}
+static int gw_index_of(VkFence f) {
+    for (int i = 0; i < g_nfl; i++) if (g_fl[i].f == f) return i;
+    return -1;
+}
+// ためている写しが、このメモリに書くか
+static int gw_pending(uint64_t mid) {
+    if (!g_gw.ready || g_gw.s[g_gw.cur].state != 1) return 0;
+    cbinfo *c = cbi(GW_CB_BASE + (uint64_t) g_gw.cur, 0);
+    if (c && c->mems) for (uint32_t j = 0; j < c->mems->n; j++) if (c->mems->ids[j] == mid) return 1;
+    return 0;
+}
+// このメモリに書く GPU の写しのうち、まだ一覧にいるいちばん後の物（無ければ -1）。
+// ドライバの番号で待ちを狭めた CPU の書き込みが、まだ走っている写しより先に書いてしまわないように使う
+static int gw_last_job(uint64_t mid) {
+    if (!g_gw.ready) return -1;
+    for (int i = g_nfl - 1; i >= 0; i--) {
+        if (g_fl[i].ncb != 1 || g_fl[i].cbs[0] < GW_CB_BASE || g_fl[i].cbs[0] >= GW_CB_BASE + GW_SLOTS) continue;
+        cbinfo *c = cbi(g_fl[i].cbs[0], 0);
+        if (c && c->mems) for (uint32_t j = 0; j < c->mems->n; j++) if (c->mems->ids[j] == mid) return i;
+    }
+    return -1;
+}
+// ためている写しを出す
+static void gw_flush(void) {
+    gwslot *x = &g_gw.s[g_gw.cur];
+    if (!g_gw.ready || x->state != 1) return;
+    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                           .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT };
+    vkCmdPipelineBarrier(x->cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    vkEndCommandBuffer(x->cb);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &x->cb };
+    if (g_nfl == 256) drain();
+    VkResult res = g_err ? g_err : vkQueueSubmit(x->q, 1, &si, x->f);
+    g_gw.flushes++;
+    if (res != VK_SUCCESS) {
+        vlog(JE("書き込みを写す submit が失敗 (%d)", "The submit that copies writes failed (%d)"), res);
+        if (res < 0) g_err = res;
+        x->state = 0;
+        return;
+    }
+    x->state = 2;
+    inflight *e = &g_fl[g_nfl++];
+    memset(e, 0, sizeof *e);
+    e->f = x->f;
+    e->own = 0; // fence は写し場の物（drain は返さない）
+    e->ncb = 1;
+    e->cbs[0] = GW_CB_BASE + (uint64_t) g_gw.cur;
+    e->q = x->q;
+    e->msg = g_submit_msgs; // ドライバの数える submit の番号は進めない（この仕事は直前の submit の後に走る）
+    cbinfo *c = cbi(e->cbs[0], 0);
+    if (c && c->mems) for (uint32_t j = 0; j < c->mems->n; j++) { ent *me = find(c->mems->ids[j]); if (me) me->use_msg = e->msg; }
+}
+// 書き込みを GPU で写すか：1 写す・0 前のやり方（CPU で待って書く）。-1 は写しをためているのに写せない（先に出して、前のやり方で待つ）
+// e はそのメモリ・k は CPU で書く前に待つ仕事・need は書く範囲のいちばん後ろの端
+static int gw_want(uint64_t mid, ent *e, int k, uint64_t need, VkQueue *qout) {
+    // 写せるのは、いまの装置（g_dev）のメモリとキューだけ（DXVK は装置を 2 つ作ることがある。違う装置の物を混ぜると GPU を失う）
+    if (!gw_on() || !e || !e->map || g_err || chain_on() || !g_dev || e->dev != (uint64_t) (uintptr_t) g_dev) return gw_pending(mid) ? -1 : 0;
+    int pend = gw_pending(mid);
+    if (!pend && gw_mode == 2 && k < 0 && g_nfl > 0) k = g_nfl - 1; // 試験用：走っている仕事の後に写す
+    if (!pend) {
+        if (k < 0) return 0;
+        if (gw_mode != 2 && vkGetFenceStatus(g_dev, g_fl[k].f) == VK_SUCCESS) return 0; // もう終わっている（待たずに CPU で書ける）
+    }
+    for (int i = 0; i < g_nfl; i++) if (g_fl[i].ntw || g_fl[i].tl_over) return pend ? -1 : 0; // 合図を待つ仕事があるときは前のやり方
+    VkQueue q = pend ? g_gw.s[g_gw.cur].q : g_fl[k].q;
+    uint32_t fam = UINT32_MAX;
+    for (size_t i = 0; i < g_cap; i++)
+        if (g_tab[i].id && g_tab[i].kind == K_QUEUE && g_tab[i].h == (uint64_t) (uintptr_t) q) {
+            if (g_tab[i].dev == (uint64_t) (uintptr_t) g_dev) fam = (uint32_t) g_tab[i].size;
+            break;
+        }
+    if (fam == UINT32_MAX || !gw_setup(fam)) return pend ? -1 : 0;
+    if (!gw_dst(e) || need > e->gwsz) return pend ? -1 : 0;
+    *qout = q;
+    return 1;
+}
+// 写す範囲を足し始める（n バイトぶんの写し場を用意する）。できなければ 0
+static int gw_begin(uint64_t mid, VkQueue q, uint64_t n) {
+    gwslot *x = &g_gw.s[g_gw.cur];
+    if (x->state == 1 && (x->q != q || x->used + n > x->cap)) gw_flush();
+    if (x->state == 2) { g_gw.cur = (g_gw.cur + 1) % GW_SLOTS; x = &g_gw.s[g_gw.cur]; }
+    if (x->state == 2) {
+        // 8 つ前の写しがまだ一覧にいれば、そこまで待って外す（fence を使い回す前に）
+        int i = gw_index_of(x->f);
+        if (i >= 0) { drain_upto(i); g_gw.waits++; }
+        if (gw_index_of(x->f) >= 0) return 0;
+        vkWaitForFences(g_dev, 1, &x->f, VK_TRUE, UINT64_MAX);
+        vkResetFences(g_dev, 1, &x->f);
+        x->state = 0;
+    }
+    if (x->state == 0) {
+        if (x->cap < n) {
+            if (x->sb) vkDestroyBuffer(g_dev, x->sb, NULL);
+            if (x->sm) vkFreeMemory(g_dev, x->sm, NULL);
+            x->sb = VK_NULL_HANDLE, x->sm = VK_NULL_HANDLE, x->map = NULL, x->cap = 0;
+            uint64_t cap = n < (4u << 20) ? (4u << 20) : (n + 0xfffff) & ~0xfffffull;
+            VkBufferCreateInfo bi = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = cap, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+            if (vkCreateBuffer(g_dev, &bi, NULL, &x->sb) != VK_SUCCESS) { x->sb = VK_NULL_HANDLE; return 0; }
+            VkMemoryRequirements mr;
+            vkGetBufferMemoryRequirements(g_dev, x->sb, &mr);
+            VkPhysicalDeviceMemoryProperties mp;
+            vkGetPhysicalDeviceMemoryProperties(g_pd, &mp);
+            uint32_t t = UINT32_MAX;
+            const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            for (uint32_t i = 0; i < mp.memoryTypeCount && t == UINT32_MAX; i++) if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) t = i;
+            VkMemoryAllocateInfo ai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = t };
+            void *p = NULL;
+            if (t == UINT32_MAX || vkAllocateMemory(g_dev, &ai, NULL, &x->sm) != VK_SUCCESS) { vkDestroyBuffer(g_dev, x->sb, NULL); x->sb = VK_NULL_HANDLE; x->sm = VK_NULL_HANDLE; return 0; }
+            if (vkBindBufferMemory(g_dev, x->sb, x->sm, 0) != VK_SUCCESS || vkMapMemory(g_dev, x->sm, 0, VK_WHOLE_SIZE, 0, &p) != VK_SUCCESS) {
+                vkDestroyBuffer(g_dev, x->sb, NULL); vkFreeMemory(g_dev, x->sm, NULL); x->sb = VK_NULL_HANDLE; x->sm = VK_NULL_HANDLE; return 0;
+            }
+            x->map = p;
+            x->cap = cap;
+        }
+        VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        vkResetCommandBuffer(x->cb, 0);
+        vkBeginCommandBuffer(x->cb, &bi);
+        // 前に出した仕事（そのメモリを読む・書く物）が済んでから写す。barrier は同じキューに前に出した命令の全部に効く
+        VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT };
+        vkCmdPipelineBarrier(x->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        x->used = 0;
+        x->q = q;
+        x->state = 1;
+        cbinfo *c = cbi(GW_CB_BASE + (uint64_t) g_gw.cur, 1);
+        c->n = 0;
+        c->serial = ++g_rec_serial;
+        if (c->mems) c->mems->n = 0;
+    }
+    if (!gw_pending(mid)) {
+        cbinfo *c = cbi(GW_CB_BASE + (uint64_t) g_gw.cur, 0);
+        if (c) idlist_add(&c->mems, mid);
+    }
+    g_gw.nrg = 0;
+    return 1;
+}
+// 1 つの範囲を足す
+static void gw_add(ent *e, uint64_t off, const void *d, uint32_t len) {
+    gwslot *x = &g_gw.s[g_gw.cur];
+    if (!len) return;
+    memcpy(x->map + x->used, d, len);
+    if (e->last) memcpy(e->last + off, d, len);
+    if (g_gw.nrg == g_gw.crg) { g_gw.crg = g_gw.crg ? g_gw.crg * 2 : 64; g_gw.rg = realloc(g_gw.rg, g_gw.crg * sizeof *g_gw.rg); }
+    g_gw.rg[g_gw.nrg++] = (VkBufferCopy) { x->used, off, len };
+    x->used += len;
+    g_gw.bytes += len;
+}
+// 足した範囲を 1 回の写しにする
+static void gw_end(ent *e) {
+    gwslot *x = &g_gw.s[g_gw.cur];
+    if (g_gw.nrg) vkCmdCopyBuffer(x->cb, x->sb, (VkBuffer) (uintptr_t) e->gwb, g_gw.nrg, g_gw.rg);
+    x->used = (x->used + 15) & ~15ull;
+    g_gw.nrg = 0;
+    g_gw.copies++;
+}
+// 次の命令の前に、ためている写しを出す（書き込み・descriptor・記録の命令はメモリの中身を読まないので、ためたまま進む）
+static void gw_before_op(uint32_t op) {
+    if (!g_gw.ready || g_gw.s[g_gw.cur].state != 1) return;
+    switch (op) {
+    case VR_MEM_WRITE: case VR_MEM_WRITE_SPANS: case VR_UPDATE_DESCRIPTOR_SETS: case VR_ALLOC_DESCRIPTOR_SETS:
+    case VR_RECORD_COMMAND_BUFFER: case VR_PING:
+        return;
+    default:
+        gw_flush();
+    }
+}
+// QUEUE_SUBMIT の前：違うキューに出す仕事は写しの後に並ばないので、まだ走っている写しを待つ
+static void gw_before_submit(VkQueue q) {
+    if (!g_gw.ready) return;
+    int k = -1;
+    for (int i = 0; i < g_nfl; i++)
+        if (g_fl[i].ncb == 1 && g_fl[i].cbs[0] >= GW_CB_BASE && g_fl[i].cbs[0] < GW_CB_BASE + GW_SLOTS && g_fl[i].q != q) k = i;
+    if (k >= 0) drain_upto(k);
+}
+
 static void jp_reset(void);
 static void vid_reset(void);
 // 手伝いの物を dev の上から消す（自前の fence・つなぎの semaphore・空の代わりの物）。どれも要るときにまた作る
 static void helpers_free(VkDevice dev) {
+    gw_free(dev);
     if (dev) {
         for (int i = 0; i < g_nfpool; i++) vkDestroyFence(dev, g_fpool[i], NULL);
         for (int i = 0; i < 4; i++) if (g_chain[i]) vkDestroySemaphore(dev, g_chain[i], NULL);
@@ -1571,7 +1905,7 @@ static void dev_free(VkDevice dev, int last) {
             case K_FENCE: vkDestroyFence(dev, (VkFence) e->h, NULL); break;
             case K_SEM: vkDestroySemaphore(dev, (VkSemaphore) e->h, NULL); break;
             case K_BUFFER: vkDestroyBuffer(dev, (VkBuffer) e->h, NULL); break;
-            case K_MEMORY: vkFreeMemory(dev, (VkDeviceMemory) e->h, NULL); break;
+            case K_MEMORY: gw_forget_mem(dev, e); vkFreeMemory(dev, (VkDeviceMemory) e->h, NULL); break;
             case K_FB: vkDestroyFramebuffer(dev, (VkFramebuffer) e->h, NULL); break;
             case K_RPASS: vkDestroyRenderPass(dev, (VkRenderPass) e->h, NULL); break;
             case K_VIEW: vkDestroyImageView(dev, (VkImageView) e->h, NULL); break;
@@ -3816,6 +4150,7 @@ static void vid_reset(void) {
 static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     g_cur_op = op;
     g_ops_total++;
+    gw_before_op(op); // ためている書き込みの写しを、メモリを読む・待つかもしれない命令の前に出す
     // 調べ用：VKR_DRAIN=命令の番号,… なら、その命令の前は出した仕事を全部待つ
     static int drain_ops_ready;
     static unsigned char drain_ops[256];
@@ -3842,9 +4177,14 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     switch (op) {
     // （command buffer の記録し直し・command pool の reset・descriptor の書き換え・fence の reset は、
     //   それを使う仕事までしか待たない。それぞれの命令の中で待つ）
+    // （descriptor pool の reset・消す・set を返す：既定は今までどおり全部を待つ。VKR_DPOOL_FULL=0 で、その set を使う仕事までだけ待つ（試し）。
+    //   10/14 に 0 を試したら、検証レイヤーで「まだ走っている command buffer を記録し直す」が出た。全部を待つことが、ほかの所の待ちの足りなさを隠している）
+    case VR_RESET_DESCRIPTOR_POOL: case VR_FREE_DESCRIPTOR_SETS: case VR_DESTROY_DESCRIPTOR_POOL:
+        if (dpool_full()) drain();
+        break;
     case VR_GET_FENCE_STATUS: case VR_GET_SEMAPHORE_COUNTER: case VR_FREE_COMMAND_BUFFERS:
-    case VR_DESTROY_COMMAND_POOL: case VR_RESET_DESCRIPTOR_POOL: case VR_FREE_DESCRIPTOR_SETS:
-    case VR_DESTROY_DESCRIPTOR_POOL: case VR_FREE_MEMORY: case VR_DESTROY_BUFFER: case VR_DESTROY_PIPELINE:
+    case VR_DESTROY_COMMAND_POOL:
+    case VR_FREE_MEMORY: case VR_DESTROY_BUFFER: case VR_DESTROY_PIPELINE:
     case VR_DESTROY_PIPELINE_LAYOUT: case VR_DESTROY_SHADER_MODULE: case VR_DESTROY_DSL: case VR_DESTROY_FENCE:
     case VR_DESTROY_SEMAPHORE: case VR_DESTROY_DEVICE: case VR_QUEUE_WAIT_IDLE: case VR_DEVICE_WAIT_IDLE:
     // （VR_DESTROY_IMAGE_VIEW と VR_DESTROY_FRAMEBUFFER は待たずに、消すのを遅らせる）
@@ -4165,7 +4505,10 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t fam = vr_ru32(r), idx = vr_ru32(r);
         VkQueue q;
         vkGetDeviceQueue(d, fam, idx, &q);
-        put(vr_ru64(r), (uint64_t) (uintptr_t) q, K_QUEUE);
+        uint64_t qid = vr_ru64(r);
+        put(qid, (uint64_t) (uintptr_t) q, K_QUEUE);
+        ent *qe = find(qid);
+        if (qe) qe->size = fam; // キューの家族（書き込みを GPU で写す command pool に使う）
         return 1;
     }
     case VR_CREATE_BUFFER_NR:
@@ -4227,6 +4570,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (res == VK_SUCCESS) {
             put(id, (uint64_t) m, K_MEMORY);
             find(id)->size = mai.allocationSize;
+            find(id)->aux = mai.memoryTypeIndex; // 書き込みを GPU で写す buffer が載るかを見るのに使う
             VkPhysicalDeviceMemoryProperties mp;
             vkGetPhysicalDeviceMemoryProperties(g_pd, &mp);
             if (mp.memoryTypes[mai.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
@@ -4240,6 +4584,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkDevice d = DEV(vr_ru64(r));
         uint64_t id = vr_ru64(r);
         vh_before_mem(id, 1);
+        gw_forget_mem(d, find(id));
         vkFreeMemory(d, OBJ(VkDeviceMemory, id), NULL);
         del(id);
         return 1;
@@ -4271,6 +4616,20 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             for (int i = 0; i < g_nfl; i++) if (g_fl[i].msg <= upto) u = i;
             if (wide ? u > k : u < k) k = u;
         }
+        { int kg = gw_last_job(mid); if (kg > k) k = kg; }
+        {
+            // まだ走っている仕事が使うメモリなら、待たずに GPU の上で写す（gw_*）
+            ent *e0 = find(mid);
+            VkQueue gq = VK_NULL_HANDLE;
+            int g = e0 && e0->map && d && off <= e0->size && n <= e0->size - off ? gw_want(mid, e0, k, off + n, &gq) : (gw_pending(mid) ? -1 : 0);
+            if (g == 1 && gw_begin(mid, gq, n)) {
+                gw_add(e0, off, d, n);
+                gw_end(e0);
+                g_bst.memw++;
+                return 1;
+            }
+            if (g != 0) { gw_flush(); int k2 = last_with_mem(mid); if (k2 > k) k = k2; }
+        }
         drain_upto(k);
         ent *e = find(mid);
         if (e && e->map && d && off <= e->size && n <= e->size - off) {
@@ -4295,6 +4654,35 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             int u = -1;
             for (int i = 0; i < g_nfl; i++) if (g_fl[i].msg <= upto) u = i;
             if (wide ? u > k : u < k) k = u;
+        }
+        { int kg = gw_last_job(mid); if (kg > k) k = kg; }
+        {
+            // まだ走っている仕事が使うメモリなら、待たずに GPU の上で写す（gw_*）。先に範囲を数える
+            ent *e0 = find(mid);
+            vr_rd t = *r;
+            uint64_t need = 0, total = 0;
+            for (uint32_t i = 0; i < n && !t.bad; i++) {
+                uint64_t off = vr_ru64(&t);
+                uint32_t len;
+                const void *d = vr_rbytes(&t, &len);
+                if (e0 && d && off <= e0->size && len <= e0->size - off) { if (off + len > need) need = off + len; total += len; }
+            }
+            VkQueue gq = VK_NULL_HANDLE;
+            int g = e0 && e0->map && !t.bad ? gw_want(mid, e0, k, need, &gq) : (gw_pending(mid) ? -1 : 0);
+            if (g == 1 && gw_begin(mid, gq, total)) {
+                for (uint32_t i = 0; i < n && !r->bad; i++) {
+                    uint64_t off = vr_ru64(r);
+                    uint32_t len;
+                    const void *d = vr_rbytes(r, &len);
+                    if (d && off <= e0->size && len <= e0->size - off) gw_add(e0, off, d, len);
+                    else vlog(JE("範囲の外への書き込みを捨てた（%llu + %u）", "Dropped a write out of range (%llu + %u)"), (unsigned long long) off, len);
+                }
+                gw_end(e0);
+                g_bst.spans_msgs++;
+                g_bst.spans += n;
+                return 1;
+            }
+            if (g != 0) { gw_flush(); int k2 = last_with_mem(mid); if (k2 > k) k = k2; }
         }
         drain_upto(k);
         ent *e = find(mid);
@@ -4327,6 +4715,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             for (int i = 0; i < g_nfl; i++) if (g_fl[i].msg <= upto) u = i;
             if (wide ? u > k : u < k) k = u;
         }
+        { int kg = gw_last_job(mid); if (kg > k) k = kg; } // GPU の写しより後に書く
         drain_upto(k);
         ent *e = find(mid);
         uint64_t need = blob ? pc_blob_bytes(blob, n) : 0;
@@ -4804,6 +5193,16 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 put(id, (uint64_t) ds, K_DSET);
                 ent *se = find(id);
                 if (se) { se->aux = pid; se->size = (uint64_t) (uintptr_t) l; } // どの pool から取ったか・ffhang：layout
+                if (fast_book()) {
+                    // pool の行の list に、取った set の番号を足していく（重なりは見ない。reset のときに確かめる）
+                    ent *pe = find(pid);
+                    if (pe && pe->kind == K_DPOOL) {
+                        if (!pe->list) pe->list = calloc(1, sizeof *pe->list);
+                        idlist *x = pe->list;
+                        if (x && x->n == x->cap) { x->cap = x->cap ? x->cap * 2 : 64; x->ids = realloc(x->ids, x->cap * sizeof *x->ids); }
+                        if (x) x->ids[x->n++] = id;
+                    }
+                }
             } else vlog(JE("descriptor set を取れない (%d)", "Cannot allocate the descriptor set (%d)"), res);
         }
         free(vcount);
@@ -5038,6 +5437,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         vr_rd sr = { stream, n, 0, 0 };
         cbinfo *ci = cbi(cid, 1);
         ci->n = 0;
+        ci->serial = ++g_rec_serial;
         if (ci->mems) ci->mems->n = 0;
         replay(cb, &sr, ci);
         vkEndCommandBuffer(cb);
@@ -5209,6 +5609,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             return 1;
         }
         VkFence f = OBJ(VkFence, vr_ru64(r));
+        gw_before_submit(q); // 書き込みの写しが別のキューにあれば、その終わりを待つ（同じキューならキューの順で後に並ぶ）
         if (g_vh.on) {
             int uses = ncb_all > ncid; // 64 本を超えて覚えきれないときは、使うものとする
             for (uint32_t k = 0; k < ncid && !uses; k++) {
@@ -5310,6 +5711,19 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 }
             }
             memcpy(e->cbs, cids, ncid * sizeof *cids);
+            // 速い引き方（fast_book）：この submit の command buffer が使う set とメモリに、この番号を付ける
+            if (fast_book())
+                for (uint32_t k = 0; k < ncid; k++) {
+                    cbinfo *c = cbi(cids[k], 0);
+                    if (!c) continue;
+                    for (uint32_t j = 0; j < c->n; j++) {
+                        ent *se = find(c->sets[j]);
+                        if (!se) continue;
+                        se->use_msg = my_msg;
+                        if (se->kind == K_DSET) { ent *pe = find(se->aux); if (pe && pe->kind == K_DPOOL) pe->use_msg = my_msg; }
+                    }
+                    if (c->mems) for (uint32_t j = 0; j < c->mems->n; j++) { ent *me = find(c->mems->ids[j]); if (me) me->use_msg = my_msg; }
+                }
             watch_add(s, f, my_msg); // 頼まれていれば、終わったら見張りの糸から知らせる
         } else {
             if (!g_err) vlog(JE("vkQueueSubmit 失敗 (%d)。この接続ではもう GPU を使えない", "vkQueueSubmit failed (%d). The GPU can no longer be used on this connection"), res);
@@ -6120,8 +6534,80 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     return 0;
 }
 
+static const char *op_short(int op) {
+    switch (op) {
+    case VR_MEM_WRITE: return "MEM_WRITE";
+    case VR_MEM_WRITE_SPANS: return "MEM_WRITE_SPANS";
+    case VR_MEM_WRITE_CODED: return "MEM_WRITE_CODED";
+    case VR_MEM_READ: return "MEM_READ";
+    case VR_UPDATE_DESCRIPTOR_SETS: return "UPDATE_DESCRIPTOR_SETS";
+    case VR_ALLOC_DESCRIPTOR_SETS: return "ALLOC_DESCRIPTOR_SETS";
+    case VR_FREE_DESCRIPTOR_SETS: return "FREE_DESCRIPTOR_SETS";
+    case VR_RESET_DESCRIPTOR_POOL: return "RESET_DESCRIPTOR_POOL";
+    case VR_RECORD_COMMAND_BUFFER: return "RECORD_COMMAND_BUFFER";
+    case VR_QUEUE_SUBMIT: return "QUEUE_SUBMIT";
+    case VR_READ_JPEG: return "READ_JPEG";
+    case VR_READ_JPEG_PIPE: return "READ_JPEG_PIPE";
+    case VR_READ_H264: return "READ_H264";
+    case VR_CREATE_GRAPHICS_PIPELINE: return "CREATE_GRAPHICS_PIPELINE";
+    case VR_CREATE_COMPUTE_PIPELINE: return "CREATE_COMPUTE_PIPELINE";
+    case VR_CREATE_IMAGE: case VR_CREATE_IMAGE_NR: return "CREATE_IMAGE";
+    case VR_CREATE_BUFFER: case VR_CREATE_BUFFER_NR: return "CREATE_BUFFER";
+    case VR_CREATE_IMAGE_VIEW: return "CREATE_IMAGE_VIEW";
+    case VR_ALLOC_MEMORY: return "ALLOC_MEMORY";
+    case VR_FREE_MEMORY: return "FREE_MEMORY";
+    case VR_WAIT_FOR_FENCES: return "WAIT_FOR_FENCES";
+    case VR_RESET_FENCES: return "RESET_FENCES";
+    case VR_GET_PROGRESS: return "GET_PROGRESS";
+    case VR_RESET_COMMAND_POOL: return "RESET_COMMAND_POOL";
+    case VR_GET_QUERY_POOL_RESULTS: return "GET_QUERY_POOL_RESULTS";
+    default: return NULL;
+    }
+}
+
+// 主の糸の 1 コマの内訳を記録に出す（VKR_PROF_EVERY 秒ごと）
+static void prof_tick(void) {
+    static int every = -1;
+    if (every < 0) { const char *e = getenv("VKR_PROF_EVERY"); every = e ? atoi(e) : 10; }
+    if (every <= 0) return;
+    double now = t_ms();
+    if (g_pf.t0 == 0) { g_pf.t0 = now; return; }
+    double dt = now - g_pf.t0;
+    if (dt < every * 1000.0) return;
+    double fr = g_pf.frames ? (double) g_pf.frames : 1.0, proc = 0, wait = 0;
+    for (int i = 0; i < 128; i++) { proc += g_pf.ms[i] - g_pf.wait[i]; wait += g_pf.wait[i]; }
+    char line[1200];
+    int at = snprintf(line, sizeof line, JE("主の糸（%.1f 秒・%llu コマ・%llu 通）：1 コマ %.1f ms＝PC を待つ %.1f・ほどく %.1f・処理 %.1f・GPU を待つ %.1f／処理の上位", "Main thread (%.1f s, %llu frames, %llu commands): per frame %.1f ms = waiting for the PC %.1f, decoding %.1f, processing %.1f, GPU wait %.1f / top processing"),
+                      dt / 1000.0, (unsigned long long) g_pf.frames, (unsigned long long) g_pf.msgs, dt / fr, g_pf.idle / fr, g_pf.lz4 / fr, proc / fr, wait / fr);
+    int used[128] = { 0 };
+    for (int k = 0; k < 6; k++) {
+        int bi = -1;
+        for (int i = 0; i < 128; i++)
+            if (!used[i] && g_pf.n[i] && (bi < 0 || g_pf.ms[i] - g_pf.wait[i] > g_pf.ms[bi] - g_pf.wait[bi])) bi = i;
+        if (bi < 0 || g_pf.ms[bi] - g_pf.wait[bi] < 0.05 * fr) break;
+        used[bi] = 1;
+        const char *nm = op_short(bi);
+        if (nm) at += snprintf(line + at, sizeof line - at, " %s %.1f（%.0f 通）", nm, (g_pf.ms[bi] - g_pf.wait[bi]) / fr, (double) g_pf.n[bi] / fr);
+        else at += snprintf(line + at, sizeof line - at, " #%d %.1f（%.0f 通）", bi, (g_pf.ms[bi] - g_pf.wait[bi]) / fr, (double) g_pf.n[bi] / fr);
+        if (at >= (int) sizeof line - 200) break;
+    }
+    if (wait > 0.05 * fr) {
+        at += snprintf(line + at, sizeof line - at, JE("／GPU を待った所", " / GPU waits in"));
+        for (int i = 0; i < 128 && at < (int) sizeof line - 64; i++)
+            if (g_pf.wait[i] > 0.05 * fr) {
+                const char *nm = op_short(i);
+                if (nm) at += snprintf(line + at, sizeof line - at, " %s %.1f", nm, g_pf.wait[i] / fr);
+                else at += snprintf(line + at, sizeof line - at, " #%d %.1f", i, g_pf.wait[i] / fr);
+            }
+    }
+    vlog("%s", line);
+    memset(&g_pf, 0, sizeof g_pf);
+    g_pf.t0 = now;
+}
+
 static void serve_client(vr_sock c) {
     vr_nodelay(c);
+    memset(&g_pf, 0, sizeof g_pf);
     // 返事の尾と押し出しは、つなぎごとに頼まれてから
     g_rx_ext = 0;
     g_reply_seq = 0;
@@ -6131,9 +6617,12 @@ static void serve_client(vr_sock c) {
     size_t cap = 0, pcap = 0;
     for (;;) {
         uint32_t h[2];
+        prof_tick();
+        double ti = t_ms();
         if (!vr_recv_all(c, h, 8)) break;
         if (h[1] > cap) { cap = h[1]; buf = realloc(buf, cap); }
         if (h[1] && !vr_recv_all(c, buf, h[1])) break;
+        g_pf.idle += t_ms() - ti;
         if (h[0] == VR_PACKED) {
             // いくつもの命令をまとめて縮めた物：ほどいて、中の命令を順に処理する
             uint32_t raw = 0;
@@ -6141,7 +6630,9 @@ static void serve_client(vr_sock c) {
             memcpy(&raw, buf, 4);
             if (raw > (512u << 20)) { vlog(JE("縮めた命令が大きすぎる (%u)", "A compressed command is too large (%u)"), raw); break; }
             if (raw > pcap) { pcap = raw; pk = realloc(pk, pcap); }
+            double tz = t_ms();
             int got = LZ4_decompress_safe((const char *) buf + 4, (char *) pk, (int) h[1] - 4, (int) raw);
+            g_pf.lz4 += t_ms() - tz;
             if (got != (int) raw) { vlog(JE("縮めた命令をほどけない (%d)", "Cannot decode a compressed command (%d)"), got); break; }
             size_t pos = 0;
             int ok = 1;
@@ -6153,7 +6644,13 @@ static void serve_client(vr_sock c) {
                 vr_rd r2 = { pk + pos, ih[1], 0, 0 };
                 double t0 = t_ms(), w0 = g_st.wait_ms;
                 if (!handle(c, ih[0], &r2)) ok = 0;
-                if (ih[0] < 128) { g_opt.n[ih[0]]++; g_opt.ms[ih[0]] += t_ms() - t0; g_opt.wait[ih[0]] += g_st.wait_ms - w0; }
+                if (ih[0] < 128) {
+                    double dt = t_ms() - t0, dw = g_st.wait_ms - w0;
+                    g_opt.n[ih[0]]++; g_opt.ms[ih[0]] += dt; g_opt.wait[ih[0]] += dw;
+                    g_pf.n[ih[0]]++; g_pf.ms[ih[0]] += dt; g_pf.wait[ih[0]] += dw;
+                    if (ih[0] == VR_READ_JPEG || ih[0] == VR_READ_JPEG_PIPE || ih[0] == VR_READ_H264) g_pf.frames++;
+                }
+                g_pf.msgs++;
                 pos += ih[1];
             }
             if (!ok) break;
@@ -6162,7 +6659,13 @@ static void serve_client(vr_sock c) {
         vr_rd r = { buf, h[1], 0, 0 };
         double t0 = t_ms(), w0 = g_st.wait_ms;
         int hk = handle(c, h[0], &r);
-        if (h[0] < 128) { g_opt.n[h[0]]++; g_opt.ms[h[0]] += t_ms() - t0; g_opt.wait[h[0]] += g_st.wait_ms - w0; }
+        if (h[0] < 128) {
+            double dt = t_ms() - t0, dw = g_st.wait_ms - w0;
+            g_opt.n[h[0]]++; g_opt.ms[h[0]] += dt; g_opt.wait[h[0]] += dw;
+            g_pf.n[h[0]]++; g_pf.ms[h[0]] += dt; g_pf.wait[h[0]] += dw;
+            if (h[0] == VR_READ_JPEG || h[0] == VR_READ_JPEG_PIPE || h[0] == VR_READ_H264) g_pf.frames++;
+        }
+        g_pf.msgs++;
         if (!hk) break;
     }
     free(buf);
