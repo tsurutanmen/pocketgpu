@@ -33,6 +33,33 @@ stop_listener() {
     for _ in $(seq 1 30); do alive "$p" || break; sleep 0.05; done
     rm -f "$f"
 }
+# スマホの nc のふり（test-android-speed.sh の試験）。待つ口・形・量を nc.port・nc.mode・nc.bytes に書いて、つながり終わる（adb_listen.py が nc.done を作る）まで動き続ける。
+#   形：sink（> /dev/null）・source（head -c バイト数 /dev/zero | nc）・echo（-e cat か mkfifo の形）
+#   場面のファイル：nc_missing（nc が無い）・nc_no_s（-s を断る）・nc_no_e（-e を断る）・nc_no_close（全部受けても閉じない）
+#                  limit_to・limit_from（PC→スマホ・スマホ→PC の MB/s の上限）・rtt_ms（echo が返すまでの待ち）
+fake_nc() {
+    local c=$1 mode port bytes=0
+    if [ -f "$D/nc_missing" ]; then echo "/system/bin/sh: nc: inaccessible or not found" >&2; exit 127; fi
+    case "$c" in *" -s "*) if [ -f "$D/nc_no_s" ]; then echo "usage: nc [-46ElLtUu] [-esnp[ARG]] [-w SEC] ..." >&2; exit 1; fi ;; esac
+    port=$(printf '%s' "$c" | sed -n 's/.*nc -l .*-p \([0-9][0-9]*\).*/\1/p')
+    case "$c" in
+    *"-e cat"*)
+        mode=echo
+        if [ -f "$D/nc_no_e" ]; then echo "usage: nc [-46ElLtUu] [-esnp[ARG]] [-w SEC] ..." >&2; exit 1; fi
+        ;;
+    "head -c "*) mode=source; bytes=$(printf '%s' "$c" | sed -n 's/^head -c \([0-9][0-9]*\) .*/\1/p') ;;
+    *mkfifo*) mode=echo ;;
+    *) mode=sink ;;
+    esac
+    rm -f "$D/nc.done"
+    printf '%s\n' "$port" > "$D/nc.port"
+    printf '%s\n' "$mode" > "$D/nc.mode"
+    printf '%s\n' "$bytes" > "$D/nc.bytes"
+    trap 'exit 143' TERM
+    trap 'rm -f "$D/nc.port" "$D/nc.mode" "$D/nc.bytes"' EXIT
+    while [ ! -f "$D/nc.done" ]; do sleep 0.02; done
+    exit 0
+}
 ready_serial() { awk -F'\t' '$2 == "device" {print $1; exit}' "$D/devices" 2> /dev/null; }
 need_device() {
     local n
@@ -44,7 +71,11 @@ need_device() {
     else serial=$(ready_serial); fi
 }
 case "$cmd" in
-version) echo "Android Debug Bridge version 1.0.41 (fake)" ;;
+version)
+    echo "Android Debug Bridge version 1.0.41 (fake)"
+    echo "Version 35.0.2-fake"
+    echo "Installed as $HERE/adb"
+    ;;
 start-server) ;;
 kill-server)
     for f in "$D"/listen.*; do [ -f "$f" ] && stop_listener "${f##*.}"; done
@@ -76,7 +107,7 @@ forward)
         dest=${2:-}
         if [ ! -f "$D/listen.$p" ]; then
             if listening "$p"; then echo "adb: error: cannot bind listener: Address already in use" >&2; exit 1; fi
-            setsid python3 "$HERE/adb_listen.py" "$p" < /dev/null > /dev/null 2>&1 &
+            setsid python3 "$HERE/adb_listen.py" "$p" "$D" < /dev/null > /dev/null 2>&1 &
             lp=$!
             echo "$lp" > "$D/listen.$p"
             for _ in $(seq 1 60); do listening "$p" && break; alive "$lp" || break; sleep 0.05; done
@@ -97,6 +128,7 @@ shell)
     need_device
     s="$*"
     case "$s" in
+    "kill \$(pidof nc)"*) rm -f "$D/nc.port" "$D/nc.mode" "$D/nc.bytes" "$D/nc.done" ;;
     *kill*) : > "$D/pids" ;;
     *nohup*) echo "$((RANDOM + 1000))" > "$D/pids" ;;
     "pidof pgpu_server") [ -s "$D/pids" ] && cat "$D/pids" ;;
@@ -108,12 +140,46 @@ shell)
         ;;
     "pm path "*) [ -f "$D/app" ] && echo "package:/data/app/com.tsurutanmen.pocketgpu/base.apk" ;;
     "dumpsys package"*) [ -f "$D/app" ] && [ -s "$D/app" ] && echo "    versionName=$(cat "$D/app")" ;;
-    "getprop ro.product.model") echo "Pixel 9 (fake)" ;;
-    "getprop ro.build.version.release") echo "16" ;;
-    "getprop ro.build.version.sdk") echo "36" ;;
-    "getprop ro.product.cpu.abi") echo "arm64-v8a" ;;
-    "cat /data/local/tmp/pgpu_server.log") echo "fake log" ;;
+    "getprop "*)
+        # prop.名前 のファイルがあれば、その中身。無ければ下の既定の答え（電話番号・IMEI・シリアルの名前は、既定では何も答えない）
+        k=${s#getprop }
+        if [ -f "$D/prop.$k" ]; then cat "$D/prop.$k"; else
+            case "$k" in
+            ro.product.model) echo "Pixel 9 (fake)" ;;
+            ro.build.version.release) echo "16" ;;
+            ro.build.version.sdk) echo "36" ;;
+            ro.product.cpu.abi) echo "arm64-v8a" ;;
+            esac
+        fi
+        ;;
+    "dumpsys SurfaceFlinger") [ -f "$D/surfaceflinger" ] && cat "$D/surfaceflinger" ;;
+    "cat /data/local/tmp/pgpu_server.log")
+        if [ -f "$D/nolog" ]; then echo "cat: /data/local/tmp/pgpu_server.log: No such file or directory" >&2; exit 1; fi
+        if [ -f "$D/srvlog" ]; then cat "$D/srvlog"; else echo "fake log"; fi
+        ;;
+    "cat /sys/class/udc/*/"*)
+        f=${s##*/}
+        if [ -f "$D/udc_$f" ]; then cat "$D/udc_$f"; else echo "cat: /sys/class/udc/*/$f: No such file or directory" >&2; exit 1; fi
+        ;;
+    "cat /proc/net/tcp /proc/net/tcp6")
+        # nc_proc_denied があれば、読めないスマホのふり。無ければ、tcp のファイルの行と、nc が待っている口の行
+        if [ -f "$D/nc_proc_denied" ]; then echo "cat: /proc/net/tcp: Permission denied" >&2; exit 1; fi
+        echo "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode"
+        [ -f "$D/tcp" ] && cat "$D/tcp"
+        if [ -f "$D/nc.port" ] && [ ! -f "$D/nc.done" ]; then
+            printf '   9: 0100007F:%04X 00000000:0000 0A 00000000:00000000 00:00000000 00000000  2000        0 77777 1 0000000000000000 100 0 0 10 0\n' "$(cat "$D/nc.port")"
+        fi
+        ;;
+    "nc -l "* | "head -c "*"| nc -l "* | "rm -f "*"mkfifo "*"nc -l "*) fake_nc "$s" ;;
     *) ;;
+    esac
+    ;;
+logcat)
+    # logcat_crash と logcat_app のファイルの中身を返す（-b crash なら前者・-s iphone-rpc-vk なら後者）
+    need_device
+    case "$*" in
+    "-d -b crash") [ -f "$D/logcat_crash" ] && cat "$D/logcat_crash" ;;
+    "-d -s iphone-rpc-vk") [ -f "$D/logcat_app" ] && cat "$D/logcat_app" ;;
     esac
     ;;
 *) echo "adb: unknown command $cmd" >&2; exit 1 ;;
