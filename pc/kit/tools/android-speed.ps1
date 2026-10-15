@@ -1,7 +1,7 @@
 ﻿# PocketGPU（Android）：USB の速さを測って、Discord に貼れる txt を 1 つ作る。Test-Android-Speed.cmd から呼ぶ。Windows PowerShell 5.1 だけで動く（Python は要らない）。
 # 日本語を含むので UTF-8（BOM 付き）で保存する。BOM が無いと 5.1 は Shift_JIS として読んで壊れる。
 # 画面の文は仮。M '日本語' 'English' の組で並べてあるので、言い回しはここで直す。ファイルの中は英語だけ。
-# 画面に出す文は、ラベルと事実だけ。説明の文章は 1 か所だけ（USB 2 のとき）で、【仮文】の印を付けた。鶴田さんが書き直す。
+# 画面に出す文は、ラベルと事実だけ。説明の文章は 1 か所だけ（USB 2 のとき）で、【仮文】の印を付けた。あとで書き直す。
 #
 # 端末には何も入れない・root も要らない。端末に最初から入っている nc（toybox）を、数十秒だけ使う。
 # 測る物（adb で、下の決まった命令だけを打つ。getprop の全部・dumpsys の全部は使わない）
@@ -441,7 +441,7 @@ if ($udcMax) { Say-Info ((M '端末の上限：' 'Phone maximum: ') + (Get-Speed
 Say-Info ((M 'PC 側：' 'PC side: ') + $pc.Text)
 Say-Info ((M '接続：' 'Link: ') + $(if ($linkClass) { $linkClass + ' (from ' + $linkBy + ')' } else { M '不明' 'unknown' }))
 if ($phoneClass -eq 'USB 2' -or ($phoneClass -eq '' -and $pc.Level -eq 'USB 2')) {
-    # 【仮文】鶴田さんが書き直す
+    # 【仮文】あとで書き直す
     Say-Warn (M '【仮文】USB 3 のポートと USB 3 のケーブルでつなぎ直すと速くなるかもしれません' 'DRAFT: it may be faster with a USB 3 port and a USB 3 cable')
 }
 
