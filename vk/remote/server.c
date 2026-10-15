@@ -8508,6 +8508,11 @@ static void *unix_thread(void *p) {
 }
 #endif
 
+// 速さを測る口（bw.c と同じ取り決め）。Android は既定で待つ。PC の代役は -DVR_BW_IN_SERVER で組んで PGPU_BW_TCP で待つ（iOS は bw.c を別に組むので、どちらも定義しない）
+#if defined(__ANDROID__) || defined(VR_BW_IN_SERVER)
+#include "bw_listen.h"
+#endif
+
 int vkr_serve(const char *host, int port) {
     qos_hi();
 #ifdef __ANDROID__
@@ -8553,6 +8558,9 @@ int vkr_serve(const char *host, int port) {
 #endif
     }
     if (ls == VR_BAD_SOCK && uls < 0) return 1;
+#if defined(__ANDROID__) || defined(VR_BW_IN_SERVER)
+    bwl_start(); // 速さを測る口。別の糸で待つので、下の accept を邪魔しない
+#endif
     if (ls != VR_BAD_SOCK)
         vlog(given ? JE("Vulkan の受け手：%s:%d で待っている（口はアプリが開けた）", "Vulkan receiver: listening on %s:%d (socket opened by the app)")
                    : JE("Vulkan の受け手：%s:%d で待っている", "Vulkan receiver: listening on %s:%d"),

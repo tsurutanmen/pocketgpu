@@ -30,7 +30,7 @@ for w in $WHAT; do
         echo "32 ビットのドライバ：$OUT/x86/iphone_icd.dll"
         ;;
     server)
-        $CC -Wall -Wextra -Wno-unused-parameter $VKH -DVR_SERVER_MAIN remote/server.c -o "$OUT/vk_server_new.exe" \
+        $CC -Wall -Wextra -Wno-unused-parameter $VKH -DVR_SERVER_MAIN -DVR_BW_IN_SERVER remote/server.c -o "$OUT/vk_server_new.exe" \
             -lws2_32 -lole32 -loleaut32 -lwindowscodecs -luuid -ldbghelp
         echo "PC の代役の受け手：$OUT/vk_server_new.exe（動いている vk_server.exe とは別の名前で出す）"
         ;;

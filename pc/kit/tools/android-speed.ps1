@@ -3,7 +3,12 @@
 # 画面の文は仮。M '日本語' 'English' の組で並べてあるので、言い回しはここで直す。ファイルの中は英語だけ。
 # 画面に出す文は、ラベルと事実だけ。説明の文章は 1 か所だけ（USB 2 のとき）で、【仮文】の印を付けた。あとで書き直す。
 #
-# 端末には何も入れない・root も要らない。端末に最初から入っている nc（toybox）を、数十秒だけ使う。
+# 端末には何も入れない・root も要らない。まず受け手（pgpu_server・アプリの中の受け手）の速さの口を使う。口が無い・答えない受け手のときだけ、端末に最初から入っている nc（toybox）を、数十秒だけ使う。
+# 受け手の口（vk/remote/bw_listen.h）：adb forward tcp:口 localabstract:pocketgpu-bw で、実際に GPU の命令が通る道と同じ形でつなぐ。取り決めは iPhone の 50058 番（vk/remote/bw.c・pc/usb_bw.py）と同じ
+#       PC→端末   [u32 1][u64 バイト数] を送り、バイト数を流して、受け手が返す [u64 受け取った数] を読み終わるまでの時間
+#       端末→PC   [u32 0][u64 バイト数] を送り、受け手が流すバイト数を読み終わるまでの時間
+#       往復      [u32 0][u64 1] を送って 1 バイトが返るまで
+# 受け手の口を試すのは 1 回だけ（[u32 0][u64 1] を送って 1 バイトが返るか）。返らなければ adb forward を張り直して nc に戻る
 # 測る物（adb で、下の決まった命令だけを打つ。getprop の全部・dumpsys の全部は使わない）
 #   端末の名前・Android の版・チップ      adb shell getprop ro.product.model / ro.product.marketname / ro.product.manufacturer / ro.build.version.release
 #                                          / ro.build.version.sdk / ro.product.cpu.abi / ro.soc.model / ro.board.platform
@@ -15,6 +20,7 @@
 #       往復      adb shell "nc -l -s 127.0.0.1 -p 口 -e cat"（返ってこなければ mkfifo の形）。1 バイトを送って 1 バイトが返るまで
 #     -s 127.0.0.1 が断られる nc のときは、-s 無し（端末のどの口でも待つ）でもう一度。そのときはファイルにそう書く
 #   adb forward は終わりに消す。前からある adb forward（受け手の口）には触らない
+# 画面とファイルに、どちらで測ったか（Measured by）を 1 行出す
 #
 # 集めない物：電話番号・IMEI・Google アカウント・端末のシリアル番号
 # 伏せる物：PC のユーザー名・PC 名・プロフィールのフォルダ名・adb のシリアル番号・メールアドレス（「(hidden)」「(serial)」「(email)」。android-log.ps1 と同じ）
@@ -24,6 +30,7 @@
 # 試す人は使わない、試験用の差し替え（pgpu_common.ps1 の物に加えて）：
 #   PGPU_SPEED_OUT=フォルダ        txt をキットのフォルダの代わりにここへ作る
 #   PGPU_SPEED_PORT=番号           口を探し始める番号（既定 47600）
+#   PGPU_SPEED_VIA=nc              受け手の口を試さず、nc で測る（比べるとき）
 #   PGPU_SPEED_MB=数               1 回に流す量（MB）を決め打ちにする（既定は、最初の 4 MB の速さから 8〜192 MB に決める）
 #   PGPU_SPEED_PINGS=数            往復を測る回数（既定 200）
 #   PGPU_SPEED_ENDWAIT_MS=数       PC→端末で、端末の nc が終わるのを待つ長さ（ミリ秒。既定 15000）
@@ -37,6 +44,9 @@ $script:Serial = $env:ANDROID_SERIAL
 $script:BindOpt = '-s 127.0.0.1 '
 $script:BindFellBack = $false
 $script:ForceKilled = $false
+$script:BwTarget = 'localabstract:pocketgpu-bw'
+$script:Via = 'nc'
+$script:RecvProblem = ''
 # 思わぬ誤りで止まるときも、短い 1 行を出して終わりのコード 2 で終わる。口の forward は消してから
 trap { Write-Host ('ERROR: ' + $_.Exception.Message) -ForegroundColor Red; try { Remove-SpeedForward } catch { }; exit 2 }
 
@@ -186,8 +196,8 @@ function Test-PhoneListening([int]$port) {
     $hex = '{0:X4}' -f $port
     return [bool]([regex]::IsMatch($r.Out, '(?mi)^\s*\d+:\s+[0-9A-F]+:' + $hex + '\s+[0-9A-F:]+\s+0A\s'))
 }
-# 空いている口を選んで adb forward tcp:口 tcp:口 を作る。PC 側の予約・使用中・前からある adb forward・端末側の使用中を避ける
-function New-SpeedForward {
+# 空いている口を選んで adb forward tcp:口 tcp:口（target があれば tcp:口 target）を作る。PC 側の予約・使用中・前からある adb forward・端末側の使用中を避ける
+function New-SpeedForward([string]$target = '') {
     $start = 47600
     if ($env:PGPU_SPEED_PORT -and $env:PGPU_SPEED_PORT -match '^\d{1,5}$') { $start = [int]$env:PGPU_SPEED_PORT }
     $ex = Get-ExcludedPortRanges
@@ -197,8 +207,8 @@ function New-SpeedForward {
         $p = $start + $i
         if ($used -contains $p) { continue }
         if (Get-PortProblem $p $ex.Ranges) { continue }
-        if ((Test-PhoneListening $p) -eq $true) { continue }
-        $r = Invoke-Adb ('forward tcp:' + $p + ' tcp:' + $p)
+        if (-not $target -and (Test-PhoneListening $p) -eq $true) { continue }
+        $r = Invoke-Adb ('forward tcp:' + $p + ' ' + $(if ($target) { $target } else { 'tcp:' + $p }))
         if ($r.Ok) { $script:FwdPort = $p; return $p }
     }
     return 0
@@ -252,8 +262,86 @@ function New-RandomBuffer([int]$n) {
     return , $b
 }
 
+# ---- 受け手の速さの口（pgpu_common.ps1 の Send-BwHead・Invoke-BwTransfer と同じ約束）----
+# 口が答えるか：[u32 0][u64 1] を送って 1 バイトが返れば Ok。adb forward の先に受け手の口が無いと、つないですぐ切られる
+function Test-ReceiverBw([int]$port) {
+    $c = Connect-Tcp '127.0.0.1' $port 3000
+    if (-not $c) { return @{ Ok = $false; Detail = 'could not connect to the adb forward port' } }
+    try {
+        $s = $c.GetStream()
+        $s.ReadTimeout = 4000
+        $s.WriteTimeout = 4000
+        Invoke-BwTransfer $s 0 1 (New-Object byte[] 16)
+        return @{ Ok = $true }
+    } catch {
+        if ($_.Exception.Message -eq 'closed' -or (Test-Closed $_.Exception)) { return @{ Ok = $false; Detail = 'the receiver has no speed socket (connection closed)' } }
+        return @{ Ok = $false; Detail = 'the receiver speed socket did not answer' }
+    } finally { $c.Close() }
+}
+function Measure-ToRecv([int]$port, [int64]$bytes) {
+    $c = Connect-Tcp '127.0.0.1' $port 5000
+    if (-not $c) { return @{ Ok = $false; Why = 'connect'; Detail = 'connect failed' } }
+    try {
+        $c.SendBufferSize = 4MB
+        $s = $c.GetStream()
+        $s.WriteTimeout = 30000
+        $s.ReadTimeout = 30000
+        $buf = New-RandomBuffer 1MB
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        try { Invoke-BwTransfer $s 1 $bytes $buf }
+        catch { return @{ Ok = $false; Why = 'io'; Detail = ('the receiver stopped the transfer (' + $_.Exception.Message + ')') } }
+        $sec = $sw.Elapsed.TotalSeconds
+        if ($sec -le 0) { $sec = 0.000001 }
+        return @{ Ok = $true; MBps = (($bytes / 1MB) / $sec); Sec = $sec; End = 'closed' }
+    } finally { $c.Close() }
+}
+function Measure-FromRecv([int]$port, [int64]$bytes) {
+    $c = Connect-Tcp '127.0.0.1' $port 5000
+    if (-not $c) { return @{ Ok = $false; Why = 'connect'; Detail = 'connect failed' } }
+    try {
+        $c.ReceiveBufferSize = 4MB
+        $s = $c.GetStream()
+        $s.ReadTimeout = 30000
+        $s.WriteTimeout = 30000
+        $buf = New-Object byte[] 1MB
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        try { Invoke-BwTransfer $s 0 $bytes $buf }
+        catch { return @{ Ok = $false; Why = 'io'; Detail = ('the receiver stopped the transfer (' + $_.Exception.Message + ')') } }
+        $sec = $sw.Elapsed.TotalSeconds
+        if ($sec -le 0) { $sec = 0.000001 }
+        return @{ Ok = $true; MBps = (($bytes / 1MB) / $sec); Sec = $sec }
+    } finally { $c.Close() }
+}
+# 往復：[u32 0][u64 1] を送って 1 バイトが返るまで。1 つのつなぎで続ける
+function Measure-RttRecv([int]$port, [int]$pings) {
+    $c = Connect-Tcp '127.0.0.1' $port 5000
+    if (-not $c) { return @{ Ok = $false; Why = 'connect'; Detail = 'connect failed' } }
+    try {
+        $s = $c.GetStream()
+        $s.ReadTimeout = 4000
+        $s.WriteTimeout = 4000
+        $buf = New-Object byte[] 16
+        $ms = New-Object System.Collections.Generic.List[double]
+        $freq = [double][Diagnostics.Stopwatch]::Frequency
+        $total = [Diagnostics.Stopwatch]::StartNew()
+        $warm = 20
+        for ($i = 0; $i -lt ($warm + $pings); $i++) {
+            $t0 = [Diagnostics.Stopwatch]::GetTimestamp()
+            try { Invoke-BwTransfer $s 0 1 $buf } catch { return @{ Ok = $false; Why = 'io'; Detail = 'no answer from the receiver' } }
+            $t1 = [Diagnostics.Stopwatch]::GetTimestamp()
+            if ($i -ge $warm) { $ms.Add(($t1 - $t0) * 1000.0 / $freq) }
+            if ($total.Elapsed.TotalSeconds -gt 12 -and $ms.Count -ge 20) { break }
+        }
+        $a = @($ms | Sort-Object)
+        $n = $a.Count
+        $p95 = $a[[Math]::Min($n - 1, [int][Math]::Ceiling($n * 0.95) - 1)]
+        return @{ Ok = $true; Min = $a[0]; Median = $a[[int](($n - 1) / 2)]; P95 = $p95; Max = $a[$n - 1]; Count = $n; Mode = 'recv' }
+    } finally { $c.Close() }
+}
+
 # 1 回の転送。戻り値：@{ Ok; MBps; Sec; Why; Detail; End }。Why：server（nc が始まらない）| connect | io
 function Measure-ToPhone([int]$port, [int64]$bytes) {
+    if ($script:Via -eq 'receiver') { return (Measure-ToRecv $port $bytes) }
     $h = Start-PhoneCmd ('nc -l ' + $script:BindOpt + '-p ' + $port + ' > /dev/null')
     if (-not $h) { return @{ Ok = $false; Why = 'server'; Detail = 'could not start adb' } }
     $c = $null
@@ -293,6 +381,7 @@ function Measure-ToPhone([int]$port, [int64]$bytes) {
     }
 }
 function Measure-FromPhone([int]$port, [int64]$bytes) {
+    if ($script:Via -eq 'receiver') { return (Measure-FromRecv $port $bytes) }
     $h = Start-PhoneCmd ('head -c ' + $bytes + ' /dev/zero | nc -l ' + $script:BindOpt + '-p ' + $port)
     if (-not $h) { return @{ Ok = $false; Why = 'server'; Detail = 'could not start adb' } }
     $c = $null
@@ -325,6 +414,7 @@ function Measure-FromPhone([int]$port, [int64]$bytes) {
 }
 # 往復：1 バイトを送って 1 バイトが返るまで。mode：'e'（nc -e cat）| 'fifo'
 function Measure-Rtt([int]$port, [string]$mode, [int]$pings) {
+    if ($script:Via -eq 'receiver') { return (Measure-RttRecv $port $pings) }
     $fifo = '/data/local/tmp/pgpu_rtt.fifo'
     if ($mode -eq 'e') { $cmd = 'nc -l ' + $script:BindOpt + '-p ' + $port + ' -e cat' }
     else { $cmd = 'rm -f ' + $fifo + '; mkfifo ' + $fifo + ' && cat ' + $fifo + ' | nc -l ' + $script:BindOpt + '-p ' + $port + ' > ' + $fifo + '; rm -f ' + $fifo }
@@ -447,7 +537,25 @@ if ($phoneClass -eq 'USB 2' -or ($phoneClass -eq '' -and $pc.Level -eq 'USB 2'))
 
 # ---- 3. 速さ ----
 Say-Step 3 4 (M 'adb forward の速さ' 'Speed through adb forward')
-$port = New-SpeedForward
+# 先に受け手の速さの口（localabstract:pocketgpu-bw）を試す。答えなければ forward を消して、nc 用に張り直す
+$port = 0
+if ($env:PGPU_SPEED_VIA -eq 'nc') {
+    $script:RecvProblem = 'skipped (PGPU_SPEED_VIA=nc)'
+} else {
+    $port = New-SpeedForward $script:BwTarget
+    if ($port -ne 0) {
+        $rp = Test-ReceiverBw $port
+        if ($rp.Ok) { $script:Via = 'receiver' }
+        else {
+            $script:RecvProblem = $rp.Detail
+            Remove-SpeedForward
+            $port = 0
+        }
+    } else {
+        $script:RecvProblem = 'could not open an adb forward port to ' + $script:BwTarget
+    }
+}
+if ($script:Via -ne 'receiver') { $port = New-SpeedForward }
 $toRes = $null; $fromRes = $null; $rttRes = $null
 $ncProblem = ''
 $mbEach = 0
@@ -457,6 +565,8 @@ if ($port -eq 0) {
     Say-NG (M 'adb forward の口を作れませんでした' 'Could not open an adb forward port')
 } else {
     Say-Info ((M 'PC の口：' 'PC port: ') + $port)
+    if ($script:Via -eq 'receiver') { Say-Info ((M '測る道具：' 'Measured by: ') + (M '受け手の速さの口（GPU の命令と同じ道）' 'the receiver speed socket (the same path as the GPU commands)')) }
+    else { Say-Info ((M '測る道具：' 'Measured by: ') + (M '端末の nc（受け手の口は使えませんでした）' 'nc on the phone (the receiver speed socket was not available)')) }
     # 最初の 4 MB で速さを見て、1 回に流す量を決める（約 2 秒分。8〜192 MB）
     $probe = Measure-ToPhone $port (4MB)
     if (-not $probe.Ok -and $probe.Why -eq 'server' -and $script:BindOpt -and -not $script:BindFellBack) {
@@ -465,8 +575,8 @@ if ($port -eq 0) {
         $probe = Measure-ToPhone $port (4MB)
     }
     if (-not $probe.Ok) {
-        $ncProblem = $(if ($probe.Detail) { 'nc on the phone did not work: ' + $probe.Detail } else { 'nc on the phone did not work (' + $probe.Why + ')' })
-        Say-NG (M 'この端末の nc が使えませんでした：' 'nc on the phone did not work: ')
+        $ncProblem = $(if ($script:Via -eq 'receiver') { 'the receiver speed socket did not work' } else { 'nc on the phone did not work' }) + $(if ($probe.Detail) { ': ' + $probe.Detail } else { ' (' + $probe.Why + ')' })
+        Say-NG $(if ($script:Via -eq 'receiver') { M '受け手の速さの口で測れませんでした：' 'The receiver speed socket did not work: ' } else { M 'この端末の nc が使えませんでした：' 'nc on the phone did not work: ' })
         Say-Info $(if ($probe.Detail) { $probe.Detail } else { $probe.Why })
     } else {
         $mb = [int][Math]::Min(192, [Math]::Max(8, [Math]::Round($probe.MBps * 2)))
@@ -483,7 +593,7 @@ if ($port -eq 0) {
         $pings = 200
         if ($env:PGPU_SPEED_PINGS -and $env:PGPU_SPEED_PINGS -match '^\d{1,4}$' -and [int]$env:PGPU_SPEED_PINGS -ge 5) { $pings = [int]$env:PGPU_SPEED_PINGS }
         $rttRes = Measure-Rtt $port 'e' $pings
-        if (-not $rttRes.Ok) { $rttRes = Measure-Rtt $port 'fifo' $pings }
+        if (-not $rttRes.Ok -and $script:Via -eq 'nc') { $rttRes = Measure-Rtt $port 'fifo' $pings }
         if ($rttRes.Ok) { Say-OK ((M '往復：' 'Round trip: ') + (Format-Ms $rttRes.Median) + ' ms') }
         else { Say-NG ((M '往復：' 'Round trip: ') + $(if ($rttRes.Detail) { $rttRes.Detail } else { $rttRes.Why })) }
     }
@@ -517,9 +627,15 @@ $info.Add('Link: ' + $(if ($linkClass) { $linkClass + ' (from ' + $linkBy + ')' 
 $info.Add('')
 $info.Add('[adb forward]')
 if ($port -eq 0 -or $ncProblem) {
-    $info.Add('Not measured: ' + $ncProblem)
+    $info.Add('Not measured: ' + $ncProblem + $(if ($script:Via -eq 'nc' -and $script:RecvProblem) { ' (receiver speed socket: ' + $script:RecvProblem + ')' } else { '' }))
 } else {
-    $info.Add('Method: adb forward tcp:' + $port + ' to nc on the phone (' + $(if ($script:BindFellBack) { 'nc listens on all addresses, -s was refused' } else { 'nc listens on 127.0.0.1' }) + ')')
+    if ($script:Via -eq 'receiver') {
+        $info.Add('Measured by: the PocketGPU receiver on the phone (speed socket ' + $script:BwTarget + ', the same path as the GPU commands)')
+        $info.Add('Method: adb forward tcp:' + $port + ' ' + $script:BwTarget)
+    } else {
+        $info.Add('Measured by: nc on the phone (receiver speed socket: ' + $(if ($script:RecvProblem) { $script:RecvProblem } else { 'not available' }) + ')')
+        $info.Add('Method: adb forward tcp:' + $port + ' to nc on the phone (' + $(if ($script:BindFellBack) { 'nc listens on all addresses, -s was refused' } else { 'nc listens on 127.0.0.1' }) + ')')
+    }
     $info.Add('Data: ' + $mbEach + ' MB per run, ' + $runs + ' run(s) per direction. 1 MB = 1048576 bytes')
     foreach ($d in @(@{ L = 'PC to phone'; R = $toRes }, @{ L = 'Phone to PC'; R = $fromRes })) {
         $rr = $d.R
@@ -533,7 +649,7 @@ if ($port -eq 0 -or $ncProblem) {
         }
     }
     if ($rttRes -and $rttRes.Ok) {
-        $info.Add('Round trip (1 byte): median ' + (Format-Ms $rttRes.Median) + ' ms, min ' + (Format-Ms $rttRes.Min) + ', p95 ' + (Format-Ms $rttRes.P95) + ', max ' + (Format-Ms $rttRes.Max) + ' (' + $rttRes.Count + ' pings, ' + $(if ($rttRes.Mode -eq 'e') { 'nc -e cat' } else { 'fifo' }) + ')')
+        $info.Add('Round trip (1 byte): median ' + (Format-Ms $rttRes.Median) + ' ms, min ' + (Format-Ms $rttRes.Min) + ', p95 ' + (Format-Ms $rttRes.P95) + ', max ' + (Format-Ms $rttRes.Max) + ' (' + $rttRes.Count + ' pings, ' + $(if ($rttRes.Mode -eq 'recv') { 'receiver' } elseif ($rttRes.Mode -eq 'e') { 'nc -e cat' } else { 'fifo' }) + ')')
     } else {
         $info.Add('Round trip: not measured (' + $(if ($rttRes -and $rttRes.Detail) { $rttRes.Detail } else { 'no answer' }) + ')')
     }
