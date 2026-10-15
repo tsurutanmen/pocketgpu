@@ -5641,6 +5641,10 @@ static VkResult create_buffer_ex(VkDevice dv, const VkBufferCreateInfo *ci, VkBu
     for (const VkBaseInStructure *x = ci->pNext; x; x = x->pNext)
         if (x->sType == VK_STRUCTURE_TYPE_BUFFER_USAGE_FLAGS_2_CREATE_INFO) usage = (uint32_t) ((const VkBufferUsageFlags2CreateInfo *) x)->usage;
     usage = gs_buffer_usage(usage); // GS を真似る VS が storage buffer として読む
+    // vval1015：transform feedback はドライバが名乗るだけで（vkd3d-proton・zink）、受け手の装置では VK_EXT_transform_feedback を
+    // 有効にしない（ALLOWED_EXT に無い）。その使い道の印を受け手に渡すと、検査の層は VUID-VkBufferCreateInfo-None-09499 を出す
+    // （d3d12test で 15 回・d3d12-rootcbv で 11 回）。DXVK 1.10 は拡張を有効にせずにこの印を付ける。受け手に渡す前に外す
+    usage &= ~(uint32_t) (VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT | VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT);
     vr_u32(&b, usage);
     if ((g_hw.caps & VR_CAP_ASYNC_CREATE) && ci->size <= async_create_max() && brq_find(flags, usage, ci->size, &bf->req)) {
         rpc_send(VR_CREATE_BUFFER_NR, &b);
@@ -5788,8 +5792,11 @@ static VkResult create_image_ex(VkDevice dv, const VkImageCreateInfo *ci, VkImag
     }
     // DXVK 1.10 は深度とステンシルの画像を SAMPLED なしで作り、ステージングへ写すときに view の側だけ SAMPLED にして読む。
     // view の印（pNext）は受け手に運ばないので、受け手では読めない view になり 0 が返る。読める形式なら画像に SAMPLED を足す
+    // vval1015：TRANSIENT_ATTACHMENT の画像には SAMPLED を足せない（VUID-VkImageCreateInfo-usage-00963。Sascha の multisampling で
+    // 受け手だけに出た）。中身を持たない画像なので、読み出しの道も要らない
     VkImageCreateInfo dci;
     if ((ci->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) && !(ci->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+        !(ci->usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) &&
         (ci->format == VK_FORMAT_D16_UNORM_S8_UINT || ci->format == VK_FORMAT_D24_UNORM_S8_UINT || ci->format == VK_FORMAT_D32_SFLOAT_S8_UINT)) {
         VkFormatProperties fp;
         get_format_ex(ci->format, &fp, NULL);

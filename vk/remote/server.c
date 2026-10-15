@@ -299,6 +299,19 @@ static void alias_mem_props(VkPhysicalDeviceMemoryProperties *m) {
             return;
         }
 }
+// vval1015：装置で有効にした geometry shader・tessellation（VR_CREATE_DEVICE で覚える）。
+// ドライバは DXVK に geometry shader を名乗るが、持たない受け手（iPhone）の装置では有効にしない。そのとき DXVK の仕切りの
+// GEOMETRY_SHADER の段がそのまま届き、検査の層は VUID-vkCmdPipelineBarrier-dstStageMask-04090 を出す。
+// GS はドライバが VS で真似るので、有効でない段は VERTEX_SHADER の段に置き換える
+static int g_dev_gs = 1, g_dev_tess = 1;
+static uint64_t fix_stages(uint64_t s) {
+    const uint64_t gs = VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT;
+    const uint64_t ts = VK_PIPELINE_STAGE_TESSELLATION_CONTROL_SHADER_BIT | VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT;
+    if (!g_dev_gs && (s & gs)) s = (s & ~gs) | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+    if (!g_dev_tess && (s & ts)) s = (s & ~ts) | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
+    return s;
+}
+
 static uint32_t alias_bits(uint32_t bits) { return g_alias_mem >= 0 && (bits & (1u << g_alias_of)) ? bits | (1u << g_alias_mem) : bits; }
 static uint32_t alias_type(uint32_t t) { return g_alias_mem >= 0 && t == (uint32_t) g_alias_mem ? g_alias_of : t; }
 
@@ -3570,7 +3583,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             if (d && (!rp_guard_on() || (b && sz && sz <= 65536 && !(sz & 3) && !(off & 3) && rp_range_ok(op, bid, off, sz)))) vkCmdUpdateBuffer(cb, b, off, sz, d);
         } break;
         case VR_CMD_PIPELINE_BARRIER: {
-            uint32_t src = vr_ru32(r), dst = vr_ru32(r), dep = vr_ru32(r), nm = vr_ru32(r);
+            uint32_t src = (uint32_t) fix_stages(vr_ru32(r)), dst = (uint32_t) fix_stages(vr_ru32(r)), dep = vr_ru32(r), nm = vr_ru32(r);
             VkMemoryBarrier mb[16];
             for (uint32_t i = 0; i < nm && !r->bad; i++) {
                 uint32_t sa = vr_ru32(r), da = vr_ru32(r); // 全部読む（16 を超えた分も読み捨てて、並びをずらさない）
@@ -3597,7 +3610,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             free(bb);
         } break;
         case VR_CMD_PIPELINE_BARRIER2: {
-            uint32_t src = vr_ru32(r), dst = vr_ru32(r), dep = vr_ru32(r), nm = vr_ru32(r);
+            uint32_t src = (uint32_t) fix_stages(vr_ru32(r)), dst = (uint32_t) fix_stages(vr_ru32(r)), dep = vr_ru32(r), nm = vr_ru32(r);
             VkMemoryBarrier mb[16];
             for (uint32_t i = 0; i < nm && !r->bad; i++) {
                 uint32_t sa = vr_ru32(r), da = vr_ru32(r);
@@ -3885,9 +3898,9 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             VkMemoryBarrier2 *mb = calloc(nm ? nm : 1, sizeof *mb);
             for (uint32_t i = 0; i < nm; i++) {
                 mb[i].sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-                mb[i].srcStageMask = vr_ru64(r);
+                mb[i].srcStageMask = fix_stages(vr_ru64(r));
                 mb[i].srcAccessMask = vr_ru64(r);
-                mb[i].dstStageMask = vr_ru64(r);
+                mb[i].dstStageMask = fix_stages(vr_ru64(r));
                 mb[i].dstAccessMask = vr_ru64(r);
             }
             uint32_t nb = vr_ru32(r);
@@ -3896,9 +3909,9 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             uint32_t nbk = 0;
             for (uint32_t i = 0; i < nb; i++) {
                 VkBufferMemoryBarrier2 t = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
-                t.srcStageMask = vr_ru64(r);
+                t.srcStageMask = fix_stages(vr_ru64(r));
                 t.srcAccessMask = vr_ru64(r);
-                t.dstStageMask = vr_ru64(r);
+                t.dstStageMask = fix_stages(vr_ru64(r));
                 t.dstAccessMask = vr_ru64(r);
                 t.srcQueueFamilyIndex = vr_ru32(r);
                 t.dstQueueFamilyIndex = vr_ru32(r);
@@ -3915,9 +3928,9 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             uint32_t nik = 0;
             for (uint32_t i = 0; i < ni; i++) {
                 VkImageMemoryBarrier2 t = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-                t.srcStageMask = vr_ru64(r);
+                t.srcStageMask = fix_stages(vr_ru64(r));
                 t.srcAccessMask = vr_ru64(r);
-                t.dstStageMask = vr_ru64(r);
+                t.dstStageMask = fix_stages(vr_ru64(r));
                 t.dstAccessMask = vr_ru64(r);
                 t.oldLayout = (VkImageLayout) vr_ru32(r);
                 t.newLayout = (VkImageLayout) vr_ru32(r);
@@ -4043,7 +4056,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             if (!r->bad && qp) vkCmdEndQuery(cb, qp, q);
         } break;
         case VR_CMD_WRITE_TIMESTAMP: {
-            uint32_t stage = vr_ru32(r);
+            uint32_t stage = (uint32_t) fix_stages(vr_ru32(r));
             VkQueryPool qp = OBJ(VkQueryPool, vr_ru64(r));
             uint32_t q = vr_ru32(r);
             if (!r->bad && qp) vkCmdWriteTimestamp(cb, (VkPipelineStageFlagBits) stage, qp, q);
@@ -5816,6 +5829,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (res == VK_SUCCESS) {
             put(id, (uint64_t) (uintptr_t) dev, K_DEVICE);
             pc_dev_add(dev);
+            g_dev_gs = has_f && feats.geometryShader;
+            g_dev_tess = has_f && feats.tessellationShader;
             if (g_dev && g_dev != dev) {
                 // 2 つ目の装置（CTS の試験が自分で作る物など）。手伝いの物は前の装置の上にあるので、新しい装置で作り直す
                 drain();
@@ -6499,8 +6514,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_CREATE_COMPUTE_PIPELINE: {
         VkDevice d = DEV(vr_ru64(r));
         uint64_t id = vr_ru64(r);
-        VkComputePipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-        ci.flags = vr_ru32(r);
+        VkComputePipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .basePipelineIndex = -1 };
+        ci.flags = vr_ru32(r) & ~(uint32_t) VK_PIPELINE_CREATE_DERIVATIVE_BIT; // vval1015：下の graphics と同じ
         uint64_t lid = vr_ru64(r);
         ci.layout = OBJ(VkPipelineLayout, lid);
         ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -6991,7 +7006,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             for (uint32_t k = 0; k < nw; k++) {
                 uint64_t sid = vr_ru64(r);
                 sm[i].ws[k] = OBJ(VkSemaphore, sid);
-                sm[i].wst[k] = vr_ru32(r);
+                sm[i].wst[k] = (VkPipelineStageFlags) fix_stages(vr_ru32(r));
                 sm[i].wv[k] = vr_ru64(r);
                 ent *se = find(sid);
                 if (se && se->kind == K_SEM && se->aux == VK_SEMAPHORE_TYPE_TIMELINE && sm[i].wv[k]) {
@@ -7452,7 +7467,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         ci.dependencyCount = vr_ru32(r);
         if (ci.dependencyCount > r->n - r->at) ci.dependencyCount = 0, r->bad = 1;
         VkSubpassDependency *dep = calloc(ci.dependencyCount ? ci.dependencyCount : 1, sizeof *dep);
-        for (uint32_t i = 0; i < ci.dependencyCount; i++) vr_rcopy(r, &dep[i], sizeof dep[i]);
+        for (uint32_t i = 0; i < ci.dependencyCount; i++) {
+            vr_rcopy(r, &dep[i], sizeof dep[i]);
+            dep[i].srcStageMask = (VkPipelineStageFlags) fix_stages(dep[i].srcStageMask);
+            dep[i].dstStageMask = (VkPipelineStageFlags) fix_stages(dep[i].dstStageMask);
+        }
         ci.pDependencies = dep;
         VkRenderPass rp;
         VkResult res = r->bad || !d ? VK_ERROR_INITIALIZATION_FAILED : vkCreateRenderPass(d, &ci, NULL, &rp);
@@ -7507,8 +7526,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     case VR_CREATE_GRAPHICS_PIPELINE: {
         VkDevice d = DEV(vr_ru64(r));
         uint64_t id = vr_ru64(r);
-        VkGraphicsPipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-        ci.flags = vr_ru32(r);
+        VkGraphicsPipelineCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .basePipelineIndex = -1 };
+        // vval1015：元の pipeline（basePipelineHandle・basePipelineIndex）は届かないので、派生の印（DERIVATIVE）は外す。
+        // 印を残すと、index 0・handle 無しの派生になり、検査の層は VUID-vkCreateGraphicsPipelines-flags-00720 を出す
+        // （Sascha の pipelines で 2 回）。派生は速さのための指定で、外しても描く物は変わらない
+        ci.flags = vr_ru32(r) & ~(uint32_t) VK_PIPELINE_CREATE_DERIVATIVE_BIT;
         uint64_t lid = vr_ru64(r);
         ci.layout = OBJ(VkPipelineLayout, lid);
         ci.renderPass = OBJ(VkRenderPass, vr_ru64(r));
@@ -7814,8 +7836,8 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             dep[i].sType = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2;
             dep[i].srcSubpass = vr_ru32(r);
             dep[i].dstSubpass = vr_ru32(r);
-            dep[i].srcStageMask = vr_ru32(r);
-            dep[i].dstStageMask = vr_ru32(r);
+            dep[i].srcStageMask = (VkPipelineStageFlags) fix_stages(vr_ru32(r));
+            dep[i].dstStageMask = (VkPipelineStageFlags) fix_stages(vr_ru32(r));
             dep[i].srcAccessMask = vr_ru32(r);
             dep[i].dstAccessMask = vr_ru32(r);
             dep[i].dependencyFlags = vr_ru32(r);
@@ -7823,9 +7845,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             // sync2 の memory barrier が付いていれば、stage と access はそちらが使われる
             if (vr_ru32(r)) {
                 dmb[i].sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-                dmb[i].srcStageMask = vr_ru64(r);
+                dmb[i].srcStageMask = fix_stages(vr_ru64(r));
                 dmb[i].srcAccessMask = vr_ru64(r);
-                dmb[i].dstStageMask = vr_ru64(r);
+                dmb[i].dstStageMask = fix_stages(vr_ru64(r));
                 dmb[i].dstAccessMask = vr_ru64(r);
                 dep[i].pNext = &dmb[i];
             }
