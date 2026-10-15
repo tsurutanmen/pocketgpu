@@ -78,6 +78,18 @@ import VideoToolbox
 //      VTCompressionSessionEncodeFrame の呼び出しの時間・回す処理の時間・エンコーダの実際の設定（ハード・RealTime・MaxFrameDelayCount）を足した
 //   4. 隠しスイッチ UserDefaults "webcamDebug"（起動引数 -webcamDebug 4 でも入る）：1 低遅延のレート制御を使わない・2 DataRateLimits を付けない・
 //      4 回転と反転を前のとおり接続で行う・8 中央の切り抜きを前のとおり Core Image で行う。ふだんは 0。本物で効き目を比べるため
+//
+// 10/16（work/cam4k1016）4K60 で、カメラの受け口（captureOutput）の中でエンコーダを同期で呼ぶため、受け口が 16〜20 ms かかり、
+// iOS が遅れたコマを捨てて 49〜51 コマ/秒になるのを直す（本物の iPhone では未確認。効き目は記録の「内訳」「内訳3」で見る）：
+//   1. 受け口は、受け取ったコマの CVPixelBuffer を持って、待ちの列に入れるだけにした。糸は 2 本：
+//        回す処理（Metal・Core Image）をする prepQueue（回す必要があるときだけ）→ エンコーダを呼ぶ encodeQueue。
+//        回す必要がなければ、受け口から直接 encodeQueue の列へ入れる。2 本に分けたのは、回す時間（180 度で約 3.5 ms）とエンコーダの呼び出しが重ならないため
+//   2. 列は糸ごとに 2 枚まで。超えたら古いコマを捨てて新しいコマを優先する（待ちで捨てたコマ）。番号（seq）とキーフレームの印は、
+//      エンコーダに渡す直前に決めるので、待ちで捨てても番号は飛ばず、キーフレームも要らない（エンコーダに入っていない）
+//   3. カメラを作り直す・止めるときは、列を空けて、2 本の糸が戻るのを待ってから、エンコーダを閉じる
+//   4. 記録の「内訳」に、待ちで捨てたコマとエンコードの糸の1コマの時間を足し、「内訳3」で受け口・回す糸・エンコードの糸の時間と、待ちで捨てたコマを出す
+//   5. 隠しスイッチ（webcamDebug）に 16 受け口の中で同期（前の作り）・32 列を 1 枚にする・64 エンコーダに入力の形（NV12・大きさ）を伝えて作る・
+//      128 回さないときも Metal で自分の入れ物へ写してからエンコーダに渡す、を足した
 final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureMetadataOutputObjectsDelegate {
     static let shared = CameraBridge()
     static let port: UInt16 = 50064
@@ -140,6 +152,8 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         static let debug = "webcamDebug"             // camrot1015：本物で効き目を比べる隠しスイッチ（ビット。上の説明の 4）。画面には出さない
     }
     // camrot1015：隠しスイッチ。1 低遅延のレート制御を使わない・2 DataRateLimits を付けない・4 回転と反転を接続で行う・8 中央の切り抜きを Core Image で行う
+    // cam4k1016：16 受け口の中で同期にエンコードする（前の作り）・32 列を 1 枚にする（ふだんは 2 枚）・64 エンコーダを作るとき入力の形（NV12・大きさ）を伝える・
+    //   128 回さないときも Metal で自分の入れ物へ写してからエンコーダに渡す（カメラの入れ物のまま渡すより、エンコーダの呼び出しが速いかを比べる）
     private static var debugBits: Int { UserDefaults.standard.integer(forKey: Key.debug) }
     // 初めの値（画面の @AppStorage の初めの値と同じにしておく）
     static let defaultCamera = 0, defaultHeight = 1080, defaultFps = 30, defaultQuality = 2, defaultPreferPC = true
@@ -306,6 +320,12 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private var flipCalls: UInt64 = 0  // camrot1015：Metal で回したコマの数
     private var flipFails: UInt64 = 0  // camrot1015：Metal で回せなかったコマの数（このつなぎの間。回せないコマは送らない）
     private var flipCopy: FrameFlipper? // camrot1015：180 度・反転を Metal で行うとき（なければ nil）
+    private var waitDrops: UInt64 = 0  // cam4k1016：糸が間に合わず、列から古いコマを捨てた数（prepQueue と encodeQueue の列の合計）
+    private var waitUs: UInt64 = 0     // cam4k1016：受け口に来てから、エンコーダに渡す直前までの時間の合計（µs。列で待った時間と回す時間を含む。エンコーダに渡したコマだけ）
+    private var workUs: UInt64 = 0     // cam4k1016：エンコードの糸が 1 コマに使った時間の合計（µs。エンコーダの呼び出しなど。回す処理は含まない）
+    private var workCalls: UInt64 = 0  // cam4k1016：その数
+    private var prepUs: UInt64 = 0     // cam4k1016：回す糸が 1 コマに使った時間の合計（µs。Metal・Core Image。回したコマだけ）
+    private var prepCalls: UInt64 = 0  // cam4k1016：その数
     private var sessionGen: UInt64 = 0  // カメラを作り直すたびに増やす。前のカメラのコマを、新しい形の後ろに送らないため
     private let maxInflight = 4         // これより溜まったら、カメラの絵を捨てて追いつく（USB が詰まったとき、古いコマを送り続けない）
     // camctl：lock で守る
@@ -319,8 +339,42 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     private var cineCopy = false                   // シネマティックが入っている
 
     private let captureQueue = DispatchQueue(label: "camera-capture", qos: .userInteractive)
+    // cam4k1016：受け口（captureQueue）は、コマを列に入れるだけ。回す処理は prepQueue、エンコーダの呼び出しは encodeQueue（どちらも直列）。
+    // 回す必要がないコマは、prepQueue を通らず、受け口から encodeQueue の列へ入る。
+    // 下の「カメラの糸だけで触る」物（ciContext・levelNow・faceNow・lastStagePts）と FrameFlipper は、prepQueue だけで触る（前は captureQueue）
+    private let prepQueue = DispatchQueue(label: "camera-prep", qos: .userInteractive)
+    private let encodeQueue = DispatchQueue(label: "camera-encode", qos: .userInteractive)
+    private static let maxWait = 2                // 列の上限（枚）。超えたら古い方を捨てる。隠しスイッチ 32 で 1 枚
+    private var waitLimit: Int { Self.debugBits & 32 != 0 ? 1 : Self.maxWait }
+    // 受け口が渡す 1 コマ。pb は、prepQueue の前ならカメラの入れ物、後なら回した入れ物。持っている間、入れ物は戻らない
+    fileprivate struct CamFrame { let pb: CVPixelBuffer; let pts: CMTime; let gen: UInt64; let enteredNs: UInt64 }
+    // 古い順の列。入れる側と取り出す側が別の糸。running は「糸が列を空にしている最中」で、入れた側は running が false のときだけ糸を起こす
+    fileprivate final class Mailbox {
+        private let l = NSLock()
+        private var items: [CamFrame] = []
+        private var running = false
+        // 入れる。limit を超えたら古い方を捨てる。返り値：捨てた数と、糸を起こす必要があるか
+        func push(_ x: CamFrame, limit: Int) -> (dropped: Int, wake: Bool) {
+            l.lock(); defer { l.unlock() }
+            items.append(x)
+            var d = 0
+            while items.count > limit { items.removeFirst(); d += 1 }
+            let w = !running
+            if w { running = true }
+            return (d, w)
+        }
+        // 古い方から 1 枚取り出す。空なら running を下ろして nil を返す（下ろすのと空の確かめが同じ lock の中なので、入れた 1 枚を取りこぼさない）
+        func pop() -> CamFrame? {
+            l.lock(); defer { l.unlock() }
+            if items.isEmpty { running = false; return nil }
+            return items.removeFirst()
+        }
+        func clear() { l.lock(); items.removeAll(); l.unlock() }
+    }
+    private let prepBox = Mailbox()    // prepQueue を待つコマ
+    private let encBox = Mailbox()     // encodeQueue を待つコマ
     private let metaQueue = DispatchQueue(label: "camera-meta", qos: .userInitiated)
-    // camctl：カメラの糸だけで触る
+    // camctl：カメラの糸だけで触る（cam4k1016：いまは prepQueue だけ。隠しスイッチ 16 のときは captureQueue）
     private lazy var ciContext = CIContext(options: [.workingColorSpace: NSNull(), .cacheIntermediates: false])
     private var levelNow: CGFloat = 0              // なめらかにした傾き（ラジアン）
     private var faceNow = CGPoint(x: 0.5, y: 0.5)  // なめらかにした顔の位置
@@ -1060,6 +1114,16 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                 log("ウェブカメラ：Metal で回す準備ができない（\(FrameFlipper.buildError)）。前のとおり接続で回す")
             }
         }
+        // cam4k1016：隠しスイッチ 128。回さないときも、Metal で自分の入れ物（IOSurface の NV12）へそのまま写してからエンコーダに渡す。
+        // 4K60 の記録では、Metal で写した 180 度の方がエンコーダの呼び出しが約 3 ms 短かった（0 度 19.5 ms・180 度 16.4 ms）。写す入れ物の違いが効いているかを比べる
+        if flipper == nil && !r.stage && connRot == 0 && !connMirror && Self.debugBits & 128 != 0 {
+            flipper = FrameFlipper(w: p.outW, h: p.outH, flipX: false, flipY: false)
+            if flipper != nil {
+                rotHow += "＋Metal の写し"
+            } else {
+                log("ウェブカメラ：Metal で写す準備ができない（\(FrameFlipper.buildError)）。カメラの入れ物のまま渡す")
+            }
+        }
         let s = AVCaptureSession()
         s.beginConfiguration()
         s.sessionPreset = .inputPriority // 形は device.activeFormat で決める（プリセットだと 1080p は 30 コマまでのことがある）
@@ -1221,18 +1285,21 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let ackFps = fr
         q.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, self.session === s else { return }
-            self.lock.lock(); let n0 = self.sent; let c0 = self.capCalls; let e0 = self.encDone; let v0 = self.vtDropped; let b0 = self.capBusyUs; self.lock.unlock()
+            self.lock.lock(); let n0 = self.sent; let c0 = self.capCalls; let e0 = self.encDone; let v0 = self.vtDropped; let b0 = self.capBusyUs
+            let wd0 = self.waitDrops; let wu0 = self.workUs; let wc0 = self.workCalls; self.lock.unlock()
             let t0 = Date()
             self.q.asyncAfter(deadline: .now() + 3.0) { [weak self] in
                 guard let self, self.session === s else { return }
-                self.lock.lock(); let n1 = self.sent; let drop = self.dropped; let c1 = self.capCalls; let e1 = self.encDone; let v1 = self.vtDropped; let b1 = self.capBusyUs; self.lock.unlock()
+                self.lock.lock(); let n1 = self.sent; let drop = self.dropped; let c1 = self.capCalls; let e1 = self.encDone; let v1 = self.vtDropped; let b1 = self.capBusyUs
+                let wd1 = self.waitDrops; let wu1 = self.workUs; let wc1 = self.workCalls; self.lock.unlock()
                 let secs = Date().timeIntervalSince(t0)
                 let rate = (secs > 0 && n1 >= n0) ? Double(n1 - n0) / secs : 0
                 let capRate = (secs > 0 && c1 >= c0) ? Double(c1 - c0) / secs : 0
                 let encRate = (secs > 0 && e1 >= e0) ? Double(e1 - e0) / secs : 0
                 let vtDrop = v1 >= v0 ? v1 - v0 : 0
                 let busyMs = (c1 > c0 && b1 >= b0) ? Double(b1 - b0) / Double(c1 - c0) / 1000 : 0
-                self.log("ウェブカメラ：内訳 カメラから \(String(format: "%.1f", capRate)) コマ/秒・エンコーダから出た \(String(format: "%.1f", encRate)) コマ/秒・エンコーダが落とした \(vtDrop)・カメラの受け口の1コマの時間 \(String(format: "%.1f", busyMs)) ms")
+                let workMs = (wc1 > wc0 && wu1 >= wu0) ? Double(wu1 - wu0) / Double(wc1 - wc0) / 1000 : 0
+                self.log("ウェブカメラ：内訳 カメラから \(String(format: "%.1f", capRate)) コマ/秒・エンコーダから出た \(String(format: "%.1f", encRate)) コマ/秒・エンコーダが落とした \(vtDrop)・カメラの受け口の1コマの時間 \(String(format: "%.2f", busyMs)) ms・エンコードの糸の1コマの時間 \(String(format: "%.2f", workMs)) ms・待ちで捨てたコマ \(Self.delta(wd1, wd0))")
                 let camFps = Self.fpsOf(dev.activeVideoMinFrameDuration)
                 self.log("ウェブカメラ：実測 \(String(format: "%.1f", rate)) コマ/秒（ACK \(ackFps)・頼み \(askedFps)・カメラの設定 \(camFps)・捨てたコマ \(drop)・熱 \(ProcessInfo.processInfo.thermalState.rawValue)）")
             }
@@ -1267,11 +1334,15 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
     // camrot1015：数えている物の写し（lock の中で読む。q の上から呼ぶ）
     private struct CamCounters {
         var late: UInt64, buf: UInt64, other: UInt64, encUs: UInt64, encCalls: UInt64, flipUs: UInt64, flipCalls: UInt64, flipFails: UInt64
+        // cam4k1016
+        var capUs: UInt64, capCalls: UInt64, workUs: UInt64, workCalls: UInt64, waitUs: UInt64, waitDrops: UInt64, prepUs: UInt64, prepCalls: UInt64
     }
     private func counters() -> CamCounters {
         lock.lock(); defer { lock.unlock() }
         return CamCounters(late: lateDrops, buf: bufDrops, other: otherDrops, encUs: encCallUs, encCalls: encCalls,
-                           flipUs: flipUs, flipCalls: flipCalls, flipFails: flipFails)
+                           flipUs: flipUs, flipCalls: flipCalls, flipFails: flipFails,
+                           capUs: capBusyUs, capCalls: capCalls, workUs: workUs, workCalls: workCalls, waitUs: waitUs, waitDrops: waitDrops,
+                           prepUs: prepUs, prepCalls: prepCalls)
     }
     private static func delta(_ a: UInt64, _ b: UInt64) -> UInt64 { a >= b ? a - b : 0 }
 
@@ -1292,6 +1363,13 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                 let encMs = ec > 0 ? Double(eu) / Double(ec) / 1000 : 0
                 let flipMs = fc > 0 ? Double(fu) / Double(fc) / 1000 : 0
                 self.log("ウェブカメラ：内訳2（\(label)）\(String(format: "%.1f", secs)) 秒間・iOS が捨てたコマ 遅れ \(late)・入れ物不足 \(buf)・その他 \(other)・エンコーダの呼び出し 1 コマ \(String(format: "%.2f", encMs)) ms（\(ec) コマ）・Metal で回す 1 コマ \(String(format: "%.2f", flipMs)) ms（\(fc) コマ・失敗 \(ff)）")
+                // cam4k1016：受け口・回す糸・エンコードの糸の 1 コマの時間、受け口に来てからエンコーダに渡す直前までの時間、列から捨てたコマ。1 行を 200 字に収める
+                let cc = Self.delta(k1.capCalls, k0.capCalls), wc = Self.delta(k1.workCalls, k0.workCalls), pc = Self.delta(k1.prepCalls, k0.prepCalls)
+                let capMs = cc > 0 ? Double(Self.delta(k1.capUs, k0.capUs)) / Double(cc) / 1000 : 0
+                let prepMs = pc > 0 ? Double(Self.delta(k1.prepUs, k0.prepUs)) / Double(pc) / 1000 : 0
+                let workMs = wc > 0 ? Double(Self.delta(k1.workUs, k0.workUs)) / Double(wc) / 1000 : 0
+                let waitMs = wc > 0 ? Double(Self.delta(k1.waitUs, k0.waitUs)) / Double(wc) / 1000 : 0
+                self.log("ウェブカメラ：内訳3（\(label)）受け口 1 コマ \(String(format: "%.2f", capMs)) ms（\(cc) コマ）・回す糸 \(String(format: "%.2f", prepMs)) ms（\(pc) コマ）・エンコードの糸 \(String(format: "%.2f", workMs)) ms（\(wc) コマ）・受け口から渡す直前まで \(String(format: "%.2f", waitMs)) ms・待ちで捨てたコマ \(Self.delta(k1.waitDrops, k0.waitDrops))")
             }
         }
     }
@@ -1778,8 +1856,16 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         let lowLatency = lowLatencyWanted && Self.debugBits & 1 == 0 // camrot1015：隠しスイッチ。低遅延のレート制御を使わない
         let spec: CFDictionary? = lowLatency ? ([kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String: true] as CFDictionary) : nil
         var llUsed = lowLatency // camrot1015：実際に低遅延で作れたか（記録用）
+        // cam4k1016：隠しスイッチ 64。エンコーダに入力の形（NV12・大きさ・IOSurface）を伝えて作る。ふだんは伝えない（nil）。伝えると、エンコーダが入力を受ける入れ物を
+        // その形に合わせて用意するので、形の違いによる中の変換やコピーが無くなる見込み（本物では未確認）。カメラの絵も Metal・Core Image の写し先も同じ形
+        let srcAttrs: CFDictionary? = Self.debugBits & 64 != 0 ? ([
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferWidthKey as String: w,
+            kCVPixelBufferHeightKey as String: h,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+        ] as [String: Any] as CFDictionary) : nil
         var st = VTCompressionSessionCreate(allocator: nil, width: Int32(w), height: Int32(h), codecType: kCMVideoCodecType_H264, encoderSpecification: spec,
-                                            imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &s)
+                                            imageBufferAttributes: srcAttrs, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &s)
         if st != noErr || s == nil {
             // 低遅延のモードを持つエンコーダが無いとき（古い iPhone の軽いアプリ PocketCam のため）は、ふつうのエンコーダで作り直す。
             // 低遅延で作れる機種ではここを通らないので、動きは前と同じ
@@ -1787,7 +1873,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             llUsed = false
             s = nil
             st = VTCompressionSessionCreate(allocator: nil, width: Int32(w), height: Int32(h), codecType: kCMVideoCodecType_H264, encoderSpecification: nil,
-                                            imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &s)
+                                            imageBufferAttributes: srcAttrs, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &s)
         }
         guard st == noErr, let s else { log("ウェブカメラ：エンコーダを作れない（\(st)）"); return nil }
         func set(_ k: CFString, _ v: CFTypeRef) { _ = VTSessionSetProperty(s, key: k, value: v) }
@@ -1812,7 +1898,7 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
             return nil
         }
         // camrot1015：エンコーダが実際に持っている設定を読み直して記録に出す（ハードで動いているか・出力を詰まらせる上限が付いていないか）
-        log("ウェブカメラ：エンコーダ \(w)×\(h)・\(fps) コマ/秒・\(kbps) kbps・準備 \(ps)・低遅延 \(llUsed ? 1 : 0)・ハード \(Self.propText(s, Self.hwKey))・RealTime \(Self.propText(s, kVTCompressionPropertyKey_RealTime))・MaxFrameDelayCount \(Self.propText(s, kVTCompressionPropertyKey_MaxFrameDelayCount))・隠しスイッチ \(Self.debugBits)")
+        log("ウェブカメラ：エンコーダ \(w)×\(h)・\(fps) コマ/秒・\(kbps) kbps・準備 \(ps)・低遅延 \(llUsed ? 1 : 0)・ハード \(Self.propText(s, Self.hwKey))・RealTime \(Self.propText(s, kVTCompressionPropertyKey_RealTime))・MaxFrameDelayCount \(Self.propText(s, kVTCompressionPropertyKey_MaxFrameDelayCount))・速さ優先 \(Self.propText(s, kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality))・並べ替え \(Self.propText(s, kVTCompressionPropertyKey_AllowFrameReordering))・想定コマ数 \(Self.propText(s, kVTCompressionPropertyKey_ExpectedFrameRate))・入力の形 \(srcAttrs != nil ? 1 : 0)・隠しスイッチ \(Self.debugBits)")
         return s
     }
 
@@ -2061,6 +2147,15 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         sendConn = nil; encCopy = nil; sessionGen &+= 1
         stage = StageParams(); poolCopy = nil; devCopy = nil; videoOutCopy = nil; faceTarget = nil; cineCopy = false; levelShown = 0; flipCopy = nil
         lock.unlock()
+        // cam4k1016：列を空けて（持っているカメラの入れ物を手放す）、回す糸とエンコードの糸がいま扱っている 1 コマを終えるのを待つ。
+        // これから閉じるエンコーダを、その糸が呼んでいる最中にしないため。上で sendConn を nil にして世代を進めてあるので、
+        // 待つ間に新しく列に入る物は無く（入っても世代が違い、prepareFrame・submitFrame が捨てる）、糸は列を空けたら戻る。
+        // 糸の中から q を待つ所は無いので、q の上から sync で待っても詰まらない。回す糸が先（そこから encBox へ入るため）
+        // 作り直しで手放した分は「待ちで捨てたコマ」に数えない（記録の窓をゆがめない）
+        prepBox.clear()
+        prepQueue.sync {}
+        encBox.clear()
+        encodeQueue.sync {}
         curReq = nil
         baseFps = 0
         stopMotion()
@@ -2074,9 +2169,12 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
                 s.stopRunning()
                 for i in s.inputs { s.removeInput(i) }
                 for o in s.outputs { s.removeOutput(o) }
-                self?.levelNow = 0
-                self?.faceNow = CGPoint(x: 0.5, y: 0.5)
-                self?.lastStagePts = -1
+                // cam4k1016：これらは回す糸が触る物なので、その糸で戻す（stopRunning が戻ったあとなので、新しいコマはもう来ない）
+                self?.prepQueue.async {
+                    self?.levelNow = 0
+                    self?.faceNow = CGPoint(x: 0.5, y: 0.5)
+                    self?.lastStagePts = -1
+                }
             }
         }
         if let e = venc {
@@ -2111,7 +2209,10 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         })
     }
 
-    // ---- カメラの糸：1 コマ来るたびに、エンコーダへ ----
+    // ---- カメラの糸：1 コマ来るたびに、列へ入れて、回す糸・エンコードの糸へ渡す ----
+    // cam4k1016：ここ（受け口）が 16.7 ms を超えると iOS が遅れたコマを捨てる（alwaysDiscardsLateVideoFrames）ので、軽い記帳と列への出し入れだけにする。
+    // 回す処理は prepQueue の prepareFrame、エンコーダの呼び出し（4K60 で 16〜19 ms かかる）は encodeQueue の submitFrame。
+    // コマの入れ物（CVPixelBuffer）を持つ間、カメラの入れ物は戻らない。持つのは、列の 2 枚＋回す糸の 1 枚＋エンコーダの中の分まで
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         let enterNs = DispatchTime.now().uptimeNanoseconds
@@ -2121,52 +2222,123 @@ final class CameraBridge: NSObject, ObservableObject, AVCaptureVideoDataOutputSa
         }
         lock.lock()
         capCalls &+= 1
-        let busy = inflight >= maxInflight
         let live = sendConn != nil
-        if busy && live { dropped += 1; forceKey = true } // 捨てたあとの次のコマは、参照が切れているので、キーフレームにする
-        let key = forceKey && !busy
-        if key { forceKey = false }
-        let n = seq
-        if !busy && live { seq &+= 1 }
         let gen = sessionGen
+        let needPrep = stage.on || flipCopy != nil // 切り抜く・水平を保つ・Metal で回すコマは、prepQueue を通す
+        lock.unlock()
+        guard live, let src = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let f = CamFrame(pb: src, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), gen: gen, enteredNs: enterNs)
+        // 隠しスイッチ 16：前の作り（受け口の中で回してエンコーダを呼ぶ）。本物で効き目を比べるため
+        if Self.debugBits & 16 != 0 {
+            if let g = prepareFrame(f) { submitFrame(g) }
+            return
+        }
+        if needPrep {
+            let r = prepBox.push(f, limit: waitLimit)
+            noteWaitDrops(r.dropped)
+            if r.wake { prepQueue.async { [weak self] in self?.drainPrep() } }
+        } else {
+            enqueueEncode(f)
+        }
+    }
+
+    // 列から捨てたコマを数える
+    private func noteWaitDrops(_ n: Int) {
+        guard n > 0 else { return }
+        lock.lock(); waitDrops &+= UInt64(n); lock.unlock()
+    }
+
+    // encodeQueue の列に入れ、糸が寝ていれば起こす
+    private func enqueueEncode(_ f: CamFrame) {
+        let r = encBox.push(f, limit: waitLimit)
+        noteWaitDrops(r.dropped)
+        if r.wake { encodeQueue.async { [weak self] in self?.drainEncode() } }
+    }
+
+    // prepQueue：列が空になるまで、古い順に 1 枚ずつ回して、エンコードの糸の列へ渡す
+    private func drainPrep() {
+        while let f = prepBox.pop() {
+            if let g = prepareFrame(f) { enqueueEncode(g) }
+        }
+    }
+
+    // encodeQueue：列が空になるまで、古い順に 1 枚ずつエンコーダに渡す
+    private func drainEncode() {
+        while let f = encBox.pop() { submitFrame(f) }
+    }
+
+    // 回す（prepQueue。隠しスイッチ 16 のときは captureQueue）。回さないコマ（設定が変わって、回す必要がなくなった）はそのまま返す。
+    // 作り直す前のカメラのコマ（列に残っていた物）と、回せなかったコマは nil（捨てる）
+    private func prepareFrame(_ f: CamFrame) -> CamFrame? {
+        lock.lock()
+        let live = sendConn != nil
+        let same = f.gen == sessionGen
         let stg = stage
         let pool = poolCopy
         let flip = flipCopy
         lock.unlock()
-        guard live, !busy, let enc = encoderForCallback(), let src = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        // camctl：切り抜く・水平を保つときは、エンコーダの前で切り出して送る大きさにする
-        var pb = src
-        if stg.on {
-            guard let pool, let cut = renderStage(src, stg, pool, pts: pts) else { lock.lock(); forceKey = true; lock.unlock(); return }
-            pb = cut
-        } else if let flip {
-            // camrot1015：180 度・反転を Metal で 1 回写して行う（接続で回すより軽い見込み）。回せないコマは送らない（回していない絵を送ると、向きが 1 コマだけ違って見える）
-            let t0 = DispatchTime.now().uptimeNanoseconds
-            let flipped = flip.flip(src)
+        guard live, same else { return nil }
+        guard stg.on || flip != nil else { return f }
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        defer {
             let us = (DispatchTime.now().uptimeNanoseconds &- t0) / 1000
-            lock.lock()
-            flipUs &+= us
-            flipCalls &+= 1
-            if flipped == nil { flipFails &+= 1; forceKey = true }
-            let fails = flipFails
-            lock.unlock()
-            guard let out = flipped else {
-                if fails == 1 || fails % 600 == 0 { log("ウェブカメラ：Metal で回せないコマがある（\(fails) 回目）：\(flip.lastError)") }
-                return
-            }
-            pb = out
+            lock.lock(); prepUs &+= us; prepCalls &+= 1; lock.unlock()
         }
+        // camctl：切り抜く・水平を保つときは、エンコーダの前で切り出して送る大きさにする
+        if stg.on {
+            guard let pool, let cut = renderStage(f.pb, stg, pool, pts: f.pts) else { lock.lock(); forceKey = true; lock.unlock(); return nil }
+            return CamFrame(pb: cut, pts: f.pts, gen: f.gen, enteredNs: f.enteredNs)
+        }
+        guard let flipper = flip else { return f }
+        // camrot1015：180 度・反転を Metal で 1 回写して行う（接続で回すより軽い見込み）。回せないコマは送らない（回していない絵を送ると、向きが 1 コマだけ違って見える）
+        let t1 = DispatchTime.now().uptimeNanoseconds
+        let flipped = flipper.flip(f.pb)
+        let fus = (DispatchTime.now().uptimeNanoseconds &- t1) / 1000
+        lock.lock()
+        flipUs &+= fus
+        flipCalls &+= 1
+        if flipped == nil { flipFails &+= 1; forceKey = true }
+        let fails = flipFails
+        lock.unlock()
+        guard let out = flipped else {
+            if fails == 1 || fails % 600 == 0 { log("ウェブカメラ：Metal で回せないコマがある（\(fails) 回目）：\(flipper.lastError)") }
+            return nil
+        }
+        return CamFrame(pb: out, pts: f.pts, gen: f.gen, enteredNs: f.enteredNs)
+    }
+
+    // エンコーダに渡す（encodeQueue。隠しスイッチ 16 のときは captureQueue）。
+    // 番号（seq）・キーフレームの印・USB の詰まり（inflight）は、ここ（エンコーダに渡す直前）で決める。列で捨てたコマには番号を使わない
+    private func submitFrame(_ f: CamFrame) {
+        let workT0 = DispatchTime.now().uptimeNanoseconds
+        lock.lock()
+        let live = sendConn != nil
+        let same = f.gen == sessionGen // 作り直す前のカメラのコマは捨てる
+        let busy = inflight >= maxInflight
+        let go = live && same && !busy
+        if busy && live && same { dropped += 1; forceKey = true } // 捨てたあとの次のコマは、参照が切れているので、キーフレームにする
+        let key = forceKey && go
+        if key { forceKey = false }
+        let n = seq
+        if go { seq &+= 1 }
+        lock.unlock()
+        guard go, let enc = encoderForCallback() else { return }
+        let gen = f.gen
+        let pts = f.pts
         let capUs = UInt64(max(0, CMTimeGetSeconds(pts)) * 1_000_000) // ホストの時計（単調）。PING の PONG と同じ時計
         let props = key ? ([kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary) : nil
         var info = VTEncodeInfoFlags()
         let encT0 = DispatchTime.now().uptimeNanoseconds
-        let st = VTCompressionSessionEncodeFrame(enc, imageBuffer: pb, presentationTimeStamp: pts, duration: CMTime(value: 1, timescale: CMTimeScale(curFpsForCallback())), frameProperties: props, infoFlagsOut: &info) { [weak self] status, flags, sb in
+        let st = VTCompressionSessionEncodeFrame(enc, imageBuffer: f.pb, presentationTimeStamp: pts, duration: CMTime(value: 1, timescale: CMTimeScale(curFpsForCallback())), frameProperties: props, infoFlagsOut: &info) { [weak self] status, flags, sb in
             self?.encoded(status, flags, sb, capUs, n, gen)
         }
-        let encUs = (DispatchTime.now().uptimeNanoseconds &- encT0) / 1000
+        let doneNs = DispatchTime.now().uptimeNanoseconds
+        let encUs = (doneNs &- encT0) / 1000
         lock.lock()
         encCallUs &+= encUs; encCalls &+= 1 // camrot1015：呼び出しが返るまでの時間。エンコーダが詰まると、ここが伸びる
+        workUs &+= (doneNs &- workT0) / 1000
+        workCalls &+= 1
+        waitUs &+= (workT0 &- f.enteredNs) / 1000 // 受け口に来てからエンコーダに渡す直前まで（列で待った時間と回した時間を含む）
         if st != noErr { forceKey = true }
         lock.unlock()
     }
@@ -3441,7 +3613,7 @@ struct ScreenLightView: View {
 // AVCaptureConnection の videoRotationAngle・isVideoMirrored は、毎コマ iOS が絵を物理的に作り直す（Apple の資料）。その代わりに、Metal の compute で
 // Y の面（R8）と CbCr の面（RG8）を 1 回ずつ写す。カメラの絵は CVMetalTextureCache で、写し先は IOSurface から直接 Metal の物にするので、CPU のコピーは無い。
 // 4K の NV12 は 1 コマ約 12 MB。読みと書きで約 24 MB の GPU メモリの往復（60 コマ/秒で約 1.5 GB/秒）。
-// captureQueue（直列）だけから呼ぶ。GPU が終わるまで待ってから返す（そのあとエンコーダが読む）
+// encodeQueue（直列。隠しスイッチ 16 のときは captureQueue）だけから呼ぶ。GPU が終わるまで待ってから返す（そのあとエンコーダが読む）
 final class FrameFlipper {
     static var buildError = ""
     private static let kernelSource = """
