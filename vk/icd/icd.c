@@ -1209,6 +1209,9 @@ static void stall_banner(double sec) {
     banner(t);
 }
 
+static size_t rxs_len(void);
+static int rx_recv_all(void *d, size_t n);
+
 // 返事の頭（8 バイト）を、届くまで待って読む。尾と押し出しは下の recv_head が扱う
 static int recv_head_raw(uint32_t h[2], uint32_t op) {
     double giveup = giveup_sec();
@@ -1218,7 +1221,7 @@ static int recv_head_raw(uint32_t h[2], uint32_t op) {
     double quiet = gpu_wait && !g_stall_hwnd ? 20 : 3;
     WSAPOLLFD pf = { .fd = g_sock, .events = POLLRDNORM };
     double t0 = 0, warned = 0;
-    while (WSAPoll(&pf, 1, 1000) == 0) {
+    while (!rxs_len() && WSAPoll(&pf, 1, 1000) == 0) {
         if (!t0) t0 = now_ms() - 1000;
         double sec = (now_ms() - t0) / 1000;
         if (sec >= quiet && (!warned || sec - warned >= 10)) {
@@ -1233,7 +1236,7 @@ static int recv_head_raw(uint32_t h[2], uint32_t op) {
             return 0;
         }
     }
-    int ok = vr_recv_all(g_sock, h, 8);
+    int ok = rx_recv_all(h, 8);
     if (g_stalled) {
         g_stalled = 0;
         fprintf(stderr, "[iphone-vk] 受け手の返事が戻った（%.1f 秒止まっていた）\n", (now_ms() - t0) / 1000);
@@ -1306,6 +1309,62 @@ static size_t sock_avail(vr_sock s) {
 #endif
 }
 
+// ---- 届きかけの返事の一時置き（cpu1016） ----
+// 窓の絵の返事（数百 KB）は、全部届くまで読み始めない（下の rx_head）。前は、届き始めてから全部そろうまでの間、
+// 返事を待つ糸（present の rpc_take_deferred・fence を待つ push_wait）が WSAPoll ですぐ起き、錠を取り直しては読まずに戻るのを繰り返した
+// （USB の速さで 1 コマ数 ms・2 本の糸が CPU を使い切る）。
+// いまは、そろっていない返事の届いた分を、錠の中でここへ読み出しておく（届いている分だけを読むので止まらない）。
+// socket の入れ物が空になるので、WSAPoll は続きが届くまで眠る。socket から読む所はどれも、先にここから読む（rx_recv_all）。
+// 読み出しは g_lock の中だけ（socket を読む所と同じ）。IPHONE_VK_RX_STAGE=0 で前のやり方
+static struct { uint8_t *p; size_t off, n, cap; } g_rxs;
+static size_t rxs_len(void) { return g_rxs.n - g_rxs.off; }
+static int rx_stage_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_RX_STAGE"); v = !(e && *e == '0'); }
+    return v;
+}
+static int rx_recv_all(void *d, size_t n) {
+    size_t k = rxs_len();
+    if (k > n) k = n;
+    if (k) {
+        memcpy(d, g_rxs.p + g_rxs.off, k);
+        g_rxs.off += k;
+        if (g_rxs.off == g_rxs.n) g_rxs.off = g_rxs.n = 0;
+    }
+    return k == n || vr_recv_all(g_sock, (uint8_t *) d + k, n - k);
+}
+// 届いている量（一時置きの分を含む）。分からなければ (size_t) -1
+static size_t rx_avail(void) {
+    size_t a = sock_avail(g_sock);
+    return a == (size_t) -1 ? a : a + rxs_len();
+}
+// 先頭の n バイトを、読まずに見る（一時置き・socket の順）。そろっていなければ 0
+static int rx_peek(void *d, size_t n) {
+    size_t k = rxs_len();
+    if (k >= n) { memcpy(d, g_rxs.p + g_rxs.off, n); return 1; }
+    if (k) memcpy(d, g_rxs.p + g_rxs.off, k);
+    return recv(g_sock, (char *) d + k, (int) (n - k), MSG_PEEK) == (int) (n - k);
+}
+// socket に届いている分を一時置きへ移す（一時置きが want バイトになるまで）
+static void rx_stage(size_t want) {
+    if (!rx_stage_on()) return;
+    size_t have = rxs_len(), av = sock_avail(g_sock);
+    if (av == (size_t) -1 || !av || have >= want) return;
+    size_t k = want - have < av ? want - have : av;
+    if (g_rxs.n + k > g_rxs.cap) {
+        if (g_rxs.off) { memmove(g_rxs.p, g_rxs.p + g_rxs.off, have); g_rxs.n = have; g_rxs.off = 0; }
+        if (g_rxs.n + k > g_rxs.cap) {
+            size_t c = g_rxs.n + k + (64u << 10);
+            uint8_t *np = realloc(g_rxs.p, c);
+            if (!np) return;
+            g_rxs.p = np;
+            g_rxs.cap = c;
+        }
+    }
+    int r = (int) recv(g_sock, (char *) g_rxs.p + g_rxs.n, (int) k, 0);
+    if (r > 0) g_rxs.n += (size_t) r;
+}
+
 // 返事の本体（need バイト）がまだ全部は届いていないか（av：いま届いている量）。
 // Linux は socket の受け取り用の入れ物が SO_RCVBUF の 4 MB ではなく net.core.rmem_max（既定 212992）で頭打ちになり、unix socket（usbmuxd）は相手の
 // SO_SNDBUF で頭打ちになる。入れ物より大きい返事（窓の絵の数百 KB）は、読まない限り全部は届かず、待っても届く量が増えない。
@@ -1349,27 +1408,28 @@ static int rx_head(uint32_t h[2], uint32_t op, int wait) {
     for (;;) {
         if (!wait) {
             WSAPOLLFD pf = { .fd = g_sock, .events = POLLRDNORM };
-            if (g_dead || WSAPoll(&pf, 1, 0) <= 0) return g_dead ? 0 : 2;
+            if (g_dead || (!rxs_len() && WSAPoll(&pf, 1, 0) <= 0)) return g_dead ? 0 : 2;
             // 返事の本体が半分しか届いていないうちは読まない。読み始めると、残りが届くまで g_lock を持ったまま止まり、
-            // その間 DXVK の命令を組む糸が命令を足せない（窓の絵の返事は数百 KB・USB で数 ms〜十数 ms）。1 MB を超える返事は待たずに読む
+            // その間 DXVK の命令を組む糸が命令を足せない（窓の絵の返事は数百 KB・USB で数 ms〜十数 ms）。1 MB を超える返事は待たずに読む。
+            // 届いた分は一時置きへ移しておく（待つ糸が空回りしないように。上の rx_stage）
             {
-                size_t hd = 8 + ((g_ext_on && g_rx_seq >= g_rx_ext_from) ? VR_EXT_BYTES : 0), av = sock_avail(g_sock);
+                size_t hd = 8 + ((g_ext_on && g_rx_seq >= g_rx_ext_from) ? VR_EXT_BYTES : 0), av = rx_avail();
                 if (av != (size_t) -1 && av > 0) { // 0 で読めると言われたのは相手が閉じたとき：下で読んで切れたことを知る
                     uint8_t pk[8 + VR_EXT_BYTES];
                     uint32_t hl;
-                    if (av < hd || recv(g_sock, (char *) pk, (int) hd, MSG_PEEK) != (int) hd) return 2;
+                    if (av < hd || !rx_peek(pk, hd)) { rx_stage(hd); return 2; }
                     memcpy(&hl, pk + 4, 4);
-                    if (hl <= (1u << 20) && rx_incomplete(av, hd + hl)) return 2;
+                    if (hl <= (1u << 20) && rx_incomplete(av, hd + hl)) { rx_stage(hd + hl); return 2; }
                 }
             }
-            if (!vr_recv_all(g_sock, h, 8)) { conn_lost("返事を読む所"); return 0; }
+            if (!rx_recv_all(h, 8)) { conn_lost("返事を読む所"); return 0; }
             if (h[1] > (512u << 20)) { say("受け手の返事が大きすぎる（%u バイト）", h[1]); conn_lost("返事の長さ"); return 0; }
         } else if (!recv_head_raw(h, op)) {
             return 0;
         }
         if (!g_ext_on || g_rx_seq < g_rx_ext_from) { g_rx_seq++; rx_result_locked(h); return 1; }
         uint8_t x[VR_EXT_BYTES];
-        if (!vr_recv_all(g_sock, x, sizeof x)) { conn_lost("返事の尾"); return 0; }
+        if (!rx_recv_all(x, sizeof x)) { conn_lost("返事の尾"); return 0; }
         uint64_t done;
         uint32_t seq, ep;
         memcpy(&done, x, 8);
@@ -1442,7 +1502,7 @@ static int pend_read_one_locked(int wait) {
         g_status_out = 0;
         if (!got) return 0;
         uint8_t st[64];
-        if (h[1] > sizeof st || (h[1] && !vr_recv_all(g_sock, st, h[1]))) { conn_lost("熱の返事の途中"); return 0; }
+        if (h[1] > sizeof st || (h[1] && !rx_recv_all(st, h[1]))) { conn_lost("熱の返事の途中"); return 0; }
         g_stat.bytes_in += 8 + h[1];
         g_status_r = (VkResult) (int32_t) h[0];
         g_status_v = 0;
@@ -1459,7 +1519,7 @@ static int pend_read_one_locked(int wait) {
         d->out.n = 0;
         if (!got) return 0;
         vr_reserve(&d->out, h[1]);
-        if (h[1] && !vr_recv_all(g_sock, d->out.p, h[1])) { conn_lost("窓の絵の返事の途中"); return 0; }
+        if (h[1] && !rx_recv_all(d->out.p, h[1])) { conn_lost("窓の絵の返事の途中"); return 0; }
         d->out.n = h[1];
         d->r = (VkResult) (int32_t) h[0];
         g_stat.bytes_in += 8 + h[1];
@@ -1468,7 +1528,7 @@ static int pend_read_one_locked(int wait) {
     g_prog_out = 0;
     if (!got) return 0;
     uint8_t tmp[64];
-    if (h[1] > sizeof tmp || (h[1] && !vr_recv_all(g_sock, tmp, h[1]))) { conn_lost("進み具合の返事の途中"); return 0; }
+    if (h[1] > sizeof tmp || (h[1] && !rx_recv_all(tmp, h[1]))) { conn_lost("進み具合の返事の途中"); return 0; }
     g_stat.bytes_in += 8 + h[1];
     if ((int32_t) h[0] < 0) gpu_lost_reply((int32_t) h[0]); // 受け手はもう GPU を使えない。番号は進まないので待たない
     if ((int32_t) h[0] == VK_SUCCESS && h[1] >= 8) {
@@ -1625,7 +1685,7 @@ static VkResult rpc_call(uint32_t op, vr_buf *b, vr_buf *out) {
             vr_buf tmp = { 0 }, *dst = out ? out : &tmp;
             dst->n = 0;
             vr_reserve(dst, h[1]);
-            if (h[1] == 0 || vr_recv_all(g_sock, dst->p, h[1])) {
+            if (h[1] == 0 || rx_recv_all(dst->p, h[1])) {
                 dst->n = h[1];
                 res = (VkResult) (int32_t) h[0];
                 g_stat.bytes_in += 8 + h[1];
@@ -2178,6 +2238,7 @@ static int connect_locked(void) {
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *) &big, sizeof big);
     sock_rcvtimeo(s, 5000); // 最初のあいさつだけは 5 秒で諦める
     g_sock = s;
+    g_rxs.off = g_rxs.n = 0;
     say("%s:%s につないだ", host, port);
     warm_maybe_start(e && !strncmp(e, "link", 4) && (e[4] == 0 || e[4] == ':')); // muxwarm1015：IPHONE_VK_WARM のときだけ
     // つないだら、このドライバの DLL をプロセスが終わるまで外させない。最後の instance を壊すとローダーが DLL を外して読み直すが、
@@ -3058,7 +3119,15 @@ struct dsl {
 // var_count：数を確保のときに決めた set の、その binding の数（pool の残りを数えるのに使う）
 // hx：(binding, 番号) から e の位置（+1）を引く表（hcap は 2 の累乗）。vkd3d-proton の set は 100 万個の大きさなので、並びを頭から探すと遅い
 // gen：update after bind の set に最後に書いた通し番号
-struct dset { struct dpool *pool; struct dset *next; uint32_t n, cap; struct dent *e; struct dsl *layout; uint32_t var_count; uint32_t *hx, hcap; uint64_t gen; };
+// e_in・hx_in：中身が少ない set（DXVK の set は数個）は、中身と引く表を set の中に置く（cpu1016。前は set ごとに calloc と realloc を 2 回ずつ）
+#define DSET_E_IN 8
+#define DSET_HX_IN 32
+struct dset { struct dpool *pool; struct dset *next; uint32_t n, cap; struct dent *e; struct dsl *layout; uint32_t var_count; uint32_t *hx, hcap; uint64_t gen;
+              struct dent e_in[DSET_E_IN]; uint32_t hx_in[DSET_HX_IN]; };
+static void dset_free_parts(struct dset *s) {
+    if (s->e != s->e_in) free(s->e);
+    if (s->hx != s->hx_in) free(s->hx);
+}
 static volatile LONG64 g_dgen; // update after bind の set に書いた通し番号
 // 受け手に頼まずに set を取るので、pool の残り（set の数と種類ごとの数）はドライバが数える
 struct dpool { struct dset *head; uint32_t max_sets, used_sets, nsz; struct { uint32_t type, total, used; } sz[16]; };
@@ -3600,12 +3669,12 @@ static int lz_read(struct mem *m, const struct lzr *p, size_t n, uint8_t *dst) {
                 g_dead = 1;
             }
             if ((int32_t) h[0] == VK_SUCCESS && h[1] == k) {
-                if (!vr_recv_all(g_sock, o, k)) { ok = 0; conn_lost("読み出しの途中"); break; }
+                if (!rx_recv_all(o, k)) { ok = 0; conn_lost("読み出しの途中"); break; }
             } else {
                 uint8_t tmp[4096];
                 for (uint32_t left = h[1]; left;) {
                     uint32_t c = left < sizeof tmp ? left : (uint32_t) sizeof tmp;
-                    if (!vr_recv_all(g_sock, tmp, c)) { ok = 0; conn_lost("読み出しの途中"); break; }
+                    if (!rx_recv_all(tmp, c)) { ok = 0; conn_lost("読み出しの途中"); break; }
                     left -= c;
                 }
             }
@@ -4004,16 +4073,67 @@ static void memw_dump(struct mem *m, uint64_t off, uint64_t len) {
 //    この待ちは 1 つずつのときのいちばん長い待ちとちょうど同じ所まで。1 通の間に受け手が処理する submit は無いので、
 //    書き終わった時点のメモリの中身と、それまでに終わっている GPU の仕事は 1 つずつのときと同じ
 //  ・ほかの命令との順：ためた物は send_dirty の終わり（か、64 KB 以上の塊を送る前）に出す。send_dirty は、その範囲を読む submit より前に呼ばれる
+// ためる入れ物は、頭 8 バイト（命令・長さ）の場所を空けて作り、送るときは写さずに入れ物ごと送る糸へ渡す（rpc_send_whole）。
+// 入れ物は使い回す（wsb_take・wsb_give）。前は send_dirty のたびに 4 KB から倍々に realloc で 1 MB まで育てては捨て、
+// 送るときにもう 1 度 g_q へ写していた（1 コマ 1.6 MB を 3 回写す。cpu1016）
 typedef struct { vr_buf b; struct mem *m; uint32_t n; uint64_t upto; int wide; } wsink;
+#define WS_HEAD 28 // 命令の頭 8・memory 8・番号 8・数 4
+
+static SRWLOCK g_wsb_lk = SRWLOCK_INIT;
+static vr_buf g_wsb[4];
+static int g_nwsb;
+static vr_buf wsb_take(void) {
+    vr_buf b = { 0 };
+    AcquireSRWLockExclusive(&g_wsb_lk);
+    if (g_nwsb) b = g_wsb[--g_nwsb];
+    ReleaseSRWLockExclusive(&g_wsb_lk);
+    b.n = 0;
+    return b;
+}
+static void wsb_give(vr_buf *b) {
+    AcquireSRWLockExclusive(&g_wsb_lk);
+    if (b->p && g_nwsb < 4 && b->cap <= (16u << 20)) g_wsb[g_nwsb++] = *b;
+    else free(b->p);
+    ReleaseSRWLockExclusive(&g_wsb_lk);
+    b->p = NULL;
+    b->n = b->cap = 0;
+}
+
+static int whole_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_SEND_WHOLE"); v = !(e && *e == '0'); }
+    return v;
+}
+
+// 頭 8 バイトを含む命令 1 つ（msg）を送りっぱなしにする。送る糸があれば、写さずに入れ物ごと渡す（msg には空いた入れ物が戻る）。
+// 順：ためていた descriptor の知らせと g_q を先に渡してから msg を渡すので、rpc_send で g_q に足すのと同じ順になる
+static void rpc_send_whole(uint32_t op, vr_buf *msg) {
+    AcquireSRWLockExclusive(&g_lock);
+    if (op < VR_OP_COUNT) g_stat.sends[op]++;
+    if (whole_on() && !g_dead && g_sock != VR_BAD_SOCK && sq_on() && sq_start_locked()) {
+        if (g_da.n || g_du_has) dq_flush_locked();
+        if (op < VR_OP_COUNT) { g_stat.bytes[op] += msg->n; g_stat.wmsg[op]++; }
+        if (g_q.n) sq_push_locked(&g_q, 0);
+        sq_push_locked(msg, 0);
+    } else {
+        vr_buf v = { msg->p + 8, msg->n - 8, msg->cap - 8 };
+        put_msg_locked(op, &v);
+        if (g_q.n > (8u << 20)) flush_locked();
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+    msg->n = 0;
+}
 
 static void ws_end(wsink *w) {
     if (!w->n) return;
     uint64_t id = ID(w->m), up = w->upto | (w->wide ? MEMW_WIDE : 0);
-    memcpy(w->b.p, &id, 8);
-    memcpy(w->b.p + 8, &up, 8);
-    memcpy(w->b.p + 16, &w->n, 4);
+    uint32_t h[2] = { VR_MEM_WRITE_SPANS, (uint32_t) (w->b.n - 8) };
+    memcpy(w->b.p, h, 8);
+    memcpy(w->b.p + 8, &id, 8);
+    memcpy(w->b.p + 16, &up, 8);
+    memcpy(w->b.p + 24, &w->n, 4);
     g_stat.spans += w->n;
-    rpc_send(VR_MEM_WRITE_SPANS, &w->b);
+    rpc_send_whole(VR_MEM_WRITE_SPANS, &w->b);
     w->n = 0;
     w->upto = 0;
     w->wide = 0;
@@ -4022,8 +4142,8 @@ static void ws_end(wsink *w) {
 static void ws_put(wsink *w, struct mem *m, uint64_t off, uint64_t len) {
     if (!w->n) {
         w->b.n = 0;
-        vr_reserve(&w->b, 20 + 12 + (size_t) len);
-        w->b.n = 20; // memory・番号・数は出すときに書く
+        vr_reserve(&w->b, WS_HEAD + 12 + (size_t) len);
+        w->b.n = WS_HEAD; // 頭・memory・番号・数は出すときに書く
         w->m = m;
     }
     vr_u64(&w->b, off);
@@ -4039,6 +4159,18 @@ static void ws_put(wsink *w, struct mem *m, uint64_t off, uint64_t len) {
     if (w->b.n >= (1u << 20)) ws_end(w);
 }
 
+// pos からの 8 バイト（末尾なら残り）が違うか。8 バイトは 1 回の読みで比べる
+// （前は memcmp を 8 バイトごとに呼んでいた。zig の memcmp は 1 バイトずつの関数で、1 コマ 2 MB を比べるのに submit の糸で 1 ms ほど使っていた・cpu1016）
+static inline int pd_ne(const uint8_t *cur, const uint8_t *old, size_t pos, size_t plen) {
+    if (plen - pos >= 8) {
+        uint64_t x, y;
+        memcpy(&x, cur + pos, 8);
+        memcpy(&y, old + pos, 8);
+        return x != y;
+    }
+    return memcmp(cur + pos, old + pos, plen - pos) != 0;
+}
+
 // 1 ページを、受け手の中身の写しと 8 バイトずつ比べ、違う所だけを送る。64 バイト未満のすき間はまとめて送る（ws があれば ws にためる）
 static void send_page_diff(vr_buf *b, wsink *ws, struct mem *m, size_t pg) {
     uint64_t base = (uint64_t) pg * PAGE;
@@ -4047,14 +4179,23 @@ static void send_page_diff(vr_buf *b, wsink *ws, struct mem *m, size_t pg) {
     uint8_t *old = m->sent + base;
     size_t a = 0;
     while (a < plen) {
+        // 同じ所は 32 バイトずつ飛ばす（8 バイトずつ 4 回進むのと同じ）
+        while (plen - a >= 32) {
+            uint64_t x[4], y[4];
+            memcpy(x, cur + a, 32);
+            memcpy(y, old + a, 32);
+            if ((x[0] ^ y[0]) | (x[1] ^ y[1]) | (x[2] ^ y[2]) | (x[3] ^ y[3])) break;
+            a += 32;
+        }
+        if (a >= plen) break;
         size_t w = plen - a < 8 ? plen - a : 8;
-        if (!memcmp(cur + a, old + a, w)) { a += w; continue; }
+        if (!pd_ne(cur, old, a, plen)) { a += w; continue; }
         size_t e = a + w;
         while (e < plen) {
             size_t g = e;
             while (g < plen) {
                 size_t w2 = plen - g < 8 ? plen - g : 8;
-                if (memcmp(cur + g, old + g, w2)) break;
+                if (pd_ne(cur, old, g, plen)) break;
                 g += w2;
             }
             if (g >= plen || g - e >= 64) break;
@@ -4243,6 +4384,7 @@ static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
     const size_t chunk = (16u << 20) / PAGE;
     vr_buf b = { 0 };
     wsink ws = { 0 }, *w = g_mbatch ? &ws : NULL;
+    if (w) ws.b = wsb_take();
     if (wdiff_on() && !m->sent && !m->delta && !m->jpeg) {
         m->sent = malloc(m->npages * PAGE);
         m->known = calloc(m->npages, 1);
@@ -4280,7 +4422,7 @@ static void send_dirty(struct mem *m, uint64_t off, uint64_t len) {
         rpc_send(VR_MEM_WRITE, &b);
         i = j;
     }
-    if (w) { ws_end(w); free(ws.b.p); }
+    if (w) { ws_end(w); wsb_give(&ws.b); }
     free(b.p);
 }
 
@@ -4327,7 +4469,7 @@ static void read_back_many(rng *r, size_t n) {
             if ((int32_t) h[0] == VK_SUCCESS && r[i].m->delta && (g_hw.caps & VR_CAP_DELTA)) {
                 // 形（0 そのまま・1 違い）を読んでから中身
                 uint8_t *buf = malloc(h[1] ? h[1] : 1);
-                if (!buf || (h[1] && !vr_recv_all(g_sock, buf, h[1]))) { free(buf); ok = 0; conn_lost("読み出しの途中"); break; }
+                if (!buf || (h[1] && !rx_recv_all(buf, h[1]))) { free(buf); ok = 0; conn_lost("読み出しの途中"); break; }
                 g_stat.bytes_in += 8 + h[1];
                 uint32_t mode = 2;
                 if (h[1] >= 4) memcpy(&mode, buf, 4);
@@ -4359,14 +4501,14 @@ static void read_back_many(rng *r, size_t n) {
                 continue;
             }
             if ((int32_t) h[0] == VK_SUCCESS && h[1] == k) {
-                if (!vr_recv_all(g_sock, r[i].m->shadow + at, k)) { ok = 0; conn_lost("読み出しの途中"); break; }
+                if (!rx_recv_all(r[i].m->shadow + at, k)) { ok = 0; conn_lost("読み出しの途中"); break; }
                 if (r[i].m->sent) memcpy(r[i].m->sent + at, r[i].m->shadow + at, (size_t) k);
             } else {
                 // 読めなかった：中身は捨てる
                 uint8_t tmp[4096];
                 for (uint32_t left = h[1]; left;) {
                     uint32_t c = left < sizeof tmp ? left : (uint32_t) sizeof tmp;
-                    if (!vr_recv_all(g_sock, tmp, c)) { ok = 0; conn_lost("読み出しの途中"); break; }
+                    if (!rx_recv_all(tmp, c)) { ok = 0; conn_lost("読み出しの途中"); break; }
                     left -= c;
                 }
             }
@@ -10181,7 +10323,7 @@ static VkResult VKAPI_CALL create_dpool(VkDevice dv, const VkDescriptorPoolCreat
 
 static void free_sets_of(struct dpool *p) {
     AcquireSRWLockExclusive(&g_pools_lock);
-    for (struct dset *s = p->head, *nx; s; s = nx) { nx = s->next; dsl_unref(s->layout); free(s->e); free(s->hx); free(s); }
+    for (struct dset *s = p->head, *nx; s; s = nx) { nx = s->next; dsl_unref(s->layout); dset_free_parts(s); free(s); }
     p->head = NULL;
     p->used_sets = 0;
     for (uint32_t j = 0; j < p->nsz; j++) p->sz[j].used = 0;
@@ -10248,7 +10390,7 @@ static VkResult VKAPI_CALL alloc_dsets(VkDevice dv, const VkDescriptorSetAllocat
         for (uint32_t i = 0; i < ai->descriptorSetCount; i++) out[i] = VK_NULL_HANDLE;
         return VK_ERROR_OUT_OF_POOL_MEMORY;
     }
-    vr_buf b = { 0 };
+    vr_buf b = wsb_take();
     vr_u64(&b, ID(dv));
     vr_u64(&b, ID(p));
     vr_u32(&b, ai->descriptorSetCount);
@@ -10270,7 +10412,7 @@ static VkResult VKAPI_CALL alloc_dsets(VkDevice dv, const VkDescriptorSetAllocat
     if (vc && (g_hw.caps & VR_CAP_DESC_FLAGS))
         for (uint32_t i = 0; i < ai->descriptorSetCount; i++) vr_u32(&b, vc->pDescriptorCounts[i]);
     rpc_send(VR_ALLOC_DESCRIPTOR_SETS, &b);
-    free(b.p);
+    wsb_give(&b);
     // immutable sampler だけの binding（SAMPLER）は、アプリが書かない。受け手の set は空のままなので、ここで書いておく
     for (uint32_t i = 0; i < ai->descriptorSetCount; i++) {
         struct dsl *l = ((struct dset *) out[i])->layout;
@@ -10313,8 +10455,7 @@ static VkResult VKAPI_CALL free_dsets(VkDevice dv, VkDescriptorPool pp, uint32_t
             }
             dsl_unref(s->layout);
         }
-        free(s->e);
-        free(s->hx);
+        dset_free_parts(s);
         free(s);
         ReleaseSRWLockExclusive(&g_pools_lock);
     }
@@ -10348,9 +10489,11 @@ static uint32_t *dset_slot(const struct dset *s, uint32_t binding, uint32_t elem
 }
 
 static int dset_rehash(struct dset *s, uint32_t cap) {
-    uint32_t *nh = calloc(cap, sizeof *nh);
+    // 引く表は中身から作り直すので、set の中の表はその場で作り直してよい
+    uint32_t *nh = cap <= DSET_HX_IN ? s->hx_in : calloc(cap, sizeof *nh);
     if (!nh) return 0;
-    free(s->hx);
+    if (nh == s->hx_in) memset(nh, 0, cap * sizeof *nh);
+    if (s->hx != s->hx_in) free(s->hx);
     s->hx = nh;
     s->hcap = cap;
     for (uint32_t i = 0; i < s->n; i++) *dset_slot(s, s->e[i].binding, s->e[i].elem) = i + 1;
@@ -10364,8 +10507,15 @@ static void dset_put_full(struct dset *s, struct dent d) {
     uint32_t *slot = dset_slot(s, d.binding, d.elem);
     if (*slot) { s->e[*slot - 1] = d; return; }
     if (s->n == s->cap) {
-        uint32_t nc = s->cap ? s->cap * 2 : 8;
-        struct dent *ne = realloc(s->e, nc * sizeof *s->e);
+        uint32_t nc = s->cap ? s->cap * 2 : DSET_E_IN;
+        struct dent *ne;
+        if (!s->e) ne = s->e_in;
+        else if (s->e == s->e_in) {
+            ne = malloc(nc * sizeof *s->e);
+            if (ne) memcpy(ne, s->e, s->n * sizeof *s->e);
+        } else {
+            ne = realloc(s->e, nc * sizeof *s->e);
+        }
         if (!ne) return;
         s->e = ne;
         s->cap = nc;
@@ -10442,7 +10592,7 @@ static void note_null_desc(uint32_t type) {
 }
 
 static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescriptorSet *w, uint32_t nc, const VkCopyDescriptorSet *c) {
-    vr_buf b = { 0 };
+    vr_buf b = wsb_take(); // 入れ物は使い回す（1 コマ 1800 回の malloc と free を省く）
     vr_u64(&b, ID(dv));
     uint32_t real = 0;
 #define KNOWN_DESC(t) (is_buffer_desc(t) || is_image_desc(t) || (is_texel_desc(t) && (g_hw.caps & VR_CAP_D3D)) || \
@@ -10506,7 +10656,7 @@ static void VKAPI_CALL update_dsets(VkDevice dv, uint32_t nw, const VkWriteDescr
         }
     }
     rpc_send(VR_UPDATE_DESCRIPTOR_SETS, &b);
-    free(b.p);
+    wsb_give(&b);
     // 写しは書き込みのあとに行う（vkUpdateDescriptorSets の決まり）
     if (nc) copy_dsets(dv, nc, c);
 }
@@ -10702,11 +10852,32 @@ static void VKAPI_CALL cmd_push_desc_tmpl2(VkCommandBuffer cbh, const VkPushDesc
     cmd_push_desc_tmpl(cbh, i->descriptorUpdateTemplate, i->layout, i->set, i->pData);
 }
 
+// 型紙で書く 1 回ぶんの一時の場所。小さければ stack の上に取る（前は書くたびに calloc を 2＋並びの数だけ呼んでいた。
+// DXVK は描画のたびにここを通るので、1 コマ 1800 回・calloc と free で DXVK の命令を組む糸の 3 割ほどを使っていた。cpu1016）
+typedef struct { uint8_t *p; size_t n, cap; } tmpl_scr;
+static void *tmpl_get(tmpl_scr *s, size_t sz, void **keep) {
+    sz = (sz + 15) & ~(size_t) 15;
+    if (s->n + sz <= s->cap) {
+        void *r = s->p + s->n;
+        s->n += sz;
+        memset(r, 0, sz);
+        *keep = NULL;
+        return r;
+    }
+    return *keep = calloc(1, sz);
+}
+
 static void VKAPI_CALL update_dset_tmpl(VkDevice dv, VkDescriptorSet set, VkDescriptorUpdateTemplate h, const void *data) {
     struct dtmpl *t = (struct dtmpl *) h;
     if (!t || !t->n) return;
-    VkWriteDescriptorSet *w = calloc(t->n, sizeof *w);
-    void **keep = calloc(t->n, sizeof *keep);
+    _Alignas(16) uint8_t stk[2048];
+    VkWriteDescriptorSet wst[16];
+    void *kst[16];
+    int small = t->n <= 16;
+    VkWriteDescriptorSet *w = small ? wst : calloc(t->n, sizeof *w);
+    void **keep = small ? kst : calloc(t->n, sizeof *keep);
+    if (small) { memset(wst, 0, t->n * sizeof *w); memset(kst, 0, t->n * sizeof *keep); }
+    tmpl_scr scr = { stk, 0, sizeof stk };
     for (uint32_t i = 0; i < t->n; i++) {
         const VkDescriptorUpdateTemplateEntry *e = &t->e[i];
         const char *p = (const char *) data + e->offset;
@@ -10714,20 +10885,17 @@ static void VKAPI_CALL update_dset_tmpl(VkDevice dv, VkDescriptorSet set, VkDesc
         w[i] = (VkWriteDescriptorSet) { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = e->dstBinding,
                                         .dstArrayElement = e->dstArrayElement, .descriptorCount = cnt, .descriptorType = e->descriptorType };
         if (is_image_desc(e->descriptorType)) {
-            VkDescriptorImageInfo *ii = calloc(cnt ? cnt : 1, sizeof *ii);
+            VkDescriptorImageInfo *ii = tmpl_get(&scr, (cnt ? cnt : 1) * sizeof *ii, &keep[i]);
             for (uint32_t k = 0; k < cnt; k++) memcpy(&ii[k], p + k * e->stride, sizeof *ii);
             w[i].pImageInfo = ii;
-            keep[i] = ii;
         } else if (is_buffer_desc(e->descriptorType)) {
-            VkDescriptorBufferInfo *bi = calloc(cnt ? cnt : 1, sizeof *bi);
+            VkDescriptorBufferInfo *bi = tmpl_get(&scr, (cnt ? cnt : 1) * sizeof *bi, &keep[i]);
             for (uint32_t k = 0; k < cnt; k++) memcpy(&bi[k], p + k * e->stride, sizeof *bi);
             w[i].pBufferInfo = bi;
-            keep[i] = bi;
         } else if (is_texel_desc(e->descriptorType)) {
-            VkBufferView *tv = calloc(cnt ? cnt : 1, sizeof *tv);
+            VkBufferView *tv = tmpl_get(&scr, (cnt ? cnt : 1) * sizeof *tv, &keep[i]);
             for (uint32_t k = 0; k < cnt; k++) memcpy(&tv[k], p + k * e->stride, sizeof *tv);
             w[i].pTexelBufferView = tv;
-            keep[i] = tv;
         } else if (e->descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
             // 中身は VkAccelerationStructureKHR の並び。書き込みの鎖（VkWriteDescriptorSetAccelerationStructureKHR）に直す
             struct { VkWriteDescriptorSetAccelerationStructureKHR w; VkAccelerationStructureKHR h[]; } *as =
@@ -10741,8 +10909,10 @@ static void VKAPI_CALL update_dset_tmpl(VkDevice dv, VkDescriptorSet set, VkDesc
     }
     update_dsets(dv, t->n, w, 0, NULL);
     for (uint32_t i = 0; i < t->n; i++) free(keep[i]);
-    free(keep);
-    free(w);
+    if (!small) {
+        free(keep);
+        free(w);
+    }
 }
 
 // ---- command buffer ----
