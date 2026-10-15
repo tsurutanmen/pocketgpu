@@ -925,6 +925,119 @@ void vkr_set_token(const char *hex) { g_token_ok = vr_token_parse(hex, g_token);
 static volatile int g_thermal; // iPhone の熱の状態（0 ふつう・1 やや熱い・2 熱い・3 とても熱い）。アプリが知らせる
 void vkr_set_thermal(int state) { g_thermal = state; }
 
+// ---- VR_GET_STATUS の答え：熱と、使えるメモリ（therm1015） ----
+// 返事は [熱][後ろに回っているか] の後ろに、状態の尾 [印][使えるメモリ MB][OS の熱の値][温度 0.1 度]（proto.h の VR_STX_*）を付ける。
+// 古いドライバは先頭の 4 バイトしか読まないので、尾を付けても壊れない。測れなかった値は印を立てない
+typedef struct { int thermal; uint32_t flags, avail_mb, raw; int32_t temp_dc; } vr_status;
+
+#ifdef __ANDROID__
+#include <dlfcn.h>
+// 電池の温度（0.1 度）。読めなければ INT32_MIN
+static int32_t android_batt_temp_dc(void) {
+    static const char *const paths[] = { "/sys/class/power_supply/battery/temp", "/sys/class/power_supply/Battery/temp" };
+    for (unsigned i = 0; i < sizeof paths / sizeof *paths; i++) {
+        FILE *f = fopen(paths[i], "r");
+        if (!f) continue;
+        int v = 0, ok = fscanf(f, "%d", &v) == 1;
+        fclose(f);
+        if (ok) return v;
+    }
+    return INT32_MIN;
+}
+// 端末の熱の状態（PowerManager の THERMAL_STATUS_* と同じ 0〜6）。NDK の AThermal は API 30 から。アプリの minSdk は 29 なので dlsym で探す。-1 は聞けない
+static int android_thermal_raw(void) {
+    typedef void *(*acq_t)(void);
+    typedef int (*get_t)(void *);
+    static int tried;
+    static acq_t acq;
+    static get_t get;
+    static void *mgr;
+    if (!tried) {
+        tried = 1;
+        void *h = dlopen("libandroid.so", RTLD_NOW);
+        if (h) {
+            acq = (acq_t) dlsym(h, "AThermal_acquireManager");
+            get = (get_t) dlsym(h, "AThermal_getCurrentThermalStatus");
+        }
+        if (acq && get) mgr = acq();
+    }
+    return mgr && get ? get(mgr) : -1;
+}
+#endif
+
+// /proc/meminfo の MemAvailable（MB）。読めなければ 0
+#if defined(__ANDROID__) || defined(__linux__)
+static uint32_t proc_mem_avail_mb(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[128];
+    long long kb = -1;
+    while (fgets(line, sizeof line, f)) if (sscanf(line, "MemAvailable: %lld kB", &kb) == 1) break;
+    fclose(f);
+    return kb > 0 ? (uint32_t) (kb >> 10) : 0;
+}
+#endif
+
+static void status_fill(vr_status *st) {
+    memset(st, 0, sizeof *st);
+    st->temp_dc = INT32_MIN;
+    int t = g_thermal;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    // アプリの ProcessInfo.thermalState（0 nominal・1 fair・2 serious・3 critical）を vkr_set_thermal で受けた物。メモリは iOS がこのアプリに今許す残り
+    st->flags |= VR_STX_PLAT_IOS << VR_STX_PLAT_SHIFT;
+    size_t av = os_proc_available_memory();
+    st->avail_mb = (uint32_t) (av >> 20);
+    st->flags |= VR_STX_AVAIL;
+    st->raw = (uint32_t) t;
+    st->flags |= VR_STX_RAW;
+#elif defined(__ANDROID__)
+    // 端末の熱の状態を、Android アプリの Thermal.level と同じ 4 段階にする（NONE 0・LIGHT 1・MODERATE と SEVERE 2・CRITICAL から上 3）。
+    // AThermal が聞けないとき（API 29 など）は、電池の温度から決める。この境目（40・43・46 度）は推測で、本物の機種で見直す
+    st->flags |= VR_STX_PLAT_ANDROID << VR_STX_PLAT_SHIFT;
+    st->temp_dc = android_batt_temp_dc();
+    if (st->temp_dc != INT32_MIN) st->flags |= VR_STX_TEMP;
+    int raw = android_thermal_raw(), lv = 0;
+    if (raw >= 0) {
+        lv = raw == 0 ? 0 : raw == 1 ? 1 : raw <= 3 ? 2 : 3;
+        st->raw = (uint32_t) raw;
+        st->flags |= VR_STX_RAW;
+    } else if (st->temp_dc != INT32_MIN) {
+        lv = st->temp_dc >= 460 ? 3 : st->temp_dc >= 430 ? 2 : st->temp_dc >= 400 ? 1 : 0;
+    }
+    if (lv > t) t = lv;
+    st->avail_mb = proc_mem_avail_mb();
+    if (st->avail_mb) st->flags |= VR_STX_AVAIL;
+#elif defined(_WIN32)
+    st->flags |= VR_STX_PLAT_WINDOWS << VR_STX_PLAT_SHIFT;
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) {
+        st->avail_mb = (uint32_t) (ms.ullAvailPhys >> 20);
+        st->flags |= VR_STX_AVAIL;
+    }
+#elif defined(__linux__)
+    st->flags |= VR_STX_PLAT_LINUX << VR_STX_PLAT_SHIFT;
+    st->avail_mb = proc_mem_avail_mb();
+    if (st->avail_mb) st->flags |= VR_STX_AVAIL;
+#endif
+    // PC の代役は VKR_THERMAL_FILE に書いた「熱 [使えるメモリ MB [温度 0.1 度]]」を返す（熱くなったときのドライバの動きを試す）。
+    // 数字は空白で区切る。熱の数字が読めなければ 0。ファイルが無ければ本物の値のまま
+    const char *f = getenv("VKR_THERMAL_FILE");
+    if (f) {
+        FILE *fp = fopen(f, "r");
+        if (fp) {
+            int a = 0, b = 0, c = 0, n = fscanf(fp, "%d %d %d", &a, &b, &c);
+            fclose(fp);
+            t = n >= 1 ? a : 0;
+            st->raw = (uint32_t) t;
+            st->flags |= VR_STX_RAW;
+            if (n >= 2) { st->avail_mb = (uint32_t) (b < 0 ? 0 : b); st->flags |= VR_STX_AVAIL; }
+            if (n >= 3) { st->temp_dc = c; st->flags |= VR_STX_TEMP; }
+        }
+    }
+    st->thermal = t;
+}
+
 // 調べ用の VKR_CHECK。命令ごとに getenv を呼ぶと、環境変数の多い PC では 1 コマに 5,000 回・約 10 ms 食っていたので、最初の 1 回だけ読む
 static int vkr_check(void) {
     static int on = -1;
@@ -6850,18 +6963,15 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         return reply(s, 0);
     }
     case VR_GET_STATUS: {
-        // PC の代役は VKR_THERMAL_FILE に書いた数字を返す（熱くなったときのドライバの動きを試す）
-        int t = g_thermal;
-        const char *f = getenv("VKR_THERMAL_FILE");
-        if (f) {
-            FILE *fp = fopen(f, "r");
-            if (fp) {
-                if (fscanf(fp, "%d", &t) != 1) t = 0;
-                fclose(fp);
-            }
-        }
-        vr_u32(&g_out, (uint32_t) t);
+        // 熱と、後ろに回っているか。その後ろに状態の尾（使えるメモリなど。proto.h の VR_STX_*）
+        vr_status st;
+        status_fill(&st);
+        vr_u32(&g_out, (uint32_t) st.thermal);
         vr_u32(&g_out, g_paused ? 1u : 0u);
+        vr_u32(&g_out, st.flags);
+        vr_u32(&g_out, st.avail_mb);
+        vr_u32(&g_out, st.raw);
+        vr_u32(&g_out, (uint32_t) st.temp_dc);
         return reply(s, 0);
     }
     case VR_CREATE_IMAGE_NR:

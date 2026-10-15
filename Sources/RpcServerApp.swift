@@ -225,6 +225,11 @@ struct ContentView: View {
         .onChange(of: webcamWifi) { _, on in webcam.setWifi(on) }
         .onChange(of: micCamOnly) { _, on in setMicCamOnly(on) }
         .onChange(of: keepAlive) { _, on in if running { on ? Keeper.shared.start() : Keeper.shared.stop() } }
+        // 熱の状態が変わったら、1 秒の tick を待たずにすぐ受け手へ渡す（PC のドライバは約 2 秒ごとに VR_GET_STATUS で聞く。
+        // 使えるメモリ os_proc_available_memory は、聞かれたときに受け手（server.c）が自分で測って答える）
+        .onReceive(NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification).receive(on: RunLoop.main)) { _ in
+            vkr_set_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
+        }
         .onReceive(tick) { _ in
             vkr_set_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
             status.tick()

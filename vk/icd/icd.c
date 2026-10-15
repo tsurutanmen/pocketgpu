@@ -9,6 +9,8 @@
 // 5 桁以下の数字だけの usb:50060 はこれまで通りポート番号。UDID の一覧は pc/usb_forward.py --list。
 // IPHONE_VK_LOG=1 で何をしているかを stderr に出す。
 // IPHONE_VK_STATS=1 で、終わりに「どの命令を何回送り、何回返事を待ち、何バイト運んだか」を stderr に出す。
+// 受け手の熱とメモリ：約 2 秒ごとに聞き（VR_GET_STATUS）、熱が変わったら stderr に 1 行・serious 以上は警告の行。
+// IPHONE_VK_STATUS_FILE=パス で最新の値を JSON 1 行で書く（{pid} はプロセス番号）。IPHONE_VK_LOWMEM_MB=数（既定 500・0 で出さない）。読む道具は pc/iphone_status.py
 //
 // メモリの同期
 //   PC 側に写しを持ち、アプリにはその写しを map させる。写しは Windows の書き込み監視つきで確保して、
@@ -53,6 +55,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #define VK_NO_PROTOTYPES
 #ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -387,6 +390,8 @@ static struct {
     double lat_sum, lat_max;       // present から窓に出るまで
     uint64_t lat_n;
     int heat_max;                  // いちばん熱かったときの iPhone の熱の状態
+    int avail_seen;                // 使えるメモリを聞けた（受け手が尾を付けた）
+    uint32_t avail_min;            // 使えるメモリの最小（MB）
     LONG64 wr_bytes[6], wr_n[6]; // GPU が書くかもしれない CPU から見える範囲（読み戻す元）を理由別に
     double cpu0;                   // 最初の present のときのプロセスの CPU 時間（ms）
     uint64_t rp_begin, rp_load, rp_store, rp_clear, rp_dload, rp_dstore, rp_same; // render pass を始めた回数と、画面を読み込む・書き戻す・消す attachment の数
@@ -498,6 +503,7 @@ static void print_stats(void) {
         fprintf(stderr, "  present %llu 回 %.1f ms（うち窓に描く %llu 回 %.1f ms）\n", (unsigned long long) g_stat.presents, g_stat.present_ms,
                 (unsigned long long) g_stat.blits, g_stat.blit_ms);
     if (g_stat.heat_max) fprintf(stderr, "  iPhone の熱：いちばん熱かったのは %d（0 ふつう〜3 とても熱い）\n", g_stat.heat_max);
+    if (g_stat.avail_seen) fprintf(stderr, "  受け手の使えるメモリ：いちばん減ったときで %u MB\n", g_stat.avail_min);
     if (g_kit_mark[11] != '#') fprintf(stderr, "  配った印：%.32s\n", (const char *) g_kit_mark + 11);
     if (g_stat.presents > 1)
         fprintf(stderr, "  最初の present からのプロセスの CPU %.0f ms（present 1 回 %.2f ms）\n", proc_cpu_ms() - g_stat.cpu0,
@@ -1145,6 +1151,9 @@ static int g_status_out;                // 答えを待っている熱の問い�
 static volatile int g_status_ready;     // 答えが届いた（heat_check が使う）
 static VkResult g_status_r;
 static uint32_t g_status_v;
+// 届いた返事の中身（頭 8 バイトと、あれば状態の尾。proto.h の VR_STX_*）。heat_check が読み取る
+static uint8_t g_status_buf[64];
+static uint32_t g_status_n;
 static unsigned char g_pend[64];
 static unsigned g_pend_head, g_pend_n;
 static int g_prog_out;                  // 答えを待っている進み具合の問い合わせがある
@@ -1283,6 +1292,8 @@ static int pend_read_one_locked(int wait) {
         g_status_r = (VkResult) (int32_t) h[0];
         g_status_v = 0;
         if (h[1] >= 4) memcpy(&g_status_v, st, 4);
+        g_status_n = h[1];
+        memcpy(g_status_buf, st, h[1]);
         g_status_ready = 1;
         return 1;
     }
@@ -8156,7 +8167,25 @@ static VkResult blit(struct swapchain *sc, uint32_t j, uint64_t serial) {
 // iOS は熱いと自分で GPU を遅くするが、コマ数を落として熱を出さない方が、速さの上がり下がりが少ない
 static int g_heat = -1;
 static double g_heat_gap;
-static void heat_apply(VkResult r, uint32_t h);
+
+// 受け手の状態（VR_GET_STATUS の返事）。新しい受け手は熱の後ろに、使えるメモリなどの尾を付ける（proto.h の VR_STX_*）。尾が無い古い受け手は ext=0
+typedef struct { int ok, ext; uint32_t thermal, paused, flags, avail_mb, raw; int32_t temp_dc; } vstat;
+static void vstat_parse(const uint8_t *p, size_t n, vstat *s) {
+    memset(s, 0, sizeof *s);
+    s->temp_dc = INT32_MIN;
+    if (n < 4) return;
+    s->ok = 1;
+    memcpy(&s->thermal, p, 4);
+    if (n >= 8) memcpy(&s->paused, p + 4, 4);
+    if (n >= VR_STATUS_HEAD_BYTES + VR_STATUS_EXT_BYTES) {
+        s->ext = 1;
+        memcpy(&s->flags, p + 8, 4);
+        memcpy(&s->avail_mb, p + 12, 4);
+        memcpy(&s->raw, p + 16, 4);
+        memcpy(&s->temp_dc, p + 20, 4);
+    }
+}
+static void heat_apply(VkResult r, const vstat *s);
 // 熱の問い合わせを返事を待たずに出す（IPHONE_VK_STATUS_ASYNC=0 で前の待つやり方）
 static int status_async(void) {
     static int v = -1;
@@ -8174,7 +8203,8 @@ static void heat_check(void) {
         if (g_status_out) rx_pump_locked();
         int ready = g_status_ready;
         VkResult r = g_status_r;
-        uint32_t h = g_status_v;
+        vstat vs;
+        vstat_parse(g_status_buf, g_status_n, &vs);
         g_status_ready = 0;
         if (!g_status_out && !g_dead && t - last >= 2000) {
             last = t;
@@ -8185,7 +8215,7 @@ static void heat_check(void) {
             if (flush_locked()) { g_status_out = 1; pend_push_locked(PEND_STATUS); }
         }
         ReleaseSRWLockExclusive(&g_lock);
-        if (ready) heat_apply(r, h);
+        if (ready) heat_apply(r, &vs);
         return;
     }
     if (t - last < 2000) return;
@@ -8193,21 +8223,144 @@ static void heat_check(void) {
     vr_buf b = { 0 }, out = { 0 };
     VkResult r = rpc_call(VR_GET_STATUS, &b, &out);
     free(b.p);
-    uint32_t h = 0;
-    if (r == VK_SUCCESS && out.n >= 4) memcpy(&h, out.p, 4);
+    vstat vs;
+    vstat_parse(out.p, r == VK_SUCCESS ? out.n : 0, &vs);
     free(out.p);
-    heat_apply(r, h);
+    heat_apply(r, &vs);
 }
 
-static void heat_apply(VkResult r, uint32_t h) {
-    if (r != VK_SUCCESS || h > 3 || (int) h == g_heat) return;
+// present の来ない仕事（AI の計算など）でも熱を聞けるように、queue_submit からも呼ぶ。時計を見るだけで、聞くのは heat_check の 2 秒ごと
+static void heat_tick(void) {
+    static double next;
+    double t = now_ms();
+    if (t < next) return;
+    next = t + (g_status_out ? 25 : 250);
+    heat_check();
+}
+
+// ---- 受け手の熱とメモリを記録とファイルに出す（therm1015） ----
+// ・熱が変わったら記録（stderr）に 1 行。serious（2）・critical（3）の間は目立つ警告の行を、変わったときと 30 秒ごとに出す
+// ・使えるメモリが IPHONE_VK_LOWMEM_MB（既定 500・0 で出さない）を切ったら 1 行、戻ったら 1 行
+// ・IPHONE_VK_STATUS_FILE=パス で、答えが届くたびに（約 2 秒ごと）最新の値を JSON 1 行でそのファイルに書く。パスの {pid} はプロセス番号に置き換える。
+//   別の道具（cluster.py など）が読める。書き換えの途中は読まれないよう「パス.tmp」に書いてから置き換える
+static const char *const HEAT_NAME[] = { "ふつう", "やや熱い", "熱い", "とても熱い" };
+static const char *const HEAT_EN[] = { "nominal", "fair", "serious", "critical" };
+
+static const char *status_who(const vstat *s) {
+    unsigned pl = (s->flags >> VR_STX_PLAT_SHIFT) & VR_STX_PLAT_MASK;
+    return s->ext && pl == VR_STX_PLAT_ANDROID ? "Android 端末" : "iPhone ";
+}
+
+static unsigned long my_pid(void) {
+#ifdef _WIN32
+    return (unsigned long) GetCurrentProcessId();
+#else
+    return (unsigned long) getpid();
+#endif
+}
+
+static void status_file_write(const vstat *s, int low_mem) {
+    static char path[560];
+    static int init;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("IPHONE_VK_STATUS_FILE");
+        if (e && *e) {
+            const char *pp = strstr(e, "{pid}");
+            if (pp) snprintf(path, sizeof path, "%.*s%lu%s", (int) (pp - e), e, my_pid(), pp + 5);
+            else snprintf(path, sizeof path, "%s", e);
+        }
+    }
+    if (!path[0]) return;
+    unsigned pl = s->ext ? (s->flags >> VR_STX_PLAT_SHIFT) & VR_STX_PLAT_MASK : 0;
+    static const char *const PL[] = { "unknown", "ios", "android", "windows", "linux" };
+    char tmp[580], js[800];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    int n = snprintf(js, sizeof js, "{\"ts\":%lld,\"pid\":%lu,\"platform\":\"%s\",\"ext\":%s,\"thermal\":%u,\"thermal_name\":\"%s\",\"raw\":",
+                     (long long) time(NULL), my_pid(), PL[pl < 5 ? pl : 0], s->ext ? "true" : "false", s->thermal, HEAT_EN[s->thermal & 3]);
+    if (s->ext && (s->flags & VR_STX_RAW)) n += snprintf(js + n, sizeof js - n, "%u", s->raw);
+    else n += snprintf(js + n, sizeof js - n, "null");
+    n += snprintf(js + n, sizeof js - n, ",\"paused\":%u,\"avail_mb\":", s->paused ? 1u : 0u);
+    if (s->ext && (s->flags & VR_STX_AVAIL)) n += snprintf(js + n, sizeof js - n, "%u", s->avail_mb);
+    else n += snprintf(js + n, sizeof js - n, "null");
+    n += snprintf(js + n, sizeof js - n, ",\"temp_c\":");
+    if (s->ext && (s->flags & VR_STX_TEMP) && s->temp_dc != INT32_MIN) n += snprintf(js + n, sizeof js - n, "%.1f", s->temp_dc / 10.0);
+    else n += snprintf(js + n, sizeof js - n, "null");
+    n += snprintf(js + n, sizeof js - n, ",\"heat_max\":%d,\"avail_min_mb\":", g_stat.heat_max);
+    if (g_stat.avail_seen) n += snprintf(js + n, sizeof js - n, "%u", g_stat.avail_min);
+    else n += snprintf(js + n, sizeof js - n, "null");
+    n += snprintf(js + n, sizeof js - n, ",\"alert\":%s,\"low_mem\":%s}\n", s->thermal >= 2 || low_mem ? "true" : "false", low_mem ? "true" : "false");
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    fwrite(js, 1, (size_t) n, f);
+    fclose(f);
+#ifdef _WIN32
+    // 読んでいる最中の相手がいて置き換えられないときは、直に書く
+    if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
+        FILE *g = fopen(path, "wb");
+        if (g) { fwrite(js, 1, (size_t) n, g); fclose(g); }
+        DeleteFileA(tmp);
+    }
+#else
+    if (rename(tmp, path) != 0) remove(tmp);
+#endif
+}
+
+static void heat_warn(const vstat *s, int force) {
+    static double last;
+    double t = now_ms();
+    if (!force && t - last < 30000) return;
+    last = t;
+    unsigned h = s->thermal & 3;
+    fprintf(stderr, "[iphone-vk] !!!! 警告：%sの熱が %s（%s）です。%s", status_who(s), HEAT_EN[h], HEAT_NAME[h],
+            h >= 3 ? "OS が GPU を大きく遅くします。冷ますか使うのをやめてください" : "OS が GPU を遅くし始めます。続けるなら冷ましてください");
+    if (s->ext && (s->flags & VR_STX_AVAIL)) fprintf(stderr, "（使えるメモリ %u MB）", s->avail_mb);
+    fputc('\n', stderr);
+}
+
+static void mem_note(const vstat *s, int *low_mem) {
+    static int low;
+    static long long thr = -1;
+    *low_mem = 0;
+    if (!s->ext || !(s->flags & VR_STX_AVAIL)) return;
+    if (!g_stat.avail_seen || s->avail_mb < g_stat.avail_min) g_stat.avail_min = s->avail_mb;
+    g_stat.avail_seen = 1;
+    if (thr < 0) { const char *e = getenv("IPHONE_VK_LOWMEM_MB"); thr = e && *e ? atoll(e) : 500; if (thr < 0) thr = 0; }
+    if (thr > 0) {
+        if (!low && (long long) s->avail_mb < thr) {
+            low = 1;
+            fprintf(stderr, "[iphone-vk] !! %sの使えるメモリが %u MB まで減った（%lld MB 未満）。使い切ると OS にアプリを止められる\n", status_who(s), s->avail_mb, thr);
+        } else if (low && (long long) s->avail_mb >= thr + thr / 4) {
+            low = 0;
+            fprintf(stderr, "[iphone-vk] %sの使えるメモリが %u MB に戻った\n", status_who(s), s->avail_mb);
+        }
+    }
+    *low_mem = low;
+}
+
+static void heat_apply(VkResult r, const vstat *s) {
+    if (r != VK_SUCCESS || !s->ok || s->thermal > 3) return;
+    uint32_t h = s->thermal;
+    int low_mem;
+    mem_note(s, &low_mem);
+    status_file_write(s, low_mem);
+    if ((int) h == g_heat) {
+        if (h >= 2) heat_warn(s, 0);
+        return;
+    }
     static double fps = -1;
     if (fps < 0) { const char *e = getenv("IPHONE_VK_HEAT_FPS"); fps = e ? atof(e) : 30; }
     double gap = h >= 2 && fps > 0 ? 1000.0 / fps : 0;
     if (gap > 0 && g_heat_gap <= 0) timeBeginPeriod(1);
-    static const char *const NAME[] = { "ふつう", "やや熱い", "熱い", "とても熱い" };
-    if (g_heat >= 0 || h > 0)
-        fprintf(stderr, "[iphone-vk] iPhone の熱：%s%s\n", NAME[h], gap > 0 ? "。冷めるまでコマ数を落とす" : g_heat_gap > 0 ? "。コマ数を戻す" : "");
+    if (g_heat >= 0 || h > 0) {
+        // 「熱：名前」の形と、名前のあとの最初の「。」は変えない（play_rec.py などが読む）。新しい情報は最後の「。」の後ろに足す
+        fprintf(stderr, "[iphone-vk] %sの熱：%s%s。%s", status_who(s), HEAT_NAME[h],
+                gap > 0 ? "。冷めるまでコマ数を落とす" : g_heat_gap > 0 ? "。コマ数を戻す" : "", HEAT_EN[h]);
+        if (s->ext && (s->flags & VR_STX_AVAIL)) fprintf(stderr, "・使えるメモリ %u MB", s->avail_mb);
+        if (s->ext && (s->flags & VR_STX_TEMP) && s->temp_dc != INT32_MIN) fprintf(stderr, "・温度 %.1f 度", s->temp_dc / 10.0);
+        fputc('\n', stderr);
+    }
+    if (h >= 2) heat_warn(s, 1);
     g_heat_gap = gap;
     g_heat = (int) h;
     if ((int) h > g_stat.heat_max) g_stat.heat_max = (int) h;
@@ -11511,6 +11664,7 @@ static VkResult VKAPI_CALL signal_sem(VkDevice dv, const VkSemaphoreSignalInfo *
 
 static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitInfo *si, VkFence f) {
     PIN_CALLER();
+    heat_tick();
     struct queue *q = (struct queue *) qh;
     struct dev *d = q->d;
     // u1：結んだあとに書いた descriptor（update after bind）と、アドレスで読み書きする buffer を、command buffer の読む・書く範囲に足す。

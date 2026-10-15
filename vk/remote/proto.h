@@ -89,6 +89,25 @@
 // 受け手は頼みのあいだも次のコマの命令を処理できるので、GPU がコマの間で空かない。コマは頼んだ 2 つ後の返事で届く（先送りより 1 コマ遅い）
 #define VR_CAP_H264_LATE 134217728u // 1u << 27
 #define VR_CAP_NEW_MASK (VR_CAP_VK13 | VR_CAP_DYNAMIC_RENDERING | VR_CAP_SYNC2 | VR_CAP_RENDER_PASS2 | VR_CAP_CMD10 | VR_CAP_EXT_DYNAMIC_STATE | VR_CAP_QUERY)
+// VR_GET_STATUS の返事（VR_CAP_STATUS）。先頭の 8 バイト [熱 u32・後ろに回っているか u32] は今までどおり。
+// 新しい受け手は、その後ろに 16 バイトの「状態の尾」（VR_STATUS_EXT_BYTES）を付ける（返事は全部で 24 バイト）：
+//   [印 u32][使えるメモリ MB u32][OS が答えた熱の値 u32][温度 i32（0.1 度。分からなければ INT32_MIN）]
+// 印の VR_STX_AVAIL・VR_STX_RAW・VR_STX_TEMP は、その値を本当に測れた印（立っていない値は読まない）。
+// 印の 8 ビット目から 4 ビットは受け手の種類（VR_STX_PLAT_*）。
+// 新しい能力の印は足さず、「返事の長さ」で見分ける。古い受け手は 8 バイトを返す（尾が無い）。
+// 古いドライバは先頭の 4 バイトだけを読み、返事は 64 バイトまで受けるので、尾が付いていても壊れない。ドライバが頼む中身は今までどおり空
+#define VR_STATUS_HEAD_BYTES 8u
+#define VR_STATUS_EXT_BYTES 16u
+#define VR_STX_AVAIL 1u   // 使えるメモリ（iPhone は os_proc_available_memory・Android は MemAvailable・PC の代役は空きの物理メモリ）
+#define VR_STX_RAW 2u     // OS が答えた熱の値（iPhone は ProcessInfo.thermalState の 0〜3・Android は THERMAL_STATUS_* の 0〜6）
+#define VR_STX_TEMP 4u    // 温度（Android は電池の温度）
+#define VR_STX_PLAT_SHIFT 8
+#define VR_STX_PLAT_MASK 0xfu
+#define VR_STX_PLAT_IOS 1u
+#define VR_STX_PLAT_ANDROID 2u
+#define VR_STX_PLAT_WINDOWS 3u  // PC の代役の受け手
+#define VR_STX_PLAT_LINUX 4u    // Linux の代役の受け手
+
 // 1.3 の受け手は、VR_GET_FORMAT_PROPS の返事の後ろに VkFormatProperties3 の 3 つの値（u64）を付ける。古いドライバは読まない
 
 // 返事のある命令（往復が 1 回かかる）には [同期] と書く。ほかは送りっぱなし
@@ -172,7 +191,7 @@ enum vr_op {
     VR_PACKED,                   // 元の長さ（u32）・LZ4 で縮めた「命令の並び」。中の命令の返事は、ふつうに順に返す（VR_CAP_PACK）
     VR_CREATE_BUFFER_NR,         // VR_CREATE_BUFFER と同じ中身で、返事をしない（VR_CAP_ASYNC_CREATE）
     VR_CREATE_IMAGE_NR,          // VR_CREATE_IMAGE と同じ中身で、返事をしない（VR_CAP_ASYNC_CREATE）
-    VR_GET_STATUS,               // [同期] → 熱の状態（u32・0 ふつう〜3 とても熱い）・後ろに回っているか（u32）（VR_CAP_STATUS）
+    VR_GET_STATUS,               // [同期] → 熱の状態（u32・0 ふつう〜3 とても熱い）・後ろに回っているか（u32）・（あれば）状態の尾（VR_STX_*）（VR_CAP_STATUS）
     VR_GET_LINK,                 // [同期] → 使えるか（u32）・合言葉（16 バイト）・住所（u32・IPv4 をネットワークの並びで）・ポート（u32）。USB の口からだけ答える（VR_CAP_LINK）
     VR_READ_H264,                // [同期] memory・offset・幅・高さ・行の長さ・BGRA か・印（VR_H264_*）・kbps・コマ/秒・キーフレームの間隔（コマ）・
                                  // 流れの番号（u64）・札（u64）→ 頭（VR_H264_HEAD）と 1 コマぶんの H.264。先送りの最初は空（VR_CAP_H264）
