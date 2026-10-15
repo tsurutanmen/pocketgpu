@@ -1511,6 +1511,8 @@ static void mark_blocked(uint8_t *blk) {
 }
 
 static void watch_forget(VkFence f); // 見張りの糸が待っている fence を、reset する・消す前に放してもらう（下の「返事の尾と押し出し」）
+static void jw_forget(VkFence f);    // JPEG の糸が待っている fence も同じく放してもらう（下の「窓の絵を別の糸で縮めて返す」）
+static void jw_flush(void);          // 並べた JPEG の頼みの返事が全部出るまで待つ（主の糸が返事を送る前）
 
 // k 番目までに出した仕事が終わるのを待って、一覧から外す。CPU からの合図を待っている物は待たずに残す
 static void drain_upto(int k) {
@@ -1740,6 +1742,7 @@ static void *watch_thread(void *a) { (void) a; qos_hi(); watch_loop(); return NU
 
 // 主の糸が fence を reset する・消す前に呼ぶ
 static void watch_forget(VkFence f) {
+    jw_forget(f);
     if (!g_watch.started || !f) return;
     watch_lock();
     while (g_watch.cur == f) watch_wait();
@@ -2296,6 +2299,7 @@ static void gw_before_submit(VkQueue q) {
 }
 
 static void jp_reset(void);
+static void jw_reset(void);
 static void vid_reset(void);
 // 手伝いの物を dev の上から消す（自前の fence・つなぎの semaphore・空の代わりの物）。どれも要るときにまた作る
 static void helpers_free(VkDevice dev) {
@@ -2694,6 +2698,7 @@ static void dev_free(VkDevice dev, int last) {
 }
 
 static void cleanup(void) {
+    jw_reset(); // JPEG の糸に回した頼みを先に終える（待っている fence と絵のメモリは、このあと消える）
     pc_report();
     drain();
     watch_stop(); // 見張りが待つ fence は装置の物なので、装置を消す前に止める。数え直す前に止めて、古い番号を新しい数え方で知らせない
@@ -2797,6 +2802,7 @@ static int peer_gone(vr_sock s) {
 }
 
 static int reply(vr_sock s, int32_t result) {
+    jw_flush(); // JPEG の糸に回した頼みの返事を先に出す（返事は届いた順）
     // 後ろに回ってこの接続を終えたなら、頼んだドライバには理由の分かる値で返す
     if (g_bgerr && g_bg_code && g_err < 0 && result == (int32_t) g_err) result = VR_RES_BACKGROUND;
     uint32_t h[2] = { (uint32_t) result, (uint32_t) g_out.n };
@@ -4509,6 +4515,7 @@ static void dummy_dirty_check(const char *why) {
     }
 }
 
+static void jw_reset(void); // 下の「窓の絵を別の糸で縮めて返す」
 // ---- 先送りの JPEG（VR_READ_JPEG_PIPE） ----
 // 今のコマを写して別の糸で縮め始め、返事にはひとつ前のコマの JPEG を入れる。
 // 縮めている間に、受け手は次のコマの仕事を進められる（窓に出るのは 1 コマ遅れる）
@@ -4564,6 +4571,7 @@ static void jp_join(void) {
 
 // 接続が切れたとき：縮めている途中なら待ち、次につないだ人に前の人のコマを見せない
 static void jp_reset(void) {
+    jw_reset();
     jp_join();
     g_jp.ok = 0;
 }
@@ -4588,7 +4596,407 @@ static int jp_start(const uint8_t *src) {
     return 1;
 }
 #else
-static void jp_reset(void) {}
+static void jp_reset(void) { jw_reset(); }
+#endif
+
+// ---- 窓の絵を別の糸で縮めて返す（VR_READ_JPEG・VR_READ_JPEG_PIPE。rxmain1016） ----
+// 前は主の糸が、頼まれたその場で「その絵を写した GPU の仕事」が終わるのを待ち（本物の iPhone で 1 コマ 5.4 ms）、
+// VR_READ_JPEG ならそのまま縮めていた（6.3 ms）。その間、主の糸は次のコマの命令を読めず、GPU も次の仕事を受け取れない。
+// いまは主の糸は頼みを覚えて並べるだけで、すぐ次の命令へ進む。JPEG の糸が GPU を待ち、絵を写し、縮めて、返事を送る。
+// 返事の中身は前と同じ（VR_READ_JPEG はそのコマ・VR_READ_JPEG_PIPE はひとつ前に頼まれたコマ）。守ること：
+//  ・返事の順：主の糸は返事を送る前（reply）に、並べた頼みの返事が全部出るのを待つ。通し番号は送るときに数える。
+//    尾の「終わった submit の番号」と「数え直しの回数」、尾を付けるかどうかは、頼まれた時点の物（ドライバは大きい方の番号を取る）
+//  ・絵の元：写し終えるまで、そのメモリへの書き込み（VR_MEM_WRITE など）・放す・そのメモリを使う submit の前で、主の糸が待つ
+//  ・fence：主の糸が fence を reset・消す前（watch_forget）に、JPEG の糸がその fence を待ち終えるのを待ち、並べた頼みからは外す
+//  ・装置を消す・接続が切れるとき：並べた頼みが全部終わるまで待つ（jw_reset）
+// VKR_JPEG_THREAD=0 で前の形（主の糸で待って縮める）
+#ifdef VR_HAVE_JPEG
+#define JW_MAX 3
+#define JW_FMAX 256
+typedef struct {
+    int pipe;                  // VR_READ_JPEG_PIPE
+    uint64_t mid;
+    const uint8_t *src;        // 頼まれた時点の e->map + offset（写し終えるまで主の糸がメモリを放さない）
+    uint32_t w, h, stride, bgra, q;
+    VkFence f[JW_FMAX];        // 待つ fence（VK_NULL_HANDLE：主の糸が reset する前に外した。もう終わっている）
+    VkDevice d[JW_FMAX];
+    int nf;
+    int ext;                   // 返事に尾を付ける（頼まれた時点の g_rx_ext）
+    uint64_t done;             // 尾の終わった submit の番号（頼まれた時点）
+    uint32_t epoch;
+    vr_sock s;
+    double t_req;
+    int copied;                // 絵を写し終えた（主の糸はこのあとならメモリを変えてよい）
+    uint8_t *px;               // 写した絵
+    size_t cap;
+} jwjob;
+static struct {
+    int started;
+    jwjob job[JW_MAX];
+    int head;
+    volatile int n;            // 並べた頼み（head から n 個。JPEG の糸が終えたら外す）
+    volatile int unsent;       // まだ返事を送っていない頼みの数
+    int waiting;               // JPEG の糸が head の fence を錠の外で待っている
+    VkResult err;              // GPU を待てなかった（主の糸が次に g_err へ移す）
+    vr_buf out;                // VR_READ_JPEG の縮めた物
+    vr_buf pout;               // VR_READ_JPEG_PIPE：ひとつ前のコマの JPEG
+    int pok;
+    // 数え（JPEG の糸）：100 コマごとに記録に出す
+    double gpu_ms, copy_ms, enc_ms, lat_ms;
+    uint64_t frames, bytes, pframes;
+    // 数え（主の糸）：JPEG の糸を待った回数と時間（返事の前・書き換えの前・fence を放す前・並びが満ちた）
+    uint64_t reqs, w_flush, w_mem, w_forget, w_room;
+    double main_ms, ms_flush, ms_mem, ms_forget, ms_room;
+    double req_ms;             // 主の糸が頼みを受け付けるのにかけた時間（GPU も縮めるのも待たない分）
+#ifdef _WIN32
+    SRWLOCK lk;
+    CONDITION_VARIABLE cv;
+#else
+    pthread_mutex_t mx;
+    pthread_cond_t cv;
+#endif
+} g_jw = {
+#ifdef _WIN32
+    .lk = SRWLOCK_INIT, .cv = CONDITION_VARIABLE_INIT,
+#else
+    .mx = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER,
+#endif
+};
+#ifdef _WIN32
+static void jw_lock(void) { AcquireSRWLockExclusive(&g_jw.lk); }
+static void jw_unlock(void) { ReleaseSRWLockExclusive(&g_jw.lk); }
+static void jw_wait(void) { SleepConditionVariableSRW(&g_jw.cv, &g_jw.lk, INFINITE, 0); }
+static void jw_wake(void) { WakeAllConditionVariable(&g_jw.cv); }
+#else
+static void jw_lock(void) { pthread_mutex_lock(&g_jw.mx); }
+static void jw_unlock(void) { pthread_mutex_unlock(&g_jw.mx); }
+static void jw_wait(void) { pthread_cond_wait(&g_jw.cv, &g_jw.mx); }
+static void jw_wake(void) { pthread_cond_broadcast(&g_jw.cv); }
+#endif
+
+static int jw_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VKR_JPEG_THREAD"); v = !(e && *e == '0'); }
+    return v;
+}
+
+// 主の糸が JPEG の糸を待った時間：GPU を待った時間として数える（主の糸の内訳の「GPU を待つ」に入る）
+static void jw_note_wait(double dt, uint64_t *cnt, double *ms) {
+    g_st.wait_ms += dt;
+    g_st.waits++;
+    if (g_cur_op < 128) { g_st.wait_by_op[g_cur_op]++; g_st.wait_ms_by_op[g_cur_op] += dt; }
+    g_jw.main_ms += dt;
+    (*cnt)++;
+    *ms += dt;
+}
+
+// JPEG の糸が GPU を待てなかったなら、主の糸の g_err に移す（主の糸から呼ぶ）
+static void jw_take_err(void) {
+    if (!g_jw.err) return;
+    jw_lock();
+    VkResult e = g_jw.err;
+    g_jw.err = VK_SUCCESS;
+    jw_unlock();
+    if (e != VK_SUCCESS && g_err == VK_SUCCESS) {
+        g_err = e;
+        vk_err_note(e);
+    }
+}
+
+// 返事を送る（JPEG の糸）。尾は頼まれた時点の物、通し番号は送る時点の物
+static int jw_send(const jwjob *j, int32_t res, const uint8_t *p, size_t n) {
+    uint32_t h[2] = { (uint32_t) res, (uint32_t) n };
+    int ok;
+    send_lock();
+    if (j->ext) {
+        uint8_t m[8 + VR_EXT_BYTES];
+        uint32_t seq = g_reply_seq, ep = j->epoch;
+        memcpy(m, h, 8);
+        memcpy(m + 8, &j->done, 8);
+        memcpy(m + 16, &seq, 4);
+        memcpy(m + 20, &ep, 4);
+        ok = vr_send_all(j->s, m, sizeof m) && (!n || vr_send_all(j->s, p, n));
+    } else {
+        ok = vr_send_all(j->s, h, 8) && (!n || vr_send_all(j->s, p, n));
+    }
+    g_reply_seq++;
+    send_unlock();
+    return ok;
+}
+
+static void jw_loop(void) {
+    jw_lock();
+    for (;;) {
+        while (!g_jw.n) jw_wait();
+        jwjob *j = &g_jw.job[g_jw.head];
+        g_jw.waiting = 1;
+        jw_unlock();
+        // 1. その絵を写した GPU の仕事（頼まれた時点でこのメモリを使っていた submit まで）を待つ
+        double t0 = t_ms();
+        VkResult r = VK_SUCCESS;
+        for (int i = 0; i < j->nf && r == VK_SUCCESS; i++) {
+            if (!j->f[i]) continue;
+            VkResult x = vkWaitForFences(j->d[i], 1, &j->f[i], VK_TRUE, UINT64_MAX);
+            if (x != VK_SUCCESS) {
+                vlog(JE("JPEG の糸：出した仕事を待てない (%d)", "JPEG thread: cannot wait for the submitted work (%d)"), x);
+                if (x < 0) r = x;
+            }
+        }
+        // 2. 絵を写す（GPU のメモリから、まとめて）。写したら主の糸はメモリを変えてよい
+        double t1 = t_ms();
+        int32_t res = r;
+        size_t need = (size_t) j->stride * j->h;
+        if (res == VK_SUCCESS) {
+            if (j->cap < need) {
+                free(j->px);
+                j->px = malloc(need);
+                j->cap = j->px ? need : 0;
+            }
+            if (j->px) memcpy(j->px, j->src, need);
+            else res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+        double t2 = t_ms();
+        jw_lock();
+        g_jw.waiting = 0;
+        j->copied = 1;
+        if (r != VK_SUCCESS && !g_jw.err) g_jw.err = r;
+        jw_wake();
+        jw_unlock();
+        // 3. 縮めて返事を送る。先送りは、ひとつ前のコマの JPEG を返してから今のコマを縮める
+        double te = 0;
+        const uint8_t *body = NULL;
+        size_t blen = 0;
+        if (res == VK_SUCCESS) {
+            if (!j->pipe) {
+                double t3 = t_ms();
+                g_jw.out.n = 0;
+                if (jpeg_encode(j->px, j->w, j->h, j->stride, (int) j->bgra, (int) j->q, &g_jw.out)) body = g_jw.out.p, blen = g_jw.out.n;
+                else res = VK_ERROR_UNKNOWN;
+                te = t_ms() - t3;
+            } else if (g_jw.pok) {
+                body = g_jw.pout.p, blen = g_jw.pout.n;
+            }
+        }
+        jw_send(j, res, body, blen);
+        double t4 = t_ms();
+        if (blen) pv_store(body, blen); // アプリの画面に出す最新の 1 枚（先送りは返事に入れたひとつ前のコマ）
+        jw_lock();
+        g_jw.unsent--;
+        jw_wake();
+        jw_unlock();
+        if (j->pipe) {
+            g_jw.pok = 0;
+            if (res == VK_SUCCESS) {
+                double t3 = t_ms();
+                g_jw.pout.n = 0;
+                g_jw.pok = jpeg_encode(j->px, j->w, j->h, j->stride, (int) j->bgra, (int) j->q, &g_jw.pout);
+                te = t_ms() - t3;
+            }
+            g_jw.pframes++;
+        }
+        g_jw.gpu_ms += t1 - t0;
+        g_jw.copy_ms += t2 - t1;
+        g_jw.enc_ms += te;
+        g_jw.lat_ms += t4 - j->t_req;
+        g_jw.bytes += blen;
+        if (++g_jw.frames % 100 == 0) {
+            vlog(JE("JPEG（別の糸%s）：%llu コマ・GPU を待つ %.1f ms・写す %.1f ms・縮める %.1f ms・頼みから返事まで %.1f ms・主の糸の受け付け %.2f ms・主の糸が待った %.1f ms・平均 %.1f KB（1 コマあたり）・熱 %d",
+                    "JPEG (separate thread%s): %llu frames, GPU wait %.1f ms, copy %.1f ms, compress %.1f ms, request to reply %.1f ms, main-thread intake %.2f ms, main thread waited %.1f ms, average %.1f KB per frame, thermal %d"),
+                 g_jw.pframes ? JE("・先送り", ", deferred") : "", (unsigned long long) g_jw.frames, g_jw.gpu_ms / 100, g_jw.copy_ms / 100, g_jw.enc_ms / 100,
+                 g_jw.lat_ms / 100, g_jw.req_ms / 100, g_jw.main_ms / 100, g_jw.bytes / 1024.0 / 100, g_thermal);
+            g_jw.gpu_ms = g_jw.copy_ms = g_jw.enc_ms = g_jw.lat_ms = g_jw.main_ms = g_jw.req_ms = 0;
+            g_jw.bytes = g_jw.pframes = 0;
+        }
+        jw_lock();
+        g_jw.head = (g_jw.head + 1) % JW_MAX;
+        g_jw.n--;
+        jw_wake();
+    }
+}
+#ifdef _WIN32
+static DWORD WINAPI jw_thread(LPVOID a) {
+    (void) a;
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    jw_loop();
+    return 0;
+}
+#else
+// iPhone では主の糸と同じく速いコアに置く
+static void *jw_thread(void *a) {
+    (void) a;
+    qos_hi();
+    jw_loop();
+    return NULL;
+}
+#endif
+
+// JPEG の糸を起こす（プロセスで 1 回。ずっと待っている）。起こせなければ 0（前の形で処理する）
+static int jw_start(void) {
+    if (g_jw.started) return g_jw.started > 0;
+#ifdef _WIN32
+    HANDLE t = CreateThread(NULL, 0, jw_thread, NULL, 0, NULL);
+    g_jw.started = t ? 1 : -1;
+    if (t) CloseHandle(t);
+#else
+    pthread_t t;
+    g_jw.started = pthread_create(&t, NULL, jw_thread, NULL) == 0 ? 1 : -1;
+    if (g_jw.started > 0) pthread_detach(t);
+#endif
+    if (g_jw.started < 0) vlog(JE("JPEG の糸を起こせないので、主の糸で縮める", "Cannot start the JPEG thread, so compressing on the main thread"));
+    return g_jw.started > 0;
+}
+
+// 主の糸が返事を送る前：並べた頼みの返事が全部出るまで待つ
+static void jw_flush(void) {
+    if (!g_jw.unsent) return;
+    double t0 = t_ms();
+    jw_lock();
+    while (g_jw.unsent) jw_wait();
+    jw_unlock();
+    jw_note_wait(t_ms() - t0, &g_jw.w_flush, &g_jw.ms_flush);
+    jw_take_err();
+}
+
+// メモリ mid を書き換える・放す命令の前（主の糸）：並べた頼みがそのメモリなら、絵を写し終えるまで待つ
+static void jw_before_mem(uint64_t mid) {
+    if (!g_jw.n) return;
+    double t0 = t_ms();
+    int waited = 0;
+    jw_lock();
+    for (;;) {
+        int need = 0;
+        for (int i = 0; i < g_jw.n && !need; i++) {
+            const jwjob *j = &g_jw.job[(g_jw.head + i) % JW_MAX];
+            if (j->mid == mid && !j->copied) need = 1;
+        }
+        if (!need) break;
+        waited = 1;
+        jw_wait();
+    }
+    jw_unlock();
+    if (waited) jw_note_wait(t_ms() - t0, &g_jw.w_mem, &g_jw.ms_mem);
+}
+
+// まだ絵を写していない頼みのメモリ（主の糸。submit の前に、そのメモリを使うかを調べる）
+static int jw_uncopied(uint64_t *mids) {
+    int k = 0;
+    if (!g_jw.n) return 0;
+    jw_lock();
+    for (int i = 0; i < g_jw.n; i++) {
+        const jwjob *j = &g_jw.job[(g_jw.head + i) % JW_MAX];
+        if (!j->copied) mids[k++] = j->mid;
+    }
+    jw_unlock();
+    return k;
+}
+
+// 主の糸が fence を reset する・消す前（watch_forget から）：JPEG の糸がその fence を待っている最中なら待ち終わるまで待ち、
+// 並べた頼みの中の同じ fence は「終わった」（NULL）に替える。主の糸が reset・消すのは終わった fence だけ
+static void jw_forget(VkFence f) {
+    if (!g_jw.n || !f) return;
+    double t0 = t_ms();
+    int waited = 0;
+    jw_lock();
+    for (;;) {
+        if (!g_jw.n || !g_jw.waiting) break;
+        const jwjob *j = &g_jw.job[g_jw.head];
+        int has = 0;
+        for (int i = 0; i < j->nf && !has; i++) has = j->f[i] == f;
+        if (!has) break;
+        waited = 1;
+        jw_wait();
+    }
+    for (int i = 0; i < g_jw.n; i++) {
+        if (i == 0 && g_jw.waiting) continue; // 待っている最中の物（f は入っていない）
+        jwjob *j = &g_jw.job[(g_jw.head + i) % JW_MAX];
+        for (int k = 0; k < j->nf; k++) if (j->f[k] == f) j->f[k] = VK_NULL_HANDLE;
+    }
+    jw_unlock();
+    if (waited) jw_note_wait(t_ms() - t0, &g_jw.w_forget, &g_jw.ms_forget);
+}
+
+// 並べた頼みが全部終わる（返事を送り、先送りの絵も縮め終える）まで待つ。装置を消す・接続が切れる前（主の糸）
+static void jw_reset(void) {
+    if (g_jw.n) {
+        jw_lock();
+        while (g_jw.n) jw_wait();
+        jw_unlock();
+    }
+    jw_take_err();
+    g_jw.pok = 0; // 次につないだ人に前の人のコマを見せない
+    // JPEG の糸の数えも接続ごと（糸は止まっているので、ここで消してよい）
+    g_jw.frames = g_jw.bytes = g_jw.pframes = 0;
+    g_jw.gpu_ms = g_jw.copy_ms = g_jw.enc_ms = g_jw.lat_ms = g_jw.main_ms = g_jw.req_ms = 0;
+    if (g_jw.reqs)
+        vlog(JE("この接続：JPEG を別の糸で %llu コマ・主の糸が待った：返事の前 %llu 回 %.0f ms・書き換えの前 %llu 回 %.0f ms・fence を放す前 %llu 回 %.0f ms・並びが満ちた %llu 回 %.0f ms",
+                "This connection: JPEG on a separate thread %llu frames, main thread waited: before replies %llu times %.0f ms, before overwrites %llu times %.0f ms, before releasing fences %llu times %.0f ms, queue full %llu times %.0f ms"),
+             (unsigned long long) g_jw.reqs, (unsigned long long) g_jw.w_flush, g_jw.ms_flush, (unsigned long long) g_jw.w_mem, g_jw.ms_mem,
+             (unsigned long long) g_jw.w_forget, g_jw.ms_forget, (unsigned long long) g_jw.w_room, g_jw.ms_room);
+    g_jw.reqs = g_jw.w_flush = g_jw.w_mem = g_jw.w_forget = g_jw.w_room = 0;
+    g_jw.ms_flush = g_jw.ms_mem = g_jw.ms_forget = g_jw.ms_room = 0;
+}
+
+// VR_READ_JPEG・VR_READ_JPEG_PIPE を JPEG の糸に回す（主の糸）。返事は JPEG の糸が送る。回せなければ -1（前の形で処理する）
+static int jw_request(vr_sock s, uint32_t op, vr_rd *r) {
+    if (!jw_on() || !jw_start()) return -1;
+    double t_in = t_ms();
+    jw_take_err();
+    uint64_t mid = vr_ru64(r);
+    uint64_t off = vr_ru64(r);
+    uint32_t w = vr_ru32(r), h = vr_ru32(r), stride = vr_ru32(r), bgra = vr_ru32(r), q = vr_ru32(r);
+    if (g_err != VK_SUCCESS) return reply(s, g_err);
+    ent *e = find(mid);
+    if (r->bad || !e || !e->map || w == 0 || h == 0 || stride < (uint64_t) w * 4 || off > e->size || (uint64_t) stride * h > e->size - off)
+        return reply(s, VK_ERROR_MEMORY_MAP_FAILED);
+    // 終わった仕事を一覧から外す（待たない）。返事の尾の番号もここで決める
+    uint64_t done = done_now();
+    // 並びが満ちていれば、いちばん古い頼みが終わるまで待つ
+    if (g_jw.n >= JW_MAX) {
+        double t0 = t_ms();
+        jw_lock();
+        while (g_jw.n >= JW_MAX) jw_wait();
+        jw_unlock();
+        jw_note_wait(t_ms() - t0, &g_jw.w_room, &g_jw.ms_room);
+    }
+    jw_lock();
+    jwjob *j = &g_jw.job[(g_jw.head + g_jw.n) % JW_MAX]; // JPEG の糸は head から n 個しか触らない
+    jw_unlock();
+    // 待つ fence：drain_upto と同じく、このメモリを使う最後の submit までの物。CPU からの合図を待って始まれない物は待たない
+    int k = last_with_mem(mid);
+    if (k >= g_nfl) k = g_nfl - 1;
+    uint8_t blk[256] = { 0 };
+    int anytw = 0;
+    for (int i = 0; i <= k && !anytw; i++) anytw = g_fl[i].ntw != 0;
+    if (anytw) mark_blocked(blk);
+    j->nf = 0;
+    for (int i = 0; i <= k && j->nf < JW_FMAX; i++)
+        if (!blk[i] && g_fl[i].f) { j->f[j->nf] = g_fl[i].f; j->d[j->nf] = fl_dev(&g_fl[i]); j->nf++; }
+    j->pipe = op == VR_READ_JPEG_PIPE;
+    j->mid = mid;
+    j->src = (const uint8_t *) e->map + off;
+    j->w = w, j->h = h, j->stride = stride, j->bgra = bgra, j->q = q ? q : 80;
+    j->ext = g_rx_ext;
+    j->done = done;
+    j->epoch = g_epoch;
+    j->s = s;
+    j->t_req = t_ms();
+    j->copied = 0;
+    jw_lock();
+    g_jw.n++;
+    g_jw.unsent++;
+    jw_wake();
+    jw_unlock();
+    g_jw.reqs++;
+    g_frames_total++;
+    g_jw.req_ms += t_ms() - t_in; // 並びが満ちて待った分も入る
+    return 1;
+}
+#else
+static void jw_flush(void) {}
+static void jw_forget(VkFence f) { (void) f; }
+static void jw_before_mem(uint64_t mid) { (void) mid; }
+static int jw_uncopied(uint64_t *mids) { (void) mids; return 0; }
+static void jw_reset(void) {}
 #endif
 
 // ---- 窓に出すコマを H.264 に縮める（VR_READ_H264） ----
@@ -5846,6 +6254,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     }
     case VR_DESTROY_DEVICE: {
         uint64_t id = vr_ru64(r);
+        jw_reset(); // JPEG の糸が、消す装置の fence を待っていないように
         if (g_vh.on) { g_vh.on = 0; g_vhs.dropped++; }
         VkDevice h = DEV(id), other = VK_NULL_HANDLE;
         int ndev = 0;
@@ -5992,6 +6401,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkDevice d = DEV(vr_ru64(r));
         uint64_t id = vr_ru64(r);
         vh_before_mem(id, 1);
+        jw_before_mem(id);
         gw_forget_mem(d, find(id));
         vkFreeMemory(d, OBJ(VkDeviceMemory, id), NULL);
         del(id);
@@ -6021,6 +6431,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint32_t n;
         const void *d = vr_rbytes(r, &n);
         vh_before_mem(mid, 0);
+        jw_before_mem(mid);
         // ドライバが「書く範囲を GPU が使う submit の番号」を付けていれば、そこまでだけ待つ（付いていなければ、そのメモリを使う仕事を全部待つ）
         int k = last_with_mem(mid);
         if (r->at + 8 <= r->n) {
@@ -6063,6 +6474,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t upto = vr_ru64(r);
         uint32_t n = vr_ru32(r);
         vh_before_mem(mid, 0);
+        jw_before_mem(mid);
         int k = last_with_mem(mid);
         {
             int wide = (int) (upto >> 63);
@@ -6121,6 +6533,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         uint64_t off = vr_ru64(r);
         uint64_t upto = vr_ru64(r);
         vh_before_mem(mid, 0);
+        jw_before_mem(mid);
         size_t n = r->bad || r->at > r->n ? 0 : r->n - r->at;
         const uint8_t *blob = r->bad ? NULL : (const uint8_t *) vr_take(r, n);
         int k = last_with_mem(mid);
@@ -6169,6 +6582,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         return reply(s, 0);
     }
     case VR_READ_JPEG: {
+#ifdef VR_HAVE_JPEG
+        { int jr = jw_request(s, op, r); if (jr >= 0) return jr; } // JPEG の糸に回す（VKR_JPEG_THREAD=0 なら下の前の形）
+#endif
         static double jt_wait, jt_enc;
         static uint64_t jn, jbytes;
         double jt0 = t_ms();
@@ -6199,6 +6615,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
 #endif
     }
     case VR_READ_JPEG_PIPE: {
+#ifdef VR_HAVE_JPEG
+        { int jr = jw_request(s, op, r); if (jr >= 0) return jr; } // JPEG の糸に回す（VKR_JPEG_THREAD=0 なら下の前の形）
+#endif
         static double jp_wait, jp_join_ms, jp_enc;
         static uint64_t jpn, jpbytes;
         double t0 = t_ms();
@@ -7062,6 +7481,20 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     for (uint32_t j = 0; j < c->mems->n; j++) if (c->mems->ids[j] == g_vh.mid) { uses = 1; break; }
             }
             if (uses) vh_before_mem(g_vh.mid, 0);
+        }
+        {
+            // JPEG の糸がまだ写していない絵のメモリを、この submit が使うなら、写し終えるまで待つ（GPU が上書きする前に）
+            uint64_t jm[8];
+            int nj = jw_uncopied(jm);
+            for (int a = 0; a < nj; a++) {
+                int uses = ncb_all > ncid;
+                for (uint32_t k = 0; k < ncid && !uses; k++) {
+                    cbinfo *c = cbi(cids[k], 0);
+                    if (c && c->mems)
+                        for (uint32_t m = 0; m < c->mems->n; m++) if (c->mems->ids[m] == jm[a]) { uses = 1; break; }
+                }
+                if (uses) jw_before_mem(jm[a]);
+            }
         }
         // 同時に走らせる submit は 64 本まで（VKR_MAXFL=n で変える・0 なら上限なし）。
         // 代役の RTX で whisper を流すと、128 本では GPU を失い、64 本までなら通った。原因はまだわからない
