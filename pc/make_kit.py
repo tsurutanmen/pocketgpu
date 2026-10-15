@@ -5,6 +5,7 @@
 # 誰に何を渡したかは tester_kit\ledger.csv に足す。配った物が外に出たら、印とハッシュで誰の分かを見分ける
 # Android の機種を持っている人用に、android\（受け手・start_android.cmd・stop_android.cmd・android_app.cmd・pocketgpu.apk・README_android.txt）と
 # pocketgpu_android.cmd・check_android.cmd も入れる。Android の受け手には印を入れない（Android 側は人ごとの印が dll にあれば足りる）。
+# Android の記録を集める入口 Send-Android-Log.cmd（中身は tools\android-log.ps1）も、Android の物と一緒に入れる（--no-android のときは入れない）。
 # 試すとき：PGKIT_OUT・PGKIT_KITBUILD・--android-dir で置き場を変えられる（台帳は PGKIT_OUT の下に作る）
 # 入口は 3 つ：Start-PocketGPU.cmd（順に確かめて足りない物を案内する）と Run-on-iPhone-GPU.cmd（1 つのアプリを iPhone の GPU で起動する）と
 # Start-Mic-Camera.cmd（GPU を使わずに、iPhone をマイクとカメラにする）。
@@ -846,6 +847,7 @@ If something does not work
   Some makers need their own USB driver on the PC.
 - "the receiver did not stay running": the script prints the receiver's log. Send it to us.
 - The picture stops or the connection drops: run android\stop_android.cmd, then android\start_android.cmd again.
+- To send the logs: double-click Send-Android-Log.cmd in the kit folder and send the zip it makes (no user name, PC name or phone number).
 
 Reporting
 Please send us, on Discord or by email:
@@ -944,6 +946,7 @@ E. 終わったら、android\android_app.cmd stop を実行してください。
   メーカーによっては、PC にそのメーカーの USB ドライバが必要です
 - 「the receiver did not stay running」：受信アプリのログが画面に表示されます。それを送ってください
 - 映像が止まる、または接続が切れる：android\stop_android.cmd を実行してから、もう一度 android\start_android.cmd を実行してください
+- 記録を送るとき：キットのフォルダの Send-Android-Log.cmd をダブルクリックして、作成される zip を送ってください。ユーザー名・PC 名・電話番号は含まれません
 
 報告
 Discord かメールで次を送ってください。
@@ -1041,6 +1044,8 @@ def missing_inputs(a):
         miss.append(os.path.join(KITBUILD, APP_EXE))
     if not a.no_android and not a.no_android_apk and not os.path.exists(a.android_apk):
         miss.append(a.android_apk)
+    if not a.no_android:
+        miss += [p for p in (os.path.join(HERE, 'kit', 'Send-Android-Log.cmd'), os.path.join(HERE, 'kit', 'tools', 'android-log.ps1')) if not os.path.exists(p)]
     return miss
 
 
@@ -1148,6 +1153,11 @@ def main():
         open(os.path.join(adir, 'README_android.txt'), 'w', encoding='utf-8-sig', newline='\r\n').write(ANDROID_README)
         for name, text in (('pocketgpu_android.cmd', ANDROID_LAUNCH), ('check_android.cmd', ANDROID_CHECK), ('Start-Android-GPU.cmd', ANDROID_EASY)):
             open(os.path.join(kit, name), 'w', encoding='ascii', newline='\r\n').write(text)
+        # Android の記録を 1 つの zip にまとめる入口（10/15）。中身は tools\android-log.ps1。android\_common.cmd で adb とスマートフォンを見てから動く。
+        # 公開リポジトリ pocketgpu-setup の kit\ にも同じ 2 つを置く（バイト単位で同じ。更新はファイルの SHA-256 で配る）
+        shutil.copy2(os.path.join(HERE, 'kit', 'Send-Android-Log.cmd'), os.path.join(kit, 'Send-Android-Log.cmd'))
+        os.makedirs(os.path.join(kit, 'tools'), exist_ok=True)
+        shutil.copy2(os.path.join(HERE, 'kit', 'tools', 'android-log.ps1'), os.path.join(kit, 'tools', 'android-log.ps1'))
 
     # カメラ・マイク・字幕：extras\ に道具と仮想カメラ、一番上に Start-Mic-Camera.cmd、tools\ に miccam.ps1。印は入れない
     if not a.no_media:
