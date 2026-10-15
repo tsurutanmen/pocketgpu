@@ -599,6 +599,8 @@ static vr_sock g_sock = VR_BAD_SOCK;
 static int g_dead;
 static vr_buf g_q; // まだ送っていない命令
 static void conn_lost(const char *what);
+static void lost_seen(void); // つながりが切れたあとの扱いを始める（下の「つながりが切れたあとに返す値」）
+static const wchar_t *g_lost_text; // 切れた理由の帯の文（窓に描き直す）
 static volatile LONG64 g_next_id;
 
 // 数字だけの物（shader module など）の番号。ポインタと重ならないように上の方の桁を使う
@@ -1123,9 +1125,11 @@ static void dr_kill_locked(void) {
 static void conn_lost(const char *what) {
     if (!g_dead) {
         fprintf(stderr, "[iphone-vk] 受け手とのつながりが切れた（%s）。この先は全部失敗にする\n", what);
-        banner(L"iPhone とのつながりが切れました");
+        g_lost_text = L"iPhone とのつながりが切れました";
+        banner(g_lost_text);
     }
     g_dead = 1;
+    lost_seen();
 }
 
 // 受け手が止まって返事が来ない間（iPhone の受け手のアプリが後ろに回ったなど）、黙って固まらずに記録と窓に出す。
@@ -1153,9 +1157,11 @@ static void bg_lost(void) {
         fprintf(stderr, "[iphone-vk] アクセスガイドでアプリを前に固定すると、後ろに回りにくくなります（設定 > アクセシビリティ > アクセスガイド）\n");
         fprintf(stderr, "[iphone-vk] Guided Access keeps the app in front (Settings > Accessibility > Guided Access).\n");
         // 帯の文は仮。画面の文章は CEO が書く
-        banner(L"iPhone のアプリが後ろに回りました。前に出してからゲームを起動し直してください");
+        g_lost_text = L"iPhone のアプリが後ろに回りました。前に出してからゲームを起動し直してください";
+        banner(g_lost_text);
     }
     g_dead = 1;
+    lost_seen();
 }
 
 // 受け手が「GPU を使えなくなった」と返した（進み具合の問い合わせの答えなど）。この先は全部失敗にする。
@@ -1164,9 +1170,11 @@ static void gpu_lost_reply(int32_t r) {
     if (!g_dead) {
         fprintf(stderr, "[iphone-vk] 受け手が GPU を使えなくなった (%d)。この先は全部失敗にする\n", r);
         fprintf(stderr, "[iphone-vk] The receiver can no longer use the GPU (%d). Everything fails from now on\n", r);
-        banner(L"iPhone の GPU を使えなくなりました");
+        g_lost_text = L"iPhone の GPU を使えなくなりました";
+        banner(g_lost_text);
     }
     g_dead = 1;
+    lost_seen();
 }
 
 #ifndef _WIN32
@@ -4432,6 +4440,75 @@ static int real_fence(void) {
     return on;
 }
 
+// ---- つながりが切れたあとに返す値（lost1016） ----
+// DXVK 1.10.3（キットの物）と 2.0 は、submit の糸（DxvkSubmissionQueue::submitCmdLists）が vkQueueSubmit か vkQueuePresentKHR の
+// VK_ERROR_DEVICE_LOST を受けると、その糸の中で DxvkDevice::waitForIdle を呼ぶ。waitForIdle は submit の列が空になるのを待つが、
+// 列から外すのはその糸自身なので、自分を待って永久に止まる。fence を待つ糸（finishCmdLists）が vkWaitForFences の DEVICE_LOST を
+// 受けた場合も、DXVK はその後の submit を全部 DEVICE_LOST にするので、次の submit で同じく止まる。present の糸もその submit を待って止まる
+// （代役で stackdump を取って確かめた。新しい DXVK は DEVICE_LOST では waitForIdle を呼ばない）。
+// Vulkan では、切れたあとも待つ命令は SUCCESS か DEVICE_LOST を返せばよく、vkQueueSubmit なども DEVICE_LOST を「返してよい」だけなので、
+// DXVK には切れたあとも SUCCESS を返し、仕事は捨てる。アプリは固まらず、閉じれば終わる（窓の絵はそこで止まり、帯で知らせる）。
+// IPHONE_VK_LOST_QUIET=0 で前のとおり DEVICE_LOST を返す（=1 で DXVK 以外のアプリにも）。
+// IPHONE_VK_EXIT_ON_LOST=秒 で、切れてからその長さのあとにドライバがプロセスを終わらせる（既定は切。終了コード 0x887A0005）
+static int lost_quiet(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("IPHONE_VK_LOST_QUIET");
+        v = e && *e ? *e == '1' : g_engine_dxvk_any;
+    }
+    return v;
+}
+
+static double exit_on_lost_sec(void) {
+    static double v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_EXIT_ON_LOST"); v = e && *e ? atof(e) : 0; if (v < 0) v = 0; }
+    return v;
+}
+
+static DWORD WINAPI exit_on_lost_thread(LPVOID a) {
+    (void) a;
+    double sec = exit_on_lost_sec();
+    Sleep((DWORD) (sec * 1000));
+    fprintf(stderr, "[iphone-vk] つながりが切れてから %.0f 秒たったので、アプリを終わらせる（IPHONE_VK_EXIT_ON_LOST）\n", sec);
+    fprintf(stderr, "[iphone-vk] Ending the app %.0f s after the connection was lost (IPHONE_VK_EXIT_ON_LOST)\n", sec);
+    fflush(stderr);
+    fflush(stdout);
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), 0x887A0005u); // DXGI_ERROR_DEVICE_REMOVED。ほかの糸は DXVK の中で止まっているかもしれないので、後片づけはしない
+#else
+    _exit(5);
+#endif
+    return 0;
+}
+
+// g_dead になったのを初めて見たとき（conn_lost などと、下の lost_rc から）
+static volatile LONG g_lost_once;
+static void lost_seen(void) {
+    if (!g_dead || InterlockedExchange(&g_lost_once, 1)) return;
+    if (lost_quiet())
+        fprintf(stderr, "[iphone-vk] この先はアプリに失敗を返さずに仕事を捨てる（DXVK が自分の中で固まらないように）。窓の絵はここで止まる。アプリを閉じてください\n");
+    double sec = exit_on_lost_sec();
+    if (sec > 0) {
+        fprintf(stderr, "[iphone-vk] %.0f 秒たったらアプリを終わらせる（IPHONE_VK_EXIT_ON_LOST）\n", sec);
+        HANDLE t = CreateThread(NULL, 0, exit_on_lost_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    }
+}
+
+// 切れたあとの「待つ」「出す」命令の答え
+static VkResult lost_rc(void) {
+    if (!g_dead) return VK_SUCCESS;
+    lost_seen();
+    return lost_quiet() ? VK_SUCCESS : VK_ERROR_DEVICE_LOST;
+}
+
+// 受け手に聞いた答えが「切れた」なら、DXVK には SUCCESS にする
+static VkResult lost_fix(VkResult r) {
+    if (!g_dead || r != VK_ERROR_DEVICE_LOST) return r;
+    lost_seen();
+    return lost_quiet() ? VK_SUCCESS : r;
+}
+
 static int progress_async(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("IPHONE_VK_PROGRESS_ASYNC"); v = !(e && *e == '0'); }
@@ -5532,6 +5609,7 @@ static VkResult VKAPI_CALL alloc_memory(VkDevice dv, const VkMemoryAllocateInfo 
     }
     VkResult r = rpc_call(VR_ALLOC_MEMORY, &b, NULL);
     free(b.p);
+    r = lost_fix(r); // 切れたあと（DXVK）：手元の写しだけで持つ。DXVK 1.10 は確保の失敗で例外を投げ、アプリが落ちる
     if (r != VK_SUCCESS) {
         if (m->shadow) shadow_free(m);
         free(m->addrs);
@@ -5725,6 +5803,10 @@ static VkResult create_buffer_ex(VkDevice dv, const VkBufferCreateInfo *ci, VkBu
         if (r == VK_SUCCESS && o.n >= sizeof bf->req) {
             memcpy(&bf->req, o.p, sizeof bf->req);
             brq_learn(flags, usage, ci->size, &bf->req);
+        } else if (g_dead && lost_fix(r) == VK_SUCCESS) {
+            // 切れたあと（DXVK）：受け手に聞けないので、大きめの値で答える（DXVK 1.10 は作れないと例外を投げ、アプリが落ちる）
+            bf->req = (VkMemoryRequirements) { (ci->size + 255) & ~(VkDeviceSize) 255, 256, 0xffffffffu };
+            r = VK_SUCCESS;
         }
         free(b.p);
         free(o.p);
@@ -5914,6 +5996,12 @@ static VkResult create_image_ex(VkDevice dv, const VkImageCreateInfo *ci, VkImag
         if (r == VK_SUCCESS && o.n >= sizeof im->req) {
             memcpy(&im->req, o.p, sizeof im->req);
             qc_put(key, r, o.p, (uint32_t) sizeof im->req);
+        } else if (g_dead && lost_fix(r) == VK_SUCCESS) {
+            // 切れたあと（DXVK）：受け手に聞けないので、1 画素 16 バイト・mip の分で 2 倍の大きめの値で答える
+            VkDeviceSize sz = (VkDeviceSize) ci->extent.width * ci->extent.height * (ci->extent.depth ? ci->extent.depth : 1) *
+                              (ci->arrayLayers ? ci->arrayLayers : 1) * (ci->samples ? ci->samples : 1) * 32;
+            im->req = (VkMemoryRequirements) { (sz + 65535) & ~(VkDeviceSize) 65535, 65536, 0xffffffffu };
+            r = VK_SUCCESS;
         }
         free(b.p);
         free(o.p);
@@ -7870,7 +7958,7 @@ static VkResult VKAPI_CALL acquire_image(VkDevice dv, VkSwapchainKHR h, uint64_t
         VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .signalSemaphoreCount = sem ? 1 : 0, .pSignalSemaphores = &sem };
         return queue_submit(sc->q, 1, &si, f);
     }
-    return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+    return lost_rc();
 }
 
 static VkResult VKAPI_CALL acquire_image2(VkDevice dv, const VkAcquireNextImageInfoKHR *ai, uint32_t *idx) {
@@ -8842,6 +8930,16 @@ static VkResult present_blit(struct swapchain *sc, uint32_t idx, uint64_t serial
 }
 
 static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi) {
+    if (g_dead && lost_rc() == VK_SUCCESS) {
+        // 切れたあと（DXVK）：絵は出さずに SUCCESS を返す。何もしない present でアプリが CPU を食い続けないよう、60 回/秒に抑える。
+        // 帯は窓が描き直されると消えるので、1 秒ごとに描き直す
+        static double last_banner;
+        double t = now_ms();
+        if (g_lost_text && t - last_banner >= 1000) { banner(g_lost_text); last_banner = t; }
+        Sleep(16);
+        for (uint32_t i = 0; pi->pResults && i < pi->swapchainCount; i++) pi->pResults[i] = VK_SUCCESS;
+        return VK_SUCCESS;
+    }
     VkResult worst = VK_SUCCESS;
     struct swapchain *sc0 = pi->swapchainCount ? (struct swapchain *) pi->pSwapchains[0] : NULL;
     double t_call = now_ms();
@@ -8914,6 +9012,11 @@ static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi)
     if (sc0 && lat_on()) {
         uint32_t ix = pi->pImageIndices[0] < 8 ? pi->pImageIndices[0] : 0;
         lat_line("P,%llu,%.3f,%.3f,%.3f,%u\n", (unsigned long long) sc0->npres, sc0->acq_t[ix], t_call, now_ms(), ix);
+    }
+    // この present の途中で切れた（DXVK）：上と同じく SUCCESS にする
+    if (g_dead && lost_rc() == VK_SUCCESS) {
+        for (uint32_t i = 0; pi->pResults && i < pi->swapchainCount; i++) pi->pResults[i] = VK_SUCCESS;
+        worst = VK_SUCCESS;
     }
     return worst;
 }
@@ -11859,7 +11962,7 @@ static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *f
                         complete(d, fc->q, fc->serial);
                         d->skipped_wait = 1;
                         g_stat.skipped++;
-                        return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+                        return lost_rc();
                     }
                 }
                 if (now_ms() - t0 >= ms) return VK_TIMEOUT;
@@ -11881,7 +11984,7 @@ static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *f
         for (uint32_t i = 0; i < n; i++) complete((struct dev *) dv, ((struct fence *) fs[i])->q, ((struct fence *) fs[i])->serial);
         ((struct dev *) dv)->skipped_wait = 1;
         g_stat.skipped++;
-        return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+        return lost_rc();
     }
     vr_buf b = { 0 };
     vr_u64(&b, ID(dv));
@@ -11908,7 +12011,7 @@ static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *f
             }
         }
     }
-    return r;
+    return lost_fix(r);
 }
 
 // 同じ fence を間を空けずに聞き続けるアプリ（llama.cpp など）は、聞くたびに USB を往復させてしまう。
@@ -11919,15 +12022,16 @@ static VkResult VKAPI_CALL fence_status(VkDevice dv, VkFence fh) {
     if (fc->q) {
         struct dev *d = (struct dev *) dv;
         if (d->npb && !pb_wait(d, fc->q, fc->serial, 0)) return VK_NOT_READY;
-        if (real_fence() && fc->msg > g_done_msg) {
+        // 切れたら番号はもう進まない。前はここで VK_NOT_READY を返し続けた（Vulkan では、切れたあとはいずれ SUCCESS か DEVICE_LOST を返す決まり）
+        if (real_fence() && fc->msg > g_done_msg && !g_dead) {
             progress_poll();
-            if (fc->msg > g_done_msg) return VK_NOT_READY;
+            if (fc->msg > g_done_msg && !g_dead) return VK_NOT_READY;
         }
         // submit に付けた fence は「終わった」と答える（版 3 の待ち方）
         complete((struct dev *) dv, fc->q, fc->serial);
         ((struct dev *) dv)->skipped_wait = 1;
         g_stat.skipped++;
-        return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+        return lost_rc();
     }
     double t = now_ms();
     int spinning = t - fc->last_poll < 2.0;
@@ -11949,7 +12053,7 @@ static VkResult VKAPI_CALL fence_status(VkDevice dv, VkFence fh) {
     fc->last_poll = now_ms();
     VkFence f = fh;
     if (r == VK_SUCCESS && ((struct fence *) f)->q) complete((struct dev *) dv, ((struct fence *) f)->q, ((struct fence *) f)->serial);
-    return r;
+    return lost_fix(r);
 }
 
 static VkResult VKAPI_CALL create_semaphore(VkDevice dv, const VkSemaphoreCreateInfo *ci, const VkAllocationCallbacks *a, VkSemaphore *out) {
@@ -12020,6 +12124,16 @@ static VkResult VKAPI_CALL get_sem_counter(VkDevice dv, VkSemaphore h, uint64_t 
     if (out.n >= 8) memcpy(v, out.p, 8);
     free(b.p);
     free(out.p);
+    if (g_dead && lost_fix(r) == VK_SUCCESS) {
+        // 切れた：知らせるはずだった値まで全部届いたことにする（待っている物が進めるように）
+        struct sem *sm = (struct sem *) h;
+        uint64_t top = sm->reached;
+        AcquireSRWLockShared(&((struct dev *) dv)->lock);
+        for (size_t k = 0; k < sm->n; k++) if (sm->sig[k].value > top) top = sm->sig[k].value;
+        ReleaseSRWLockShared(&((struct dev *) dv)->lock);
+        *v = top;
+        r = VK_SUCCESS;
+    }
     if (r == VK_SUCCESS) sem_reached((struct dev *) dv, (struct sem *) h, *v);
     return r;
 }
@@ -12047,7 +12161,7 @@ static VkResult VKAPI_CALL wait_sems(VkDevice dv, const VkSemaphoreWaitInfo *wi,
                 if (need[i]) sem_reached(d, (struct sem *) wi->pSemaphores[i], need[i]);
             d->skipped_wait = 1;
             g_stat.skipped++;
-            return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+            return lost_rc();
         }
     }
     // 受け手は 1 本の流れで命令を順に片づけるので、長く待たせるとほかのスレッドの合図（vkSignalSemaphore）が届かない。
@@ -12068,6 +12182,7 @@ static VkResult VKAPI_CALL wait_sems(VkDevice dv, const VkSemaphoreWaitInfo *wi,
         free(b.p);
         if (r != VK_TIMEOUT || slice == left) break;
     }
+    r = lost_fix(r);
     if (r != VK_SUCCESS) return r;
     if (wi->flags & VK_SEMAPHORE_WAIT_ANY_BIT) {
         // どれが届いたか分からないので、いまの値を尋ねる
@@ -12281,7 +12396,7 @@ static VkResult VKAPI_CALL queue_submit(VkQueue qh, uint32_t n, const VkSubmitIn
     free(fr0);
     if (f) { ((struct fence *) f)->serial = serial; ((struct fence *) f)->q = q; ((struct fence *) f)->msg = last_msg; }
     if (last_msg) q->last_msg = last_msg;
-    return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+    return lost_rc();
 }
 
 // ---- vkQueueBindSparse（S1） ----
@@ -12331,7 +12446,7 @@ static VkResult VKAPI_CALL queue_wait_idle(VkQueue qh) {
     complete(q->d, q, q->d->serial);
     q->d->skipped_wait = 1;
     g_stat.skipped++;
-    return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+    return lost_rc();
     vr_buf b = { 0 };
     vr_u64(&b, ID(q));
     VkResult r = rpc_call(VR_QUEUE_WAIT_IDLE, &b, NULL);
@@ -12347,7 +12462,7 @@ static VkResult VKAPI_CALL device_wait_idle(VkDevice dv) {
     complete(d, NULL, d->serial);
     d->skipped_wait = 1;
     g_stat.skipped++;
-    return g_dead ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+    return lost_rc();
     vr_buf b = { 0 };
     vr_u64(&b, ID(d));
     VkResult r = rpc_call(VR_DEVICE_WAIT_IDLE, &b, NULL);
