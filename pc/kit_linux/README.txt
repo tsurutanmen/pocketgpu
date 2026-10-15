@@ -145,6 +145,8 @@ Android phone
     sudo pacman -S android-udev on Arch and CachyOS, or sudo apt install android-sdk-platform-tools-common on Ubuntu and Debian.
   - No phone is found: try another cable or USB port. Set the USB mode of the phone to File transfer. Check step 1.
   - The picture stops or the connection drops: run ./stop-android.sh and then ./start-android.sh again.
+  - To send the logs: run ./send-android-log.sh and send the file it makes, a zip, or a tar.gz when the zip command is not installed (no user name, PC name, phone serial number or phone number).
+  - To measure the USB speed: run ./test-android-speed.sh and paste the text it makes on Discord (DRAFT wording: no user name, PC name, serial number or phone number). It takes about 30 seconds and installs nothing on the phone.
 - Reporting for Android: send pocketgpu-android-start-log.txt, pocketgpu-android-check-log.txt, or pocketgpu-android-miccam-log.txt, whichever you ran.
   They have no user name, PC name, home folder, or phone serial. Please also tell us the phone model, the Android version, and the chip, for example Pixel 10 Pro XL, Android 16, Tensor G5.
   If the receiver did not start, also send the output of:   adb shell cat /data/local/tmp/pgpu_server.log
@@ -333,6 +335,8 @@ Android のスマートフォン
     Arch・CachyOS は sudo pacman -S android-udev、Ubuntu・Debian は sudo apt install android-sdk-platform-tools-common
   - スマートフォンが見つからない：別のケーブルや USB ポートを試してください。スマートフォンの USB の用途を「ファイル転送」にして、手順 1 をチェックしてください
   - 映像が止まる、または接続が切れる：./stop-android.sh を実行してから、もう一度 ./start-android.sh を実行してください
+  - 記録を送るとき：./send-android-log.sh を実行して、作成されるファイルを送ってください。zip コマンドが入っていない PC では、zip の代わりに tar.gz になります。ユーザー名・PC 名・スマートフォンのシリアル番号・電話番号は含まれません
+  - USB の速さを測るとき：./test-android-speed.sh を実行して、作成される txt の中身を Discord に貼ってください【仮文】ユーザー名・PC 名・シリアル番号・電話番号は含まれません。約 30 秒かかります。スマートフォンには何もインストールしません
 - Android の報告：実行した台本に合わせて、pocketgpu-android-start-log.txt、pocketgpu-android-check-log.txt、pocketgpu-android-miccam-log.txt のどれかを送ってください。
   ユーザー名・PC 名・ホームフォルダの場所・スマートフォンのシリアルは含まれません。スマートフォンの機種、Android のバージョン、チップも書いてください。例：Pixel 10 Pro XL、Android 16、Tensor G5
   受け手が起動しなかったときは、次の出力も送ってください：   adb shell cat /data/local/tmp/pgpu_server.log

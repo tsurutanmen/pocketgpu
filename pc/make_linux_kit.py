@@ -20,6 +20,8 @@
 #   tools/kit.ini             受け手との約束の版（proto=）とアプリの版（app=）
 #   start-android.sh・stop-android.sh・check-android.sh・run-on-android-gpu.sh・start-android-mic-camera.sh と android/common.sh
 #                             Android のスマホ用（--no-android で入れない）。Windows のキットの android\ と同じ流れ
+#   send-android-log.sh・test-android-speed.sh と android/tools.sh
+#                             Android の記録を 1 つにまとめる・USB の速さを測る（--no-android で入れない）。Windows のキットの Send-Android-Log.cmd・Test-Android-Speed.cmd と同じ物
 #   android/server_aarch64    スマホで動く受け手（PGKIT_ANDROID_DIR にある物。--with-x86_64 で server_x86_64 も。印は入れない）
 #   android/pocketgpu.apk     Android のアプリ（PGKIT_ANDROID_APK の物。adb install -r で入れる）
 #   THIRD-PARTY.txt           ドライバに入っている他の人のコード（lz4・bcdec・stb_image）のライセンス
@@ -333,7 +335,8 @@ def main():
         if a.with_x86_64:
             shutil.copyfile(os.path.join(ANDROID_DIR, 'server_x86_64'), os.path.join(kit, 'android', 'server_x86_64'))
         shutil.copyfile(ANDROID_APK, os.path.join(kit, 'android', 'pocketgpu.apk'))
-        names += ['android/common.sh', 'start-android.sh', 'stop-android.sh', 'check-android.sh', 'run-on-android-gpu.sh']
+        names += ['android/common.sh', 'android/tools.sh', 'start-android.sh', 'stop-android.sh', 'check-android.sh', 'run-on-android-gpu.sh',
+                  'send-android-log.sh', 'test-android-speed.sh']
         if not a.no_media:
             names.append('start-android-mic-camera.sh')
     for n in names:
