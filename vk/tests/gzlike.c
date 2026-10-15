@@ -387,7 +387,23 @@ int main(int argc, char **argv) {
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "gzlike", .apiVersion = VK_API_VERSION_1_1 };
     VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
         .enabledLayerCount = use_layer ? 1 : 0, .ppEnabledLayerNames = layers, .enabledExtensionCount = (use_layer && use_dbg) ? 1 : 0, .ppEnabledExtensionNames = iexts };
-    VK(vkCreateInstance(&ici, NULL, &inst));
+    VkResult ir = vkCreateInstance(&ici, NULL, &inst);
+    if (ir != VK_SUCCESS) {
+        // ここで落ちるのはドライバより前（ローダー・layer）か、メモリ不足のことが多い。切り分けのために、layer と拡張を付けずにもう 1 回作る
+        printf("FAIL vkCreateInstance(&ici, NULL, &inst) = %d (line %d)\n", (int) ir, __LINE__);
+        if (ici.enabledLayerCount || ici.enabledExtensionCount) {
+            ici.enabledLayerCount = 0;
+            ici.enabledExtensionCount = 0;
+            VkResult r2 = vkCreateInstance(&ici, NULL, &inst);
+            printf("  retry without layers and extensions = %d%s\n", (int) r2, r2 == VK_SUCCESS ? " (so the layer / extension was the problem)" : "");
+            if (r2 == VK_SUCCESS) { use_layer = use_dbg = 0; ir = r2; }
+        }
+        if (ir != VK_SUCCESS) {
+            printf("  -1 is out of memory, -9 is no usable driver (check VK_DRIVER_FILES). Set VK_LOADER_DEBUG=error,warn,driver to see why the loader refused.\n");
+            fflush(stdout);
+            return 1;
+        }
+    }
 #define IFN(name) name = (PFN_##name) gipa(inst, #name)
 #define X(n) IFN(n);
     INST_FUNCS(X)
@@ -407,7 +423,7 @@ int main(int argc, char **argv) {
     uint32_t nd = 16;
     VkPhysicalDevice pds[16];
     VkResult er = vkEnumeratePhysicalDevices(inst, &nd, pds);
-    if ((er != VK_SUCCESS && er != VK_INCOMPLETE) || nd == 0) { printf("FAIL no Vulkan device\n"); return 1; }
+    if ((er != VK_SUCCESS && er != VK_INCOMPLETE) || nd == 0) { printf("FAIL no Vulkan device (vkEnumeratePhysicalDevices = %d, %u devices). Is the receiver running and reachable (IPHONE_VK)? The Vulkan loader answers -3 when the driver has no device.\n", (int) er, (er == VK_SUCCESS || er == VK_INCOMPLETE) ? nd : 0u); return 1; }
     pd = pds[0];
     if (*want_dev) {
         int found = 0;

@@ -4540,11 +4540,14 @@ static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *ci, const
             say("DirectX 12 の feature level 12_0 を名乗らせる（VKD3D_FEATURE_LEVEL=12_0）");
         }
     }
-    struct inst *i = calloc(1, sizeof *i);
-    if (!i) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    // instance は受け手につながなくても作れる（つなぐのは vkEnumeratePhysicalDevices のとき）。iPhone が見えなくても失敗にせず、装置は 0 台と答える。
+    // ローダーはそれを -3（VK_ERROR_INITIALIZATION_FAILED）にしてアプリへ返す
+    struct inst *i = out ? calloc(1, sizeof *i) : NULL;
+    if (!i) { say("インスタンスを作れない（メモリが足りない）"); return VK_ERROR_OUT_OF_HOST_MEMORY; }
     set_loader_magic_value(i);
     set_loader_magic_value(&i->pd);
     *out = (VkInstance) i;
+    say("インスタンスを作った（受け手につなぐのは装置を数えるとき）");
     return VK_SUCCESS;
 }
 
