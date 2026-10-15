@@ -371,7 +371,7 @@ static const char *const OP_NAME[VR_OP_COUNT] = {
     [VR_RECORD_CTL] = "RECORD_CTL", [VR_RECORD_FRAME] = "RECORD_FRAME", [VR_RECORD_FETCH] = "RECORD_FETCH",
     [VR_MEM_WRITE_CODED] = "MEM_WRITE_CODED",
     [VR_CREATE_ACCEL] = "CREATE_ACCEL", [VR_DESTROY_ACCEL] = "DESTROY_ACCEL", [VR_GET_ACCEL_SIZES] = "GET_ACCEL_SIZES",
-    [VR_SET_OPTIONS] = "SET_OPTIONS", [VR_MEM_WRITE_SPANS] = "MEM_WRITE_SPANS",
+    [VR_SET_OPTIONS] = "SET_OPTIONS", [VR_MEM_WRITE_SPANS] = "MEM_WRITE_SPANS", [VR_SET_MVK_CONFIG] = "SET_MVK_CONFIG",
 };
 static struct {
     uint64_t sends[VR_OP_COUNT], calls[VR_OP_COUNT], bytes[VR_OP_COUNT];
@@ -2687,6 +2687,41 @@ static int hello(void) {
                 }
                 g_hw.ok = 1;
                 say("受け手の GPU：%s", g_hw.props.deviceName);
+                // MoltenVK の設定を受け手に渡す（IPHONE_VK_MVK="SYNCHRONOUS_QUEUE_SUBMITS=0,FAST_MATH_ENABLED=1" のような形）。
+                // 受け手は許した名前だけを受け、MoltenVK の instance を作り直す。装置を作る前（ここ）でないと渡せない。
+                // 受け手が VR_CAP_MVK_CFG を名乗らなければ（古い受け手）送らない。受け手の答えが悪くても、そのまま続ける（設定が付かないだけ）
+                {
+                    const char *mv = getenv("IPHONE_VK_MVK");
+                    if (mv && *mv) {
+                        if (!(g_hw.caps & VR_CAP_MVK_CFG)) {
+                            say("IPHONE_VK_MVK は渡さない：この受け手は MoltenVK の設定を受けられない（古い受け手）");
+                        } else if (strlen(mv) > 512) {
+                            say("IPHONE_VK_MVK は渡さない：512 文字を超えている");
+                        } else {
+                            vr_buf mb = { 0 }, mo = { 0 };
+                            vr_u32(&mb, 0);
+                            vr_bytes(&mb, mv, (uint32_t) strlen(mv));
+                            sock_rcvtimeo(g_sock, 20000); // 受け手が Vulkan を作り直す間は、あいさつより長く待つ
+                            VkResult mr = rpc_call(VR_SET_MVK_CONFIG, &mb, &mo);
+                            sock_rcvtimeo(g_sock, 5000);
+                            vr_rd mrd = { mo.p, mo.n, 0, 0 };
+                            uint32_t mst = vr_ru32(&mrd), macc = vr_ru32(&mrd), mbad = vr_ru32(&mrd), el = 0, rl = 0;
+                            const char *eff = (const char *) vr_rbytes(&mrd, &el);
+                            const char *rjs = (const char *) vr_rbytes(&mrd, &rl);
+                            if (mrd.bad) {
+                                say("MoltenVK の設定：受け手の答えを読めない (%d)", (int) mr);
+                            } else {
+                                say("MoltenVK の設定 %s：受けた %u 個・断った %u 個 (結果 %d・state %u)%s%.*s%s%.*s", (mst & VR_MVK_APPLIED) ? "を渡した" : "は付かなかった", macc, mbad, (int) mr, mst,
+                                    el ? "・受けた設定 " : "", (int) el, eff ? eff : "", rl ? "・断った理由 " : "", (int) rl, rjs ? rjs : "");
+                                if (mst & VR_MVK_NO_EXT) say("MoltenVK の設定：この受け手の Vulkan は VK_EXT_layer_settings を持たない（MoltenVK でない・古い）");
+                                if (mst & VR_MVK_CREATE_FAIL) say("MoltenVK の設定：付けて作るのに失敗したので、受け手は付けずに作った");
+                                if (mst & VR_MVK_BUSY) say("MoltenVK の設定：受け手に装置がもうあった");
+                            }
+                            free(mb.p);
+                            free(mo.p);
+                        }
+                    }
+                }
                 // 返事に「終わった submit の番号」の尾を付けてもらい、受け手が名乗れば submit の終わりも知らせてもらう。
                 // 名乗らない古い受け手には送らない。IPHONE_VK_REPLY_EXT=0・IPHONE_VK_PUSH=0 で頼まない
                 {

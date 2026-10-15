@@ -47,6 +47,17 @@
 #define VR_CAP_BG_ERR 536870912u    // 1u << 29
 #define VR_OPT_BG_ERR 4u
 #define VR_RES_BACKGROUND (-2000000001) // Vulkan の VkResult には無い値
+// MoltenVK の設定を PC から渡す（mvk1015）。受け手は Vulkan の instance を作り直せるので、装置を作る前なら VR_SET_MVK_CONFIG で、
+// MoltenVK の速さの設定（remote/mvkcfg.h の表にある名前だけ）を VK_EXT_layer_settings で渡して instance を作り直す。
+// 設定はこの接続だけに効く（切れたら受け手は元の設定で instance を作り直す）。ドライバは受け手がこの印を名乗ったときだけ送る。
+// 印の無い古い受け手には送らない。古いドライバは送らないので、新しい受け手と組んでも今までどおり。
+// 番号は 1<<30（1<<22〜1<<29 は使用済み。ほかの係と重なったらまとめるときに決め直してよい）
+#define VR_CAP_MVK_CFG 1073741824u  // 1u << 30
+// VR_SET_MVK_CONFIG の返事の state（u32）の印
+#define VR_MVK_APPLIED 1u           // layer settings を付けた instance を作り直した（MoltenVK が受け取ったか読み戻す道は無い。速さで確かめる）
+#define VR_MVK_NO_EXT 2u            // この受け手の Vulkan は VK_EXT_layer_settings を持たない（MoltenVK 以外・古い MoltenVK）。何も変えていない
+#define VR_MVK_CREATE_FAIL 4u       // 付けて作ろうとして失敗したので、付けずに作り直した
+#define VR_MVK_BUSY 8u              // 装置がもうある。何も変えていない
 // 返事の尾（VR_SET_OPTIONS の VR_OPT_REPLY_EXT を受けたつなぎだけ）：どの返事も、頭の 8 バイトのすぐ後ろに 16 バイトを足す。
 //   終わった submit の番号（u64。VR_GET_PROGRESS と同じ意味）・返事の通し番号（u32。このつなぎで送った返事を 0 から数える。尾を付ける前の返事も数える）・
 //   数え直しの回数（u32。装置が全部なくなって submit の番号を 0 に戻した回数）。頭の長さ（2 つ目）は尾を含まない
@@ -224,6 +235,10 @@ enum vr_op {
     VR_SET_OPTIONS = 120,        // 印（u32。VR_OPT_*）。返事なし。このつなぎの間だけ効く。名乗っていない印は受け手が無視する（VR_CAP_REPLY_EXT）
     VR_MEM_WRITE_SPANS,          // memory（u64）・番号（u64。VR_MEM_WRITE の末尾と同じ意味で、全部の範囲の中でいちばん後の物）・数（u32）・
                                  // 数だけ [offset（u64）・中身（u32 の長さ＋バイト）]。受け手は番号まで待ってから、順に書く（VR_CAP_BATCH）
+    VR_SET_MVK_CONFIG,           // [同期] 印（u32・今は 0）・設定の文字列（u32 の長さ＋バイト。"NAME=値,NAME=値"。remote/mvkcfg.h）。装置を作る前だけ。空の文字列は元の設定に戻す。
+                                 // → 結果（VK_SUCCESS：渡した・VK_ERROR_EXTENSION_NOT_PRESENT：VK_EXT_layer_settings が無い・VK_ERROR_INITIALIZATION_FAILED：作り直しに失敗・
+                                 // VK_ERROR_TOO_MANY_OBJECTS：装置がもうある）・state（u32。VR_MVK_*）・受けた数（u32）・断った数（u32）・
+                                 // 受けた設定（u32 の長さ＋バイト）・断った理由（u32 の長さ＋バイト）（VR_CAP_MVK_CFG）
     VR_OP_COUNT
 };
 

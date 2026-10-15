@@ -9,6 +9,7 @@
 #include "proto.h"
 #include "wire.h"
 #include "plane_codec.h" // 縮めた平面をほどく（VR_MEM_WRITE_CODED）
+#include "mvkcfg.h" // MoltenVK の設定を PC から渡す（VR_SET_MVK_CONFIG）。許した名前の表と読み取り
 // 命令の並びを縮める LZ4（BSD-2）。この 1 つのファイルの中に取り込む
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
@@ -722,6 +723,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     caps |= VR_CAP_PROGRESS; // 終わった submit の番号を、GPU を待たずに答える
     caps |= VR_CAP_REPLY_EXT | VR_CAP_PUSH_DONE; // 返事に終わった submit の番号を付ける・終わったら頼まれなくても知らせる（VR_SET_OPTIONS で頼まれたつなぎだけ）
     caps |= VR_CAP_DESC_FLAGS; // binding の flags と set ごとの数を読む（vkd3d-proton）
+    caps |= VR_CAP_MVK_CFG; // VR_SET_MVK_CONFIG：MoltenVK の設定を渡されたら instance を作り直す（装置を作る前だけ）
     caps |= VR_CAP_BATCH; // 小さな書き込みをまとめた VR_MEM_WRITE_SPANS を受ける・descriptor の取る・書くをまとめた物を受ける
     caps |= VR_CAP_BG_ERR; // 後ろに回ったことを返事で伝える（VR_OPT_BG_ERR を頼まれたつなぎだけ）
     // 調べ用：VKR_CAPS=数 で名乗る印を絞る（古い受け手のふりをする）
@@ -766,6 +768,39 @@ static void dbg_stop(void) {
     g_dbg_mess = VK_NULL_HANDLE;
 }
 
+// ---- MoltenVK の設定を PC から渡す（VR_SET_MVK_CONFIG） ----
+// MoltenVK の設定は、環境変数だと最初の vkCreateInstance の前に 1 回読まれるだけ（プロセスの中で 1 つ。後から setenv しても効かない）。
+// iPhone のアプリには環境変数を渡せない。VK_EXT_layer_settings なら instance ごとに設定でき（MoltenVK 1.4.2・MVKInstance::initMVKConfig）、
+// 受け手は instance を接続をまたいで使い回している（vk_init は起動時の 1 回。GPU を失ったときだけ作り直す）ので、
+// 設定を渡されたら装置を作る前に instance を作り直す。切れたら、元の設定でもう一度作り直す（serve_one）。
+static mvkcfg_set g_mvk_cfg;       // 次の vk_init が instance に付ける設定（空なら付けない）
+static unsigned g_mvk_state;       // 最後の vk_init の結果（VR_MVK_*）
+static int g_mvk_dirty;            // この接続で設定を付けた instance に替えた（切れたら戻す）
+
+// 調べ用の VKR_MVK_FAKE_EXT（MoltenVK を持たない PC の代役で、設定を渡す流れだけを試す）：
+//   1：VK_EXT_layer_settings があるふりをして本当に頼む（代役の Vulkan は断るので、付けずに作り直す道を通る）
+//   2：あるふりをするが instance には何も付けない（作り直し・切れたときに戻す道を通る。設定は実際には効かない）
+static int mvk_fake_ext(void) {
+    static int v = -1;
+    if (v < 0) { const char *fk = getenv("VKR_MVK_FAKE_EXT"); v = fk && *fk == '1' ? 1 : fk && *fk == '2' ? 2 : 0; }
+    return v;
+}
+
+// instance の拡張に name があるか
+static int inst_has_ext(const char *name) {
+    if (mvk_fake_ext()) return 1;
+    PFN_vkEnumerateInstanceExtensionProperties ee = (PFN_vkEnumerateInstanceExtensionProperties) gipa(NULL, "vkEnumerateInstanceExtensionProperties");
+    if (!ee) return 0;
+    uint32_t n = 0;
+    if (ee(NULL, &n, NULL) != VK_SUCCESS || !n) return 0;
+    VkExtensionProperties *p = calloc(n, sizeof *p);
+    int found = 0;
+    if (p) ee(NULL, &n, p); // VK_INCOMPLETE でも読めた分を見る
+    if (p) for (uint32_t i = 0; i < n; i++) if (!strcmp(p[i].extensionName, name)) { found = 1; break; }
+    free(p);
+    return found;
+}
+
 static int vk_init(void) {
 #ifdef _WIN32
     HMODULE lib = LoadLibraryA("vulkan-1.dll");
@@ -782,7 +817,7 @@ static int vk_init(void) {
     if (eiv) eiv(&iv);
     uint32_t want = VK_API_VERSION_MAJOR(iv) > 1 || VK_API_VERSION_MINOR(iv) >= 3 ? VK_API_VERSION_1_3 : VK_API_VERSION_1_2;
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "iphone-rpc-vk", .apiVersion = want };
-    const char *ext[2];
+    const char *ext[4];
     int want_dbg = 0;
     VkInstanceCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app, .ppEnabledExtensionNames = ext };
     // portability_enumeration は Vulkan のローダーが持つ拡張。iPhone のように MoltenVK を直接つなぐと無いので、
@@ -807,8 +842,50 @@ static int vk_init(void) {
         }
     }
     free(ie);
+    // PC から渡された MoltenVK の設定（VR_SET_MVK_CONFIG）を VK_EXT_layer_settings で付ける。
+    // 付けられない（拡張が無い・付けて作るのに失敗した）ときは、付けずに作る。状態は g_mvk_state に残して、VR_SET_MVK_CONFIG の返事で伝える
+    g_mvk_state = 0;
+    int use_ls = 0;
+#ifdef VK_EXT_layer_settings
+    VkLayerSettingEXT ls_set[MVKCFG_MAX];
+    char ls_name[MVKCFG_MAX][64];
+    uint32_t ls_val[MVKCFG_MAX];
+    VkLayerSettingsCreateInfoEXT lsci = { .sType = VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT };
+    if (g_mvk_cfg.n > 0) {
+        if (inst_has_ext(VK_EXT_LAYER_SETTINGS_EXTENSION_NAME)) {
+            for (int i = 0; i < g_mvk_cfg.n; i++) {
+                const mvkcfg_def *d = &mvkcfg_defs[g_mvk_cfg.idx[i]];
+                snprintf(ls_name[i], sizeof ls_name[i], "MVK_CONFIG_%s", d->name);
+                ls_val[i] = g_mvk_cfg.val[i];
+                ls_set[i] = (VkLayerSettingEXT) { .pLayerName = "MoltenVK", .pSettingName = ls_name[i],
+                                                  .type = d->is_bool ? VK_LAYER_SETTING_TYPE_BOOL32_EXT : VK_LAYER_SETTING_TYPE_UINT32_EXT,
+                                                  .valueCount = 1, .pValues = &ls_val[i] };
+            }
+            lsci.settingCount = (uint32_t) g_mvk_cfg.n;
+            lsci.pSettings = ls_set;
+            if (mvk_fake_ext() != 2) {
+                ci.pNext = &lsci;
+                ext[ci.enabledExtensionCount++] = VK_EXT_LAYER_SETTINGS_EXTENSION_NAME;
+            }
+            use_ls = 1;
+        } else {
+            g_mvk_state |= VR_MVK_NO_EXT;
+        }
+    }
+#else
+    if (g_mvk_cfg.n > 0) g_mvk_state |= VR_MVK_NO_EXT; // 組んだときの Vulkan のヘッダーが古い
+#endif
     VkResult ir = vkCreateInstance(&ci, NULL, &g_inst);
+    if (ir != VK_SUCCESS && use_ls) {
+        vlog(JE("MoltenVK の設定を付けた vkCreateInstance が失敗 (%d)。付けずに作り直す", "vkCreateInstance with MoltenVK settings failed (%d). Retrying without them"), ir);
+        ci.pNext = NULL;
+        if (mvk_fake_ext() != 2) ci.enabledExtensionCount--;
+        use_ls = 0;
+        g_mvk_state |= VR_MVK_CREATE_FAIL;
+        ir = vkCreateInstance(&ci, NULL, &g_inst);
+    }
     if (ir != VK_SUCCESS) { vlog(JE("vkCreateInstance が失敗 (%d)", "vkCreateInstance failed (%d)"), ir); return 0; }
+    if (use_ls) g_mvk_state |= VR_MVK_APPLIED;
     if (want_dbg) {
         PFN_vkCreateDebugUtilsMessengerEXT mk = (PFN_vkCreateDebugUtilsMessengerEXT) gipa(g_inst, "vkCreateDebugUtilsMessengerEXT");
         g_dbg_destroy = (PFN_vkDestroyDebugUtilsMessengerEXT) gipa(g_inst, "vkDestroyDebugUtilsMessengerEXT");
@@ -2731,6 +2808,66 @@ static int reply(vr_sock s, int32_t result) {
     g_reply_seq++;
     g_out.n = 0;
     return ok;
+}
+
+// ---- VR_SET_MVK_CONFIG：MoltenVK の設定を受けて instance を作り直す（装置を作る前だけ） ----
+// 返事の中身は g_out に積む（proto.h の VR_SET_MVK_CONFIG）。戻り値がその返事の結果
+static VkResult mvk_apply_config(const char *tx, size_t tl) {
+    char rej[240];
+    mvkcfg_set want;
+    int bad = mvkcfg_parse(tx, tl, &want, rej, sizeof rej);
+    unsigned st = 0;
+    VkResult res = VK_SUCCESS;
+    int ndev = 0;
+    for (size_t i = 0; i < g_cap; i++) if (g_tab[i].id && g_tab[i].kind == K_DEVICE) ndev++;
+    if (ndev) {
+        // 装置が使っている instance は消せない
+        st = VR_MVK_BUSY;
+        res = VK_ERROR_TOO_MANY_OBJECTS;
+        vlog(JE("MoltenVK の設定を渡せない：装置がもうある（接続したらすぐ、装置を作る前に渡す）", "Cannot pass MoltenVK settings: a device already exists (they must come right after connecting, before any device)"));
+    } else if (mvkcfg_equal(&want, &g_mvk_cfg)) {
+        st = g_mvk_cfg.n ? VR_MVK_APPLIED : 0; // 同じ設定が付いている（作り直さない）
+    } else {
+        g_mvk_cfg = want;
+        dbg_stop();
+        if (g_inst) vkDestroyInstance(g_inst, NULL);
+        g_inst = VK_NULL_HANDLE;
+        g_dbg_msgs = 0;
+        if (!vk_init()) {
+            // 設定を付けたせいかもしれない。外してもう一度作る
+            vlog(JE("MoltenVK の設定を付けた instance を作り直せない。設定を外してもう一度作る", "Cannot recreate the instance with MoltenVK settings. Retrying without them"));
+            mvkcfg_clear(&g_mvk_cfg);
+            dbg_stop();
+            if (g_inst) vkDestroyInstance(g_inst, NULL);
+            g_inst = VK_NULL_HANDLE;
+            if (!vk_init()) vlog(JE("Vulkan を作り直せない", "Cannot recreate Vulkan"));
+            st = VR_MVK_CREATE_FAIL;
+            res = VK_ERROR_INITIALIZATION_FAILED;
+        } else {
+            st = g_mvk_state;
+            if (st & VR_MVK_NO_EXT) res = VK_ERROR_EXTENSION_NOT_PRESENT;
+            else if (st & VR_MVK_CREATE_FAIL) res = VK_ERROR_INITIALIZATION_FAILED;
+        }
+        if (!(st & VR_MVK_APPLIED)) mvkcfg_clear(&g_mvk_cfg); // 付かなかった設定は覚えない
+        g_mvk_dirty = (st & VR_MVK_APPLIED) != 0;
+        if (st & VR_MVK_APPLIED) {
+            char eff[300];
+            mvkcfg_format(&g_mvk_cfg, eff, sizeof eff);
+            vlog(JE("MoltenVK の設定を渡した（VK_EXT_layer_settings・instance を作り直した。MoltenVK が受け取ったかは読み戻せないので速さで確かめる）：%s", "Passed MoltenVK settings (VK_EXT_layer_settings, instance recreated; MoltenVK offers no read-back, so verify by speed): %s"), eff);
+        } else if (!g_mvk_cfg.n && want.n) {
+            vlog(JE("MoltenVK の設定は付かなかった（%s）", "MoltenVK settings were not applied (%s)"),
+                 st & VR_MVK_NO_EXT ? JE("この Vulkan は VK_EXT_layer_settings を持たない", "this Vulkan has no VK_EXT_layer_settings") : JE("付けて作るのに失敗した", "instance creation with them failed"));
+        }
+    }
+    if (bad) vlog(JE("MoltenVK の設定：許していない・読めない指定を %d 個断った：%s", "MoltenVK settings: refused %d entries that are not allowed or not readable: %s"), bad, rej);
+    char eff[300];
+    mvkcfg_format(&g_mvk_cfg, eff, sizeof eff);
+    vr_u32(&g_out, st);
+    vr_u32(&g_out, (uint32_t) g_mvk_cfg.n);
+    vr_u32(&g_out, (uint32_t) bad);
+    vr_bytes(&g_out, eff, (uint32_t) strlen(eff));
+    vr_bytes(&g_out, rej, (uint32_t) strlen(rej));
+    return res;
 }
 
 // ---- 物の性質の鎖（pNext）を、届いた (sType, 大きさ) の並びから組み立てる ----
@@ -7099,6 +7236,17 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
              ext ? JE("あり", "yes") : JE("なし", "no"), push ? JE("あり", "yes") : JE("なし", "no"), g_bg_code ? JE("あり", "yes") : JE("なし", "no"));
         return 1;
     }
+    case VR_SET_MVK_CONFIG: {
+        (void) vr_ru32(r); // 印（今は 0）
+        uint32_t tl = 0;
+        const char *tx = (const char *) vr_rbytes(r, &tl);
+        if (r->bad || !(g_caps & VR_CAP_MVK_CFG)) {
+            vr_u32(&g_out, 0); vr_u32(&g_out, 0); vr_u32(&g_out, 0); vr_u32(&g_out, 0); vr_u32(&g_out, 0);
+            return reply(s, VK_ERROR_FEATURE_NOT_PRESENT);
+        }
+        VkResult mr = mvk_apply_config(tx, tl);
+        return reply(s, mr);
+    }
     case VR_GET_LINK: {
         // USB の口からだけ答える（インターネット共有の口から来た相手には、合言葉を教えない）
         struct in_addr ia = { 0 };
@@ -8057,6 +8205,10 @@ static void serve_one(vr_sock c, int remote) {
     g_cur_remote = 0;
     rec_on_disconnect(); // 録画中に切れたら書き終える（ファイルは残す）
     pv_clear(); // 次につないだときに、前の接続の絵をアプリの画面に残さない
+    // この接続で渡された MoltenVK の設定は、この接続だけの物。次の接続は元の設定で始める
+    int mvk_was = g_mvk_dirty;
+    g_mvk_dirty = 0;
+    mvkcfg_clear(&g_mvk_cfg);
     if (g_lost) {
 #ifdef _WIN32
         // PC の代役（RTX）は、GPU を失うと同じプロセスでは Vulkan を作り直しても装置を作れない（-3 が続く）。
@@ -8071,6 +8223,12 @@ static void serve_one(vr_sock c, int remote) {
         vkDestroyInstance(g_inst, NULL);
         g_inst = VK_NULL_HANDLE;
         g_lost = 0;
+        if (!vk_init()) vlog(JE("Vulkan を作り直せない", "Cannot recreate Vulkan"));
+    } else if (mvk_was) {
+        vlog(JE("MoltenVK の設定を元に戻すために、Vulkan を作り直す", "Recreating Vulkan to restore the default MoltenVK settings"));
+        dbg_stop();
+        vkDestroyInstance(g_inst, NULL);
+        g_inst = VK_NULL_HANDLE;
         if (!vk_init()) vlog(JE("Vulkan を作り直せない", "Cannot recreate Vulkan"));
     }
 #ifdef _WIN32
