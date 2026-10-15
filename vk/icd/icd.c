@@ -7340,12 +7340,88 @@ struct swapchain {
     uint64_t lq_ser[8];
     uint32_t lq_n;
     uint64_t jreq_prev;     // ひとつ前に JPEG を頼んだコマの present の番号（次の返事に入っている絵がそのコマの物）
+    // 最新の絵だけ残す形（IPHONE_VK_PRESENT_MAILBOX）。返事待ちが上限なら、そのコマの絵は頼まずに捨てる。返事は表示の糸が受け取る
+    int mbox, mb_pipe, mb_wait;
+    int mb_out;             // 頼んで、表示の糸がまだ受け取り終えていない数（disp.lk で守る）
+    CONDITION_VARIABLE mb_room;
+    uint64_t mb_sent, mb_drop;
+    double mb_wait_ms;
+    // 遅れを測る記録（IPHONE_VK_LAT_CSV）：画像ごとに acquire で渡した時刻・present の番号ごとに呼ばれた時刻
+    double acq_t[8];
+    double call_t[64];
     VkQueue q;
     uint64_t frames;
     double t0;
     double fps_t;      // IPHONE_VK_FPS_LOG：直近の数え始めの時刻とコマ数
     uint64_t fps_f;
 };
+
+// ---- 遅れを測る記録（IPHONE_VK_LAT_CSV=ファイル。既定は切） ----
+// 1 行ずつ、次の 3 種を書く。時刻はこのプロセスの now_ms（ms）
+//   P,present の番号,acquire で画像を渡した時刻,present を呼ばれた時刻,present から戻った時刻,画像の番号
+//   S,present の番号,窓に描き終えた時刻,描いた絵の (8,8) の B,G,R   （窓に出た絵）
+//   D,present の番号,捨てた時刻                                        （最新の絵だけ残す形で、頼まずに捨てた絵）
+static FILE *g_latf;
+static SRWLOCK g_latlk = SRWLOCK_INIT;
+static void lat_flush(void);
+static int lat_on(void) {
+    static volatile LONG v = -1;
+    if (v < 0) {
+        AcquireSRWLockExclusive(&g_latlk);
+        if (v < 0) {
+            const char *e = getenv("IPHONE_VK_LAT_CSV");
+            if (e && *e && (g_latf = fopen(e, "w"))) {
+                setvbuf(g_latf, NULL, _IOFBF, 1 << 20);
+                fprintf(g_latf, "kind,serial,a,b,c,d\n");
+                atexit(lat_flush);
+            }
+            v = g_latf != NULL;
+        }
+        ReleaseSRWLockExclusive(&g_latlk);
+    }
+    return (int) v;
+}
+static void lat_line(const char *fmt, ...) {
+    if (!lat_on()) return;
+    va_list ap;
+    va_start(ap, fmt);
+    AcquireSRWLockExclusive(&g_latlk);
+    vfprintf(g_latf, fmt, ap);
+    ReleaseSRWLockExclusive(&g_latlk);
+    va_end(ap);
+}
+static void lat_flush(void) {
+    if (!lat_on()) return;
+    AcquireSRWLockExclusive(&g_latlk);
+    fflush(g_latf);
+    ReleaseSRWLockExclusive(&g_latlk);
+}
+
+// 窓に描いた絵の present の番号から、present から窓に出るまでを足す（px があれば (8,8) の色も記録に書く）
+static void lat_shown(struct swapchain *sc, uint64_t serial, const uint8_t *px) {
+    double t = now_ms();
+    if (serial && sc->npres - serial < 64) {
+        double lat = t - sc->pres_t[serial % 64];
+        sc->lat_sum += lat;
+        sc->lat_n++;
+        if (lat > sc->lat_max) sc->lat_max = lat;
+        g_stat.lat_sum += lat;
+        g_stat.lat_n++;
+        if (lat > g_stat.lat_max) g_stat.lat_max = lat;
+    }
+    if (lat_on()) {
+        uint32_t x = sc->w > 8 ? 8 : 0, y = sc->h > 8 ? 8 : 0;
+        const uint8_t *p = px ? px + ((size_t) y * sc->w + x) * 4 : NULL;
+        lat_line("S,%llu,%.3f,%d,%d,%d\n", (unsigned long long) serial, t, p ? p[0] : -1, p ? p[1] : -1, p ? p[2] : -1);
+    }
+}
+
+// 最新の絵だけ残す形の持ち主を放す（下の mbox_* を参照）
+static void mbox_release(struct swapchain *sc);
+static int mbox_want(VkPresentModeKHR mode);
+static int mbox_claim(struct swapchain *sc);
+static int jpeg_lag(void);
+static int present_depth(void);
 
 // コマを 1 つ数える。IPHONE_VK_FPS_LOG=1 なら、5 秒ごとに直近のコマ数を記録に出す（読み込みの時間を混ぜずに速さを見る）
 static void sc_tick(struct swapchain *sc) {
@@ -7445,6 +7521,10 @@ static void VKAPI_CALL destroy_swapchain(VkDevice dv, VkSwapchainKHR h, const Vk
             (proc_cpu_ms() - sc->cpu0) / (double) sc->npres, sc->disp_cpu, sc->disp_cpu / (double) sc->npres);
     if (sc->lat_n) say("present から窓に出るまで：平均 %.1f ms・いちばん長い %.1f ms（%llu 枚）", sc->lat_sum / (double) sc->lat_n, sc->lat_max,
                        (unsigned long long) sc->lat_n);
+    if (sc->mbox) say("最新の絵だけ残す形：頼んだ絵 %llu 枚・頼まずに捨てた絵 %llu 枚・空きを待った %.0f ms", (unsigned long long) sc->mb_sent,
+                      (unsigned long long) sc->mb_drop, sc->mb_wait_ms);
+    if (sc->mbox) mbox_release(sc);
+    lat_flush();
     free(sc);
 }
 
@@ -7567,6 +7647,20 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
             say("窓の絵は H.264 で受け取る（%u kbps・%u コマ/秒・キーフレームは %u コマごと）", sc->v_kbps, sc->v_fps, sc->v_gop);
         }
     }
+    // 最新の絵だけ残す形：JPEG を表示の糸で受け取り、前のコマを待たずに頼む（先送りの）形のときだけ。返事待ちの列を使えるのは 1 つの swapchain だけ
+    if (mbox_want(ci->presentMode) && sc->use_jpeg && !sc->use_video && disp_thread_on() && jpeg_lag() == 2 && sc->hwnd) {
+        const char *pp = getenv("IPHONE_VK_MAILBOX_PIPE"), *pd = getenv("IPHONE_VK_PEND");
+        if (pd && *pd == '1') say("最新の絵だけ残す形は IPHONE_VK_PEND=1 と一緒には使えない");
+        else if (!mbox_claim(sc)) say("最新の絵だけ残す形は、ほかの swapchain が使っているので、この窓は今までの形");
+        else {
+            sc->mbox = 1;
+            const char *pw = getenv("IPHONE_VK_MAILBOX_WAIT");
+            sc->mb_pipe = !(pp && *pp == '0');
+            sc->mb_wait = pw && *pw == '1';
+            say("窓の絵は%s（返事待ちは %d 個まで・%s）", sc->mb_wait ? "表示の糸が受け取る形（空きを待つ）" : "最新の絵だけ残す形", present_depth(),
+                sc->mb_pipe ? "先送りの JPEG" : "その場の JPEG");
+        }
+    }
     sc->cpu0 = proc_cpu_ms();
     sc->n = ci->minImageCount < 2 ? 2 : ci->minImageCount > 8 ? 8 : ci->minImageCount;
     sc->pend = -1;
@@ -7649,6 +7743,7 @@ static VkResult VKAPI_CALL acquire_image(VkDevice dv, VkSwapchainKHR h, uint64_t
     struct swapchain *sc = (struct swapchain *) h;
     *idx = sc->next;
     sc->next = (sc->next + 1) % sc->n;
+    if (lat_on()) sc->acq_t[*idx] = now_ms();
     // 出すときに持ち帰りまで済ませているので、画像はもう空いている。知らせる物があれば、空の submit で知らせる
     if (sem || f) {
         VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .signalSemaphoreCount = sem ? 1 : 0, .pSignalSemaphores = &sem };
@@ -7846,15 +7941,7 @@ static DWORD WINAPI disp_thread(LPVOID arg) {
         ReleaseSRWLockExclusive(&sc->disp.lk);
         if (!jok || !px || jdec_decode(&jd, mine.p, mine.n, sc->w, sc->h, px) != 1) continue;
         win_draw(sc->hwnd, px, sc->w, sc->h);
-        if (serial && sc->npres - serial < 64) {
-            double lat = now_ms() - sc->pres_t[serial % 64];
-            sc->lat_sum += lat;
-            sc->lat_n++;
-            if (lat > sc->lat_max) sc->lat_max = lat;
-            g_stat.lat_sum += lat;
-            g_stat.lat_n++;
-            if (lat > g_stat.lat_max) g_stat.lat_max = lat;
-        }
+        lat_shown(sc, serial, px);
         sc_tick(sc);
         dump_frame(sc, px);
     }
@@ -8076,16 +8163,7 @@ static DWORD WINAPI vdisp_thread(LPVOID arg) {
         }
         sc->v_cvt_ms += t2 - t1;
         sc->v_draw_ms += now_ms() - t2;
-        uint64_t serial = d.tag;
-        if (serial && sc->npres - serial < 64) {
-            double lat = now_ms() - sc->pres_t[serial % 64];
-            sc->lat_sum += lat;
-            sc->lat_n++;
-            if (lat > sc->lat_max) sc->lat_max = lat;
-            g_stat.lat_sum += lat;
-            g_stat.lat_n++;
-            if (lat > g_stat.lat_max) g_stat.lat_max = lat;
-        }
+        lat_shown(sc, d.tag, sc->upscale ? NULL : px);
         sc_tick(sc);
     }
 #ifdef _WIN32
@@ -8500,8 +8578,141 @@ static int present_lag(const struct swapchain *sc) {
     return v < m ? v : (m > 0 ? m : 0);
 }
 
+// ---- 最新の絵だけ残す形（IPHONE_VK_PRESENT_MAILBOX。Vulkan の MAILBOX に近い） ----
+// 今までの形は、窓の絵の返事待ちが IPHONE_VK_PRESENT_DEPTH 個になると、present の中で古い返事を待つ（アプリはそのあいだ次のコマを作れない）。
+// この形では待たない。返事待ちが DEPTH 個なら、そのコマの絵は頼まずに捨てる（受け手は縮めない・送らない）。窓に出るのは頼めたコマだけ。
+// 返事は present でなく表示の糸が届いたそばから受け取って描くので、次の present まで待たない。
+//   IPHONE_VK_PRESENT_MAILBOX=0 使わない（既定）・1 いつも・app アプリが MAILBOX か IMMEDIATE を頼んだ swapchain だけ
+//   IPHONE_VK_MAILBOX_PIPE=1（既定）先送りの JPEG（VR_READ_JPEG_PIPE。返事はひとつ前に頼んだ絵）・0 その場の JPEG（VR_READ_JPEG。返事はそのコマの絵）
+//   IPHONE_VK_MAILBOX_WAIT=1 捨てずに、返事待ちに空きができるまで present で待つ（受け取りは表示の糸のまま。比べる用）
+// 返事待ちの列（g_dr）は 1 本なので、使えるのは同時に 1 つの swapchain だけ（ほかは今までの形）
+static SRWLOCK g_mbox_lk = SRWLOCK_INIT;
+static struct swapchain *g_mbox_owner;
+
+static int mbox_want(VkPresentModeKHR mode) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("IPHONE_VK_PRESENT_MAILBOX");
+        v = !e || !*e ? 0 : !strcmp(e, "app") ? 2 : atoi(e) ? 1 : 0;
+    }
+    return v == 1 || (v == 2 && (mode == VK_PRESENT_MODE_MAILBOX_KHR || mode == VK_PRESENT_MODE_IMMEDIATE_KHR));
+}
+
+static int mbox_claim(struct swapchain *sc) {
+    AcquireSRWLockExclusive(&g_mbox_lk);
+    int ok = !g_mbox_owner;
+    if (ok) g_mbox_owner = sc;
+    ReleaseSRWLockExclusive(&g_mbox_lk);
+    return ok;
+}
+
+static void mbox_release(struct swapchain *sc) {
+    AcquireSRWLockExclusive(&g_mbox_lk);
+    if (g_mbox_owner == sc) g_mbox_owner = NULL;
+    ReleaseSRWLockExclusive(&g_mbox_lk);
+}
+
+// 表示の糸（この形のとき）：頼んだ数だけ返事を受け取り（届くまで待つ）、ほどいて描く。disp.has は頼んで、まだ受け取っていない数
+static DWORD WINAPI mbox_thread(LPVOID arg) {
+    struct swapchain *sc = (struct swapchain *) arg;
+#ifdef _WIN32
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+#endif
+    struct jdec jd;
+    int jok = jdec_open(&jd);
+    uint8_t *px = malloc((size_t) sc->w * sc->h * 4);
+    for (;;) {
+        AcquireSRWLockExclusive(&sc->disp.lk);
+        while (!sc->disp.has && !sc->disp.quit) SleepConditionVariableSRW(&sc->disp.cv, &sc->disp.lk, INFINITE, 0);
+        if (!sc->disp.has) { ReleaseSRWLockExclusive(&sc->disp.lk); break; }
+        sc->disp.has--;
+        int quit = sc->disp.quit;
+        ReleaseSRWLockExclusive(&sc->disp.lk);
+        vr_buf t = { 0 };
+        uint64_t tg = 0;
+        VkResult x = rpc_take_deferred(&t, &tg);
+        AcquireSRWLockExclusive(&sc->disp.lk);
+        sc->mb_out--;
+        WakeConditionVariable(&sc->mb_room);
+        ReleaseSRWLockExclusive(&sc->disp.lk);
+        if (x == VK_SUCCESS && t.n) {
+            sc->jpeg_bytes += t.n;
+            // 片づけの途中（quit）は、返事は受け取るが描かない
+            if (!quit && jok && px && jdec_decode(&jd, t.p, t.n, sc->w, sc->h, px) == 1) {
+                win_draw(sc->hwnd, px, sc->w, sc->h);
+                lat_shown(sc, tg, px);
+                sc_tick(sc);
+                dump_frame(sc, px);
+            }
+        }
+        free(t.p);
+    }
+    free(px);
+    jdec_close(&jd);
+#ifdef _WIN32
+    CoUninitialize();
+#endif
+    return 0;
+}
+
+// present から：lag 回前の present の絵を、返事待ちに空きがあれば頼み、無ければ捨てる。present は返事を待たない
+static VkResult mbox_blit(struct swapchain *sc, uint32_t idx, uint64_t serial, int lag) {
+    sc->lq_idx[sc->lq_n] = idx;
+    sc->lq_ser[sc->lq_n] = serial;
+    sc->lq_n++;
+    if (sc->lq_n <= (uint32_t) lag) return VK_SUCCESS;
+    uint32_t j = sc->lq_idx[0];
+    uint64_t s = sc->lq_ser[0];
+    sc->lq_n--;
+    for (uint32_t i = 0; i < sc->lq_n; i++) { sc->lq_idx[i] = sc->lq_idx[i + 1]; sc->lq_ser[i] = sc->lq_ser[i + 1]; }
+    rc_frame(sc, j, s); // 録画中なら、捨てる絵も録ってもらう
+    if (!sc->disp.thr) {
+        InitializeSRWLock(&sc->disp.lk);
+        InitializeConditionVariable(&sc->disp.cv);
+        InitializeConditionVariable(&sc->mb_room);
+        sc->disp.thr = CreateThread(NULL, 0, mbox_thread, sc, 0, NULL);
+        if (!sc->disp.thr) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    int depth = present_depth();
+    AcquireSRWLockExclusive(&sc->disp.lk);
+    if (sc->mb_wait && sc->mb_out >= depth && !g_dead) {
+        double tw = now_ms();
+        while (sc->mb_out >= depth && !g_dead) SleepConditionVariableSRW(&sc->mb_room, &sc->disp.lk, 100, 0);
+        sc->mb_wait_ms += now_ms() - tw;
+    }
+    int full = sc->mb_out >= depth;
+    ReleaseSRWLockExclusive(&sc->disp.lk);
+    if (full) {
+        sc->mb_drop++;
+        lat_line("D,%llu,%.3f\n", (unsigned long long) s, now_ms());
+        return ask_resize(sc) ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
+    }
+    static int q = -1;
+    if (q < 0) { const char *e = getenv("IPHONE_VK_JPEG_Q"); q = e && atoi(e) > 0 ? atoi(e) : 80; }
+    vr_buf b = { 0 };
+    vr_u64(&b, ID(sc->rbmem[j]));
+    vr_u64(&b, 0);
+    vr_u32(&b, sc->w);
+    vr_u32(&b, sc->h);
+    vr_u32(&b, sc->w * 4);
+    vr_u32(&b, sc->fmt == VK_FORMAT_B8G8R8A8_UNORM || sc->fmt == VK_FORMAT_B8G8R8A8_SRGB ? 1 : 0);
+    vr_u32(&b, (uint32_t) q);
+    // 先送りの返事に入っているのは、ひとつ前に頼んだ絵（捨てた絵は数えない）
+    rpc_call_deferred(sc->mb_pipe ? VR_READ_JPEG_PIPE : VR_READ_JPEG, &b, sc->mb_pipe ? sc->jreq_prev : s);
+    free(b.p);
+    if (sc->mb_pipe) sc->jreq_prev = s;
+    sc->mb_sent++;
+    AcquireSRWLockExclusive(&sc->disp.lk);
+    sc->mb_out++;
+    sc->disp.has++;
+    WakeConditionVariable(&sc->disp.cv);
+    ReleaseSRWLockExclusive(&sc->disp.lk);
+    return ask_resize(sc) ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
+}
+
 static VkResult present_blit(struct swapchain *sc, uint32_t idx, uint64_t serial) {
     int lag = present_lag(sc);
+    if (sc->mbox && sc->hwnd) return mbox_blit(sc, idx, serial, lag);
     if (lag <= 0) return blit(sc, idx, serial);
     sc->lq_idx[sc->lq_n] = idx;
     sc->lq_ser[sc->lq_n] = serial;
@@ -8517,6 +8728,7 @@ static VkResult present_blit(struct swapchain *sc, uint32_t idx, uint64_t serial
 static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi) {
     VkResult worst = VK_SUCCESS;
     struct swapchain *sc0 = pi->swapchainCount ? (struct swapchain *) pi->pSwapchains[0] : NULL;
+    double t_call = now_ms();
     heat_check();
     rc_tick(sc0); // 録画を始める・止める時か
     double slept = sc0 ? pace_present(sc0) : 0;
@@ -8534,6 +8746,7 @@ static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi)
             .pWaitSemaphores = pi->pWaitSemaphores, .pWaitDstStageMask = st, .commandBufferCount = 1, .pCommandBuffers = &sc->cmd[idx] };
         uint64_t serial = ++sc->npres;
         sc->pres_t[serial % 64] = now_ms();
+        sc->call_t[serial % 64] = t_call;
         // 窓の絵を先送りで受け取るときは、受け手が写し終わりを待ってから縮めるので、PC からは待たない。
         // 毎コマの往復が 1 回減り、窓に出るのが 1 コマ早くなる。IPHONE_VK_PEND=1 で前のやり方
         static int direct = -1;
@@ -8582,6 +8795,10 @@ static VkResult VKAPI_CALL queue_present(VkQueue qh, const VkPresentInfoKHR *pi)
     }
     g_stat.present_ms += now_ms() - tp;
     if (sc0) sc0->last_end = now_ms();
+    if (sc0 && lat_on()) {
+        uint32_t ix = pi->pImageIndices[0] < 8 ? pi->pImageIndices[0] : 0;
+        lat_line("P,%llu,%.3f,%.3f,%.3f,%u\n", (unsigned long long) sc0->npres, sc0->acq_t[ix], t_call, now_ms(), ix);
+    }
     return worst;
 }
 
