@@ -106,6 +106,73 @@ static void say(const char *fmt, ...) {
     va_end(ap);
 }
 
+// ---- 窓の絵の遅れの形（IPHONE_VK_LATENCY） ----
+// 窓に出す絵を受け取る形をひとまとめに選ぶ。値：
+//   default（既定）：表示の糸が返事を受け取り、返事待ちに空きができるまで present で待つ。その場の JPEG。頼みは 1 コマ遅らせる
+//   low            ：default から頼みの遅らせをやめる。遅れはいちばん短いが、重い場面で速さが落ちることがある
+//   old            ：d073a28 より前の形（present が返事を待つ。先送りの JPEG。頼みは 1 コマ遅らせる）
+// 次の古い環境変数は、決めた形に対する上書きとして今も効く（空でなければ）：
+//   IPHONE_VK_PRESENT_MAILBOX（0・1・app）・IPHONE_VK_MAILBOX_WAIT（0・1）・IPHONE_VK_MAILBOX_PIPE（0・1）・IPHONE_VK_PRESENT_LAG（0〜6）
+// 形は JPEG の道（H.264 でない・窓がある・表示の糸を使う・受け手が先送りを名乗る）だけで効く。ほかの道は old と同じ（頼みの遅らせは LAG に従う）
+struct lat_form {
+    const char *name;
+    int mailbox;   // 0 使わない・1 いつも・2 app アプリが MAILBOX か IMMEDIATE を頼んだ swapchain だけ
+    int wait;      // 1 返事待ちに空きができるまで待つ・0 空きが無ければそのコマの絵は頼まずに捨てる
+    int pipe;      // 1 先送りの JPEG・0 その場の JPEG
+    int lag;       // 頼みを何コマ遅らせるか（0〜6）
+    char over[200]; // 上書きした環境変数の一覧（記録用）
+};
+
+static const struct lat_form *lat_form(void) {
+    static struct lat_form f;
+    static int ready;
+    static SRWLOCK lk = SRWLOCK_INIT;
+    if (ready) return &f;
+    AcquireSRWLockExclusive(&lk);
+    if (!ready) {
+        static const struct lat_form tab[] = {
+            { "default", 1, 1, 0, 1, "" },
+            { "low", 1, 1, 0, 0, "" },
+            { "old", 0, 0, 1, 1, "" },
+        };
+        const char *e = getenv("IPHONE_VK_LATENCY");
+        int k = 0, known = 1;
+        if (e && *e) {
+            known = 0;
+            for (int i = 0; i < 3 && !known; i++) {
+                const char *a = e, *b = tab[i].name;
+                while (*a && *b && (*a | 0x20) == *b) a++, b++;
+                if (!*a && !*b) k = i, known = 1;
+            }
+        }
+        f = tab[k];
+        if (!known) say("IPHONE_VK_LATENCY=%s は知らない値なので default にする（default・low・old）", e);
+        size_t n = 0;
+#define LAT_OVER(...) do { if (n < sizeof f.over) n += (size_t) snprintf(f.over + n, sizeof f.over - n, __VA_ARGS__); } while (0)
+        const char *mb = getenv("IPHONE_VK_PRESENT_MAILBOX"), *mw = getenv("IPHONE_VK_MAILBOX_WAIT");
+        const char *mp = getenv("IPHONE_VK_MAILBOX_PIPE"), *lg = getenv("IPHONE_VK_PRESENT_LAG");
+        if (mb && *mb) { f.mailbox = !strcmp(mb, "app") ? 2 : atoi(mb) ? 1 : 0; LAT_OVER("%sIPHONE_VK_PRESENT_MAILBOX=%s", n ? "・" : "", mb); }
+        if (mw && *mw) { f.wait = *mw == '1'; LAT_OVER("%sIPHONE_VK_MAILBOX_WAIT=%s", n ? "・" : "", mw); }
+        if (mp && *mp) { f.pipe = *mp != '0'; LAT_OVER("%sIPHONE_VK_MAILBOX_PIPE=%s", n ? "・" : "", mp); }
+        if (lg && *lg) { f.lag = atoi(lg); if (f.lag < 0) f.lag = 0; if (f.lag > 6) f.lag = 6; LAT_OVER("%sIPHONE_VK_PRESENT_LAG=%s", n ? "・" : "", lg); }
+#undef LAT_OVER
+        ready = 1;
+    }
+    ReleaseSRWLockExclusive(&lk);
+    return &f;
+}
+
+// 起動のあいさつのあとで 1 回、どの形で動くかを記録に出す
+static void lat_form_say(void) {
+    const struct lat_form *f = lat_form();
+    char lag[48];
+    if (f->lag > 0) snprintf(lag, sizeof lag, "頼みを %d コマ遅らせる", f->lag);
+    else snprintf(lag, sizeof lag, "頼みを遅らせない");
+    say("窓の絵の遅れの形：%s（%s・%s）%s%s", f->name,
+        f->mailbox == 0 ? "present が返事を待つ今までの形" : f->wait ? "表示の糸が返事を受け取る・空きを待つ" : "表示の糸が返事を受け取る・空きが無ければ捨てる",
+        lag, f->over[0] ? "・上書き " : "", f->over);
+}
+
 // ---- 落ちたときに、どのプログラムのどこで落ちたかを書き出す（IPHONE_VK_LOG=1 のとき） ----
 #ifdef _WIN32
 static void where(const char *tag, void *addr) {
@@ -2751,6 +2818,7 @@ static int hello(void) {
                         if (fl & VR_OPT_BG_ERR) say("iPhone のアプリが後ろに回ったら、返事で知らせてもらう");
                     }
                 }
+                lat_form_say();
                 // あいさつが済んだら、計算を待つ間は切らない
                 sock_rcvtimeo(g_sock, 0);
                 // 送りは IPHONE_VK_GIVEUP の長さ進まなければ諦める（受け手が止められて読まないと、送る糸がいつまでも止まる。0 で上限なし）
@@ -7692,19 +7760,27 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice dv, const VkSwapchainCreate
             say("窓の絵は H.264 で受け取る（%u kbps・%u コマ/秒・キーフレームは %u コマごと）", sc->v_kbps, sc->v_fps, sc->v_gop);
         }
     }
-    // 最新の絵だけ残す形：JPEG を表示の糸で受け取り、前のコマを待たずに頼む（先送りの）形のときだけ。返事待ちの列を使えるのは 1 つの swapchain だけ
-    if (mbox_want(ci->presentMode) && sc->use_jpeg && !sc->use_video && disp_thread_on() && jpeg_lag() == 2 && sc->hwnd) {
-        const char *pp = getenv("IPHONE_VK_MAILBOX_PIPE"), *pd = getenv("IPHONE_VK_PEND");
-        if (pd && *pd == '1') say("最新の絵だけ残す形は IPHONE_VK_PEND=1 と一緒には使えない");
-        else if (!mbox_claim(sc)) say("最新の絵だけ残す形は、ほかの swapchain が使っているので、この窓は今までの形");
-        else {
+    // 最新の絵だけ残す形（IPHONE_VK_LATENCY）：JPEG を表示の糸で受け取り、前のコマを待たずに頼む（先送りの）形のときだけ。返事待ちの列を使えるのは 1 つの swapchain だけ
+    if (mbox_want(ci->presentMode)) {
+        const struct lat_form *lf = lat_form();
+        const char *why = !sc->use_jpeg ? "JPEG でない" : sc->use_video ? "H.264 の道" : !disp_thread_on() ? "表示の糸を使わない" : jpeg_lag() != 2 ? "受け手が先送りを名乗らない"
+                          : !sc->hwnd ? "窓がない" : sc->low ? "書き換えに合わせる区切りがあり、その場で受け取る" : NULL;
+        const char *pd = getenv("IPHONE_VK_PEND");
+        if (why) {
+            say("窓の絵は今までの形（%s）：頼みを %d コマ遅らせる", why, lf->lag);
+        } else if (pd && *pd == '1') {
+            say("窓の絵は今までの形（IPHONE_VK_PEND=1 と一緒には使えない）：頼みを %d コマ遅らせる", lf->lag);
+        } else if (!mbox_claim(sc)) {
+            say("窓の絵は今までの形（ほかの swapchain が返事待ちの列を使っている）：頼みを %d コマ遅らせる", lf->lag);
+        } else {
             sc->mbox = 1;
-            const char *pw = getenv("IPHONE_VK_MAILBOX_WAIT");
-            sc->mb_pipe = !(pp && *pp == '0');
-            sc->mb_wait = pw && *pw == '1';
-            say("窓の絵は%s（返事待ちは %d 個まで・%s）", sc->mb_wait ? "表示の糸が受け取る形（空きを待つ）" : "最新の絵だけ残す形", present_depth(),
-                sc->mb_pipe ? "先送りの JPEG" : "その場の JPEG");
+            sc->mb_pipe = lf->pipe;
+            sc->mb_wait = lf->wait;
+            say("窓の絵は表示の糸が受け取る形（%s・返事待ちは %d 個まで・%s・%s）", sc->mb_wait ? "空きを待つ" : "空きが無ければ捨てる", present_depth(),
+                sc->mb_pipe ? "先送りの JPEG" : "その場の JPEG", lf->lag ? "頼みを遅らせる" : "頼みを遅らせない");
         }
+    } else {
+        say("窓の絵は今までの形（present が返事を待つ）：頼みを %d コマ遅らせる", lat_form()->lag);
     }
     sc->cpu0 = proc_cpu_ms();
     sc->n = ci->minImageCount < 2 ? 2 : ci->minImageCount > 8 ? 8 : ci->minImageCount;
@@ -8610,15 +8686,13 @@ static double pace_present(struct swapchain *sc) {
     return now_ms() - t0;
 }
 
-// 窓の絵を頼むのを、何回あとの present まで遅らせるか（IPHONE_VK_PRESENT_LAG。既定 PRESENT_LAG_DEFAULT）。
+// 窓の絵を頼むのを、何回あとの present まで遅らせるか（IPHONE_VK_LATENCY の形が決める。IPHONE_VK_PRESENT_LAG で上書き）。
 // 受け手は絵を頼まれると、その絵を写した仕事が GPU で終わるまで次の命令を読まない。今のコマの頼みを今のコマの submit の直後に送ると、
 // 受け手は次のコマの命令を読む前に GPU が今のコマを描き終えるのを待ち、GPU はそのあいだ次の仕事が無い（受け手の処理と GPU が重ならない）。
 // 頼みを lag コマ遅らせて送れば、頼みの前に次のコマの submit まで読んで GPU に渡してあるので、待つあいだ GPU は次のコマを描ける。
 // 受け手は変えない。窓に出るのは lag コマ遅くなる。持ち帰り用のメモリは画像ごとなので、lag が swapchain の枚数より小さければ、頼むまで上書きされない
-#define PRESENT_LAG_DEFAULT 1
 static int present_lag(const struct swapchain *sc) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("IPHONE_VK_PRESENT_LAG"); v = e && *e ? atoi(e) : PRESENT_LAG_DEFAULT; if (v < 0) v = 0; if (v > 6) v = 6; }
+    int v = lat_form()->lag;
     int m = (int) sc->n - 1;
     return v < m ? v : (m > 0 ? m : 0);
 }
@@ -8627,19 +8701,16 @@ static int present_lag(const struct swapchain *sc) {
 // 今までの形は、窓の絵の返事待ちが IPHONE_VK_PRESENT_DEPTH 個になると、present の中で古い返事を待つ（アプリはそのあいだ次のコマを作れない）。
 // この形では待たない。返事待ちが DEPTH 個なら、そのコマの絵は頼まずに捨てる（受け手は縮めない・送らない）。窓に出るのは頼めたコマだけ。
 // 返事は present でなく表示の糸が届いたそばから受け取って描くので、次の present まで待たない。
-//   IPHONE_VK_PRESENT_MAILBOX=0 使わない（既定）・1 いつも・app アプリが MAILBOX か IMMEDIATE を頼んだ swapchain だけ
-//   IPHONE_VK_MAILBOX_PIPE=1（既定）先送りの JPEG（VR_READ_JPEG_PIPE。返事はひとつ前に頼んだ絵）・0 その場の JPEG（VR_READ_JPEG。返事はそのコマの絵）
-//   IPHONE_VK_MAILBOX_WAIT=1 捨てずに、返事待ちに空きができるまで present で待つ（受け取りは表示の糸のまま。比べる用）
+//   使うかは IPHONE_VK_LATENCY の形（既定 default は使う）。上書き用：
+//   IPHONE_VK_PRESENT_MAILBOX=0 使わない・1 いつも・app アプリが MAILBOX か IMMEDIATE を頼んだ swapchain だけ
+//   IPHONE_VK_MAILBOX_PIPE=1 先送りの JPEG（VR_READ_JPEG_PIPE。返事はひとつ前に頼んだ絵）・0 その場の JPEG（VR_READ_JPEG。返事はそのコマの絵）
+//   IPHONE_VK_MAILBOX_WAIT=1 捨てずに、返事待ちに空きができるまで present で待つ（受け取りは表示の糸のまま）・0 捨てる
 // 返事待ちの列（g_dr）は 1 本なので、使えるのは同時に 1 つの swapchain だけ（ほかは今までの形）
 static SRWLOCK g_mbox_lk = SRWLOCK_INIT;
 static struct swapchain *g_mbox_owner;
 
 static int mbox_want(VkPresentModeKHR mode) {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("IPHONE_VK_PRESENT_MAILBOX");
-        v = !e || !*e ? 0 : !strcmp(e, "app") ? 2 : atoi(e) ? 1 : 0;
-    }
+    int v = lat_form()->mailbox;
     return v == 1 || (v == 2 && (mode == VK_PRESENT_MODE_MAILBOX_KHR || mode == VK_PRESENT_MODE_IMMEDIATE_KHR));
 }
 
