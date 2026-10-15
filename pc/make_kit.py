@@ -6,6 +6,8 @@
 # Android の機種を持っている人用に、android\（受け手・start_android.cmd・stop_android.cmd・android_app.cmd・pocketgpu.apk・README_android.txt）と
 # pocketgpu_android.cmd・check_android.cmd も入れる。Android の受け手には印を入れない（Android 側は人ごとの印が dll にあれば足りる）。
 # Android の記録を集める入口 Send-Android-Log.cmd（中身は tools\android-log.ps1）も、Android の物と一緒に入れる（--no-android のときは入れない）。
+# Android の USB の速さを測る入口 Test-Android-Speed.cmd（中身は tools\android-speed.ps1）も同じ（10/15）。android\_gamemode.cmd は、受け手を起こす android\start_android.cmd と
+# android\android_app.cmd が呼ぶ「ゲームモードをパフォーマンスに」の頼み（失敗しても止まらない。PGPU_NOGAMEMODE=1 で飛ばす）
 # 試すとき：PGKIT_OUT・PGKIT_KITBUILD・--android-dir で置き場を変えられる（台帳は PGKIT_OUT の下に作る）
 # 入口は 3 つ：Start-PocketGPU.cmd（順に確かめて足りない物を案内する）と Run-on-iPhone-GPU.cmd（1 つのアプリを iPhone の GPU で起動する）と
 # Start-Mic-Camera.cmd（GPU を使わずに、iPhone をマイクとカメラにする）。
@@ -411,6 +413,8 @@ goto server_slow
 :listening
 "%ADB%" forward tcp:%PGPU_PORT% tcp:%PGPU_PORT% >nul
 if errorlevel 1 goto forward_failed
+rem Ask Android for the performance game mode for the PocketGPU app (if it is installed). It never stops this file.
+call "%~dp0_gamemode.cmd"
 
 echo.
 echo Done. The receiver is running on the phone and port %PGPU_PORT% is connected to this PC.
@@ -578,6 +582,8 @@ set "GPU_WHO=the app receiver, port 50060 on the phone"
 "%ADB%" forward tcp:%PGPU_PORT% tcp:50060 >nul || goto forward_failed
 :gpu_done
 "%ADB%" shell am start -n %APP% --ez webcam true --ez audio true --ez gpu true >nul
+rem Ask Android for the performance game mode for the app. It never stops this file.
+call "%~dp0_gamemode.cmd"
 echo.
 echo Done. If the phone asks for camera or microphone access, tap Allow.
 echo Port form: %FORM% (%FORMBY%)
@@ -626,6 +632,40 @@ if "%PGPU_NOPAUSE%"=="" pause
 exit /b 1
 :end
 if "%PGPU_NOPAUSE%"=="" pause
+exit /b 0
+'''
+
+ANDROID_GAMEMODE = r'''@echo off
+rem PocketGPU for Android: ask Android for the "performance" game mode for the PocketGPU app. start_android.cmd and android_app.cmd call this after they set ADB.
+rem Always exits with code 0: when it fails (Android 11 or older has no "cmd game", the app is not installed, the phone refuses) it only says so.
+rem   To skip it:   set PGPU_NOGAMEMODE=1
+rem The package name is com.tsurutanmen.pocketgpu (the app's AndroidManifest.xml). The app declares itself a game and lists the performance mode in res/xml/game_mode_config.xml.
+rem Only English here on purpose: a Japanese Windows reads .cmd files as Shift_JIS.
+setlocal
+if "%PGPU_NOGAMEMODE%"=="1" exit /b 0
+if not defined ADB exit /b 0
+set "GM_PKG=com.tsurutanmen.pocketgpu"
+"%ADB%" shell pm path %GM_PKG% 2>nul | findstr /b /c:"package:" >nul
+if errorlevel 1 goto gm_noapp
+set "GM_OUT=%TEMP%\pocketgpu_gamemode.txt"
+"%ADB%" shell cmd game mode performance %GM_PKG% > "%GM_OUT%" 2>&1 <nul
+if errorlevel 1 goto gm_second
+findstr /i /c:"exception" /c:"error" /c:"unknown" /c:"usage" /c:"can't find" /c:"not found" /c:"inaccessible" /c:"fail" "%GM_OUT%" >nul
+if errorlevel 1 goto gm_ok
+:gm_second
+"%ADB%" shell cmd game set --mode performance %GM_PKG% > "%GM_OUT%" 2>&1 <nul
+if errorlevel 1 goto gm_failed
+findstr /i /c:"exception" /c:"error" /c:"unknown" /c:"usage" /c:"can't find" /c:"not found" /c:"inaccessible" /c:"fail" "%GM_OUT%" >nul
+if errorlevel 1 goto gm_ok
+:gm_failed
+echo Game mode: not set. adb said:
+type "%GM_OUT%"
+exit /b 0
+:gm_noapp
+echo Game mode: not set, the PocketGPU app is not installed
+exit /b 0
+:gm_ok
+echo Game mode: performance requested for %GM_PKG%
 exit /b 0
 '''
 
@@ -874,6 +914,8 @@ If something does not work
 - "the receiver did not stay running": the script prints the receiver's log. Send it to us.
 - The picture stops or the connection drops: run android\stop_android.cmd, then android\start_android.cmd again.
 - To send the logs: double-click Send-Android-Log.cmd in the kit folder and send the zip it makes (no user name, PC name or phone number).
+- To measure the USB speed: double-click Test-Android-Speed.cmd in the kit folder and paste the text it makes on Discord (DRAFT wording: no user name, PC name, serial number or phone number).
+- start_android.cmd and android_app.cmd ask Android for the "performance" game mode for the PocketGPU app (DRAFT wording). If it fails they go on. To skip it:   set PGPU_NOGAMEMODE=1
 
 Reporting
 Please send us, on Discord or by email:
@@ -976,6 +1018,8 @@ E. 終わったら、android\android_app.cmd stop を実行してください。
 - 「the receiver did not stay running」：受信アプリのログが画面に表示されます。それを送ってください
 - 映像が止まる、または接続が切れる：android\stop_android.cmd を実行してから、もう一度 android\start_android.cmd を実行してください
 - 記録を送るとき：キットのフォルダの Send-Android-Log.cmd をダブルクリックして、作成される zip を送ってください。ユーザー名・PC 名・電話番号は含まれません
+- USB の速さを測るとき：キットのフォルダの Test-Android-Speed.cmd をダブルクリックして、作成される txt の中身を Discord に貼ってください【仮文】ユーザー名・PC 名・シリアル番号・電話番号は含まれません
+- start_android.cmd と android_app.cmd は、PocketGPU アプリのゲームモードを「パフォーマンス」にするよう Android に頼みます【仮文】失敗しても先へ進みます。頼まないときは set PGPU_NOGAMEMODE=1
 
 報告
 Discord かメールで次を送ってください。
@@ -1074,7 +1118,8 @@ def missing_inputs(a):
     if not a.no_android and not a.no_android_apk and not os.path.exists(a.android_apk):
         miss.append(a.android_apk)
     if not a.no_android:
-        miss += [p for p in (os.path.join(HERE, 'kit', 'Send-Android-Log.cmd'), os.path.join(HERE, 'kit', 'tools', 'android-log.ps1')) if not os.path.exists(p)]
+        miss += [p for p in (os.path.join(HERE, 'kit', 'Send-Android-Log.cmd'), os.path.join(HERE, 'kit', 'tools', 'android-log.ps1'),
+                             os.path.join(HERE, 'kit', 'Test-Android-Speed.cmd'), os.path.join(HERE, 'kit', 'tools', 'android-speed.ps1')) if not os.path.exists(p)]
     return miss
 
 
@@ -1174,7 +1219,7 @@ def main():
         android_sha = sha256(srv)
         if a.with_x86_64:
             shutil.copy2(os.path.join(a.android_dir, 'server_x86_64'), os.path.join(adir, 'server_x86_64'))
-        for name, text in (('_common.cmd', ANDROID_COMMON), ('start_android.cmd', ANDROID_START), ('stop_android.cmd', ANDROID_STOP), ('android_app.cmd', ANDROID_APP)):
+        for name, text in (('_common.cmd', ANDROID_COMMON), ('_gamemode.cmd', ANDROID_GAMEMODE), ('start_android.cmd', ANDROID_START), ('stop_android.cmd', ANDROID_STOP), ('android_app.cmd', ANDROID_APP)):
             open(os.path.join(adir, name), 'w', encoding='ascii', newline='\r\n').write(text)
         if not a.no_android_apk:
             shutil.copy2(a.android_apk, os.path.join(adir, 'pocketgpu.apk'))
@@ -1187,6 +1232,9 @@ def main():
         shutil.copy2(os.path.join(HERE, 'kit', 'Send-Android-Log.cmd'), os.path.join(kit, 'Send-Android-Log.cmd'))
         os.makedirs(os.path.join(kit, 'tools'), exist_ok=True)
         shutil.copy2(os.path.join(HERE, 'kit', 'tools', 'android-log.ps1'), os.path.join(kit, 'tools', 'android-log.ps1'))
+        # Android の USB の速さを測る入口（10/15）。中身は tools\android-speed.ps1（tools\pgpu_common.ps1 と pgpu_port.ps1 も使う。どちらも tools\ に入る）
+        shutil.copy2(os.path.join(HERE, 'kit', 'Test-Android-Speed.cmd'), os.path.join(kit, 'Test-Android-Speed.cmd'))
+        shutil.copy2(os.path.join(HERE, 'kit', 'tools', 'android-speed.ps1'), os.path.join(kit, 'tools', 'android-speed.ps1'))
 
     # カメラ・マイク・字幕：extras\ に道具と仮想カメラ、一番上に Start-Mic-Camera.cmd、tools\ に miccam.ps1。印は入れない
     if not a.no_media:
