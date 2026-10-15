@@ -35,6 +35,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <time.h>
+#include <sys/stat.h>
 #ifndef _WIN32
 #include <pthread.h>
 #include <unistd.h>
@@ -196,7 +197,8 @@ static int g_portability; // MoltenVK のときは portability_subset を有効�
     X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) X(vkCmdClearAttachments) X(vkCmdClearDepthStencilImage) \
     X(vkCmdResolveImage) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkGetQueryPoolResults) X(vkCmdResetQueryPool) \
     X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdWriteTimestamp) X(vkCmdCopyQueryPoolResults) X(vkGetPhysicalDeviceFormatProperties2) \
-    X(vkCreateBufferView) X(vkDestroyBufferView) X(vkGetImageSubresourceLayout)
+    X(vkCreateBufferView) X(vkDestroyBufferView) X(vkGetImageSubresourceLayout) \
+    X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData)
 
 // 1.2・1.3 の入口。本体の名前か拡張の名前で読む。GPU が持っていなければ NULL のまま（そのときは caps で名乗らない）
 #define VKFUNCS_OPT(X) \
@@ -1981,6 +1983,317 @@ static void helpers_free(VkDevice dev) {
     g_dummy_smp = VK_NULL_HANDLE;
 }
 
+// ---- pipeline cache（受け手だけの物）----
+// PC から届く pipeline の作成には、PC 側の cache の値を使わず、装置ごとに 1 つ持つこの cache を渡す。
+// iPhone（MoltenVK）では SPIR-V から MSL、さらに Metal への変換が、起動のたびに全部の shader で走っていた。
+// cache をファイルに残して次の起動で読み込めば、同じ shader の変換を省ける。
+//  ・置き場：iPhone は Library/Caches（アプリから vkr_set_pcache_dir で渡す。無ければ HOME/Library/Caches）・Android は受け手の作業場所（記録 pgpu_server.log の隣）
+//    ・PC の代役は実行ファイルの隣（書けなければ TEMP）。環境変数 PGPU_PCACHE_DIR で変えられる
+//  ・切る：環境変数 PGPU_PCACHE=0 か vkr_set_pcache(0)（iPhone はアプリから）。既定は入
+//  ・ファイルは 24 バイトの頭（PGPC・版・大きさ・FNV 風の 64 ビット検査値）＋ Vulkan が決めた頭（vendorID・deviceID・pipelineCacheUUID）つきの本体。
+//    どれかが合わない・大きさが上限（PGPU_PCACHE_MAX_MB・既定 64）を超える・ドライバが読めないときは捨てて、空から始める
+//  ・書くのは、受け手を閉じる（装置を消す・接続が切れる）とき、新しい pipeline が増えて 30 秒たち 1 秒静かになったとき（作り続けているなら 150 秒ごと）。一時ファイルに書いて名前を変える
+#define PC_MAX_DEV 8
+#define PC_HDR 24
+#define PC_QUIET_MS 1000.0
+static int g_pc_on = -1;
+static char g_pc_dir[640];     // アプリが渡した置き場
+static char g_pc_use[640];     // 決まった置き場（空は使えない）
+static int g_pc_dir_done;
+static struct { VkDevice dev; VkPipelineCache cache; int slot; uint64_t sum; size_t sz; unsigned made; } g_pcd[PC_MAX_DEV];
+static struct { unsigned n; double ms; int dirty; double last_save, last_make; unsigned long long loaded, saved; } g_pcx;
+
+void vkr_set_pcache(int on) { g_pc_on = on ? 1 : 0; }
+void vkr_set_pcache_dir(const char *dir) { snprintf(g_pc_dir, sizeof g_pc_dir, "%s", dir ? dir : ""); g_pc_dir_done = 0; }
+
+// 接続の途中で保存する間隔（既定 30 秒。環境変数 PGPU_PCACHE_SAVE_SEC で変えられる。0 なら途中では保存しない）
+static double pc_save_every_ms(void) {
+    static double v = -1;
+    if (v < 0) { const char *e = getenv("PGPU_PCACHE_SAVE_SEC"); v = (e && *e ? atof(e) : 30.0) * 1000.0; if (v < 0) v = 30000.0; }
+    return v;
+}
+static int pc_enabled(void) {
+    if (g_pc_on < 0) { const char *e = getenv("PGPU_PCACHE"); g_pc_on = e && *e == '0' ? 0 : 1; }
+    return g_pc_on;
+}
+static size_t pc_max_bytes(void) {
+    static long long mb = -1;
+    if (mb < 0) { const char *e = getenv("PGPU_PCACHE_MAX_MB"); mb = e && *e ? atoll(e) : 64; if (mb < 1) mb = 1; if (mb > 1024) mb = 1024; }
+    return (size_t) mb << 20;
+}
+// 検査値。FNV-1a の素数を 8 バイトずつ掛ける（PC で 64 MB が約 11 ms・1 バイトずつは約 52 ms）。壊れの検出が目的で、守りの道具ではない
+static uint64_t pc_fnv(const uint8_t *p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h ^= w; h *= 1099511628211ull; h ^= h >> 29; }
+    for (; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+static void pc_mkdir(const char *d) {
+#ifdef _WIN32
+    CreateDirectoryA(d, NULL);
+#else
+    mkdir(d, 0700);
+#endif
+}
+// その置き場に一時ファイルを書けるか。書ければ 1
+static int pc_probe(const char *d) {
+    char p[700];
+    snprintf(p, sizeof p, "%s/pgpu_pcache_probe.tmp", d);
+    FILE *f = fopen(p, "wb");
+    if (!f) return 0;
+    int ok = fwrite("p", 1, 1, f) == 1;
+    fclose(f);
+    remove(p);
+    return ok;
+}
+// 置き場を 1 回だけ決める。決められなければ g_pc_use は空のまま（cache は作るが、ファイルは読み書きしない）
+static const char *pc_dir(void) {
+    if (g_pc_dir_done) return g_pc_use;
+    g_pc_dir_done = 1;
+    g_pc_use[0] = 0;
+    char cand[4][640];
+    int nc = 0;
+    const char *e = getenv("PGPU_PCACHE_DIR");
+    if (g_pc_dir[0]) snprintf(cand[nc++], sizeof cand[0], "%s", g_pc_dir);
+    if (e && *e) snprintf(cand[nc++], sizeof cand[0], "%s", e);
+#if defined(_WIN32)
+    {
+        char b[600];
+        DWORD n = GetModuleFileNameA(NULL, b, sizeof b);
+        if (n > 0 && n < sizeof b) {
+            char *sl = strrchr(b, '\\');
+            if (sl) { *sl = 0; snprintf(cand[nc++], sizeof cand[0], "%s", b); }
+        }
+        n = GetTempPathA(sizeof b, b);
+        if (n > 0 && n < sizeof b) {
+            if (b[n - 1] == '\\' || b[n - 1] == '/') b[n - 1] = 0;
+            snprintf(cand[nc++], sizeof cand[0], "%s", b);
+        }
+    }
+#elif defined(__APPLE__)
+    {
+        const char *h = getenv("HOME");
+        if (h && *h) snprintf(cand[nc++], sizeof cand[0], "%s/Library/Caches", h);
+    }
+#elif defined(__ANDROID__)
+    {
+        // 受け手の作業場所。キットは /data/local/tmp・APK はアプリの files（どちらも記録 pgpu_server.log を置く所）
+        char b[600];
+        if (getcwd(b, sizeof b)) snprintf(cand[nc++], sizeof cand[0], "%s", b);
+    }
+#else
+    {
+        const char *t = getenv("TMPDIR");
+        snprintf(cand[nc++], sizeof cand[0], "%s", t && *t ? t : "/tmp");
+    }
+#endif
+    for (int i = 0; i < nc; i++) {
+        pc_mkdir(cand[i]);
+        if (pc_probe(cand[i])) { snprintf(g_pc_use, sizeof g_pc_use, "%s", cand[i]); break; }
+    }
+    if (g_pc_use[0]) vlog(JE("pipeline cache の置き場：%s", "pipeline cache folder: %s"), g_pc_use);
+    else vlog(JE("pipeline cache の置き場が見つからない・書けない。ファイルには残さない", "No writable pipeline cache folder. Not saving it to a file"));
+    return g_pc_use;
+}
+static int pc_path(int slot, char *out, size_t cap) {
+    const char *d = pc_dir();
+    if (!d[0]) return 0;
+    snprintf(out, cap, "%s/pgpu_pcache_%d.bin", d, slot);
+    return 1;
+}
+// ファイルを読み、検査に通った本体（24 バイトの頭つき）を返す。通らなければ NULL と理由。*n は本体（頭なし）の大きさ
+static uint8_t *pc_load(int slot, size_t *n, const char **why) {
+    char path[720];
+    *n = 0;
+    *why = NULL;
+    if (!pc_path(slot, path, sizeof path)) { *why = JE("置き場なし", "no folder"); return NULL; }
+    FILE *f = fopen(path, "rb");
+    if (!f) { *why = JE("ファイルなし", "no file"); return NULL; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *buf = NULL;
+    if (sz < 0 || (size_t) sz < PC_HDR + sizeof(VkPipelineCacheHeaderVersionOne)) *why = JE("小さすぎる", "too small");
+    else if ((size_t) sz > PC_HDR + pc_max_bytes()) *why = JE("上限より大きい", "over the size limit");
+    else if (!(buf = malloc((size_t) sz))) *why = JE("メモリ不足", "out of memory");
+    else if (fread(buf, 1, (size_t) sz, f) != (size_t) sz) *why = JE("読めない", "read failed");
+    fclose(f);
+    if (*why) { free(buf); return NULL; }
+    uint32_t fmt;
+    uint64_t psz, sum;
+    memcpy(&fmt, buf + 4, 4);
+    memcpy(&psz, buf + 8, 8);
+    memcpy(&sum, buf + 16, 8);
+    if (memcmp(buf, "PGPC", 4) || fmt != 1) *why = JE("見出しが違う", "bad file header");
+    else if (psz != (uint64_t) sz - PC_HDR) *why = JE("大きさが合わない（途中で切れている）", "size mismatch (truncated)");
+    else if (pc_fnv(buf + PC_HDR, (size_t) psz) != sum) *why = JE("検査値が合わない（壊れている）", "checksum mismatch (corrupt)");
+    else {
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(g_pd, &p);
+        VkPipelineCacheHeaderVersionOne h;
+        memcpy(&h, buf + PC_HDR, sizeof h);
+        if (h.headerSize < sizeof h || h.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE) *why = JE("Vulkan の頭が読めない", "unreadable Vulkan header");
+        else if (h.vendorID != p.vendorID || h.deviceID != p.deviceID) *why = JE("GPU が違う（vendorID・deviceID）", "different GPU (vendorID/deviceID)");
+        else if (memcmp(h.pipelineCacheUUID, p.pipelineCacheUUID, VK_UUID_SIZE)) *why = JE("ドライバの版が違う（pipelineCacheUUID）", "different driver (pipelineCacheUUID)");
+    }
+    if (*why) { free(buf); return NULL; }
+    *n = (size_t) psz;
+    return buf;
+}
+// 装置を作ったら呼ぶ。この装置の cache を作り、前のファイルがあれば読み込む
+static void pc_dev_add(VkDevice d) {
+    if (!pc_enabled()) {
+        static int told;
+        if (!told) { told = 1; vlog(JE("pipeline cache：切ってある（PGPU_PCACHE=0）", "pipeline cache: off (PGPU_PCACHE=0)")); }
+        return;
+    }
+    if (!vkCreatePipelineCache || !vkGetPipelineCacheData || !vkDestroyPipelineCache) return;
+    int i = 0;
+    while (i < PC_MAX_DEV && g_pcd[i].dev) i++;
+    if (i == PC_MAX_DEV) return;
+    int slot = 0;
+    for (int again = 1; again;) { again = 0; for (int k = 0; k < PC_MAX_DEV; k++) if (g_pcd[k].dev && g_pcd[k].slot == slot) { slot++; again = 1; } }
+    size_t n = 0;
+    const char *why = NULL;
+    uint8_t *data = pc_load(slot, &n, &why);
+    VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = data ? n : 0, .pInitialData = data ? data + PC_HDR : NULL };
+    VkPipelineCache c = VK_NULL_HANDLE;
+    VkResult r = vkCreatePipelineCache(d, &ci, NULL, &c);
+    if (r != VK_SUCCESS && data) {
+        vlog(JE("pipeline cache：前のファイルをドライバが読めない (%d)。空から始める", "pipeline cache: the driver could not read the old file (%d). Starting empty"), r);
+        free(data);
+        data = NULL;
+        n = 0;
+        why = JE("ドライバが読めない", "driver rejected it");
+        ci.initialDataSize = 0;
+        ci.pInitialData = NULL;
+        c = VK_NULL_HANDLE;
+        r = vkCreatePipelineCache(d, &ci, NULL, &c);
+    }
+    if (r != VK_SUCCESS) { vlog(JE("pipeline cache を作れない (%d)。PC から届く pipeline は cache なしで作る", "Cannot create the pipeline cache (%d). Pipelines will be created without it"), r); free(data); return; }
+    g_pcd[i].dev = d;
+    g_pcd[i].cache = c;
+    g_pcd[i].slot = slot;
+    g_pcd[i].sz = n;
+    g_pcd[i].sum = data ? pc_fnv(data + PC_HDR, n) : 0; // 保存した物と同じなら書き直さない
+    g_pcd[i].made = 0;
+    if (data) {
+        g_pcx.loaded += n;
+        vlog(JE("pipeline cache：読み込んだ %llu バイト（装置 %d 番目）", "pipeline cache: loaded %llu bytes (device slot %d)"), (unsigned long long) n, slot);
+    } else
+        vlog(JE("pipeline cache：読み込んだ 0 バイト（装置 %d 番目・%s）", "pipeline cache: loaded 0 bytes (device slot %d, %s)"), slot, why ? why : "?");
+    free(data);
+}
+static VkPipelineCache pc_for(VkDevice d) {
+    for (int i = 0; i < PC_MAX_DEV; i++) if (g_pcd[i].dev == d) return g_pcd[i].cache;
+    return VK_NULL_HANDLE;
+}
+// pipeline を作った。かかった時間を数え、cache が増えたかもしれない印を付ける
+static void pc_made(VkDevice d, double ms) {
+    g_pcx.n++;
+    g_pcx.ms += ms;
+    g_pcx.last_make = t_ms();
+    for (int i = 0; i < PC_MAX_DEV; i++) if (g_pcd[i].dev == d && g_pcd[i].cache) { g_pcd[i].made++; g_pcx.dirty = 1; }
+}
+// 1 つの装置の cache をファイルに書く。変わっていなければ書かない
+static void pc_save(int i) {
+    if (!g_pcd[i].dev || !g_pcd[i].cache) return;
+    char path[720];
+    if (!pc_path(g_pcd[i].slot, path, sizeof path)) return;
+    size_t n = 0;
+    VkResult r = vkGetPipelineCacheData(g_pcd[i].dev, g_pcd[i].cache, &n, NULL);
+    if (r != VK_SUCCESS || n < sizeof(VkPipelineCacheHeaderVersionOne)) {
+        static int told1;
+        if (!told1) { told1 = 1; vlog(JE("pipeline cache：中身を取れない (%d・%llu バイト)。保存しない", "pipeline cache: cannot read its data (%d, %llu bytes). Not saving"), r, (unsigned long long) n); }
+        return;
+    }
+    if (n > pc_max_bytes()) {
+        // 古いファイルを残すと、次の起動もその古い物から始まり、新しい物はいつまでも残せない。捨てて、次は空から始める
+        remove(path);
+        g_pcd[i].sz = 0;
+        g_pcd[i].sum = 0;
+        g_pcd[i].made = 0;
+        vlog(JE("pipeline cache：%llu バイトで上限（%llu バイト）を超えた。ファイルを捨てて、保存しない", "pipeline cache: %llu bytes is over the limit (%llu bytes). Removed the file, not saving"), (unsigned long long) n, (unsigned long long) pc_max_bytes());
+        return;
+    }
+    uint8_t *buf = malloc(PC_HDR + n);
+    if (!buf) return;
+    r = vkGetPipelineCacheData(g_pcd[i].dev, g_pcd[i].cache, &n, buf + PC_HDR);
+    if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || n < sizeof(VkPipelineCacheHeaderVersionOne)) {
+        // lavapipe は空の cache で 20 バイトしか返さない（頭の途中まで）。中身を出さないドライバとして、1 回だけ知らせて保存しない
+        static int told;
+        if (!told) { told = 1; vlog(JE("pipeline cache：ドライバが返した中身が頭より短い (%d・%llu バイト)。このドライバは cache の中身を出さないので保存しない", "pipeline cache: the driver returned less than a header (%d, %llu bytes). It does not export its cache, so not saving"), r, (unsigned long long) n); }
+        free(buf);
+        return;
+    }
+    VkPhysicalDeviceProperties p;
+    vkGetPhysicalDeviceProperties(g_pd, &p);
+    VkPipelineCacheHeaderVersionOne h;
+    memcpy(&h, buf + PC_HDR, sizeof h);
+    if (h.headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || h.vendorID != p.vendorID || h.deviceID != p.deviceID ||
+        memcmp(h.pipelineCacheUUID, p.pipelineCacheUUID, VK_UUID_SIZE)) {
+        vlog(JE("pipeline cache：ドライバが返した頭がこの GPU と合わない。保存しない", "pipeline cache: the header from the driver does not match this GPU. Not saving"));
+        free(buf);
+        return;
+    }
+    uint64_t sum = pc_fnv(buf + PC_HDR, n);
+    if (sum == g_pcd[i].sum && n == g_pcd[i].sz) { free(buf); g_pcd[i].made = 0; return; }
+    uint32_t fmt = 1;
+    uint64_t psz = n;
+    memcpy(buf, "PGPC", 4);
+    memcpy(buf + 4, &fmt, 4);
+    memcpy(buf + 8, &psz, 8);
+    memcpy(buf + 16, &sum, 8);
+    char tmp[740];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    int ok = f && fwrite(buf, 1, PC_HDR + n, f) == PC_HDR + n;
+    if (f) { ok = fflush(f) == 0 && ok; ok = fclose(f) == 0 && ok; }
+    if (ok) {
+#ifdef _WIN32
+        ok = MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+        ok = rename(tmp, path) == 0;
+#endif
+    }
+    if (!ok) { remove(tmp); vlog(JE("pipeline cache：ファイルに書けない（%s）", "pipeline cache: cannot write the file (%s)"), path); }
+    else {
+        g_pcd[i].sum = sum;
+        g_pcd[i].sz = n;
+        g_pcd[i].made = 0;
+        g_pcx.saved += n;
+        vlog(JE("pipeline cache：保存した %llu バイト（装置 %d 番目）", "pipeline cache: saved %llu bytes (device slot %d)"), (unsigned long long) n, g_pcd[i].slot);
+    }
+    free(buf);
+}
+// 装置を消す前に呼ぶ：保存して、cache を放す
+static void pc_dev_drop(VkDevice d) {
+    for (int i = 0; i < PC_MAX_DEV; i++)
+        if (g_pcd[i].dev == d) {
+            if (g_pcd[i].made) pc_save(i);
+            vkDestroyPipelineCache(d, g_pcd[i].cache, NULL);
+            memset(&g_pcd[i], 0, sizeof g_pcd[i]);
+        }
+}
+// 接続の途中の保存：新しい pipeline が増えて 30 秒たち、1 秒静かになったとき（静かにならなくても 150 秒たてば）
+static void pc_tick(void) {
+    if (!g_pcx.dirty) return;
+    double now = t_ms();
+    double every = pc_save_every_ms();
+    // 静かになるのを待つが、ずっと作り続けていても、間隔の 5 倍たったら保存する（読み込み中に受け手が落ちても、そこまでは残す）
+    if (every <= 0 || now - g_pcx.last_save < every || (now - g_pcx.last_make < PC_QUIET_MS && now - g_pcx.last_save < every * 5)) return;
+    for (int i = 0; i < PC_MAX_DEV; i++) if (g_pcd[i].made) pc_save(i);
+    g_pcx.last_save = now;
+    g_pcx.dirty = 0;
+}
+// 接続の終わりに、この接続での pipeline の作成の数と時間を記録に出す
+static void pc_report(void) {
+    if (g_pcx.n) vlog(JE("pipeline の作成：%u 本・合計 %.1f ms（この接続）", "Pipeline creation: %u pipelines, %.1f ms total (this connection)"), g_pcx.n, g_pcx.ms);
+    g_pcx.n = 0;
+    g_pcx.ms = 0;
+}
+
 // 装置 dev の物を全部消してから dev を消し、表からも外す。last なら持ち主の分からない物もここで消す
 static void dev_free(VkDevice dev, int last) {
     vkDeviceWaitIdle(dev);
@@ -2014,6 +2327,7 @@ static void dev_free(VkDevice dev, int last) {
             }
             e->h = 0; // 消した印（表から外すのは最後にまとめて）
         }
+    pc_dev_drop(dev); // 保存して、この装置の pipeline cache を放す
     vkDestroyDevice(dev, NULL);
     // 表から外す：この装置の物（消した物・キュー・command buffer・descriptor set）と装置そのもの
     size_t nk = 0, ck = 64;
@@ -2036,6 +2350,7 @@ static void dev_free(VkDevice dev, int last) {
 }
 
 static void cleanup(void) {
+    pc_report();
     drain();
     watch_stop(); // 見張りが待つ fence は装置の物なので、装置を消す前に止める。数え直す前に止めて、古い番号を新しい数え方で知らせない
     g_submit_msgs = 0;
@@ -5102,6 +5417,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         for (uint32_t i = 0; i < nc && i < 32; i++) free(blocks[i]);
         if (res == VK_SUCCESS) {
             put(id, (uint64_t) (uintptr_t) dev, K_DEVICE);
+            pc_dev_add(dev);
             if (g_dev && g_dev != dev) {
                 // 2 つ目の装置（CTS の試験が自分で作る物など）。手伝いの物は前の装置の上にあるので、新しい装置で作り直す
                 drain();
@@ -5809,7 +6125,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             return reply(s, VK_ERROR_INITIALIZATION_FAILED);
         }
         VkPipeline p;
-        VkResult res = vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &ci, NULL, &p);
+        double tpc = t_ms();
+        VkResult res = vkCreateComputePipelines(d, pc_for(d), 1, &ci, NULL, &p);
+        pc_made(d, t_ms() - tpc);
         if (res == VK_SUCCESS) { put(id, (uint64_t) p, K_PIPELINE); note_pipe_sets(id, lid); }
         else vlog(JE("compute pipeline を作れない (%d)", "Cannot create the compute pipeline (%d)"), res);
         return reply(s, res);
@@ -6972,7 +7290,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                     return reply(s, VK_ERROR_INITIALIZATION_FAILED);
                 }
         VkPipeline pp;
-        VkResult res = r->bad ? VK_ERROR_INITIALIZATION_FAILED : vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &ci, NULL, &pp);
+        double tpc = t_ms();
+        VkResult res = r->bad ? VK_ERROR_INITIALIZATION_FAILED : vkCreateGraphicsPipelines(d, pc_for(d), 1, &ci, NULL, &pp);
+        if (!r->bad) pc_made(d, t_ms() - tpc);
         if (res == VK_SUCCESS) { put(id, (uint64_t) pp, K_PIPELINE); note_pipe_sets(id, lid); }
         else vlog(JE("graphics pipeline を作れない (%d)", "Cannot create the graphics pipeline (%d)"), res);
         return reply(s, res);
@@ -7362,6 +7682,7 @@ static void serve_client(vr_sock c) {
     for (;;) {
         uint32_t h[2];
         prof_tick();
+        pc_tick();
         double ti = t_ms();
         if (!vr_recv_all(c, h, 8)) break;
         if (h[1] > cap) { cap = h[1]; buf = realloc(buf, cap); }

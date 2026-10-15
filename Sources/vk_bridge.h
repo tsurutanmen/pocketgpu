@@ -42,6 +42,11 @@ int vkr_bw_serve(const char * host, int port);
 // インターネット共有の口（USB を有線のネットワークとして使う道）。合言葉は 16 進 32 文字で、起動のたびに作る。
 // 住所で待ち始め、同じ住所なら何もしない。空の住所なら口を閉じる。PC のドライバは USB の口で住所と合言葉を聞いてからつなぐ
 void vkr_set_token(const char * hex);
+// 受け手だけの pipeline cache（MoltenVK の shader 変換の結果）を、次の起動まで残すファイルの置き場を渡す（Library/Caches など）。vkr_serve の前に呼ぶ。
+// 渡さなければ HOME/Library/Caches。環境変数 PGPU_PCACHE_DIR があればそちらが次に使われる。書けない置き場は飛ばす
+void vkr_set_pcache_dir(const char * dir);
+// pipeline cache の保存と読み込みを入れる（1）・切る（0）。既定は入。vkr_serve の前に呼ぶ。環境変数 PGPU_PCACHE=0 でも切れる
+void vkr_set_pcache(int on);
 int vkr_listen_extra(const char * host);
 // アプリから 1 秒ごとに呼ぶ。on はアプリの設定（インターネット共有でも待ち受けるか）。受け手が、IPv4 が 172.20.10.0/28 にあり、住所が 172.20.10.1 か名前が bridge で始まる口を探して待ち、
 // 消えたら閉じる（0.0.0.0 や Wi-Fi の en0 では待たない）。out に今待っている住所を書く（無ければ空）。Vulkan がまだ起きていなければ 2・待てなければ 1・ほかは 0

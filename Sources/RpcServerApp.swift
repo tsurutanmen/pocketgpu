@@ -539,6 +539,10 @@ struct ContentView: View {
         if h == usbHost && !vkStarted {
             vkStarted = true
             vkr_set_token(linkToken)
+            // 受け手の pipeline cache を Library/Caches に残す。容量が足りないとシステムが消すことがあるが、消えても空から始まるだけ
+            if let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+                caches.path.withCString { vkr_set_pcache_dir($0) }
+            }
             let v = Thread {
                 // 待ち受けている間は戻ってこない。戻ってきたら起動に失敗した
                 _ = vkr_serve("127.0.0.1", 50060)
