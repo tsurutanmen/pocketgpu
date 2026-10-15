@@ -4,6 +4,9 @@
 // 窓に出すときは、受け手で描いた 1 コマを PC に持ち帰って、Windows の窓に描き写す（GDI）。
 //
 // つなぎ先は環境変数 IPHONE_VK（既定 127.0.0.1:50061。usb_forward.py --local 50061 --remote 50060 で iPhone へ）。
+// USB の iPhone が何台か見えるとき（usbmuxd の一覧）は、IPHONE_VK=usb:<UDID>（ポートも付けるなら usb:<UDID>:50060）か、
+// IPHONE_VK_UDID=<UDID> で 1 台を選ぶ。UDID は大文字小文字と '-' を問わない。無ければ最初の 1 台。合う機器が無ければ、見える UDID を記録に出して失敗する。
+// 5 桁以下の数字だけの usb:50060 はこれまで通りポート番号。UDID の一覧は pc/usb_forward.py --list。
 // IPHONE_VK_LOG=1 で何をしているかを stderr に出す。
 // IPHONE_VK_STATS=1 で、終わりに「どの命令を何回送り、何回返事を待ち、何バイト運んだか」を stderr に出す。
 //
@@ -1675,22 +1678,96 @@ static vr_sock mux_open(char *where, size_t nw) {
     return tcp_connect(host, port);
 }
 
+// <key>名前</key> の次の <string> を out に読む。見つからなければ 0
+static int plist_str_after(const char *at, const char *key, const char *limit, char *out, size_t n) {
+    char k[64];
+    snprintf(k, sizeof k, "<key>%s</key>", key);
+    const char *q = strstr(at, k);
+    if (!q || (limit && q > limit)) return 0;
+    q = strstr(q + strlen(k), "<string>");
+    if (!q || (limit && q > limit)) return 0;
+    q += 8;
+    const char *e = strstr(q, "</string>");
+    if (!e) return 0;
+    size_t len = (size_t) (e - q) < n - 1 ? (size_t) (e - q) : n - 1;
+    memcpy(out, q, len);
+    out[len] = 0;
+    return 1;
+}
+
+// UDID の比べ方：大文字小文字と '-' を無視する（00008110-001234567890401E と 00008110001234567890401e を同じに見る）
+static int udid_same(const char *a, const char *b) {
+    for (;;) {
+        while (*a == '-') a++;
+        while (*b == '-') b++;
+        if (!*a || !*b) return !*a && !*b;
+        char x = *a, y = *b;
+        if (x >= 'a' && x <= 'z') x = (char) (x - 32);
+        if (y >= 'a' && y <= 'z') y = (char) (y - 32);
+        if (x != y) return 0;
+        a++;
+        b++;
+    }
+}
+
+// 選ぶ iPhone の UDID（usbmuxd の SerialNumber）。IPHONE_VK=usb:<UDID>[:ポート] が先、無ければ IPHONE_VK_UDID。無ければ空（最初の 1 台）。
+// IPHONE_VK=usb:50060 のように 5 桁以下の数字だけなら、これまで通りポート番号で、UDID ではない。
+// link の道（インターネット共有の口を USB で聞く）も、ウォームの流れも、同じ 1 台を使う
+static void want_udid(char *out, size_t n) {
+    out[0] = 0;
+    const char *e = getenv("IPHONE_VK");
+    if (e && !strncmp(e, "usb:", 4)) {
+        const char *u = e + 4;
+        const char *c = strchr(u, ':');
+        size_t len = c ? (size_t) (c - u) : strlen(u), digits = 0;
+        for (size_t i = 0; i < len; i++) digits += u[i] >= '0' && u[i] <= '9';
+        if (len > 0 && !(digits == len && len <= 5)) {
+            if (len > n - 1) len = n - 1;
+            memcpy(out, u, len);
+            out[len] = 0;
+            return;
+        }
+    }
+    e = getenv("IPHONE_VK_UDID");
+    if (e && *e) snprintf(out, n, "%s", e);
+}
+
 static vr_sock usb_connect(int port) {
-    char where[320];
+    char where[320], want[96];
+    want_udid(want, sizeof want);
     vr_sock s = mux_open(where, sizeof where);
     if (s == INVALID_SOCKET) { say("%s につながらない（usbmuxd が動いていない）", where); return s; }
     char *list = mux_call(s, "ListDevices", "");
     closesocket(s);
     if (!list) { say("usbmuxd が機器の一覧を返さない"); return INVALID_SOCKET; }
-    // 機器ごとの Properties の中で、ConnectionType が USB のものの DeviceID を使う（Wi-Fi 越しの同期は使わない）
+    // 機器ごとの Properties の中で、ConnectionType が USB のものの DeviceID を使う（Wi-Fi 越しの同期は使わない）。
+    // UDID の指定があれば、SerialNumber が合う機器だけ。無ければ最初の 1 台
     long long dev = -1;
-    for (const char *q = list; dev < 0 && (q = strstr(q, "<key>ConnectionType</key>")); q++) {
+    char serial[96] = "", chosen[96] = "", seen[1024] = "";
+    int nusb = 0;
+    for (const char *q = list; (q = strstr(q, "<key>ConnectionType</key>")); q++) {
         const char *v = strstr(q, "<string>");
         const char *end = strstr(q, "</dict>");
-        if (v && !strncmp(v + 8, "USB<", 4)) dev = plist_int_after(q, "DeviceID", end);
+        if (!v || !end || strncmp(v + 8, "USB<", 4)) continue;
+        // この機器の Properties の始まり（q より前で一番近い <dict>）から終わりまでを見る
+        const char *beg = list;
+        for (const char *d = list; (d = strstr(d, "<dict>")) && d < q; d++) beg = d;
+        long long id = plist_int_after(beg, "DeviceID", end);
+        serial[0] = 0;
+        plist_str_after(beg, "SerialNumber", end, serial, sizeof serial);
+        if (id < 0) continue;
+        nusb++;
+        size_t sl = strlen(seen);
+        if (sl < sizeof seen - 100) snprintf(seen + sl, sizeof seen - sl, "%s%s", sl ? "、" : "", serial[0] ? serial : "(UDID なし)");
+        if (dev < 0 && (!want[0] || udid_same(want, serial))) { dev = id; snprintf(chosen, sizeof chosen, "%s", serial); }
     }
     free(list);
-    if (dev < 0) { say("USB でつながった iPhone が見えない"); return INVALID_SOCKET; }
+    if (dev < 0) {
+        if (want[0]) say("UDID %s の USB の iPhone が見えない。USB でつながっている機器は %d 台：%s", want, nusb, nusb ? seen : "なし");
+        else say("USB でつながった iPhone が見えない");
+        return INVALID_SOCKET;
+    }
+    if (want[0]) say("UDID %s の iPhone を選んだ（usbmuxd の機器 %lld。USB でつながっている機器は %d 台）", chosen, dev, nusb);
     s = mux_open(where, sizeof where);
     if (s == INVALID_SOCKET) return s;
     char extra[160];
@@ -1890,7 +1967,14 @@ static int connect_locked(void) {
         // 「link」なら USB の口で聞いて、「link:host:port」なら host:port で聞いて、インターネット共有の口につなぐ
         s = link_connect(e[4] == ':' ? e + 5 : NULL, host, sizeof host, port, sizeof port);
     } else if (e && !strncmp(e, "usb", 3) && (e[3] == 0 || e[3] == ':')) {
-        int p = e[3] == ':' ? atoi(e + 4) : 50060;
+        // usb:ポート番号 か usb:<UDID> か usb:<UDID>:ポート番号。5 桁以下の数字だけならポート番号（want_udid と同じ決まり）
+        int p = 50060;
+        if (e[3] == ':') {
+            char want[96];
+            want_udid(want, sizeof want);
+            if (!want[0]) p = atoi(e + 4);
+            else if (strchr(e + 4, ':')) p = atoi(strchr(e + 4, ':') + 1);
+        }
         s = usb_connect(p);
         snprintf(host, sizeof host, "USB の iPhone");
         snprintf(port, sizeof port, "%d", p);

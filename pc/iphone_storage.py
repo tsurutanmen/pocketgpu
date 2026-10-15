@@ -51,8 +51,7 @@ def wrap_tls(sock, rec):
 
 
 def main():
-    devs = [d for d in uf.list_devices() if d.get("Properties", {}).get("ConnectionType") == "USB"]
-    dev = devs[0]
+    dev = uf.pick_device()  # 環境変数 IPHONE_VK_UDID があればその UDID の iPhone、無ければ USB の最初の 1 台
     did, udid = dev["DeviceID"], dev["Properties"]["SerialNumber"]
     with open(f"C:/ProgramData/Apple/Lockdown/{udid}.plist", "rb") as f:
         rec = plistlib.load(f)

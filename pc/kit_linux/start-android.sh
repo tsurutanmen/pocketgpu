@@ -74,6 +74,12 @@ while :; do
     android_device_problem
     ask_retry || stop_here
 done
+# 何台かのスマホを同時に使うとき、PGPU_PORT は台ごとに分ける（例：PGPU_PORT=47441 ./start-android.sh --serial 番号）。adb forward は、別のスマホが使っている口を黙って付け替えるので、先に確かめる
+if android_port_other_phone "$PGPU_PORT"; then
+    ng "$(M "この PC の $PGPU_PORT 番は、すでに別のスマホにつながっています。台ごとに別の PGPU_PORT を使ってください。" "Port $PGPU_PORT on this PC already goes to another phone. Use a different PGPU_PORT for each phone.")"
+    info "$(M "例：PGPU_PORT=$((PGPU_PORT + 1)) $SELF" "Example: PGPU_PORT=$((PGPU_PORT + 1)) $SELF")"
+    stop_here
+fi
 SRV=
 case "$ANDROID_ABI" in
 arm64-v8a) SRV=server_aarch64 ;;

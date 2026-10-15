@@ -248,8 +248,12 @@ rem The ports on this PC are chosen in this order: the variable (set PGPU_PORT=.
 rem If the PC port is reserved by Windows (see: netsh int ipv4 show excludedportrange protocol=tcp) or used by another program, tools\pgpu_port.ps1
 rem   picks a free port outside the reserved ranges (47300, 47400, 47500 and up), prints one line about it, and saves it in android\port.txt.
 rem   This happens when the caller sets PGPU_PICK=gpu or PGPU_PICK=gpu,cam,audio before calling this file. To forget the saved ports: delete android\port.txt.
+rem Several phones at the same time: set PGPU_FIXED_PORTS=1, ANDROID_SERIAL=the-serial and PGPU_PORT=a-different-port-for-each-phone (PGPU_CAM_PORT and PGPU_AUDIO_PORT too, if the app is used).
+rem   Then android\port.txt is neither read nor written, and the ports are never changed behind your back. Every file of this kit uses exactly the numbers you set.
 set "ADB_OK="
-call :load_ports
+if defined PGPU_FIXED_PORTS goto fixed_check
+:fixed_back
+if not defined PGPU_FIXED_PORTS call :load_ports
 if "%PGPU_PORT%"=="" set PGPU_PORT=50300
 if "%PGPU_CAM_PORT%"=="" set PGPU_CAM_PORT=50064
 if "%PGPU_AUDIO_PORT%"=="" set PGPU_AUDIO_PORT=50063
@@ -324,10 +328,22 @@ echo ERROR: the device "%ANDROID_SERIAL%" is not ready. Run   "%ADB%" devices   
 exit /b 1
 
 :pick_ports
+rem With PGPU_FIXED_PORTS the numbers are the caller's choice: nothing is checked here and nothing is saved.
+if defined PGPU_FIXED_PORTS exit /b 0
 rem Check the ports on this PC and save the ones that had to change. The result is read back from android\port.txt.
 if exist "%~dp0..\tools\pgpu_port.ps1" "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\tools\pgpu_port.ps1" -PgpuPick "%PGPU_PICK%" <nul
 call :load_ports force
 exit /b 0
+
+:fixed_check
+rem PGPU_FIXED_PORTS needs the phone and the PC port to be chosen by the caller, so that two phones can never share a port by accident.
+if "%ANDROID_SERIAL%"=="" goto fixed_bad
+if "%PGPU_PORT%"=="" goto fixed_bad
+goto fixed_back
+:fixed_bad
+echo.
+echo ERROR: PGPU_FIXED_PORTS is set, so ANDROID_SERIAL and PGPU_PORT must be set too (a different PGPU_PORT for each phone).
+exit /b 1
 
 rem Read android\port.txt (lines like gpu=47300). Without "force" a variable that is already set wins; with "force" the file wins.
 :load_ports
@@ -361,6 +377,8 @@ rem Check the port on this PC first (Windows can reserve some ports). The chosen
 set "PGPU_PICK=gpu"
 call "%~dp0_common.cmd"
 if errorlevel 1 goto fail
+rem Several phones (PGPU_FIXED_PORTS=1): adb forward quietly takes a port over from another phone. Stop here if this PC port already goes to a different phone.
+if defined PGPU_FIXED_PORTS for /f "tokens=1,2" %%A in ('"%ADB%" forward --list') do if "%%B"=="tcp:%PGPU_PORT%" if /i not "%%A"=="%ANDROID_SERIAL%" goto port_taken
 
 set "SRV="
 "%ADB%" shell getprop ro.product.cpu.abi | findstr /b /c:"arm64-v8a" >nul && set "SRV=server_aarch64"
@@ -427,6 +445,11 @@ echo.
 echo ERROR: the receiver is running on the phone, but it did not start listening within 30 seconds. Its log:
 "%ADB%" shell cat /data/local/tmp/pgpu_server.log
 echo Unlock the phone and run this file again. If it happens again, send us this log.
+goto fail
+:port_taken
+echo.
+echo ERROR: port %PGPU_PORT% on this PC already goes to another phone. Use a different PGPU_PORT for each phone.
+"%ADB%" forward --list
 goto fail
 :forward_failed
 echo.
@@ -617,13 +640,13 @@ echo Stopping the receiver on the phone ...
 "%ADB%" shell "kill $(pidof pgpu_server) 2>/dev/null; rm -f /data/local/tmp/pgpu_server; true" >nul 2>&1
 "%ADB%" forward --remove tcp:%PGPU_PORT% >nul 2>&1
 rem The port saved in android\port.txt (the one start_android.cmd used) is closed too, even if PGPU_PORT is set to something else in this window.
-if exist "%~dp0port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0port.txt") do if /i "%%A"=="gpu" "%ADB%" forward --remove tcp:%%B >nul 2>&1
+if not defined PGPU_FIXED_PORTS if exist "%~dp0port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0port.txt") do if /i "%%A"=="gpu" "%ADB%" forward --remove tcp:%%B >nul 2>&1
 echo Stopped. The receiver is removed from the phone; its log stays at /data/local/tmp/pgpu_server.log.
 if "%PGPU_NOPAUSE%"=="" pause
 exit /b 0
 :nodev
 if defined ADB_OK "%ADB%" forward --remove tcp:%PGPU_PORT% >nul 2>&1
-if defined ADB_OK if exist "%~dp0port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0port.txt") do if /i "%%A"=="gpu" "%ADB%" forward --remove tcp:%%B >nul 2>&1
+if defined ADB_OK if not defined PGPU_FIXED_PORTS if exist "%~dp0port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0port.txt") do if /i "%%A"=="gpu" "%ADB%" forward --remove tcp:%%B >nul 2>&1
 echo The receiver on the phone was not stopped. Connect the phone and run this file again, or restart the phone.
 if "%PGPU_NOPAUSE%"=="" pause
 exit /b 1
@@ -694,7 +717,7 @@ echo.
 echo [2/2] Checking that Windows sees the phone GPU ...
 set "VK_ADD_DRIVER_FILES=%~dp0iphone_icd.json;%~dp0x86\iphone_icd.json"
 rem start_android.cmd may have picked another port (Windows can reserve some ports) and saved it in android\port.txt. That one wins here.
-if exist "%~dp0android\port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0android\port.txt") do if /i "%%A"=="gpu" echo %%B| findstr /r /x "[0-9][0-9]*" >nul && set "PGPU_PORT=%%B"
+if not defined PGPU_FIXED_PORTS if exist "%~dp0android\port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0android\port.txt") do if /i "%%A"=="gpu" echo %%B| findstr /r /x "[0-9][0-9]*" >nul && set "PGPU_PORT=%%B"
 if "%PGPU_PORT%"=="" set PGPU_PORT=50300
 set IPHONE_VK=127.0.0.1:%PGPU_PORT%
 set "VK_ICD_FILENAMES=%VK_ADD_DRIVER_FILES%"
@@ -838,6 +861,9 @@ Notes
   To choose a port yourself: set PGPU_PORT=47301 before step 4, 5 and 6 (use the same number in all of them). The camera and mic ports of android_app.cmd work the same way
   (PGPU_CAM_PORT and PGPU_AUDIO_PORT, usually 50064 and 50063): use the numbers it prints for webcam_rx.exe and ipaudio.exe.
 - More than one phone connected: run   adb devices   and set ANDROID_SERIAL=the-serial before step 4.
+  To use several phones at the same time, give each phone its own PC port and keep android\port.txt out of it. Open one Command Prompt per phone and, in each one, run
+    set PGPU_FIXED_PORTS=1   then   set ANDROID_SERIAL=the-serial   and   set PGPU_PORT=47441 (47442 for the next phone, and so on)   before step 4, 5 and 6.
+  The numbers are used as they are (nothing is picked or saved). If a port goes to another phone already, start_android.cmd says so and stops.
 - To send the window picture as video (less data, the PC needs to decode H.264): set IPHONE_VK_VIDEO=1 before step 6.
 
 If something does not work
@@ -937,6 +963,9 @@ E. 終わったら、android\android_app.cmd stop を実行してください。
   自分でポートを決める場合は、手順 4・5・6 の前に set PGPU_PORT=47301 を入力してください。3 つの手順で同じ番号を使ってください。
   android_app.cmd のカメラとマイクのポート（PGPU_CAM_PORT と PGPU_AUDIO_PORT。通常は 50064 と 50063）も同じ仕組みです。webcam_rx.exe と ipaudio.exe には、表示された番号を使ってください
 - スマートフォンを 2 台以上接続している場合は、adb devices を入力し、手順 4 の前に set ANDROID_SERIAL=一覧の番号 を入力してください
+  複数台を同時に使う場合は、台ごとに PC のポートを分け、android\port.txt を使わないようにします。台ごとにコマンドプロンプトを開き、手順 4・5・6 の前に
+    set PGPU_FIXED_PORTS=1 、set ANDROID_SERIAL=一覧の番号 、set PGPU_PORT=47441（次の台は 47442、…）を入力してください
+  番号はそのまま使われます（選び直しも記録もしません）。すでに別のスマートフォンにつながっているポートを指定すると、start_android.cmd が知らせて止まります
 - ウィンドウの映像を動画で送る場合は、手順 6 の前に set IPHONE_VK_VIDEO=1 を入力してください。通信量が減りますが、PC で H.264 をデコードする必要があります
 
 動作しないとき

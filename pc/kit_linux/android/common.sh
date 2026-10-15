@@ -348,6 +348,14 @@ fw_add() {
     LOG+=("      adb forward tcp:$port $target -> $rc")
     return $rc
 }
+# この PC の口 $1 が、使うスマホ（ANDROID_SERIAL）とは別のスマホにつながっていれば 0。adb forward は同じ口を黙って付け替えるので、複数台のときに先に確かめる
+android_port_other_phone() {
+    local s p
+    while read -r s p _; do
+        [ "$p" = "tcp:$1" ] && [ "$s" != "${ANDROID_SERIAL:-}" ] && return 0
+    done < <("$ADB" forward --list 2> /dev/null < /dev/null | tr -d '\r')
+    return 1
+}
 fw_remove() { "$ADB" forward --remove "tcp:$1" > /dev/null 2>&1 < /dev/null; }
 
 # PGPU_PORT：GPU の口
