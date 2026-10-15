@@ -8,6 +8,7 @@
 # Android の記録を集める入口 Send-Android-Log.cmd（中身は tools\android-log.ps1）も、Android の物と一緒に入れる（--no-android のときは入れない）。
 # Android の USB の速さを測る入口 Test-Android-Speed.cmd（中身は tools\android-speed.ps1）も同じ（10/15）。android\_gamemode.cmd は、受け手を起こす android\start_android.cmd と
 # android\android_app.cmd が呼ぶ「ゲームモードをパフォーマンスに」の頼み（失敗しても止まらない。PGPU_NOGAMEMODE=1 で飛ばす）
+# この PC の様子を読んで 1 つの txt にまとめる入口 Check-PC.cmd（中身は tools\pc-check.ps1。読むだけ・管理者の権限は要らない）は、iPhone 用でも Android 用でも全員に入れる（10/15）。
 # 試すとき：PGKIT_OUT・PGKIT_KITBUILD・--android-dir で置き場を変えられる（台帳は PGKIT_OUT の下に作る）
 # 入口は 3 つ：Start-PocketGPU.cmd（順に確かめて足りない物を案内する）と Run-on-iPhone-GPU.cmd（1 つのアプリを iPhone の GPU で起動する）と
 # Start-Mic-Camera.cmd（GPU を使わずに、iPhone をマイクとカメラにする）。
@@ -140,6 +141,7 @@ Reporting
 - In the iPhone app, tap "Send logs" and send the text to us on Discord or by email.
 - On the PC, send pocketgpu-start-log.txt, which Start-PocketGPU.cmd writes. If you used Setup-PocketGPU.cmd, also send pocketgpu-setup-summary.txt.
   Also double-click report.cmd and send pocketgpu-report.txt. Neither has your user name, PC name or IP.
+- If a game does not use the iPhone GPU, a tool is blocked, or a file disappears: double-click Check-PC.cmd in the kit folder and paste the text it makes on Discord (DRAFT wording: it only reads, and has no user name, PC name or serial number).
 - For the webcam and microphone, also send pocketgpu-miccam-log.txt, which Start-Mic-Camera.cmd writes.
 - Please also tell us the PC, the app or game, the resolution, and what happened.
 
@@ -209,6 +211,7 @@ iPhone へのアプリの入れ方を案内して、最後に Start-PocketGPU.cm
 - iPhone のアプリの「ログを送信」をタップして、そのテキストを Discord かメールで送ってください
 - PC では、Start-PocketGPU.cmd が作成する pocketgpu-start-log.txt を送ってください。Setup-PocketGPU.cmd を使ったときは、pocketgpu-setup-summary.txt も送ってください。
   report.cmd をダブルクリックして作成される pocketgpu-report.txt も送ってください。どちらのファイルにも、ユーザー名・PC 名・IP アドレスは含まれません
+- ゲームが iPhone の GPU を使わないとき・道具が止められたとき・ファイルが消えたとき：キットのフォルダの Check-PC.cmd をダブルクリックして、作成される txt の中身を Discord に貼ってください【仮文】読むだけで、ユーザー名・PC 名・シリアル番号は含まれません
 - ウェブカメラとマイクについては、Start-Mic-Camera.cmd が作成する pocketgpu-miccam-log.txt も送ってください
 - PC、アプリやゲームの名前、解像度、何が起きたかも書いてください
 
@@ -1117,6 +1120,7 @@ def missing_inputs(a):
         miss.append(os.path.join(KITBUILD, APP_EXE))
     if not a.no_android and not a.no_android_apk and not os.path.exists(a.android_apk):
         miss.append(a.android_apk)
+    miss += [p for p in (os.path.join(HERE, 'kit', 'Check-PC.cmd'), os.path.join(HERE, 'kit', 'tools', 'pc-check.ps1')) if not os.path.exists(p)]
     if not a.no_android:
         miss += [p for p in (os.path.join(HERE, 'kit', 'Send-Android-Log.cmd'), os.path.join(HERE, 'kit', 'tools', 'android-log.ps1'),
                              os.path.join(HERE, 'kit', 'Test-Android-Speed.cmd'), os.path.join(HERE, 'kit', 'tools', 'android-speed.ps1')) if not os.path.exists(p)]
@@ -1187,10 +1191,11 @@ def main():
         open(os.path.join(kit, name), 'w', encoding='ascii', newline='\r\n').write(text)
     # 入口 2 つと、その中身（PowerShell）。前の check.cmd は Start-PocketGPU.cmd の 7 番目が代わる
     # Update-PocketGPU.cmd と tools\update.ps1 は更新の入口（10/12）
-    for name in ('Start-PocketGPU.cmd', 'Setup-PocketGPU.cmd', 'Run-on-iPhone-GPU.cmd', 'Update-PocketGPU.cmd'):
+    # Check-PC.cmd と tools\pc-check.ps1 は、この PC の様子を読んで txt にする入口（10/15）。tools\pgpu_common.ps1 も使う
+    for name in ('Start-PocketGPU.cmd', 'Setup-PocketGPU.cmd', 'Run-on-iPhone-GPU.cmd', 'Update-PocketGPU.cmd', 'Check-PC.cmd'):
         shutil.copy2(os.path.join(HERE, 'kit', name), os.path.join(kit, name))
     os.makedirs(os.path.join(kit, 'tools'), exist_ok=True)
-    for name in ('pgpu_common.ps1', 'pgpu_port.ps1', 'start.ps1', 'setup.ps1', 'setup-admin.ps1', 'run.ps1', 'update.ps1'):
+    for name in ('pgpu_common.ps1', 'pgpu_port.ps1', 'start.ps1', 'setup.ps1', 'setup-admin.ps1', 'run.ps1', 'update.ps1', 'pc-check.ps1'):
         shutil.copy2(os.path.join(HERE, 'kit', 'tools', name), os.path.join(kit, 'tools', name))
     # 更新を聞く先と、その人の合言葉。人ごとの物なので更新では差し替えない。ひな形には入れない
     if not a.template:
