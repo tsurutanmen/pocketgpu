@@ -40,6 +40,34 @@ struct RpcServerApp: App {
     var body: some Scene { WindowGroup { ContentView() } }
 }
 
+// 後ろに回ったとき、PC が GPU につながっていれば、少しの間だけ動き続けさせてもらう（beginBackgroundTask）。
+// その間に受け手が PC の次の命令へ「後ろに回った」と答え、PC のゲームが固まらずに終われるようにする。
+// PC が切れたら・前に戻ったら・iOS が時間切れを告げたら終える。「バックグラウンドでも実行する」（Keeper）が入りなら、もともと止められない
+final class GPUBackgroundGrace {
+    static let shared = GPUBackgroundGrace()
+    private var task: UIBackgroundTaskIdentifier = .invalid
+    private var timer: Timer?
+
+    func enteredBackground() {
+        guard task == .invalid, vkr_clients() != 0 else { return }
+        task = UIApplication.shared.beginBackgroundTask(withName: "PocketGPU GPU stop") { [weak self] in self?.finish() }
+        guard task != .invalid else { return }
+        vkr_note("後ろに回った：PC に GPU を止めたことを伝え終わるまで動かしてもらう")
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            if vkr_clients() == 0 { self?.finish() }
+        }
+    }
+
+    func finish() {
+        timer?.invalidate()
+        timer = nil
+        if task != .invalid {
+            UIApplication.shared.endBackgroundTask(task)
+            task = .invalid
+        }
+    }
+}
+
 // 後ろに回っても止められないように、音の出ない再生を流し続ける
 final class Keeper {
     static let shared = Keeper()
@@ -213,9 +241,14 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             // 後ろに回ると GPU が使えない。前に戻ったら GPU に戻す
             rpc_bridge_set_background(phase == .background ? 1 : 0)
-            // Vulkan の受け手は、前にいない間（切り替えの途中も含む）は GPU に仕事を出さずに待つ
-            vkr_set_paused(phase == .active ? 0 : 1)
-            if phase == .active { AudioBridgeModel.shared.foregrounded() }
+            // Vulkan の受け手は、切り替えの途中（1）は GPU に仕事を出さずに待ち、後ろ（2）に回ったら PC に「GPU を失った」と返して接続を終える。
+            // iOS は後ろに回ったアプリの Metal の仕事を捨てるので、待っていても PC のゲームが固まるだけだった
+            vkr_set_paused(phase == .active ? 0 : phase == .inactive ? 1 : 2)
+            if phase == .background { GPUBackgroundGrace.shared.enteredBackground() }
+            if phase == .active {
+                GPUBackgroundGrace.shared.finish()
+                AudioBridgeModel.shared.foregrounded()
+            }
         }
         // 切り替えたときの処理。前は切り替えの所に付けていた物を、ここにまとめた（呼ぶ物は同じ）
         .onChange(of: showFrames) { _, on in preview.setOn(on) }
@@ -232,6 +265,8 @@ struct ContentView: View {
         }
         .onReceive(tick) { _ in
             vkr_set_thermal(Int32(ProcessInfo.processInfo.thermalState.rawValue))
+            // アクセスガイド中か（受け手の記録に出す。手動で始めたアクセスガイドで変わるかは、実機で確かめていない）
+            vkr_set_guided(UIAccessibility.isGuidedAccessEnabled ? 1 : 0)
             status.tick()
             mirror.tick()
             webcam.tick()

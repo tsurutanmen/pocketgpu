@@ -39,6 +39,14 @@
 // descriptor の種類 VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR（1 つにつき acceleration structure の番号 u64）。
 // ray tracing pipeline（SBT）はまだ入らない。番号はほかの係（1<<22・1<<23 往復を減らす・1<<25 平面・1<<26 録画）と重ならないよう 1<<28
 #define VR_CAP_RT 268435456u
+// 後ろに回ったことを返事で伝える（fg1015）。iOS は後ろに回ったアプリの Metal の仕事を捨てるので、受け手は後ろに回ったら
+// GPU に仕事を出さず、この接続を「GPU を失った」で終える。ドライバが VR_SET_OPTIONS で VR_OPT_BG_ERR を頼んだつなぎだけ、
+// そのときの返事の結果を VK_ERROR_DEVICE_LOST ではなく VR_RES_BACKGROUND にする（ドライバはアプリには VK_ERROR_DEVICE_LOST を返す）。
+// 頼まないドライバには今までどおり VK_ERROR_DEVICE_LOST。VR_SET_OPTIONS の VR_OPT_BG_ERR は VR_OPT_REPLY_EXT が無くても効く。
+// 番号はほかの係（1<<22〜1<<28）と重ならないよう 1<<29（まとめるときに決め直してよい）
+#define VR_CAP_BG_ERR 536870912u    // 1u << 29
+#define VR_OPT_BG_ERR 4u
+#define VR_RES_BACKGROUND (-2000000001) // Vulkan の VkResult には無い値
 // 返事の尾（VR_SET_OPTIONS の VR_OPT_REPLY_EXT を受けたつなぎだけ）：どの返事も、頭の 8 バイトのすぐ後ろに 16 バイトを足す。
 //   終わった submit の番号（u64。VR_GET_PROGRESS と同じ意味）・返事の通し番号（u32。このつなぎで送った返事を 0 から数える。尾を付ける前の返事も数える）・
 //   数え直しの回数（u32。装置が全部なくなって submit の番号を 0 に戻した回数）。頭の長さ（2 つ目）は尾を含まない

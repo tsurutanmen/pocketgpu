@@ -21,8 +21,12 @@ void vkr_set_recorder(vkr_rec_start_fn start, vkr_rec_video_fn video, vkr_rec_au
 // 口 50063（スピーカーの係の AudioBridge）で届いた PC の音を録画に入れる。録画していなければ何もしない。
 // pcm は 16 ビットの交互（NULL なら無音の塊）。index はその塊の頭のコマの番号（AudioBridge の index のまま）
 void vkr_record_pcm(const int16_t * pcm, uint32_t frames, uint32_t rate, uint32_t ch, uint64_t index);
-// アプリが前にいないときは 1。その間は GPU に新しい仕事を出さずに待つ（出すと GPU を失う）
+// アプリが前にいるか：0 前にいる・1 切り替えの途中（inactive）・2 後ろ（background）。
+// 1 の間は GPU に新しい仕事を出さずに待つ。2 になったら GPU に出さず、PC に「GPU を失った」（新しいドライバには「後ろに回った」）と返して接続を終える。
+// iOS は後ろに回ったアプリの Metal の仕事を捨てる（notPermitted か成功扱い）ので、待っても PC のゲームが固まるだけ
 void vkr_set_paused(int on);
+// iPhone がアクセスガイド中なら 1（UIAccessibility.isGuidedAccessEnabled）。受け手の記録（つないだ時・後ろに回った時）に出す
+void vkr_set_guided(int on);
 // iPhone の熱の状態（ProcessInfo.thermalState の 0〜3）。PC のドライバが聞いて、熱いときはコマ数を落とす
 void vkr_set_thermal(int state);
 // 受け手が処理した命令の数（つないでから増え続ける）と、いま PC がつながっているか。画面のファンを回すのに使う

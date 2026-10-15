@@ -723,6 +723,7 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
     caps |= VR_CAP_REPLY_EXT | VR_CAP_PUSH_DONE; // 返事に終わった submit の番号を付ける・終わったら頼まれなくても知らせる（VR_SET_OPTIONS で頼まれたつなぎだけ）
     caps |= VR_CAP_DESC_FLAGS; // binding の flags と set ごとの数を読む（vkd3d-proton）
     caps |= VR_CAP_BATCH; // 小さな書き込みをまとめた VR_MEM_WRITE_SPANS を受ける・descriptor の取る・書くをまとめた物を受ける
+    caps |= VR_CAP_BG_ERR; // 後ろに回ったことを返事で伝える（VR_OPT_BG_ERR を頼まれたつなぎだけ）
     // 調べ用：VKR_CAPS=数 で名乗る印を絞る（古い受け手のふりをする）
     const char *mask = getenv("VKR_CAPS");
     if (mask && *mask) caps &= (uint32_t) strtoul(mask, NULL, 0);
@@ -749,9 +750,11 @@ static void detect_caps(const VkExtensionProperties *ep, uint32_t ne, uint32_t a
 static VkDebugUtilsMessengerEXT g_dbg_mess;
 static PFN_vkDestroyDebugUtilsMessengerEXT g_dbg_destroy;
 static volatile int g_dbg_msgs;
+static void np_note(const char *m); // 下の「アプリが前にいないとき」
 static VKAPI_ATTR VkBool32 VKAPI_CALL dbg_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
                                              const VkDebugUtilsMessengerCallbackDataEXT *d, void *u) {
     (void) type; (void) u;
+    if (d && d->pMessage) np_note(d->pMessage); // 300 件を超えても見る
     if (g_dbg_msgs < 300 && d && d->pMessage) {
         g_dbg_msgs++;
         vlog(JE("MoltenVK（%s）：%.440s", "MoltenVK (%s): %.440s"), sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? JE("誤り", "error") : JE("注意", "warning"), d->pMessage);
@@ -849,10 +852,7 @@ static inflight g_fl[256];
 static int g_nfl;
 static VkResult g_err;          // GPU を失ったなど。次に返事をするときに伝える
 static int g_lost;              // この接続で GPU を失った。切れたあと Vulkan を作り直す
-static volatile int g_paused;   // アプリが前にいない間は 1（GPU に新しい仕事を出さない）
-
-// アプリから呼ぶ：前にいないときは 1
-void vkr_set_paused(int on) { g_paused = on; }
+static volatile int g_paused;   // 0 前にいる・1 切り替えの途中（inactive）・2 後ろ（background）。前にいない間は GPU に新しい仕事を出さない
 
 // ---- メモリの確保の失敗を、落ちずに「足りない」で返す（devlost1015） ----
 // Android：GPU と CPU が同じメモリを使う。端末に残っている量（/proc/meminfo の MemAvailable）から余裕（PGPU_MEM_MARGIN_MB・既定 256。0 で確かめない）を
@@ -1083,6 +1083,143 @@ static volatile uint64_t g_ops_total;
 static volatile int g_clients;
 uint64_t vkr_ops_total(void) { return g_ops_total; }
 int vkr_clients(void) { return g_clients; }
+
+// ---- アプリが前にいないとき（fg1015） ----
+// iOS は、後ろに回ったアプリの Metal の仕事を捨てる（command buffer は notPermitted で終わるか、成功扱いで終わる）。
+// 前は、前に戻るまで submit を出さずに待っていたので、後ろにいる間は PC のゲームが固まって見えた（テスターは「固まった」としか言えない）。
+// いまは、切り替えの途中（inactive。コントロールセンターや通知を引き出した間など）だけ待ち、
+// 後ろ（background）に回ったら GPU に出さずに、この接続を「GPU を失った」で終える。
+// ドライバが VR_OPT_BG_ERR を頼んでいれば、そのときの返事の結果を VR_RES_BACKGROUND にして、PC の記録に理由を出せるようにする
+static volatile int g_bg_hit;   // 接続中に後ろに回った（主の糸が次の命令の前に見る）
+static volatile int g_np_seen;  // MoltenVK が「Metal が仕事を断った（notPermitted）」と言った
+static volatile int g_guided;   // アクセスガイド中（アプリが知らせる。受け手の記録に出す）
+static int g_bgerr;             // この接続を後ろに回ったことで終えた：1 出さずに断っただけ・2 GPU の仕事を失ったかもしれない
+static int g_real_lost;         // この接続で、Vulkan が本当に device lost を返した
+static int g_bg_code;           // ドライバが VR_OPT_BG_ERR を頼んだ（このつなぎだけ）
+
+// アプリから呼ぶ：0 前にいる・1 切り替えの途中（inactive）・2 後ろ（background）。2 より大きい値は 2 と同じ
+void vkr_set_paused(int on) {
+    int v = on <= 0 ? 0 : on == 1 ? 1 : 2;
+    if (v == 2 && g_paused != 2 && g_clients) g_bg_hit = 1;
+    g_paused = v;
+}
+// アプリから呼ぶ：アクセスガイド中なら 1
+void vkr_set_guided(int on) { g_guided = on ? 1 : 0; }
+
+// MoltenVK の言い分に、Metal が後ろからの仕事を断った印があるか。MoltenVK は command buffer が失敗すると
+// 「MTLCommandBuffer "…" execution failed (code 7): Insufficient Permission (to submit GPU work from background) (…NotPermitted)」の形で言う
+// （7 は MTLCommandBufferErrorNotPermitted）。Metal の糸から呼ばれることがある
+static void np_note(const char *m) {
+    if (!m || g_np_seen) return;
+    if (strstr(m, "NotPermitted") || strstr(m, "execution failed (code 7)")) {
+        g_np_seen = 1;
+        vlog(JE("Metal が後ろに回ったアプリの仕事を断った（notPermitted）", "Metal refused work from the app in the background (notPermitted)"));
+    }
+}
+
+// 後ろに回ったので、この接続の GPU をやめる。real：出した仕事を失ったかもしれない（切れたあとに Vulkan を作り直す）
+static void bg_fail(int real, const char *why_ja, const char *why_en) {
+    if (g_err == VK_SUCCESS) {
+        g_err = VK_ERROR_DEVICE_LOST;
+        vlog(JE("iPhone のアプリが後ろに回ったので、この接続では GPU を使わない（%s・アクセスガイド %s）。PC には device lost を返す",
+                "The iPhone app went to the background, so the GPU is not used on this connection (%s, Guided Access %s). Returning device lost to the PC"),
+             JE(why_ja, why_en), g_guided ? JE("入", "on") : JE("切", "off"));
+    }
+    if (real) g_bgerr = 2;
+    else if (!g_bgerr) g_bgerr = 1;
+}
+
+// 主の糸が命令の前に呼ぶ。接続中に後ろに回った・Metal が仕事を断ったなら、この接続を終える
+static void bg_check(void) {
+    if (g_np_seen) {
+        g_np_seen = 0;
+        bg_fail(1, "Metal が仕事を断った", "Metal refused the work");
+    }
+    if (g_bg_hit) {
+        g_bg_hit = 0;
+        // 装置を作っていなければ（あいさつだけの接続など）、失う物は無い。出した仕事が残っていれば、捨てられたかもしれない
+        if (g_dev) bg_fail(g_nfl != 0, "後ろに回った", "went to the background");
+    }
+}
+
+// Vulkan の呼び出しが失敗を返した（本物の GPU から）。後ろにいる間の device lost は、後ろに回ったせいにする
+static void vk_err_note(VkResult r) {
+    if (r != VK_ERROR_DEVICE_LOST) return;
+    g_real_lost = 1;
+    if (g_paused) bg_fail(1, "後ろにいる間に GPU を失った", "lost the GPU while in the background");
+}
+
+// 試験用（PC の代役）：VKR_TEST_BG=n[:ms[:種類]] で、n 回目の VR_QUEUE_SUBMIT が届いたときに、アプリが
+// 後ろに回った（種類 2・既定）・切り替えの途中になった（1）・MoltenVK が notPermitted と言った（3）ことにする。
+// ms を付けると、その長さのあとで前に戻ったことにする（0 なら戻らない）。プロセスの中で 1 回だけ
+static int g_tbg_ms;
+#ifdef _WIN32
+static DWORD WINAPI tbg_thread(LPVOID a) {
+#else
+static void *tbg_thread(void *a) {
+#endif
+    (void) a;
+    sleep_ms(g_tbg_ms);
+    vlog(JE("試験用：アプリが前に戻ったことにする（VKR_TEST_BG）", "Test: the app is back in the foreground (VKR_TEST_BG)"));
+    vkr_set_paused(0);
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+static void test_bg_tick(void) {
+    static long long n = -1;
+    static int kind;
+    static long long seen;
+    if (n < 0) {
+        const char *e = getenv("VKR_TEST_BG");
+        n = e && *e ? atoll(e) : 0;
+        kind = 2;
+        const char *c = e ? strchr(e, ':') : NULL;
+        if (c) {
+            g_tbg_ms = atoi(c + 1);
+            c = strchr(c + 1, ':');
+            if (c) kind = atoi(c + 1);
+        }
+    }
+    if (n <= 0 || ++seen != n) return;
+    if (kind == 3) {
+        vlog(JE("試験用：MoltenVK が notPermitted と言ったことにする（VKR_TEST_BG・submit %lld 回目）", "Test: pretending MoltenVK reported notPermitted (VKR_TEST_BG, submit %lld)"), seen);
+        np_note("MTLCommandBuffer \"\" execution failed (code 7): Insufficient Permission (to submit GPU work from background) "
+                "(00000006:kIOGPUCommandBufferCallbackErrorBackgroundExecutionNotPermitted)");
+        return;
+    }
+    vlog(JE("試験用：アプリが%sことにする（VKR_TEST_BG・submit %lld 回目）", "Test: the app %s (VKR_TEST_BG, submit %lld)"),
+         kind == 1 ? JE("切り替えの途中になった", "became inactive") : JE("後ろに回った", "went to the background"), seen);
+    vkr_set_paused(kind == 1 ? 1 : 2);
+    if (g_tbg_ms > 0) {
+#ifdef _WIN32
+        HANDLE t = CreateThread(NULL, 0, tbg_thread, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+#else
+        pthread_t t;
+        if (pthread_create(&t, NULL, tbg_thread, NULL) == 0) pthread_detach(t);
+#endif
+    }
+}
+
+// GPU に仕事を出す前に呼ぶ（主の糸）。後ろに回っていたら g_err を立てる（呼ぶ側は g_err があれば出さない）。
+// 切り替えの途中は、前に戻るか後ろに回るまで待つ（iOS はまだ GPU を使わせる。Apple は、この間は新しい仕事を積まないよう勧めている）
+static void bg_gate(void) {
+    bg_check();
+    if (g_err != VK_SUCCESS || !g_paused) return;
+    if (g_paused == 1) {
+        vlog(JE("アプリが切り替えの途中なので、前に戻るまで GPU に仕事を出さずに待つ", "The app is inactive, so not submitting GPU work until it returns to the foreground"));
+        double t0 = t_ms();
+        while (g_paused == 1) sleep_ms(20);
+        g_st.paused_ms += t_ms() - t0;
+        if (!g_paused) vlog(JE("前に戻ったので続ける", "Back in the foreground, continuing"));
+        bg_check();
+        if (g_err != VK_SUCCESS || !g_paused) return;
+    }
+    bg_fail(g_nfl != 0, "後ろに回った", "went to the background");
+}
 // 窓に出すコマとして PC に返した数（JPEG・H.264）。アプリが 1 秒ごとに読んで、毎秒のコマ数を出す
 static volatile uint64_t g_frames_total;
 uint64_t vkr_frames_total(void) { return g_frames_total; }
@@ -1312,6 +1449,7 @@ static void drain_upto(int k) {
         if (r != VK_SUCCESS) {
             vlog(JE("出した仕事を待てない (%d)", "Cannot wait for the submitted work (%d)"), r);
             if (r < 0) g_err = r;
+            vk_err_note(r);
         }
     }
     int w = 0;
@@ -1917,11 +2055,14 @@ static void gw_flush(void) {
     vkEndCommandBuffer(x->cb);
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &x->cb };
     if (g_nfl == 256) drain();
+    bg_gate(); // 後ろに回っていたら出さない
+    int real = g_err == VK_SUCCESS;
     VkResult res = g_err ? g_err : vkQueueSubmit(x->q, 1, &si, x->f);
     g_gw.flushes++;
     if (res != VK_SUCCESS) {
         vlog(JE("書き込みを写す submit が失敗 (%d)", "The submit that copies writes failed (%d)"), res);
         if (res < 0) g_err = res;
+        if (real) vk_err_note(res);
         x->state = 0;
         return;
     }
@@ -2483,7 +2624,11 @@ static void cleanup(void) {
     vid_reset();
     for (size_t i = 0; i < g_ncbi; i++) { free(g_cbi[i].sets); idlist_free(&g_cbi[i].mems); }
     g_ncbi = 0;
-    if (g_err == VK_ERROR_DEVICE_LOST) g_lost = 1;
+    // 後ろに回ったので出さずに断っただけ（GPU は失っていない）なら、Vulkan を作り直さない（PC の代役もプロセスを終えない）
+    if (g_err == VK_ERROR_DEVICE_LOST && (g_bgerr != 1 || g_real_lost)) g_lost = 1;
+    if (g_bgerr) vlog(JE("後ろに回って終えた装置を片づけた。アプリを前に出せば、次の接続を受けられる", "Cleaned up the device ended by the background. Bring the app to the front to accept the next connection"));
+    g_bgerr = 0;
+    g_real_lost = 0;
     g_err = VK_SUCCESS;
     for (int i = 0; i < g_nfpool; i++) vkDestroyFence(g_fpool[i].d, g_fpool[i].f, NULL);
     g_nfpool = 0;
@@ -2562,6 +2707,8 @@ static int peer_gone(vr_sock s) {
 }
 
 static int reply(vr_sock s, int32_t result) {
+    // 後ろに回ってこの接続を終えたなら、頼んだドライバには理由の分かる値で返す
+    if (g_bgerr && g_bg_code && g_err < 0 && result == (int32_t) g_err) result = VR_RES_BACKGROUND;
     uint32_t h[2] = { (uint32_t) result, (uint32_t) g_out.n };
     int ok;
     if (g_rx_ext) {
@@ -5217,6 +5364,7 @@ static void vid_reset(void) {
 static int handle(vr_sock s, uint32_t op, vr_rd *r) {
     g_cur_op = op;
     g_ops_total++;
+    bg_check(); // 後ろに回った・Metal が仕事を断ったなら、ここから先の返事で伝える
     gw_before_op(op); // ためている書き込みの写しを、メモリを読む・待つかもしれない命令の前に出す
     // 調べ用：VKR_DRAIN=命令の番号,… なら、その命令の前は出した仕事を全部待つ
     static int drain_ops_ready;
@@ -6806,14 +6954,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             for (int i = 0; i < g_nfl; i++) g_fl[i].tl_over = 1;
             drain();
         }
-        // iPhone のアプリが前にいない間は GPU を使えない。出すと GPU を失うので、前に戻るまで待つ（PC は待たされるだけ）
-        if (g_paused) {
-            vlog(JE("アプリが前にいないので、前に戻るまで GPU に仕事を出さずに待つ", "The app is not in the foreground, so not submitting GPU work until it returns"));
-            double t0 = t_ms();
-            while (g_paused) sleep_ms(20);
-            g_st.paused_ms += t_ms() - t0;
-            vlog(JE("前に戻ったので続ける", "Back in the foreground, continuing"));
-        }
+        // iPhone のアプリが前にいない間は GPU を使えない（出しても iOS が捨てる）。切り替えの途中なら前に戻るまで待ち、
+        // 後ろに回っていれば出さずに、この接続を「GPU を失った」で終える（前は前に戻るまで待ち、PC のゲームが固まって見えた）
+        test_bg_tick();
+        bg_gate();
+        int real = g_err == VK_SUCCESS;
         double t0 = t_ms();
         VkResult res = g_err ? g_err : vkQueueSubmit(q, ns, si, f);
         g_st.submit_ms += t_ms() - t0;
@@ -6829,6 +6974,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 fflush(stdout);
                 res = w;
                 g_err = w;
+                vk_err_note(w);
             }
         }
         if (res == VK_SUCCESS) {
@@ -6873,6 +7019,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         } else {
             if (!g_err) vlog(JE("vkQueueSubmit 失敗 (%d)。この接続ではもう GPU を使えない", "vkQueueSubmit failed (%d). The GPU can no longer be used on this connection"), res);
             if (res < 0) g_err = res;
+            if (real) vk_err_note(res);
             if (own) fpool_put(f, qdev);
         }
         // 64 本を超える command buffer は走っているかを覚えきれないので、終わるまで待つ（同じ物を走っている間に出し直さないため）
@@ -6947,7 +7094,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (!push) watch_stop();
         g_rx_ext = ext;
         g_watch.on = push;
-        vlog(JE("返事の尾 %s・終わった submit の押し出し %s", "Reply tail %s, pushing finished submits %s"), ext ? JE("あり", "yes") : JE("なし", "no"), push ? JE("あり", "yes") : JE("なし", "no"));
+        g_bg_code = (f & VR_OPT_BG_ERR) && (g_caps & VR_CAP_BG_ERR);
+        vlog(JE("返事の尾 %s・終わった submit の押し出し %s・後ろに回ったことを返事で伝える %s", "Reply tail %s, pushing finished submits %s, reporting the background in replies %s"),
+             ext ? JE("あり", "yes") : JE("なし", "no"), push ? JE("あり", "yes") : JE("なし", "no"), g_bg_code ? JE("あり", "yes") : JE("なし", "no"));
         return 1;
     }
     case VR_GET_LINK: {
@@ -7787,6 +7936,13 @@ static void serve_client(vr_sock c) {
     g_reply_seq = 0;
     g_epoch = 0;
     g_watch.on = 0;
+    g_bg_code = 0;
+    // 前の接続のときに後ろに回った印は持ち越さない（いま後ろにいれば、submit の前に bg_gate が断る）
+    g_bg_hit = 0;
+    g_np_seen = 0;
+    if (g_paused) vlog(JE("アプリが前にいない（%s）。GPU の仕事は前に出てから", "The app is not in the foreground (%s). GPU work waits until it is in front"),
+                       g_paused == 1 ? JE("切り替えの途中", "inactive") : JE("後ろ", "background"));
+    if (g_guided) vlog(JE("アクセスガイド中", "Guided Access is on"));
     uint8_t *buf = NULL, *pk = NULL;
     size_t cap = 0, pcap = 0;
     for (;;) {
@@ -8414,9 +8570,27 @@ int vkr_serve(const char *host, int port) {
         else vlog(JE("USB の口の糸を作れない", "Cannot start the USB socket thread"));
     }
 #endif
+    int fails = 0;
     for (;;) {
         vr_sock c = accept(ls, NULL, NULL);
-        if (c == VR_BAD_SOCK) continue;
+        if (c == VR_BAD_SOCK) {
+            // iOS は、止めていたアプリの待ち受けの口を取り上げることがある（前に戻っても accept が失敗し続け、PC がつなげない）。
+            // 続けて失敗したら口を開け直す。アプリが開けた口（Android）は開け直せないので待つだけ。前は待たずに回り続けていた
+            fails++;
+            if (fails >= 20 && !given) {
+                char et[160];
+                sock_err_text(sock_errno(), et, sizeof et);
+                vlog(JE("待ち受けの口が使えない（%d 回続けて失敗・%s）。開け直す", "The listening socket stopped working (%d failures in a row, %s). Reopening it"), fails, et);
+                vr_close_sock(ls);
+                while ((ls = tcp_listen(host, port)) == VR_BAD_SOCK) sleep_ms(2000);
+                vlog(JE("Vulkan の受け手：%s:%d で待ち直した", "Vulkan receiver: listening again on %s:%d"), host, port);
+                fails = 0;
+            } else {
+                sleep_ms(50);
+            }
+            continue;
+        }
+        fails = 0;
 #ifdef SO_NOSIGPIPE
         // PC が先に切ったときに書き込むと SIGPIPE でアプリごと落ちるので、止める
         setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);

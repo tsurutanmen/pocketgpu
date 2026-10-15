@@ -526,6 +526,7 @@ static void print_stats(void) {
 static void print_stats_fwd(void) { print_stats(); }
 
 // ---- 受け手との通り道 ----
+static void banner(const wchar_t *t); // 窓の上の帯（下の「受け手が止まって返事が来ない間」）
 static SRWLOCK g_lock = SRWLOCK_INIT;
 static vr_sock g_sock = VR_BAD_SOCK;
 static int g_dead;
@@ -1052,7 +1053,6 @@ static void dr_kill_locked(void) {
 }
 
 // つながりが切れたことにする。最初の 1 回だけ書く（IPHONE_VK_LOG が無くても書く）
-static void banner(const wchar_t *t);
 static void conn_lost(const char *what) {
     if (!g_dead) {
         fprintf(stderr, "[iphone-vk] 受け手とのつながりが切れた（%s）。この先は全部失敗にする\n", what);
@@ -1062,9 +1062,45 @@ static void conn_lost(const char *what) {
 }
 
 // 受け手が止まって返事が来ない間（iPhone の受け手のアプリが後ろに回ったなど）、黙って固まらずに記録と窓に出す。
-// 受け手が戻れば、つながりは生きているので続きから動く。IPHONE_VK_GIVEUP=秒 を決めると、その長さで諦めて切れたことにする
+// 受け手が戻れば、つながりは生きているので続きから動く。IPHONE_VK_GIVEUP=秒 の長さで諦めて切れたことにする。
+// 既定は 180 秒（fg1015。前は決めなければ待ち続け、後ろに回って止められた iPhone のアプリを PC のゲームがいつまでも待った）。
+// 長めにしたのは、受け手が 1 つの命令に長くかかることがあるため（窓の無い計算のアプリの GPU の仕事・大きな pipeline を作る・
+// 代役の lavapipe の重い仕事・切り替えの途中で待っている間）。0 で前と同じく待ち続ける
 static HWND g_stall_hwnd; // 帯を出す窓（いちばん新しい swapchain の窓）
 static int g_stalled;
+static double giveup_sec(void) {
+    static double v = -1;
+    if (v < 0) { const char *e = getenv("IPHONE_VK_GIVEUP"); v = e && *e ? atof(e) : 180; if (v < 0) v = 0; }
+    return v;
+}
+static void giveup_say(double sec) {
+    fprintf(stderr, "[iphone-vk] 受け手の返事が %.0f 秒なかったので、切れたことにする（IPHONE_VK_GIVEUP で変える）\n", sec);
+    fprintf(stderr, "[iphone-vk] No reply from the receiver for %.0f s, treating the connection as lost (change with IPHONE_VK_GIVEUP)\n", sec);
+}
+
+// 受け手が「iPhone のアプリが後ろに回った」と返した（VR_RES_BACKGROUND）。最初の 1 回だけ書く（IPHONE_VK_LOG が無くても書く）
+static void bg_lost(void) {
+    if (!g_dead) {
+        fprintf(stderr, "[iphone-vk] iPhone のアプリが後ろに回りました。前に出してからゲームを起動し直してください\n");
+        fprintf(stderr, "[iphone-vk] The iPhone app went to the background. Bring it to the front, then restart the game.\n");
+        fprintf(stderr, "[iphone-vk] アクセスガイドでアプリを前に固定すると、後ろに回りにくくなります（設定 > アクセシビリティ > アクセスガイド）\n");
+        fprintf(stderr, "[iphone-vk] Guided Access keeps the app in front (Settings > Accessibility > Guided Access).\n");
+        // 帯の文は仮。画面の文章は CEO が書く
+        banner(L"iPhone のアプリが後ろに回りました。前に出してからゲームを起動し直してください");
+    }
+    g_dead = 1;
+}
+
+// 受け手が「GPU を使えなくなった」と返した（進み具合の問い合わせの答えなど）。この先は全部失敗にする。
+// 前は進み具合の答えの失敗を見ず、fence を本当の進み具合で待つアプリ（DXVK）は進まない番号を待ち続けた
+static void gpu_lost_reply(int32_t r) {
+    if (!g_dead) {
+        fprintf(stderr, "[iphone-vk] 受け手が GPU を使えなくなった (%d)。この先は全部失敗にする\n", r);
+        fprintf(stderr, "[iphone-vk] The receiver can no longer use the GPU (%d). Everything fails from now on\n", r);
+        banner(L"iPhone の GPU を使えなくなりました");
+    }
+    g_dead = 1;
+}
 
 #ifndef _WIN32
 // 窓の無い Linux 版は、帯を出す窓が無い（記録だけ）
@@ -1100,8 +1136,7 @@ static void stall_banner(double sec) {
 
 // 返事の頭（8 バイト）を、届くまで待って読む。尾と押し出しは下の recv_head が扱う
 static int recv_head_raw(uint32_t h[2], uint32_t op) {
-    static double giveup = -1;
-    if (giveup < 0) { const char *e = getenv("IPHONE_VK_GIVEUP"); giveup = e ? atof(e) : 0; }
+    double giveup = giveup_sec();
     // 窓の無い計算のアプリ（画像生成など）は GPU の 1 回の仕事が数秒かかることがあるので、GPU を待つ命令は 20 秒まで黙る
     int gpu_wait = op == VR_WAIT_FOR_FENCES || op == VR_WAIT_SEMAPHORES || op == VR_QUEUE_WAIT_IDLE || op == VR_DEVICE_WAIT_IDLE ||
                    op == VR_MEM_READ || op == VR_MEM_READ_DELTA || op == VR_GET_QUERY_POOL_RESULTS;
@@ -1118,6 +1153,7 @@ static int recv_head_raw(uint32_t h[2], uint32_t op) {
         }
         if (g_stalled) stall_banner(sec);
         if (giveup > 0 && sec >= giveup) {
+            giveup_say(sec);
             conn_lost("返事を待ちきれなかった");
             return 0;
         }
@@ -1216,6 +1252,24 @@ static int rx_incomplete(size_t av, size_t need) {
 }
 #endif
 
+// 最後に受け手から何か届いた時（待っている返事が無い所から待ち始めた時も）。返事を待ちながら回る所（stall_check_locked）が使う
+static double g_rx_last;
+static void rx_result_locked(uint32_t h[2]) {
+    g_rx_last = now_ms();
+    if (g_stalled) {
+        g_stalled = 0;
+        fprintf(stderr, "[iphone-vk] 受け手の返事が戻った\n");
+#ifdef _WIN32
+        if (g_stall_hwnd) InvalidateRect(g_stall_hwnd, NULL, FALSE);
+#endif
+    }
+    // 後ろに回った（新しい受け手が、頼んだつなぎだけ返す）：アプリには device lost を返す
+    if ((int32_t) h[0] == VR_RES_BACKGROUND) {
+        bg_lost();
+        h[0] = (uint32_t) VK_ERROR_DEVICE_LOST;
+    }
+}
+
 static int rx_head(uint32_t h[2], uint32_t op, int wait) {
     for (;;) {
         if (!wait) {
@@ -1238,7 +1292,7 @@ static int rx_head(uint32_t h[2], uint32_t op, int wait) {
         } else if (!recv_head_raw(h, op)) {
             return 0;
         }
-        if (!g_ext_on || g_rx_seq < g_rx_ext_from) { g_rx_seq++; return 1; }
+        if (!g_ext_on || g_rx_seq < g_rx_ext_from) { g_rx_seq++; rx_result_locked(h); return 1; }
         uint8_t x[VR_EXT_BYTES];
         if (!vr_recv_all(g_sock, x, sizeof x)) { conn_lost("返事の尾"); return 0; }
         uint64_t done;
@@ -1247,6 +1301,7 @@ static int rx_head(uint32_t h[2], uint32_t op, int wait) {
         memcpy(&seq, x + 8, 4);
         memcpy(&ep, x + 12, 4);
         g_stat.bytes_in += VR_EXT_BYTES;
+        g_rx_last = now_ms();
         if (seq == VR_PUSH_SEQ) {
             // 頭が [1, 0] なら「これ以降は知らせない」（受け手の見張りの一覧が満ちた・GPU を失った）。進み具合の問い合わせに戻る
             if (h[1] || h[0] > 1) { say("押し出しの知らせの形がおかしい（%u・%u）", h[0], h[1]); conn_lost("押し出しの形"); return 0; }
@@ -1264,6 +1319,7 @@ static int rx_head(uint32_t h[2], uint32_t op, int wait) {
         g_rx_seq++;
         g_stat.ext_in++;
         note_done(done, ep, 0);
+        rx_result_locked(h);
         return 1;
     }
 }
@@ -1271,7 +1327,31 @@ static int rx_head(uint32_t h[2], uint32_t op, int wait) {
 static int recv_head(uint32_t h[2], uint32_t op) { return rx_head(h, op, 1) == 1; }
 
 static void pend_push_locked(int kind) {
+    if (!g_pend_n) g_rx_last = now_ms(); // ここから待ち始める
     if (g_pend_n < sizeof g_pend) g_pend[(g_pend_head + g_pend_n++) % sizeof g_pend] = (unsigned char) kind;
+}
+
+// 返事を待ちながら回る所（窓の絵の返事・進み具合・押し出し）で呼ぶ。g_lock を持って呼ぶ。
+// 待っている返事があるのに受け手から何も届かない間は、recv_head_raw と同じく記録と帯に出し、IPHONE_VK_GIVEUP の長さで諦める。
+// 前は、ここで回る間は何も書かず、上限も無かった（iPhone のアプリが止められると、ゲームが黙って固まった）
+static void stall_check_locked(void) {
+    static double warned;
+    if (g_dead || !g_pend_n || !g_rx_last) return;
+    double sec = (now_ms() - g_rx_last) / 1000;
+    double quiet = g_stall_hwnd ? 3 : 20;
+    if (sec < quiet) { warned = 0; return; }
+    if (!warned || sec - warned >= 10) {
+        fprintf(stderr, "[iphone-vk] 受け手の返事が %.0f 秒ない。GPU の仕事が長いか、iPhone の受け手のアプリが後ろに回っている\n", sec);
+        warned = sec;
+        g_stalled = 1;
+    }
+    if (g_stalled) stall_banner(sec);
+    double giveup = giveup_sec();
+    if (giveup > 0 && sec >= giveup) {
+        giveup_say(sec);
+        conn_lost("返事を待ちきれなかった");
+        g_pend_n = 0; g_prog_out = 0; g_status_out = 0; dr_kill_locked();
+    }
 }
 
 // 列の先頭の返事を 1 つ読む。1＝読んだ・0＝切れた・2＝待たない（wait=0）で、まだ届いていない
@@ -1315,6 +1395,7 @@ static int pend_read_one_locked(int wait) {
     uint8_t tmp[64];
     if (h[1] > sizeof tmp || (h[1] && !vr_recv_all(g_sock, tmp, h[1]))) { conn_lost("進み具合の返事の途中"); return 0; }
     g_stat.bytes_in += 8 + h[1];
+    if ((int32_t) h[0] < 0) gpu_lost_reply((int32_t) h[0]); // 受け手はもう GPU を使えない。番号は進まないので待たない
     if ((int32_t) h[0] == VK_SUCCESS && h[1] >= 8) {
         uint64_t v;
         memcpy(&v, tmp, 8);
@@ -1415,6 +1496,7 @@ static VkResult rpc_take_deferred(vr_buf *out, uint64_t *tag) {
         for (;;) {
             AcquireSRWLockExclusive(&g_lock);
             if (!g_dr.ready && g_dr.n && flush_locked()) rx_pump_locked();
+            stall_check_locked();
             int done = g_dr.ready || !g_dr.n || g_dead;
             ReleaseSRWLockExclusive(&g_lock);
             if (done) break;
@@ -1492,6 +1574,17 @@ static void sock_rcvtimeo(vr_sock s, unsigned ms) {
 #else
     struct timeval to = { (time_t) (ms / 1000), (suseconds_t) (ms % 1000) * 1000 };
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &to, sizeof to);
+#endif
+}
+
+// 送りを待つ長さ（ミリ秒・0 は無限）
+static void sock_sndtimeo(vr_sock s, unsigned ms) {
+#ifdef _WIN32
+    DWORD to = ms;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *) &to, sizeof to);
+#else
+    struct timeval to = { (time_t) (ms / 1000), (suseconds_t) (ms % 1000) * 1000 };
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof to);
 #endif
 }
 
@@ -2597,12 +2690,14 @@ static int hello(void) {
                 // 返事に「終わった submit の番号」の尾を付けてもらい、受け手が名乗れば submit の終わりも知らせてもらう。
                 // 名乗らない古い受け手には送らない。IPHONE_VK_REPLY_EXT=0・IPHONE_VK_PUSH=0 で頼まない
                 {
-                    const char *ee = getenv("IPHONE_VK_REPLY_EXT"), *pe = getenv("IPHONE_VK_PUSH");
+                    const char *ee = getenv("IPHONE_VK_REPLY_EXT"), *pe = getenv("IPHONE_VK_PUSH"), *be = getenv("IPHONE_VK_BG_ERR");
                     uint32_t fl = 0;
                     if ((g_hw.caps & VR_CAP_REPLY_EXT) && !(ee && *ee == '0')) {
                         fl |= VR_OPT_REPLY_EXT;
                         if ((g_hw.caps & VR_CAP_PUSH_DONE) && !(pe && *pe == '0')) fl |= VR_OPT_PUSH_DONE;
                     }
+                    // iPhone のアプリが後ろに回ったら、理由の分かる値で返してもらう（IPHONE_VK_BG_ERR=0 で頼まない）
+                    if ((g_hw.caps & VR_CAP_BG_ERR) && !(be && *be == '0')) fl |= VR_OPT_BG_ERR;
                     if (fl) {
                         vr_buf ob = { 0 };
                         vr_u32(&ob, fl);
@@ -2612,16 +2707,19 @@ static int hello(void) {
                         if (flush_locked()) {
                             // いま答えを待っている返事（列の分）までは尾が無い。その次から付く
                             g_rx_ext_from = g_rx_seq + g_pend_n;
-                            g_ext_on = 1;
+                            g_ext_on = (fl & VR_OPT_REPLY_EXT) != 0;
                             g_push = (fl & VR_OPT_PUSH_DONE) != 0;
                         }
                         ReleaseSRWLockExclusive(&g_lock);
                         free(ob.p);
-                        say("返事に終わった submit の番号を付けてもらう%s", g_push ? "・終わったら知らせてもらう" : "");
+                        if (fl & VR_OPT_REPLY_EXT) say("返事に終わった submit の番号を付けてもらう%s", g_push ? "・終わったら知らせてもらう" : "");
+                        if (fl & VR_OPT_BG_ERR) say("iPhone のアプリが後ろに回ったら、返事で知らせてもらう");
                     }
                 }
                 // あいさつが済んだら、計算を待つ間は切らない
                 sock_rcvtimeo(g_sock, 0);
+                // 送りは IPHONE_VK_GIVEUP の長さ進まなければ諦める（受け手が止められて読まないと、送る糸がいつまでも止まる。0 で上限なし）
+                sock_sndtimeo(g_sock, (unsigned) (giveup_sec() * 1000));
             }
         } else {
             say("あいさつに返事がない (%d)", r);
@@ -4256,6 +4354,7 @@ static int progress_take(void) {
     double t0 = now_ms();
     int had = g_prog_out;
     rx_pump_locked(); // 届いている物を全部（進み具合の答え・窓の絵・押し出し）
+    stall_check_locked();
     int got = had && !g_prog_out;
     g_stat.wait_ms[VR_GET_PROGRESS] += now_ms() - t0;
     ReleaseSRWLockExclusive(&g_lock);
@@ -4299,10 +4398,16 @@ static void progress_poll(void) {
         return;
     }
     vr_buf b = { 0 }, out = { 0 };
-    if (rpc_call(VR_GET_PROGRESS, &b, &out) == VK_SUCCESS && out.n >= 8 && !g_ext_on) { // 尾があれば番号は尾で入っている
+    VkResult pr = rpc_call(VR_GET_PROGRESS, &b, &out);
+    if (pr == VK_SUCCESS && out.n >= 8 && !g_ext_on) { // 尾があれば番号は尾で入っている
         uint64_t v;
         memcpy(&v, out.p, 8);
         if (v > g_done_msg) g_done_msg = v;
+    }
+    if (pr < 0) {
+        AcquireSRWLockExclusive(&g_lock);
+        gpu_lost_reply(pr);
+        ReleaseSRWLockExclusive(&g_lock);
     }
     free(b.p);
     free(out.p);
@@ -4315,6 +4420,7 @@ static int push_wait(uint64_t msg, double ms) {
     for (;;) {
         AcquireSRWLockExclusive(&g_lock);
         rx_pump_locked();
+        stall_check_locked();
         int dead = g_dead;
         ReleaseSRWLockExclusive(&g_lock);
         double t = now_ms();
