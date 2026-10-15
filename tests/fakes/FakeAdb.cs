@@ -14,6 +14,14 @@
 //   fwds=口>先>pid;…   今の adb forward の一覧（先は tcp:番号 か localabstract:名前。pid は口を開けている偽の adb の PID）
 //   next=7001       次に使う pid
 //   lport=47300     キットの受け手（nohup ./pgpu_server 127.0.0.1 口）に渡された口。受け手が動いている間、ログに「Vulkan receiver: listening on 127.0.0.1:口」を出す
+// Send-Android-Log.cmd の試験用（| が改行の代わり。どれも無ければ、下の既定の答え）：
+//   android=14 sdk=34 maker=FakeMaker soc=FakeSoC   getprop の答え（ro.build.version.release・ro.build.version.sdk・ro.product.manufacturer・ro.soc.model と ro.board.platform）
+//   gpuname=Adreno (TM) 740   dumpsys SurfaceFlinger の「GLES:」の行の GPU の名前（その前後に、集めてはいけない飾りの行も出す）
+//   srvlog=行|行     adb shell cat /data/local/tmp/pgpu_server.log の最後に足す行
+//   nolog=1          受け手の記録のファイルが無い（cat が失敗する）
+//   crash=行|行      adb logcat -d -b crash の中身
+//   applog=行|行     adb logcat -d -s iphone-rpc-vk の中身
+//   adb version は「Installed as 場所」の行を出す（偽の adb.exe の置き場所）
 // 環境変数 FAKE_ADB_LOG に書くと、呼ばれた adb の引数を 1 行ずつそのファイルに足す。
 // adb forward のふり：口を開けて待つ「adb.exe __serve 口 状態ファイル」を別に起こす。つながると、先と状態に応じて答える：
 //   tcp:番号（GPU）             キットの受け手が動いていれば GPU のあいさつに答える。先が 50060 なら、アプリの受け手が 50060 で動いていれば答える
@@ -109,6 +117,13 @@ public static class FakeAdb
                 return 0;
             case "forward":
                 return Forward(a, s, st, serial);
+            case "version":
+                Line("Android Debug Bridge version 1.0.41");
+                Line("Version 35.0.2-fake");
+                Line("Installed as " + System.Reflection.Assembly.GetExecutingAssembly().Location);
+                return 0;
+            case "logcat":
+                return Logcat(a, s);
             case "shell":
                 return Shell(string.Join(" ", a.GetRange(1, a.Count - 1).ToArray()), s, st);
         }
@@ -119,6 +134,20 @@ public static class FakeAdb
     {
         if (cmd.StartsWith("getprop ro.product.cpu.abi")) { Line("arm64-v8a"); return 0; }
         if (cmd.StartsWith("getprop ro.product.model")) { Line("FakePhone"); return 0; }
+        if (cmd.StartsWith("getprop ro.product.manufacturer")) { Line(Or(Get(s, "maker"), "FakeMaker")); return 0; }
+        if (cmd.StartsWith("getprop ro.build.version.release")) { Line(Or(Get(s, "android"), "14")); return 0; }
+        if (cmd.StartsWith("getprop ro.build.version.sdk")) { Line(Or(Get(s, "sdk"), "34")); return 0; }
+        if (cmd.StartsWith("getprop ro.soc.model") || cmd.StartsWith("getprop ro.board.platform")) { Line(Or(Get(s, "soc"), "FakeSoC")); return 0; }
+        if (cmd.StartsWith("dumpsys SurfaceFlinger"))
+        {
+            // 本物は長い。GLES の行の前後に、集めてはいけない行（アプリの名前など）を置いて、その行だけが残ることを見る
+            Line("Build configuration: [sf]");
+            Line("Visible layers (count = 1)");
+            Line("  Layer name: com.example.privatebank/com.example.privatebank.MainActivity#0");
+            Line("GLES: FakeVendor, " + Or(Get(s, "gpuname"), "Adreno (TM) 740") + ", OpenGL ES 3.2 V@0615.0 (GIT@fake)");
+            Line("Extensions: GL_OES_fake");
+            return 0;
+        }
         if (cmd.StartsWith("pidof pgpu_server"))
         {
             var p = Get(s, "pids");
@@ -184,11 +213,30 @@ public static class FakeAdb
         }
         if (cmd.StartsWith("cat /data/local/tmp/pgpu_server.log"))
         {
+            if (Get(s, "nolog") == "1") { Console.Error.WriteLine("cat: /data/local/tmp/pgpu_server.log: No such file or directory"); return 1; }
             // 受け手が動いていて、口が分かれば、本物と同じ「待っています」の行を出す（start_android.cmd が待つ行）
             if (Get(s, "pids") != "" && Get(s, "lport") != "") Line("Vulkan receiver: listening on 127.0.0.1:" + Get(s, "lport"));
             else Line("fake receiver log");
+            Lines(Get(s, "srvlog"));
             return 0;
         }
+        return 0;
+    }
+
+    static string Or(string v, string d) { return v == "" ? d : v; }
+    // | で区切った行を、1 行ずつ出す
+    static void Lines(string packed)
+    {
+        if (packed == "") return;
+        foreach (var l in packed.Split('|')) Line(l);
+    }
+
+    // adb logcat -d -b crash と adb logcat -d -s iphone-rpc-vk。ほかの使い方は何も出さない
+    static int Logcat(List<string> a, Dictionary<string, string> s)
+    {
+        string j = " " + string.Join(" ", a.ToArray()) + " ";
+        if (j.Contains(" -b crash ")) { Line("--------- beginning of crash"); Lines(Get(s, "crash")); }
+        else if (j.Contains(" -s iphone-rpc-vk ")) { Line("--------- beginning of main"); Lines(Get(s, "applog")); }
         return 0;
     }
 

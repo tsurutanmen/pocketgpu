@@ -17,6 +17,7 @@ This repository has only the scripts that install, check and repair a PocketGPU 
 - `Update-PocketGPU.cmd`: downloads only the files that changed
 - `Run-on-iPhone-GPU.cmd`: starts a game or app on the phone GPU
 - Android scripts in `kit/android/`: `start_android.cmd` and `stop_android.cmd` for the GPU receiver, `android_app.cmd` for the PocketGPU app (camera, microphone, speaker and GPU)
+- `Send-Android-Log.cmd`: one double-click collects the receiver log, the crash log (PocketGPU only unless you answer y), the app log and the phone and kit info into one zip. It leaves out the PC user name, the PC name, the adb serial number and e-mail addresses, and it never reads the phone number, IMEI or accounts
 - Tests in `tests/`
 
 Not in here: the GPU driver (`iphone_icd.dll`), the iPhone and Android apps, the webcam and audio tools, and `PocketGPU.exe`.
@@ -155,6 +156,7 @@ PocketGPU は、スマホを Windows の PC の 2 枚目の GPU・ウェブカ�
 - `Fix-PocketGPU.cmd`：問題を探して、直せる物を直します。直す前に 1 つずつ `y/N` で聞きます。何も消しません。入れ替えた物は `fix-backup\` に残します
 - `Update-PocketGPU.cmd`：変わったファイルだけをダウンロードします
 - `Run-on-iPhone-GPU.cmd`：ゲームやアプリを iPhone の GPU で起動します
+- `Send-Android-Log.cmd`：ダブルクリック 1 回で、受け手の記録・Android の落ちた記録（既定は PocketGPU の分だけ。y と答えたときだけ全部）・アプリの記録・スマートフォンとキットの情報を、1 つの zip にまとめます。PC のユーザー名・PC 名・adb のシリアル番号・メールアドレスは伏せます。電話番号・IMEI・アカウントは読みません
 
 直らないときは、`pocketgpu-fix-summary.txt` の中身を Discord か Issue に貼ってください。合言葉・ユーザー名・PC の名前・フォルダの場所は入っていません。
 

@@ -12,8 +12,9 @@
 | `kit/report.cmd`・`kit/report.ps1` | 同じ場所 | PC の様子を 1 つのテキストにまとめる |
 | `kit/pocketgpu.cmd` | 同じ場所 | 起動の入口（Steam の起動オプション用） |
 | `kit/pocketgpu_android.cmd`・`kit/check_android.cmd` | 同じ場所 | Android 用の入口 |
+| `kit/Send-Android-Log.cmd` | 同じ場所 | Android の記録を 1 つの zip にまとめる入口。`android\_common.cmd` で adb とスマートフォンを見てから、`tools\android-log.ps1` を動かす。キットに `android\` が入るときだけ入る |
 | `kit/android/*.cmd` | `android\` | Android の受け手を入れる・止める。`android_app.cmd` は PocketGPU アプリ用（カメラ・マイク・スピーカー・GPU の口をつなぐ） |
-| `kit/tools/*.ps1` | `tools\` | 上の入口の中身（Windows PowerShell 5.1）。`pgpu_port.ps1` は Android の PC 側の口を選んで `android\port.txt` に覚える |
+| `kit/tools/*.ps1` | `tools\` | 上の入口の中身（Windows PowerShell 5.1）。`pgpu_port.ps1` は Android の PC 側の口を選んで `android\port.txt` に覚える。`android-log.ps1` は `Send-Android-Log.cmd` の中身 |
 | `kit/tools/setup.ps1`・`kit/tools/setup-admin.ps1` | `tools\` | `Setup-PocketGPU.cmd` の中身。`setup-admin.ps1` は管理者権限が要る物（winget の iTunes・Vulkan Runtime・Visual C++・Apple のサービスの開始）を、UAC 1 回でまとめて受け取る小さな部分で、`setup.ps1` からだけ起動する。受け取るのは決まった名前だけ |
 | `kit/tools/fix-data/*.cmd` | `tools\fix-data\` | Fix-PocketGPU.cmd が、古い入口と入れ替える新しい物 |
 

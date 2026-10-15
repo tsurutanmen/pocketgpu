@@ -1659,7 +1659,285 @@ function Scn-SetupLang([string]$mode) {
 }
 
 # =====================================================================
+# Send-Android-Log.cmd（tools\android-log.ps1）：Android の記録を 1 つの zip にまとめる
+#   偽の adb だけを使う（本物の端末・adb・エミュレーターは使わない）。エクスプローラーは開かず、開くはずだった場所を記録する
+#   fix：本物の動き。sabotage：効かせたい部分（zip を作る・伏せる・落ちた記録を絞る）だけを何もしない物に差し替えた android-log.ps1。
+#   効果の検査は zip の中身を読むので、差し替えると偽になる。「安全」の検査（打つ adb の命令・秘密を集めない）は、差し替えても真のまま
+# =====================================================================
+# 打ってよい adb の命令の一覧（これ以外を打ったら安全の検査が偽になる）。getprop の全部・dumpsys の全部・bugreport などは入れない
+$script:LogAdbAllowed = @(
+    '^(start-server|devices|get-state|version|forward --list)$',
+    '^shell getprop ro\.(product\.model|product\.manufacturer|build\.version\.release|build\.version\.sdk|product\.cpu\.abi|soc\.model|board\.platform)$',
+    '^shell dumpsys (SurfaceFlinger|package com\.tsurutanmen\.pocketgpu)$',
+    '^shell pidof pgpu_server$',
+    '^shell cat /data/local/tmp/pgpu_server\.log$',
+    '^logcat -d -b crash$',
+    '^logcat -d -s iphone-rpc-vk$'
+)
+function Test-LogAdbCalls([string]$calls) {
+    $lines = @($calls -split "`r?`n" | Where-Object { $_ })
+    if ($lines.Count -eq 0) { return $false }
+    foreach ($l in $lines) {
+        $ok = $false
+        foreach ($re in $script:LogAdbAllowed) { if ($l -match $re) { $ok = $true; break } }
+        if (-not $ok) { return $false }
+    }
+    return $true
+}
+# 効かせたい部分だけを何もしない物に差し替える。差し替えの関数は、本物の定義の後ろ（Main の印の前）に置いて、あとの定義が勝つようにする
+function Make-SabotagedLogTool([string]$kit, [string]$overrides) {
+    $p = Join-Path $kit 'tools\android-log.ps1'
+    $t = [IO.File]::ReadAllText($p, [Text.Encoding]::UTF8)
+    $marker = '# ---- 流れ / Main ----'
+    if (-not $t.Contains($marker)) { throw 'marker not found' }
+    $t = $t.Replace($marker, $overrides + "`r`n" + $marker)
+    [IO.File]::WriteAllText($p, $t, (New-Object Text.UTF8Encoding($true)))
+}
+# Send-Android-Log.cmd を動かす。出力のフォルダは毎回空にする。$r.Zip：できた zip（無ければ $null）、$r.Dir：出力のフォルダ
+function Invoke-LogCmd($k, [hashtable]$envs = @{}, [string]$answers = 'n') {
+    $root = Split-Path -Parent $k.Kit
+    $out = Join-Path $root 'logout'
+    if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Recurse -Force }
+    [void](New-Item -ItemType Directory -Path $out -Force)
+    $calls = Join-Path $root 'adb-calls.txt'
+    if (Test-Path -LiteralPath $calls) { Remove-Item -LiteralPath $calls -Force }
+    $launch = Join-Path $root 'launch.log'
+    if (Test-Path -LiteralPath $launch) { Remove-Item -LiteralPath $launch -Force }
+    $e = @{ PGPU_NOPROMPT = '1'; PGPU_ANSWERS = $answers; PGPU_LOG_OUT = $out; PGPU_TEST_LAUNCH_LOG = $launch }
+    foreach ($key in $envs.Keys) { $e[$key] = $envs[$key] }
+    $r = Invoke-KitCmd $k 'Send-Android-Log.cmd' '' $e
+    $r.Dir = $out
+    $r.Zip = @(Get-ChildItem -LiteralPath $out -Filter '*.zip' -File -ErrorAction SilentlyContinue | Select-Object -First 1)[0]
+    $r.Launch = $(if (Test-Path -LiteralPath $launch) { [IO.File]::ReadAllText($launch) } else { '' })
+    return $r
+}
+# zip の中のファイルを、名前（フォルダなし）→ 中身の表にする。zip が無ければ $null
+function Get-LogZipMap($zip) {
+    if (-not $zip) { return $null }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $m = @{}
+    $z = [IO.Compression.ZipFile]::OpenRead($zip.FullName)
+    try {
+        foreach ($en in $z.Entries) {
+            $sr = New-Object IO.StreamReader($en.Open(), (New-Object Text.UTF8Encoding($false)))
+            try { $m[$en.Name] = $sr.ReadToEnd() } finally { $sr.Dispose() }
+        }
+        $m['*dirs'] = (@($z.Entries | ForEach-Object { ($_.FullName -replace '[\\/][^\\/]*$', '') } | Select-Object -Unique) -join ';')
+    } finally { $z.Dispose() }
+    return $m
+}
+# zip の中身を全部つなげた 1 つの文字列。zip が無ければ $null（「含まない」の検査が、zip が無いだけで真にならないように）
+function Join-LogZip($map) {
+    if ($null -eq $map) { return $null }
+    return (($map.Keys | Sort-Object | ForEach-Object { [string]$map[$_] }) -join "`n")
+}
+$script:LogIdle = @{ serial = 'SERIAL0123TEST'; dstate = 'device'; pids = ''; hash = ''; file = '0'; next = '7001' }
+# 落ちた記録のひな形（logcat の threadtime の形）。| が改行の代わり
+$script:LogCrashMine = '10-15 12:00:01.000  5678  5678 F libc    : Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0 in tid 5678 (pgpu_server), pid 5678 (pgpu_server)|' +
+    '10-15 12:00:01.500  1010  1010 F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***|' +
+    '10-15 12:00:01.500  1010  1010 F DEBUG   : Build fingerprint: ''FakeMaker/FakePhone/fake:14/TEST/1:user/release-keys''|' +
+    '10-15 12:00:01.500  1010  1010 F DEBUG   : pid: 5678, tid: 5678, name: pgpu_server  >>> ./pgpu_server <<<|' +
+    '10-15 12:00:01.500  1010  1010 F DEBUG   :       #00 pc 000000000012abcd  /data/local/tmp/pgpu_server (vkr_decode+123)'
+$script:LogCrashJava = '10-15 12:05:00.000  2000  2000 E AndroidRuntime: FATAL EXCEPTION: main|' +
+    '10-15 12:05:00.000  2000  2000 E AndroidRuntime: Process: com.example.privatebank, PID: 2000|' +
+    '10-15 12:05:00.000  2000  2000 E AndroidRuntime: java.lang.NullPointerException: secret-account-note'
+$script:LogCrashOther = '10-15 12:09:00.000  1020  1020 F DEBUG   : *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***|' +
+    '10-15 12:09:00.000  1020  1020 F DEBUG   : pid: 9999, tid: 9999, name: com.example.otherapp  >>> com.example.otherapp <<<|' +
+    '10-15 12:09:00.000  1020  1020 F DEBUG   :       #00 pc 00000000000dead0  /system/lib64/libotherapp.so'
+
+# 繋がっている：機種・版・GPU・アプリの版・キットの版・PC 側の口・adb forward が info.txt に入り、4 つのファイルが 1 つのフォルダに入った zip ができる。
+# 打つ adb の命令は決まった物だけ。ほかのアプリの名前（飾りの行）・update.ini の合言葉は入らない。エクスプローラーで開くのは y と答えたときだけ
+function Scn-LogOk([string]$mode) {
+    if ($mode -eq 'decline') { return }
+    $s = $script:LogIdle.Clone(); $s.pids = '1111'; $s.hash = '@local'; $s.file = '1'; $s.app = '0.1.4'; $s.apprecv = '1'
+    $s.srvlog = 'Receiver GPU: FakeGPU X1|Phone memory: total 12000 MB'; $s.gpuname = 'Adreno (TM) 740'
+    $s.applog = '10-15 12:00:00.000  3000  3000 I iphone-rpc-vk: app receiver started|10-15 12:00:01.000  3000  3000 I iphone-rpc-vk: Receiver GPU: FakeGPU X1'
+    $k = New-AndroidKit 'logok' $s $true
+    [IO.File]::WriteAllText((Join-Path $k.Kit 'android\port.txt'), "gpu=$($k.Port)`r`n", [Text.Encoding]::ASCII)
+    $token = 'SECRETTOKENabcdefghij0123456789'  # pgpu-allow-secret: 試験用の偽の値
+    [IO.File]::WriteAllText((Join-Path $k.Kit 'tools\update.ini'), "url=http://127.0.0.1:1`r`ntoken=$token`r`n", [Text.Encoding]::ASCII)
+    if ($mode -eq 'sabotage') { Make-SabotagedLogTool $k.Kit 'function New-LogZip([string]$dir, [string]$zip) { }' }
+    $r = Invoke-LogCmd $k @{} 'y'
+    $z = Get-LogZipMap $r.Zip
+    $info = $(if ($z) { [string]$z['info.txt'] } else { $null })
+    $all = Join-LogZip $z
+    Check 'Send-Android-Log.cmd：つながっていれば、終わりのコード 0 で pocketgpu-android-log-日時.zip ができる' (($r.Exit -eq 0) -and ($null -ne $r.Zip) -and ($r.Zip.Name -match '^pocketgpu-android-log-\d{8}-\d{6}\.zip$'))
+    Check 'zip：1 つのフォルダ pocketgpu-android-log-日時 の中に info.txt・receiver-log.txt・logcat-crash.txt・logcat-app.txt の 4 つ' (($null -ne $z) -and ($z.Keys.Count -eq 5) -and ($z['*dirs'] -match '^pocketgpu-android-log-\d{8}-\d{6}$') -and $z.ContainsKey('info.txt') -and $z.ContainsKey('receiver-log.txt') -and $z.ContainsKey('logcat-crash.txt') -and $z.ContainsKey('logcat-app.txt'))
+    Check 'info.txt：機種・メーカー・Android の版と SDK・チップ・アプリの版・受け手が動いていること' (($null -ne $info) -and ($info -match 'Model: FakePhone') -and ($info -match 'Maker: FakeMaker') -and ($info -match 'Android: 14 \(SDK 34\)') -and ($info -match 'Chip: FakeSoC') -and ($info -match 'PocketGPU app: 0\.1\.4') -and ($info -match 'Kit receiver running: yes'))
+    Check 'info.txt：GPU の名前は受け手の記録の行と、dumpsys SurfaceFlinger の GLES: の行から' (($null -ne $info) -and ($info -match 'GPU \(receiver log\): FakeGPU X1') -and ($info -match 'GPU \(GLES\): FakeVendor, Adreno \(TM\) 740') -and ($info -match 'OpenGL ES 3\.2 V@0615\.0 \(GIT@fake\)'))
+    Check 'info.txt：キットの版（tools\kit.ini）・Windows の版・PC 側の口（android\port.txt と PGPU_PORT）・adb forward の一覧' (($null -ne $info) -and ($info -match 'tools\\kit\.ini: proto=3') -and ($info -match 'tools\\kit\.ini: app=0\.7\.58') -and ($info -match '(?m)^Windows: \S') -and ($info -match ('android\\port\.txt: gpu=' + $k.Port)) -and ($info -match ('Port in use \(PGPU_PORT\): ' + $k.Port)) -and ($info -match ('adb forward --list: .*tcp:' + $k.Port + ' tcp:' + $k.Port)))
+    Check 'receiver-log.txt とアプリの記録 logcat-app.txt：スマートフォンの記録がそのまま入る' (($null -ne $z) -and ([string]$z['receiver-log.txt'] -match 'fake receiver log') -and ([string]$z['receiver-log.txt'] -match 'Receiver GPU: FakeGPU X1') -and ([string]$z['logcat-app.txt'] -match 'iphone-rpc-vk: app receiver started'))
+    Check 'ほかのアプリの名前（dumpsys SurfaceFlinger の飾りの行）は info.txt に入らない。GLES: の 1 行だけが残る' (($null -ne $info) -and ($info -notmatch 'privatebank') -and ($info -notmatch 'Layer name') -and ($info -notmatch 'Visible layers'))
+    Check '画面に zip の場所が出て、日本語でなく英語の見出し（PGPU_LANG=en）が出る' (($null -ne $r.Zip) -and $r.Out.Contains($r.Zip.FullName) -and ($r.Out -match '\[1/3\] Check the phone') -and ($r.Out -match '\[3/3\] Make the zip') -and ($r.Out -match 'Send this zip on Discord'))
+    Check 'エクスプローラーで開くかを聞き、y と答えたときだけ、zip の場所を開く（試験では記録だけ）' (($null -ne $r.Zip) -and ($r.Launch -match ('(?m)^folder ' + [regex]::Escape($r.Zip.FullName) + '\s*$')))
+    Check '打つ adb の命令は決まった物だけ（getprop の全部・dumpsys の全部・bugreport などは打たない）' (Test-LogAdbCalls $r.Calls) 'safety'
+    $files = @(Get-ChildItem -LiteralPath $r.Dir -Recurse -File | Where-Object { $_.Extension -eq '.txt' })
+    $raw = ($files | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join "`n"
+    Check '集めた物に、tools\update.ini の合言葉は入らない（フォルダの 4 つのファイルを読んで確かめる）' (($files.Count -eq 4) -and ($raw -notmatch 'SECRETTOKEN') -and ($raw -notmatch 'token=') -and ($raw -notmatch 'PGKIT-MARK')) 'safety'
+    # y/N の n：開かない
+    $r2 = Invoke-LogCmd $k @{} 'n'
+    Check 'エクスプローラーで開くかに n と答えたら、開かない（zip は作る）' (($r2.Exit -eq 0) -and ($null -ne $r2.Zip) -and ($r2.Launch -notmatch 'folder '))
+    Stop-Spawned
+    # アプリが入っていない・受け手の記録のファイルが無い・行末が CR CR LF の古い adb
+    $s2 = $script:LogIdle.Clone(); $s2.nolog = '1'; $s2.crlf = '1'
+    $k2 = New-AndroidKit 'logok-min' $s2 $false
+    if ($mode -eq 'sabotage') { Make-SabotagedLogTool $k2.Kit 'function New-LogZip([string]$dir, [string]$zip) { }' }
+    $r3 = Invoke-LogCmd $k2 @{} 'n'
+    $z3 = Get-LogZipMap $r3.Zip
+    $i3 = $(if ($z3) { [string]$z3['info.txt'] } else { $null })
+    Check 'アプリが入っていない・受け手の記録のファイルが無いとき：logcat-app.txt は作らず、receiver-log.txt に「no file」と書く。info.txt に not installed' (($r3.Exit -eq 0) -and ($null -ne $z3) -and (-not $z3.ContainsKey('logcat-app.txt')) -and ([string]$z3['receiver-log.txt'] -match 'no file on the phone') -and ($i3 -match 'PocketGPU app: not installed') -and ($i3 -match 'Kit receiver running: no'))
+    Check '行末が CR CR LF の古い adb でも、info.txt の行末は CR LF だけ（CR が重ならない）' (($null -ne $i3) -and ($i3 -match 'Model: FakePhone\r\n') -and ($i3 -notmatch "\r\r"))
+}
+
+# 日本語の画面（utf8-run.ps1 を通して、画面そのものを読む）
+function Scn-LogLang([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $s = $script:LogIdle.Clone(); $s.app = '0.1.4'; $s.apprecv = '1'; $s.crash = ($script:LogCrashMine + '|' + $script:LogCrashJava)
+    $k = New-AndroidKit 'loglang' $s $false
+    $out = Join-Path (Split-Path -Parent $k.Kit) 'logout'
+    [void](New-Item -ItemType Directory -Path $out -Force)
+    $scr = Join-Path $k.Kit 'tools\android-log.ps1'
+    $e = @{ ADB = $k.Adb; FAKE_ADB_STATE = $k.State; ANDROID_SERIAL = 'SERIAL0123TEST'; PGPU_LANG = 'ja'; PGPU_LOG_OUT = $out }
+    $script:RawOut = $true
+    try { $r = Invoke-Fix $k.Kit @('"' + $scr + '"') $e 'n,n' (Join-Path $PSScriptRoot 'fakes\utf8-run.ps1') } finally { $script:RawOut = $false }
+    $bytes = [Text.Encoding]::GetEncoding(28591).GetBytes([string]$r.Out)
+    try { $r.Out = (New-Object Text.UTF8Encoding($false, $true)).GetString($bytes) } catch { }
+    Check '日本語の画面：見出し・[1/3]〜[3/3]・落ちた記録の y/N・エクスプローラーの y/N が出る' (($r.Exit -eq 0) -and ($r.Out -match 'PocketGPU Android の記録をまとめます') -and ($r.Out -match '\[1/3\] スマートフォンをチェック') -and ($r.Out -match '\[2/3\] 記録を集める') -and ($r.Out -match '\[3/3\] zip を作る') -and ($r.Out -match '落ちた記録を全部送りますか') -and ($r.Out -match 'エクスプローラーでこの場所を開きますか') -and ($r.Out -match 'この zip を Discord に送ってください')) 'safety'
+}
+
+# adb が無い・スマートフォンが無い・許可がまだ -> 短い英語の案内を出して止まる。何も集めず、zip も作らず、スマートフォンの記録も読まない
+function Scn-LogStop([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    # 1) ADB に指定した adb.exe が無い
+    $k = New-AndroidKit 'logstop-adb' $script:LogIdle $false
+    $missing = Join-Path (Split-Path -Parent $k.Kit) 'nothere\adb.exe'
+    $r = Invoke-LogCmd $k @{ ADB = $missing }
+    Check 'adb が無いとき（ADB に指定した adb.exe が無い）：英語の案内を出して、終わりのコード 1・zip を作らない・adb を 1 回も打たない' (($r.Exit -eq 1) -and ($r.Out -match 'ERROR: ADB is set to') -and ($r.Out -match 'Nothing was collected') -and ($null -eq $r.Zip) -and (-not $r.Calls)) 'safety'
+    # 2) adb がどこにも見つからない（PATH と、探す場所を空にする。C:\platform-tools・C:\adb に本物があれば、この検査は飛ばす）
+    $realHere = (Test-Path 'C:\platform-tools\adb.exe') -or (Test-Path 'C:\adb\adb.exe')
+    if (-not $realHere) {
+        $empty = Join-Path (Split-Path -Parent $k.Kit) 'emptyhome'
+        [void](New-Item -ItemType Directory -Path $empty -Force)
+        $r = Invoke-LogCmd $k @{ ADB = $null; PATH = ($env:WINDIR + '\System32;' + $env:WINDIR); LOCALAPPDATA = $empty; USERPROFILE = $empty; OneDrive = $empty; ProgramFiles = $empty }
+        Check 'adb がどこにも無いとき：「adb.exe was not found」と入れ方を出して、終わりのコード 1・zip を作らない' (($r.Exit -eq 1) -and ($r.Out -match 'ERROR: adb\.exe was not found') -and ($r.Out -match 'Nothing was collected') -and ($null -eq $r.Zip) -and (-not $r.Calls)) 'safety'
+    }
+    # 3) スマートフォンが無い
+    $s = $script:LogIdle.Clone(); $s.serial = ''
+    $k = New-AndroidKit 'logstop-nophone' $s $false
+    $r = Invoke-LogCmd $k
+    Check 'スマートフォンが無いとき：「no Android phone found」と USB デバッグの案内・終わりのコード 1・zip を作らない・スマートフォンの記録を読まない' (($r.Exit -eq 1) -and ($r.Out -match 'ERROR: no Android phone found') -and ($r.Out -match 'USB debugging') -and ($r.Out -match 'Nothing was collected') -and ($null -eq $r.Zip) -and ($r.Calls -notmatch 'shell|logcat')) 'safety'
+    # 4) USB デバッグの許可がまだ
+    $s = $script:LogIdle.Clone(); $s.dstate = 'unauthorized'
+    $k = New-AndroidKit 'logstop-unauth' $s $false
+    $r = Invoke-LogCmd $k
+    Check '許可がまだのとき：「not allowed yet」と Allow の案内・終わりのコード 1・zip を作らない・スマートフォンの記録を読まない' (($r.Exit -eq 1) -and ($r.Out -match 'ERROR: the phone is connected but not allowed yet') -and ($r.Out -match 'Allow') -and ($r.Out -match 'Nothing was collected') -and ($null -eq $r.Zip) -and ($r.Calls -notmatch 'shell|logcat')) 'safety'
+    # 5) キットの tools\android-log.ps1 が無い（zip の中で開いた形）
+    $k = New-AndroidKit 'logstop-noext' $script:LogIdle $false
+    Remove-Item -LiteralPath (Join-Path $k.Kit 'tools\android-log.ps1') -Force
+    $r = Invoke-LogCmd $k
+    Check 'tools\android-log.ps1 が無い（zip の中で開いた）とき：「Extract All」の案内・終わりのコード 1' (($r.Exit -eq 1) -and ($r.Out -match 'Extract All') -and ($null -eq $r.Zip)) 'safety'
+}
+
+# 伏せる：PC のユーザー名・PC 名・プロフィールのフォルダ名・adb のシリアル番号・メールアドレスが、全部のファイルで (hidden)・(serial)・(email) になる
+function Scn-LogHide([string]$mode) {
+    if ($mode -eq 'decline') { return }
+    $bs = [string][char]92
+    $fakeUser = 'pgpuUser77x'
+    $fakePc = 'PGPUPC77X'
+    $mail = 'someone' + '@' + 'example.org'
+    $s = $script:LogIdle.Clone(); $s.app = '0.1.4'; $s.apprecv = '1'
+    $s.srvlog = ('Kit at C:' + $bs + 'Users' + $bs + $fakeUser + $bs + 'Downloads|host ' + $fakePc + ' user ' + $fakeUser + '|serial SERIAL0123TEST|contact ' + $mail + '|tail ok|gl V@0615.0 (GIT@abc1234)')
+    $s.crash = ('10-15 12:00:01.000  5678  5678 F DEBUG   : name: pgpu_server  >>> ./pgpu_server <<< cwd C:' + $bs + 'Users' + $bs + $fakeUser + $bs + 'x ' + $fakePc)
+    $s.applog = ('10-15 12:00:00.000  3000  3000 I iphone-rpc-vk: SERIAL0123TEST ' + $fakeUser)
+    $k = New-AndroidKit 'loghide' $s $true
+    if ($mode -eq 'sabotage') { Make-SabotagedLogTool $k.Kit 'function Hide-Private([string]$text) { return $text }' }
+    $r = Invoke-LogCmd $k @{ USERNAME = $fakeUser; COMPUTERNAME = $fakePc } 'n'
+    $z = Get-LogZipMap $r.Zip
+    $all = Join-LogZip $z
+    Check '伏せる：PC のユーザー名・PC 名・adb のシリアル番号・メールアドレスが、受け手の記録・落ちた記録・アプリの記録・info.txt のどこにも残らない' (($r.Exit -eq 0) -and ($null -ne $all) -and ($all -notmatch [regex]::Escape($fakeUser)) -and ($all -notmatch [regex]::Escape($fakePc)) -and ($all -notmatch 'SERIAL0123TEST') -and ($all -notmatch 'someone@'))
+    Check '伏せた場所には (hidden)・(serial)・(email) が入る（Users の次の名前も、PC 名も、シリアル番号も）。ほかの行はそのまま' (($null -ne $all) -and ($all -match ('Users' + [regex]::Escape($bs) + '\(hidden\)' + [regex]::Escape($bs) + 'Downloads')) -and ($all -match 'host \(hidden\) user \(hidden\)') -and ($all -match 'serial \(serial\)') -and ($all -match 'contact \(email\)') -and ($all -match 'tail ok'))
+    Check 'GPU の版の書き方（V@0615.0・GIT@abc1234）は、メールアドレスではないので壊さない' (($null -ne $all) -and ($all -match 'gl V@0615\.0 \(GIT@abc1234\)')) 'safety'
+    Check 'adb forward の一覧のシリアル番号も (serial) になる。キットの場所（info.txt の Folder:）に PC のユーザー名が残らない' (($null -ne $z) -and ([string]$z['info.txt'] -match 'adb forward --list: \(serial\) tcp:') -and ([string]$z['info.txt'] -match '(?m)^Folder: ') -and (([string]$z['info.txt'] -split "`r?`n" | Where-Object { $_ -like 'Folder: *' }) -notmatch [regex]::Escape($env:USERNAME)))
+    Stop-Spawned
+    # 本物のユーザー名・PC 名（環境変数のまま）。キットの場所は、この PC のユーザーのフォルダの下にある
+    $s2 = $script:LogIdle.Clone(); $s2.app = '0.1.4'; $s2.apprecv = '1'
+    $s2.srvlog = ('Kit at C:' + $bs + 'Users' + $bs + $env:USERNAME + $bs + 'Downloads|host ' + $env:COMPUTERNAME)
+    $k2 = New-AndroidKit 'loghide-real' $s2 $false
+    if (($env:USERNAME.Length -lt 3) -or ($env:COMPUTERNAME.Length -lt 3)) { return }
+    if ($mode -eq 'sabotage') { Make-SabotagedLogTool $k2.Kit 'function Hide-Private([string]$text) { return $text }' }
+    $r2 = Invoke-LogCmd $k2 @{} 'n'
+    $all2 = Join-LogZip (Get-LogZipMap $r2.Zip)
+    $leak = @()
+    if ($null -ne $all2) {
+        if ($env:USERNAME -and $env:USERNAME.Length -ge 3 -and $all2 -match [regex]::Escape($env:USERNAME)) { $leak += 'username' }
+        if ($env:COMPUTERNAME -and $env:COMPUTERNAME.Length -ge 3 -and $all2 -match [regex]::Escape($env:COMPUTERNAME)) { $leak += 'pcname' }
+    }
+    Check ('この PC の本物のユーザー名・PC 名（キットの場所を含む）が、集めた物に残らない ' + ($leak -join ',')) (($null -ne $all2) -and ($leak.Count -eq 0))
+    Stop-Spawned
+    # 短いユーザー名（2 字）：Users\ の次の場所だけ直す。ふつうの文字は壊さない
+    $s3 = $script:LogIdle.Clone(); $s3.app = '0.1.4'; $s3.apprecv = '1'
+    $s3.srvlog = ('path C:' + $bs + 'Users' + $bs + 'zq' + $bs + 'x|word zq and bazqux')
+    $k3 = New-AndroidKit 'loghide-short' $s3 $false
+    if ($mode -eq 'sabotage') { Make-SabotagedLogTool $k3.Kit 'function Hide-Private([string]$text) { return $text }' }
+    $r3 = Invoke-LogCmd $k3 @{ USERNAME = 'zq' } 'n'
+    $a3 = [string](Get-LogZipMap $r3.Zip)['receiver-log.txt']
+    Check '2 字のユーザー名は、Users\ の次の場所だけ (hidden) にする' (($a3 -match ('Users' + [regex]::Escape($bs) + '\(hidden\)' + [regex]::Escape($bs) + 'x')) -and ($a3 -notmatch ('Users' + [regex]::Escape($bs) + 'zq')))
+    Check '2 字のユーザー名でも、ふつうの語（zq・bazqux）は壊さない' (($a3 -match 'word zq and bazqux')) 'safety'
+}
+
+# 落ちた記録：既定は PocketGPU の受け手（pgpu_server・libpgpu_server.so）の行だけ。ほかのアプリの落ちた記録があるときだけ、全部を送るか聞く
+function Scn-LogCrash([string]$mode) {
+    if ($mode -eq 'decline') { return }
+    $both = $script:LogCrashMine + '|' + $script:LogCrashJava + '|' + $script:LogCrashOther
+    # A) PocketGPU とほかのアプリが混ざっている：聞く。n（既定）なら PocketGPU の受け手の分だけ
+    $s = $script:LogIdle.Clone(); $s.crash = $both
+    $k = New-AndroidKit 'logcrash-a' $s $false
+    if ($mode -eq 'sabotage') { Make-SabotagedLogTool $k.Kit 'function Select-PgpuCrash([string[]]$blocks) { return @($blocks) }' }
+    $r = Invoke-LogCmd $k @{} 'n,n'
+    $c = [string](Get-LogZipMap $r.Zip)['logcat-crash.txt']
+    Check '落ちた記録にほかのアプリがあるとき：「Send the full crash log」と y/N で聞く（PocketGPU 2 件・ほかのアプリ 2 件と画面に出す）' (($r.Out -match 'Crash log: PocketGPU 2, other apps 2') -and ($r.Out -match 'Send the full crash log, with other apps\? \(N: PocketGPU only\)'))
+    Check 'n（既定）：logcat-crash.txt に、受け手の落ちた行（libc の Fatal signal・DEBUG の name: pgpu_server・#00 pc …/pgpu_server）が入る' (($c -match 'Fatal signal 11 .*pgpu_server') -and ($c -match 'name: pgpu_server') -and ($c -match '#00 pc 000000000012abcd  /data/local/tmp/pgpu_server') -and ($c -match 'Build fingerprint') -and ($c -match 'PocketGPU receiver only: 2 other block'))
+    Check 'n（既定）：ほかのアプリの落ちた記録（Java の例外・ほかのアプリの tombstone）は入らない' (($c -match 'pgpu_server') -and ($c -notmatch 'privatebank') -and ($c -notmatch 'secret-account-note') -and ($c -notmatch 'otherapp') -and ($c -notmatch 'libotherapp'))
+    # B) y：全部を送る
+    $r = Invoke-LogCmd $k @{} 'y,n'
+    $c = [string](Get-LogZipMap $r.Zip)['logcat-crash.txt']
+    Check 'y：全部の落ちた記録が入る（ほかのアプリの分も）。先頭の行に full と書く' (($c -match 'name: pgpu_server') -and ($c -match 'privatebank') -and ($c -match 'otherapp') -and ($c -match 'full: other apps included'))
+    # C) PocketGPU の分だけ：聞かない
+    $s = $script:LogIdle.Clone(); $s.crash = $script:LogCrashMine
+    $k = New-AndroidKit 'logcrash-c' $s $false
+    $r = Invoke-LogCmd $k @{} 'n'
+    $c = [string](Get-LogZipMap $r.Zip)['logcat-crash.txt']
+    Check '落ちた記録が PocketGPU の分だけなら、聞かずに全部入れる（質問は出ない）' (($r.Out -notmatch 'Send the full crash log') -and ($r.Out -match 'Crash log: PocketGPU 2, other apps 0') -and ($c -match 'name: pgpu_server')) 'safety'
+    # D) ほかのアプリの分だけ：n なら「見つからない」
+    $s = $script:LogIdle.Clone(); $s.crash = $script:LogCrashJava + '|' + $script:LogCrashOther
+    $k = New-AndroidKit 'logcrash-d' $s $false
+    if ($mode -eq 'sabotage') { Make-SabotagedLogTool $k.Kit 'function Select-PgpuCrash([string[]]$blocks) { return @($blocks) }' }
+    $r = Invoke-LogCmd $k @{} 'n,n'
+    $c = [string](Get-LogZipMap $r.Zip)['logcat-crash.txt']
+    Check 'ほかのアプリの落ちた記録だけのとき：n なら「no PocketGPU receiver crash found」だけで、ほかのアプリの行は入らない' (($c -match 'no PocketGPU receiver crash found') -and ($c -notmatch 'privatebank') -and ($c -notmatch 'otherapp'))
+    # E) logcat の古い形（brief：F/DEBUG ( 1010): …）でも同じように絞る
+    $brief = 'F/libc    ( 5678): Fatal signal 11 (SIGSEGV) in tid 5678 (pgpu_server), pid 5678 (pgpu_server)|F/DEBUG   ( 1010): pid: 5678, tid: 5678, name: pgpu_server  >>> ./pgpu_server <<<|F/DEBUG   ( 1010):     #00 pc 0000000000001234  /data/local/tmp/pgpu_server|E/AndroidRuntime( 2000): FATAL EXCEPTION: main|E/AndroidRuntime( 2000): Process: com.example.privatebank, PID: 2000'
+    $s = $script:LogIdle.Clone(); $s.crash = $brief
+    $k = New-AndroidKit 'logcrash-e' $s $false
+    if ($mode -eq 'sabotage') { Make-SabotagedLogTool $k.Kit 'function Select-PgpuCrash([string[]]$blocks) { return @($blocks) }' }
+    $r = Invoke-LogCmd $k @{} 'n,n'
+    $c = [string](Get-LogZipMap $r.Zip)['logcat-crash.txt']
+    Check 'logcat の古い形（brief）でも、PocketGPU の受け手の行だけに絞れる' (($c -match 'name: pgpu_server') -and ($c -match '#00 pc 0000000000001234') -and ($c -notmatch 'privatebank'))
+    # F) 空：聞かない
+    $s = $script:LogIdle.Clone()
+    $k = New-AndroidKit 'logcrash-f' $s $false
+    $r = Invoke-LogCmd $k @{} 'n'
+    $c = [string](Get-LogZipMap $r.Zip)['logcat-crash.txt']
+    Check '落ちた記録が空のとき：聞かず、「no PocketGPU receiver crash found」と書く' (($r.Out -match 'Crash log: PocketGPU 0, other apps 0') -and ($r.Out -notmatch 'Send the full crash log') -and ($c -match 'no PocketGPU receiver crash found')) 'safety'
+}
+
+# =====================================================================
 $scenarios = [ordered]@{
+    'log-ok'            = { param($m) Scn-LogOk $m }
+    'log-lang'          = { param($m) Scn-LogLang $m }
+    'log-stop'          = { param($m) Scn-LogStop $m }
+    'log-hide'          = { param($m) Scn-LogHide $m }
+    'log-crash'         = { param($m) Scn-LogCrash $m }
     'setup-ok'          = { param($m) Scn-SetupOk $m }
     'setup-apple'       = { param($m) Scn-SetupApple $m }
     'setup-nowinget'    = { param($m) Scn-SetupNoWinget $m }
