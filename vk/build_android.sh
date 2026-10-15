@@ -1,7 +1,8 @@
 #!/bin/bash
 # Android 用の受け手（server.c）を NDK の clang で組む。Visual Studio も Android Studio も要らない。
 #   build_android.sh [出す所]       既定は D:/iphone-rpc/work/android/out
-# arm64（実機）と x86_64（エミュレーター）の 2 つを出す。-g で組んで、実行ファイルの横に .debug は付けない（adb push は strip しない）
+# arm64（実機）と x86_64（エミュレーター）の 2 つを出す。受け手（server_<arch>）のほかに、端末の中で直接動かす試験 gzlike_<arch> も出す
+# （adb push して adb shell で動かす。tests/gzlike.c の頭を見る）。-g で組んで、実行ファイルの横に .debug は付けない（adb push は strip しない）
 set -e
 NDK=${NDK:-/d/android-sdk/ndk/27.3.13750724}
 BIN=$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin
@@ -15,4 +16,7 @@ for a in aarch64 x86_64; do
     "$BIN/${a}-linux-android${API}-clang.cmd" -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable \
         -Wno-unused-function $VKH -DVR_SERVER_MAIN remote/server.c -o "$OUT/server_$a" -lvulkan -llog -lm -lmediandk
     echo "受け手（$a）：$OUT/server_$a"
+    # GZDoom の Vulkan の使い方をまねた試験。端末の libvulkan.so を直接使う（受け手も PC も通らない）
+    "$BIN/${a}-linux-android${API}-clang.cmd" -O2 -g -Wall -Wextra -Wno-unused-parameter $VKH tests/gzlike.c -o "$OUT/gzlike_$a" -lm
+    echo "試験（$a）：$OUT/gzlike_$a"
 done

@@ -50,6 +50,8 @@ for w in $WHAT; do
         ;;
     tests)
         for t in tri tri13 vecadd pushdesc copydesc copyimg extlist nullrec; do $CC $VKH tests/$t.c -o "$OUT/$t.exe" $VKLIB; done
+        # GZDoom の Vulkan の使い方をまねた試験（毎コマ作り直す descriptor set・dynamic offset 付きの UBO・数 MB の ring・数百回の draw・数百枚の画像・push constants。tests/gzlike.c）
+        $CC -Wall -Wextra -Wno-unused-parameter $VKH tests/gzlike.c -o "$OUT/gzlike.exe"
         # 落ちたときの手がかりの書き出しの試験（server.c を取り込む。crash34）
         $CC -Wall -Wno-unused-parameter $VKH tests/rpdump.c -o "$OUT/rpdump.exe" -lws2_32 -lole32 -loleaut32 -lwindowscodecs -luuid -ldbghelp
         for t in d3d11tri d3d11cube d3d11event; do $CC -Wall -Wno-unused-parameter tests/$t.c -o "$OUT/d3d11/$t.exe" -ld3d11 -ldxguid -luuid -luser32 -lgdi32; done
@@ -66,7 +68,7 @@ for w in $WHAT; do
         # DirectX 12 の小さな試験（tests/d3d12/d3d12test.c）。横に vkd3d-proton の d3d12.dll と d3d12core.dll を置けばドライバ越し、無ければふつうの DirectX 12
         mkdir -p "$OUT/d3d12"
         $CC -Wall -Wextra -Wno-unused-parameter tests/d3d12/d3d12test.c -o "$OUT/d3d12/d3d12test.exe"
-        echo "試験：tri・tri13・vecadd・pushdesc・copydesc・copyimg・extlist・d3d11/d3d11tri・d3d11/d3d11cube・d3d11/d3d11event・d3d11/gstest・d3d11/feat・d3d12/d3d12test"
+        echo "試験：gzlike・tri・tri13・vecadd・pushdesc・copydesc・copyimg・extlist・d3d11/d3d11tri・d3d11/d3d11cube・d3d11/d3d11event・d3d11/gstest・d3d11/feat・d3d12/d3d12test"
         ;;
     *) echo "知らない名前：$w"; exit 2 ;;
     esac
