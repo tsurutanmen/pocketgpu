@@ -9,6 +9,8 @@ rem Check the port on this PC first (Windows can reserve some ports). The chosen
 set "PGPU_PICK=gpu"
 call "%~dp0_common.cmd"
 if errorlevel 1 goto fail
+rem Several phones (PGPU_FIXED_PORTS=1): adb forward quietly takes a port over from another phone. Stop here if this PC port already goes to a different phone.
+if defined PGPU_FIXED_PORTS for /f "tokens=1,2" %%A in ('"%ADB%" forward --list') do if "%%B"=="tcp:%PGPU_PORT%" if /i not "%%A"=="%ANDROID_SERIAL%" goto port_taken
 
 set "SRV="
 "%ADB%" shell getprop ro.product.cpu.abi | findstr /b /c:"arm64-v8a" >nul && set "SRV=server_aarch64"
@@ -41,6 +43,8 @@ goto server_slow
 :listening
 "%ADB%" forward tcp:%PGPU_PORT% tcp:%PGPU_PORT% >nul
 if errorlevel 1 goto forward_failed
+rem Ask Android for the performance game mode for the PocketGPU app (if it is installed). It never stops this file.
+call "%~dp0_gamemode.cmd"
 
 echo.
 echo Done. The receiver is running on the phone and port %PGPU_PORT% is connected to this PC.
@@ -75,6 +79,11 @@ echo.
 echo ERROR: the receiver is running on the phone, but it did not start listening within 30 seconds. Its log:
 "%ADB%" shell cat /data/local/tmp/pgpu_server.log
 echo Unlock the phone and run this file again. If it happens again, send us this log.
+goto fail
+:port_taken
+echo.
+echo ERROR: port %PGPU_PORT% on this PC already goes to another phone. Use a different PGPU_PORT for each phone.
+"%ADB%" forward --list
 goto fail
 :forward_failed
 echo.

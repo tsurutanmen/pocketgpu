@@ -110,6 +110,8 @@ set "GPU_WHO=the app receiver, port 50060 on the phone"
 "%ADB%" forward tcp:%PGPU_PORT% tcp:50060 >nul || goto forward_failed
 :gpu_done
 "%ADB%" shell am start -n %APP% --ez webcam true --ez audio true --ez gpu true >nul
+rem Ask Android for the performance game mode for the app. It never stops this file.
+call "%~dp0_gamemode.cmd"
 echo.
 echo Done. If the phone asks for camera or microphone access, tap Allow.
 echo Port form: %FORM% (%FORMBY%)

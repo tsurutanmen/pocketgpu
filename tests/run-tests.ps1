@@ -784,7 +784,7 @@ function Scn-PristineApp([string]$mode) {
     }
 }
 # android\android_app.cmd を、偽の adb で動かす。版に合う向け方を選ぶこと、選べないときの決め方、stop
-function Invoke-KitCmd($k, [string]$rel, [string]$cmdArgs = '', [hashtable]$envs = @{}, [string]$stdin = $null) {
+function Invoke-KitCmd($k, [string]$rel, [string]$cmdArgs = '', [hashtable]$envs = @{}, [string]$stdin = $null, [int]$timeoutSec = 60) {
     $cmd = Join-Path $k.Kit $rel
     $psi = New-Object Diagnostics.ProcessStartInfo
     $psi.FileName = $env:ComSpec
@@ -800,7 +800,7 @@ function Invoke-KitCmd($k, [string]$rel, [string]$cmdArgs = '', [hashtable]$envs
     $p = [Diagnostics.Process]::Start($psi)
     $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
     if ($null -ne $stdin) { $p.StandardInput.Write($stdin); $p.StandardInput.Close() }
-    if (-not $p.WaitForExit(60000)) { try { $p.Kill() } catch { }; return @{ Exit = -99; Out = $o.Result; Err = 'TIMEOUT'; Calls = '' } }
+    if (-not $p.WaitForExit($timeoutSec * 1000)) { try { $p.Kill() } catch { }; return @{ Exit = -99; Out = $o.Result; Err = 'TIMEOUT'; Calls = '' } }
     [void]$p.WaitForExit()
     foreach ($id in (Get-FwdPids $k.State)) { if (-not $script:Spawned.Contains($id)) { $script:Spawned.Add($id) } }
     $calls = $(if (Test-Path $base.FAKE_ADB_LOG) { [IO.File]::ReadAllText($base.FAKE_ADB_LOG) } else { '' })
@@ -1932,7 +1932,345 @@ function Scn-LogCrash([string]$mode) {
 }
 
 # =====================================================================
+# Test-Android-Speed.cmd（tools\android-speed.ps1）・受け手を起こすときのゲームモードの頼み（android\_gamemode.cmd）・PGPU_FIXED_PORTS の試験
+# 偽の adb.exe が、端末の nc・/sys/class/udc/・cmd game のふりをする。速さは偽の adb の上限（limit_to・limit_from MB/s）で決まるので、
+# 測った値が上限に近いことが、測りが動いている証拠になる。どの場面も、本物の端末・GPU・iPhone は使わない
+# =====================================================================
+$script:SpeedIdle = @{ serial = 'SPEEDSER9999XYZ'; dstate = 'device'; pids = ''; hash = ''; file = '0'; next = '7001'; udc = 'super-speed'; udcmax = 'super-speed-plus'; marketname = 'Fake Phone Pro' }
+# 測る部品を、測らずに決まった値を返す物に差し替える（android-log.ps1 の試験と同じ作り）。本物の定義の後ろ（Main の印の前）に置く
+$script:SpeedSabotage = @'
+function Measure-ToPhone([int]$port, [int64]$bytes) { return @{ Ok = $true; MBps = 999.9; Sec = 0.001; End = 'closed' } }
+function Measure-FromPhone([int]$port, [int64]$bytes) { return @{ Ok = $true; MBps = 999.9; Sec = 0.001 } }
+function Measure-Rtt([int]$port, [string]$mode, [int]$pings) { return @{ Ok = $true; Min = 0.01; Median = 0.01; P95 = 0.01; Max = 0.01; Count = $pings; Mode = $mode } }
+'@
+function Make-SabotagedSpeed([string]$kit, [string]$overrides) {
+    $p = Join-Path $kit 'tools\android-speed.ps1'
+    $t = [IO.File]::ReadAllText($p, [Text.Encoding]::UTF8)
+    $marker = '# ---- 流れ / Main ----'
+    if (-not $t.Contains($marker)) { throw 'marker not found' }
+    $t = $t.Replace($marker, $overrides + "`r`n" + $marker)
+    [IO.File]::WriteAllText($p, $t, (New-Object Text.UTF8Encoding($true)))
+}
+# Test-Android-Speed.cmd を動かす。txt は毎回空のフォルダに作る。$r.Txt：できた txt の中身（無ければ $null）、$r.Clip：クリップボードの代わりのファイル
+# 画面は英語（PGPU_LANG=en）。名前はこの試験の偽の物にする（伏せる物が、本物の名前とぶつからないように）
+function Invoke-SpeedCmd($k, [hashtable]$envs = @{}, [int]$timeoutSec = 150) {
+    $root = Split-Path -Parent $k.Kit
+    $out = Join-Path $root 'speedout'
+    if (Test-Path -LiteralPath $out) { Remove-Item -LiteralPath $out -Recurse -Force }
+    [void](New-Item -ItemType Directory -Path $out -Force)
+    $calls = Join-Path $root 'adb-calls.txt'
+    if (Test-Path -LiteralPath $calls) { Remove-Item -LiteralPath $calls -Force }
+    $clip = Join-Path $root 'clip.txt'
+    if (Test-Path -LiteralPath $clip) { Remove-Item -LiteralPath $clip -Force }
+    $e = @{ PGPU_NOPROMPT = '1'; PGPU_SPEED_OUT = $out; PGPU_SPEED_PORT = (Get-FreePort); PGPU_TEST_CLIP = $clip; USERNAME = 'pgpuUser77x'; COMPUTERNAME = 'PGPUPC77X' }
+    foreach ($key in $envs.Keys) { $e[$key] = $envs[$key] }
+    $r = Invoke-KitCmd $k 'Test-Android-Speed.cmd' '' $e '' $timeoutSec
+    $f = @(Get-ChildItem -LiteralPath $out -Filter 'pocketgpu-android-speed-*.txt' -File -ErrorAction SilentlyContinue | Select-Object -First 1)[0]
+    $r.Txt = $(if ($f) { [IO.File]::ReadAllText($f.FullName) } else { $null })
+    $r.Dir = $out
+    $r.Clip = $clip
+    return $r
+}
+function Get-SpeedNum([string]$text, [string]$pattern) {
+    $m = [regex]::Match([string]$text, $pattern)
+    if ($m.Success) { return [double]::Parse($m.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture) } else { return -1.0 }
+}
+function Get-CallCount([string]$calls, [string]$pattern) { return ([regex]::Matches([string]$calls, $pattern)).Count }
+
+# USB 3 の端末（上限 40・60 MB/s・往復 3 ms）：測った値が上限に近い。端末・USB・名前の伏せ・クリップボード・adb forward の後始末
+# 効果の検査は、測った値だけ。sabotage は測る部品を決まった値に差し替えた物（値が合わなくなること）
+function Scn-SpeedUsb3([string]$mode) {
+    if ($mode -eq 'decline') { return }
+    $s = $script:SpeedIdle.Clone(); $s.limit_to = '40'; $s.limit_from = '60'; $s.rtt_ms = '3'
+    $k = New-AndroidKit 'speed-usb3' $s $true
+    if ($mode -eq 'sabotage') { Make-SabotagedSpeed $k.Kit $script:SpeedSabotage }
+    $r = Invoke-SpeedCmd $k @{ PGPU_TEST_PC_USB = 'super'; PGPU_ANSWERS = 'y' }
+    $t = $r.Txt
+    $to = Get-SpeedNum $t 'PC to phone: ([\d.]+) MB/s'
+    $from = Get-SpeedNum $t 'Phone to PC: ([\d.]+) MB/s'
+    $rtt = Get-SpeedNum $t 'median ([\d.]+) ms'
+    $m = Get-FwdMap $k.State
+    Check ('Test-Android-Speed.cmd：終わりのコード 0 で pocketgpu-android-speed-日時.txt ができる（' + $r.Exit + '）') (($r.Exit -eq 0) -and ($null -ne $t)) 'safety'
+    Check ('PC→端末が、偽の端末の上限 40 MB/s に近い（測った値 ' + $to + '）') (($to -gt 30) -and ($to -lt 44))
+    Check ('端末→PC が、偽の端末の上限 60 MB/s に近い（測った値 ' + $from + '）') (($from -gt 45) -and ($from -lt 66))
+    Check ('往復が、偽の端末の待ち 3 ms を含む（測った値 ' + $rtt + ' ms）') (($rtt -ge 3) -and ($rtt -lt 6))
+    Check '端末の名前・Android の版・チップが txt に書いてある' (($null -ne $t) -and ($t -match 'Name: FakeMaker FakePhone \(Fake Phone Pro\)') -and ($t -match 'Android: 14 \(SDK 34\)') -and ($t -match 'Chip: FakeSoC')) 'safety'
+    Check 'USB：端末側 super-speed・PC 側 SuperSpeed・接続 USB 3（端末から）' (($null -ne $t) -and ($t -match 'Phone side \(current\): super-speed \(5 Gbps, USB 3\)') -and ($t -match 'PC side: SuperSpeed port') -and ($t -match 'Link: USB 3 \(from phone\)')) 'safety'
+    Check 'USB 3 なので、【仮文】の勧め（DRAFT）は出ない' (($null -ne $t) -and ($r.Out -notmatch 'DRAFT')) 'safety'
+    Check 'adb のシリアル番号・PC のユーザー名・PC 名が、txt にも画面にも無い' (($null -ne $t) -and ($t -notmatch 'SPEEDSER9999XYZ') -and ($r.Out -notmatch 'SPEEDSER9999XYZ') -and ($t -notmatch 'pgpuUser77x') -and ($t -notmatch 'PGPUPC77X') -and ($r.Out -notmatch 'PGPUPC77X')) 'safety'
+    Check 'y と答えると、クリップボード（試験ではファイル）に txt と同じ中身が入る' (($null -ne $t) -and (Test-Path -LiteralPath $r.Clip) -and (([IO.File]::ReadAllText($r.Clip) -replace "`r`n", "`n").Trim() -eq ($t -replace "`r`n", "`n").Trim())) 'safety'
+    Check '1 MB = 1048576 バイトの注記と、流した量・回数が txt に書いてある' (($null -ne $t) -and ($t -match '1 MB = 1048576 bytes') -and ($t -match 'Data: \d+ MB per run, 3 run')) 'safety'
+    Check '終わりに、速さの試験の adb forward は残らず、前からある adb forward（GPU の口）には触らない（--remove は 1 回だけ）' (($m.Count -eq 1) -and ($m[[string]$k.Port] -eq ('tcp:' + $k.Port)) -and ((Get-CallCount $r.Calls '(?m)^forward --remove ') -eq 1)) 'safety'
+}
+
+# 上限を変えると、測った値も同じ割合で変わる（測りが上限に反応している証拠）。流す量は、最初の 4 MB の速さで決まる
+function Scn-SpeedLimit([string]$mode) {
+    if ($mode -eq 'decline') { return }
+    $s = $script:SpeedIdle.Clone(); $s.limit_to = '10'; $s.limit_from = '15'; $s.rtt_ms = '1'
+    $k = New-AndroidKit 'speed-limit' $s $false
+    if ($mode -eq 'sabotage') { Make-SabotagedSpeed $k.Kit $script:SpeedSabotage }
+    $r = Invoke-SpeedCmd $k @{ PGPU_SPEED_MB = '8'; PGPU_SPEED_PINGS = '30'; PGPU_TEST_PC_USB = 'super' }
+    $t = $r.Txt
+    $to = Get-SpeedNum $t 'PC to phone: ([\d.]+) MB/s'
+    $from = Get-SpeedNum $t 'Phone to PC: ([\d.]+) MB/s'
+    Check ('上限 10・15 MB/s では、測った値も 10・15 に近い（測った値 ' + $to + ' / ' + $from + '）') (($to -gt 7.5) -and ($to -lt 11) -and ($from -gt 11) -and ($from -lt 16.5))
+    Check '流す量を PGPU_SPEED_MB=8 で決め打ちにすると、txt に 8 MB と書く' (($null -ne $t) -and ($t -match 'Data: 8 MB per run')) 'safety'
+    Stop-Spawned
+    $s2 = $script:SpeedIdle.Clone(); $s2.limit_to = '40'; $s2.limit_from = '40'; $s2.rtt_ms = '1'
+    $k2 = New-AndroidKit 'speed-limit-fast' $s2 $false
+    if ($mode -eq 'sabotage') { Make-SabotagedSpeed $k2.Kit $script:SpeedSabotage }
+    $r2 = Invoke-SpeedCmd $k2 @{ PGPU_SPEED_PINGS = '30'; PGPU_TEST_PC_USB = 'super' }
+    $t2 = $r2.Txt
+    $mb = Get-SpeedNum $t2 'Data: (\d+) MB per run'
+    $to2 = Get-SpeedNum $t2 'PC to phone: ([\d.]+) MB/s'
+    Check ('流す量を決めないと、最初の 4 MB の速さから決まる：8 MB より多く、192 MB 以下（' + $mb + ' MB）で、速さは上限 40 に近い（' + $to2 + '）') (($mb -gt 30) -and ($mb -le 192) -and ($to2 -gt 30) -and ($to2 -lt 44))
+}
+
+# USB 2 の端末：接続は USB 2。【仮文】の勧めは画面に出て、txt には入らない
+function Scn-SpeedUsb2([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $s = $script:SpeedIdle.Clone(); $s.udc = 'high-speed'; $s.udcmax = 'high-speed'; $s.limit_to = '30'; $s.limit_from = '30'; $s.rtt_ms = '1'
+    $k = New-AndroidKit 'speed-usb2' $s $false
+    $r = Invoke-SpeedCmd $k @{ PGPU_SPEED_MB = '8'; PGPU_SPEED_PINGS = '20'; PGPU_TEST_PC_USB = 'high' }
+    $t = $r.Txt
+    Check 'USB 2：端末側 high-speed・PC 側 High-Speed・接続 USB 2（端末から）' (($null -ne $t) -and ($t -match 'high-speed \(480 Mbps, USB 2\)') -and ($t -match 'PC side: High-Speed port') -and ($t -match 'Link: USB 2 \(from phone\)')) 'safety'
+    Check 'USB 2：【仮文】の勧め（DRAFT）が画面に出て、txt には入らない' (($null -ne $t) -and ($r.Out -match 'DRAFT') -and ($t -notmatch 'DRAFT')) 'safety'
+}
+
+# 日本語の画面（utf8-run.ps1 を通して、画面そのものを読む）。txt は日本語でも英語だけ
+function Scn-SpeedLang([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $s = $script:SpeedIdle.Clone(); $s.udc = 'high-speed'; $s.limit_to = '30'; $s.limit_from = '30'; $s.rtt_ms = '1'
+    $k = New-AndroidKit 'speedlang' $s $false
+    $out = Join-Path (Split-Path -Parent $k.Kit) 'speedout'
+    [void](New-Item -ItemType Directory -Path $out -Force)
+    $scr = Join-Path $k.Kit 'tools\android-speed.ps1'
+    $e = @{ ADB = $k.Adb; FAKE_ADB_STATE = $k.State; ANDROID_SERIAL = 'SPEEDSER9999XYZ'; PGPU_LANG = 'ja'; PGPU_SPEED_OUT = $out; PGPU_SPEED_PORT = (Get-FreePort)
+            PGPU_SPEED_MB = '8'; PGPU_SPEED_PINGS = '20'; PGPU_TEST_PC_USB = 'high'; PGPU_TEST_CLIP = (Join-Path (Split-Path -Parent $k.Kit) 'clip.txt') }
+    $script:RawOut = $true
+    try { $r = Invoke-Fix $k.Kit @('"' + $scr + '"') $e 'n' (Join-Path $PSScriptRoot 'fakes\utf8-run.ps1') } finally { $script:RawOut = $false }
+    $bytes = [Text.Encoding]::GetEncoding(28591).GetBytes([string]$r.Out)
+    try { $r.Out = (New-Object Text.UTF8Encoding($false, $true)).GetString($bytes) } catch { }
+    $f = @(Get-ChildItem -LiteralPath $out -Filter 'pocketgpu-android-speed-*.txt' -File -ErrorAction SilentlyContinue | Select-Object -First 1)[0]
+    $t = $(if ($f) { [IO.File]::ReadAllText($f.FullName) } else { $null })
+    Check '日本語の画面：見出し・ラベル・【仮文】の目印が出る' (($r.Exit -eq 0) -and ($r.Out -match 'USB の接続の速さ') -and ($r.Out -match '【仮文】') -and ($r.Out -match 'PC → 端末')) 'safety'
+    Check '日本語の画面でも、txt は英語だけ（ASCII のみ）' (($null -ne $t) -and ($t -notmatch '[^\x00-\x7F]')) 'safety'
+}
+
+# 端末側が読めない・PC 側が読めない：「unknown」と書いて、止まらない
+function Scn-SpeedUnknown([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $s = $script:SpeedIdle.Clone(); $s.noudc = '1'; $s.limit_to = '30'; $s.limit_from = '30'
+    $k = New-AndroidKit 'speed-udc-unknown' $s $false
+    $r = Invoke-SpeedCmd $k @{ PGPU_SPEED_MB = '8'; PGPU_SPEED_PINGS = '20'; PGPU_TEST_PC_USB = 'super' }
+    $t = $r.Txt
+    Check '端末側が読めない：Phone side は unknown・接続は PC 側の答え（from PC）' (($null -ne $t) -and ($t -match 'Phone side \(current\): unknown') -and ($t -match 'Link: USB 3 \(from PC\)')) 'safety'
+    $k2 = New-AndroidKit 'speed-usb-none' $s $false
+    $r2 = Invoke-SpeedCmd $k2 @{ PGPU_SPEED_MB = '8'; PGPU_SPEED_PINGS = '20'; PGPU_TEST_PC_USB = 'none' }
+    $t2 = $r2.Txt
+    Check '端末側も PC 側も読めない：接続は unknown' (($null -ne $t2) -and ($t2 -match 'PC side: unknown') -and ($t2 -match 'Link: unknown')) 'safety'
+    # 本物の Windows の USB の読み取り（試験機に端末は無い）。読めなくても、止まらずに unknown と書く
+    $k3 = New-AndroidKit 'speed-real-pc-usb' $s $false
+    $r3 = Invoke-SpeedCmd $k3 @{ PGPU_SPEED_MB = '8'; PGPU_SPEED_PINGS = '20'; PGPU_TEST_PC_USB = $null }
+    $t3 = $r3.Txt
+    Check 'PC の USB の読み取りが本物のとき：端末が見つからなくても、終わりのコード 0 で PC side は unknown' (($r3.Exit -eq 0) -and ($null -ne $t3) -and ($t3 -match 'PC side: unknown')) 'safety'
+}
+
+# 端末の nc の形：無い・-s を断る・-e を断る・接続を閉じない
+function Scn-SpeedNc([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    # nc が無い：終わりのコード 3・txt は作る・理由と USB の情報が書いてある・forward は消す
+    $s = $script:SpeedIdle.Clone(); $s.nonc = '1'
+    $k = New-AndroidKit 'speed-nonc' $s $false
+    $r = Invoke-SpeedCmd $k @{ PGPU_TEST_PC_USB = 'super' }
+    $t = $r.Txt
+    $m = Get-FwdMap $k.State
+    Check ('nc が無い：終わりのコード 3・txt は作る・理由が書いてある（' + $r.Exit + '）') (($r.Exit -eq 3) -and ($null -ne $t) -and ($t -match 'Not measured: nc on the phone did not work: .*nc: inaccessible or not found')) 'safety'
+    Check 'nc が無くても、USB の情報は書いてある・adb forward は残らない' (($null -ne $t) -and ($t -match 'Link: USB 3 \(from phone\)') -and ($m.Count -eq 0)) 'safety'
+    Stop-Spawned
+    # -s を断る nc：-s 無しでやり直して測れる。txt にそう書く
+    $s = $script:SpeedIdle.Clone(); $s.nonos = '1'; $s.limit_to = '30'; $s.limit_from = '30'; $s.rtt_ms = '1'
+    $k = New-AndroidKit 'speed-nonos' $s $false
+    $r = Invoke-SpeedCmd $k @{ PGPU_SPEED_MB = '8'; PGPU_SPEED_PINGS = '20'; PGPU_TEST_PC_USB = 'super' }
+    $t = $r.Txt
+    $to = Get-SpeedNum $t 'PC to phone: ([\d.]+) MB/s'
+    Check ('-s を断る nc：-s 無しでやり直して測れ、txt にそう書く（' + $to + ' MB/s）') (($r.Exit -eq 0) -and ($to -gt 20) -and ($t -match 'nc listens on all addresses, -s was refused')) 'safety'
+    Check '-s 無しの命令（nc -l -p 口 > /dev/null）が実際に打たれている' ($r.Calls -match 'nc -l -p \d+ > /dev/null') 'safety'
+    Stop-Spawned
+    # -e を断る nc：mkfifo の形で往復を測る
+    $s = $script:SpeedIdle.Clone(); $s.noe = '1'; $s.limit_to = '30'; $s.limit_from = '30'; $s.rtt_ms = '2'
+    $k = New-AndroidKit 'speed-noe' $s $false
+    $r = Invoke-SpeedCmd $k @{ PGPU_SPEED_MB = '8'; PGPU_SPEED_PINGS = '50'; PGPU_TEST_PC_USB = 'super' }
+    $rtt = Get-SpeedNum $r.Txt 'median ([\d.]+) ms'
+    Check ('-e を断る nc：mkfifo の形で往復を測り、txt に fifo と書く（' + $rtt + ' ms）') (($rtt -ge 2) -and ($r.Txt -match 'fifo\)')) 'safety'
+    Stop-Spawned
+    # 端末の nc が接続を閉じない：PC→端末の行に「end of transfer not seen」と書く
+    $s = $script:SpeedIdle.Clone(); $s.noclose = '1'; $s.limit_to = '30'; $s.limit_from = '30'; $s.rtt_ms = '1'
+    $k = New-AndroidKit 'speed-noclose' $s $false
+    $r = Invoke-SpeedCmd $k @{ PGPU_SPEED_MB = '8'; PGPU_SPEED_PINGS = '20'; PGPU_TEST_PC_USB = 'super'; PGPU_SPEED_ENDWAIT_MS = '800' }
+    Check '端末の nc が閉じない：PC→端末の行に「end of transfer not seen」と書く' (($null -ne $r.Txt) -and ($r.Txt -match 'PC to phone: [\d.]+ MB/s .*end of transfer not seen')) 'safety'
+}
+
+# 端末が無い・キットの一部が無い（zip の中で開いた形）：短い英語の案内を出して止まる。何も測らず、txt も作らない
+function Scn-SpeedStop([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $s = $script:SpeedIdle.Clone(); $s.serial = ''
+    $k = New-AndroidKit 'speed-nophone' $s $false
+    $r = Invoke-SpeedCmd $k
+    Check ('端末が無いとき：「no Android phone found」・「Nothing was measured」・終わりのコード 1・txt を作らない（' + $r.Exit + '）') (($r.Exit -eq 1) -and ($r.Out -match 'no Android phone found') -and ($r.Out -match 'Nothing was measured') -and ($null -eq $r.Txt)) 'safety'
+    $k2 = New-AndroidKit 'speed-noext' $script:SpeedIdle $false
+    Remove-Item -LiteralPath (Join-Path $k2.Kit 'tools\android-speed.ps1') -Force
+    $r2 = Invoke-SpeedCmd $k2
+    Check 'tools\android-speed.ps1 が無い（zip の中で開いた）とき：「Extract All」の案内・終わりのコード 1・txt を作らない' (($r2.Exit -eq 1) -and ($r2.Out -match 'Extract All') -and ($null -eq $r2.Txt)) 'safety'
+}
+
+# 伏せる：端末が返した文に、PC のユーザー名・PC 名・adb のシリアル番号・メールアドレスがあっても、txt では (hidden)・(serial)・(email) になる
+# 効果の検査は、伏せたあとの txt。sabotage は伏せる部品を何もしない物に差し替えた物
+function Scn-SpeedHide([string]$mode) {
+    if ($mode -eq 'decline') { return }
+    $mail = 'someone' + '@' + 'example.org'
+    $s = $script:SpeedIdle.Clone(); $s.nonc = '1'
+    $s.ncerr = ('nc: cannot reach SPEEDSER9999XYZ as pgpuUser77x on PGPUPC77X mail ' + $mail + ' tail ok')
+    $k = New-AndroidKit 'speed-hide' $s $false
+    if ($mode -eq 'sabotage') { Make-SabotagedSpeed $k.Kit 'function Hide-Private([string]$text) { return $text }' }
+    $r = Invoke-SpeedCmd $k @{ PGPU_TEST_PC_USB = 'super' }
+    $t = $r.Txt
+    Check 'txt を作る（nc が使えないので、終わりのコードは 3）' (($r.Exit -eq 3) -and ($null -ne $t) -and ($t -match 'Not measured: nc on the phone did not work: nc: cannot reach')) 'safety'
+    Check '伏せる：adb のシリアル番号・PC のユーザー名・PC 名・メールアドレスが、txt のどこにも残らない' (($null -ne $t) -and ($t -notmatch 'SPEEDSER9999XYZ') -and ($t -notmatch 'pgpuUser77x') -and ($t -notmatch 'PGPUPC77X') -and ($t -notmatch 'someone@'))
+    Check '伏せた場所には (serial)・(hidden)・(email) が入る。ほかの語（tail ok）はそのまま' (($null -ne $t) -and ($t -match 'reach \(serial\) as \(hidden\) on \(hidden\) mail \(email\) tail ok'))
+}
+
+# android\_gamemode.cmd：start_android.cmd と android_app.cmd が、受け手を起こしたあとに「performance」のゲームモードを頼む。失敗しても止まらない
+# 効果の検査は、頼む動作と、その結果の一言。sabotage は _gamemode.cmd を何もしない物に差し替えた物（頼まなくなること）
+$script:GamePkg = 'com.tsurutanmen.pocketgpu'
+function Invoke-GameCase([string]$mode, [string]$name, [hashtable]$extra, [hashtable]$envs = @{}, [string]$cmd = 'start_android.cmd') {
+    $s = @{ serial = 'EMU1'; dstate = 'device'; pids = ''; hash = ''; file = '0'; next = '7001' }
+    foreach ($key in $extra.Keys) { $s[$key] = $extra[$key] }
+    $k = New-AndroidKit ('game-' + $name) $s $false
+    if ($mode -eq 'sabotage') { [IO.File]::WriteAllText((Join-Path $k.Kit 'android\_gamemode.cmd'), "@echo off`r`nexit /b 0`r`n", [Text.Encoding]::ASCII) }
+    $r = Invoke-KitCmd $k ('android' + [char]92 + $cmd) '' $envs '' 90
+    Stop-Spawned
+    return $r
+}
+function Scn-GameMode([string]$mode) {
+    if ($mode -eq 'decline') { return }
+    $pkg = [regex]::Escape($script:GamePkg)
+    $done = 'Done\. The receiver is running'
+    # アプリが入っている：mode の形で頼む。start も成功。頼むのは、受け手が待ち始めて adb forward が出来たあと（Done の前）
+    $r = Invoke-GameCase $mode 'ok' @{ app = '0.1.6' }
+    Check ('アプリが入っている：mode の形（cmd game mode performance）で頼み、「performance requested」と言う') (($r.Exit -eq 0) -and ($r.Calls -match ('shell cmd game mode performance ' + $pkg)) -and ($r.Calls -notmatch 'cmd game set') -and ($r.Out -match 'Game mode: performance requested'))
+    Check 'ゲームモードの頼みは、受け手を起こしたあとで、Done の前' (($r.Out.IndexOf('Game mode:') -gt $r.Out.IndexOf('Starting the receiver')) -and ($r.Out.IndexOf('Game mode:') -lt $r.Out.IndexOf('Done.')))
+    Check ('start_android.cmd は最後まで行く（Done. The receiver is running）・終わりのコード 0') (($r.Exit -eq 0) -and ($r.Out -match $done)) 'safety'
+    # mode の形が失敗しても、set の形で頼み直して成功する
+    $r = Invoke-GameCase $mode 'fail1' @{ app = '0.1.6'; gamemode = 'fail1' }
+    Check 'mode の形が失敗しても、set の形（cmd game set --mode performance）で頼み直して成功する' (($r.Calls -match 'cmd game mode performance') -and ($r.Calls -match ('cmd game set --mode performance ' + $pkg)) -and ($r.Out -match 'Game mode: performance requested'))
+    # 両方失敗：「not set」と adb の言葉を出すが、止まらない
+    $r = Invoke-GameCase $mode 'fail' @{ app = '0.1.6'; gamemode = 'fail' }
+    Check '両方失敗：「Game mode: not set. adb said:」と adb の言葉を出す' (($r.Out -match 'Game mode: not set\. adb said:') -and ($r.Out -match 'IllegalArgumentException'))
+    Check '両方失敗しても、start_android.cmd は止まらず最後まで行く・終わりのコード 0' (($r.Exit -eq 0) -and ($r.Out -match $done)) 'safety'
+    # cmd game が無い端末（Android 11 以前）
+    $r = Invoke-GameCase $mode 'nogame' @{ app = '0.1.6'; gamemode = 'nogame' }
+    Check 'cmd game が無い端末（Android 11 以前）：「not set」と、adb の言葉（Can''t find service: game）を出す' (($r.Out -match 'Game mode: not set') -and ($r.Out -match 'Can''t find service: game'))
+    Check 'cmd game が無い端末でも、start_android.cmd は最後まで行く・終わりのコード 0' (($r.Exit -eq 0) -and ($r.Out -match $done)) 'safety'
+    # 終わりのコード 0 でも Error: と出たら、失敗として扱う
+    $r = Invoke-GameCase $mode 'errtext' @{ app = '0.1.6'; gamemode = 'errtext' }
+    Check '終わりのコードが 0 でも Error: と出たら失敗として扱う（「performance requested」と言わず、「not set」と言う）' (($r.Out -match 'Game mode: not set') -and ($r.Out -notmatch 'performance requested'))
+    # アプリが入っていない：頼まない
+    $r = Invoke-GameCase $mode 'noapp' @{ app = '' }
+    Check 'アプリが入っていない：「the PocketGPU app is not installed」と言い、cmd game は呼ばない' (($r.Out -match 'Game mode: not set, the PocketGPU app is not installed') -and ($r.Calls -notmatch 'cmd game'))
+    Check 'アプリが入っていなくても、start_android.cmd は最後まで行く' ($r.Out -match $done) 'safety'
+    # PGPU_NOGAMEMODE=1：adb を呼ばない（対照：同じ状態の ok の場面は呼ぶ）
+    $r = Invoke-GameCase $mode 'skip' @{ app = '0.1.6' } @{ PGPU_NOGAMEMODE = '1' }
+    Check 'PGPU_NOGAMEMODE=1：cmd game も pm path も呼ばず、Game mode の行も出さない。start は最後まで行く' (($r.Calls -notmatch 'cmd game') -and ($r.Calls -notmatch 'pm path') -and ($r.Out -notmatch 'Game mode') -and ($r.Out -match $done)) 'safety'
+    # android_app.cmd でも頼む。失敗しても、口の案内まで進む
+    $r = Invoke-GameCase $mode 'appcmd' @{ app = '0.1.6' } @{} 'android_app.cmd'
+    Check 'android_app.cmd でも、mode の形で頼み、「performance requested」と言う' (($r.Exit -eq 0) -and ($r.Calls -match ('shell cmd game mode performance ' + $pkg)) -and ($r.Out -match 'Game mode: performance requested'))
+    Check 'android_app.cmd は口の案内（Done. If the phone asks）まで進む' (($r.Exit -eq 0) -and ($r.Out -match 'Done\. If the phone asks')) 'safety'
+    $r = Invoke-GameCase $mode 'appcmd-fail' @{ app = '0.1.6'; gamemode = 'fail' } @{} 'android_app.cmd'
+    Check 'android_app.cmd：頼みが失敗したら「Game mode: not set」と言う' ($r.Out -match 'Game mode: not set')
+    Check 'android_app.cmd：頼みが失敗しても、口の案内まで進む・終わりのコード 0' (($r.Exit -eq 0) -and ($r.Out -match 'Done\. If the phone asks')) 'safety'
+}
+
+# PGPU_FIXED_PORTS=1：何台もつなぐ人のために、口を環境変数の数のまま使う。android\port.txt は読まず、書かず、口は勝手に変えない。
+# 同じ口がもう別の端末に向いているなら、奪わずに止まる。どれも、PGPU_FIXED_PORTS が無い場合（対照）と並べて確かめる
+function Scn-AndroidFixedPorts([string]$mode) {
+    if ($mode -ne 'fix') { return }
+    $idle = @{ serial = 'EMU1'; dstate = 'device'; pids = ''; hash = ''; file = '0'; next = '7001'; app = '0.1.4' }
+    $Start = 'android\start_android.cmd'
+    $fixed = @{ PGPU_FIXED_PORTS = '1'; ANDROID_SERIAL = 'EMU1' }
+    # 1) ANDROID_SERIAL か PGPU_PORT が無いと、adb を打たずに止まる
+    $k = New-AndroidKit 'fixed-noserial' $idle $false
+    $r = Invoke-KitCmd $k $Start '' @{ PGPU_FIXED_PORTS = '1' }
+    Check 'PGPU_FIXED_PORTS=1 で ANDROID_SERIAL が無い：「ANDROID_SERIAL and PGPU_PORT must be set too」・終わりのコード 1・adb は打たない' (($r.Exit -eq 1) -and ($r.Out -match 'PGPU_FIXED_PORTS is set, so ANDROID_SERIAL and PGPU_PORT must be set too') -and (-not $r.Calls)) 'safety'
+    $k = New-AndroidKit 'fixed-noport' $idle $false
+    $r = Invoke-KitCmd $k $Start '' @{ PGPU_FIXED_PORTS = '1'; ANDROID_SERIAL = 'EMU1'; PGPU_PORT = $null }
+    Check 'PGPU_FIXED_PORTS=1 で PGPU_PORT が無い：同じ案内・終わりのコード 1・adb は打たない' (($r.Exit -eq 1) -and ($r.Out -match 'ANDROID_SERIAL and PGPU_PORT must be set too') -and (-not $r.Calls)) 'safety'
+    # 2) 古い android\port.txt があっても、PGPU_FIXED_PORTS=1 なら読まない。対照：無ければ、port.txt は PGPU_PORT の口に書き直される
+    $other = Get-FreePort
+    $k = New-AndroidKit 'fixed-stale' $idle $false
+    [IO.File]::WriteAllText((Join-Path $k.Kit 'android\port.txt'), "gpu=$other`r`n", [Text.Encoding]::ASCII)
+    $r = Invoke-KitCmd $k $Start '' $fixed
+    $m = Get-FwdMap $k.State
+    Check ('PGPU_FIXED_PORTS=1：android\port.txt の口（' + $other + '）ではなく、PGPU_PORT の口（' + $k.Port + '）につなぐ・port.txt は書き換えない') (($r.Exit -eq 0) -and ($m[[string]$k.Port] -eq ('tcp:' + $k.Port)) -and (-not $m.ContainsKey([string]$other)) -and (([IO.File]::ReadAllText((Join-Path $k.Kit 'android\port.txt'))).Trim() -eq "gpu=$other")) 'safety'
+    Stop-Spawned
+    $k = New-AndroidKit 'fixed-stale-control' $idle $false
+    [IO.File]::WriteAllText((Join-Path $k.Kit 'android\port.txt'), "gpu=$other`r`n", [Text.Encoding]::ASCII)
+    $r = Invoke-KitCmd $k $Start '' @{}
+    $m = Get-FwdMap $k.State
+    Check '対照：PGPU_FIXED_PORTS が無いと、PGPU_PORT の口を android\port.txt に書き直す（古い口は消える）。上の場面は、この違いを見ている' (($r.Exit -eq 0) -and ($m[[string]$k.Port] -eq ('tcp:' + $k.Port)) -and ((Get-PortFileValue $k.Kit 'gpu') -eq $k.Port)) 'safety'
+    Stop-Spawned
+    # 3) PC の口をほかのプログラムが使っているとき：PGPU_FIXED_PORTS=1 なら別の口に変えずに止まる。対照：無ければ別の口を選んで port.txt に覚える
+    $k = New-AndroidKit 'fixed-busy' $idle $false
+    [void](Start-Blocker $k.Port)
+    $r = Invoke-KitCmd $k $Start '' $fixed
+    $m = Get-FwdMap $k.State
+    Check 'PGPU_FIXED_PORTS=1：PC の口が使われていても、別の口に変えずに止まる（「could not open port」・終わりのコード 1・port.txt を作らない・adb forward を作らない）' (($r.Exit -eq 1) -and ($r.Out -match 'could not open port') -and (-not (Test-Path -LiteralPath (Join-Path $k.Kit 'android\port.txt'))) -and ($m.Count -eq 0)) 'safety'
+    Stop-Spawned
+    $k = New-AndroidKit 'fixed-busy-control' $idle $false
+    [void](Start-Blocker $k.Port)
+    $r = Invoke-KitCmd $k $Start '' @{}
+    $picked = Get-PortFileValue $k.Kit 'gpu'
+    Check '対照：PGPU_FIXED_PORTS が無いと、使われている口を避けて別の口を選び、android\port.txt に覚える' (($r.Exit -eq 0) -and ($null -ne $picked) -and ($picked -ne $k.Port)) 'safety'
+    Stop-Spawned
+    # 4) 同じ PC の口がもう別の端末に向いているなら、奪わずに止まる。同じ端末なら、そのまま置き換える
+    $s = $idle.Clone(); $s.fwdserial = 'OTHERPHONE99'
+    $k = New-AndroidKit 'fixed-taken' $s $true
+    $r = Invoke-KitCmd $k $Start '' $fixed
+    $m = Get-FwdMap $k.State
+    Check 'PGPU_FIXED_PORTS=1：PC の口がもう別の端末に向いているなら、奪わずに止まる（「already goes to another phone」・終わりのコード 1・forward は元のまま）' (($r.Exit -eq 1) -and ($r.Out -match 'already goes to another phone') -and ($m[[string]$k.Port] -eq ('tcp:' + $k.Port)) -and ($r.Calls -notmatch '(?m)^push ')) 'safety'
+    Stop-Spawned
+    $s = $idle.Clone(); $s.fwdserial = 'EMU1'
+    $k = New-AndroidKit 'fixed-same' $s $true
+    $r = Invoke-KitCmd $k $Start '' $fixed
+    $m = Get-FwdMap $k.State
+    Check '対照：同じ端末が持っている口なら、止まらずに受け手を入れ直してつなぎ直す' (($r.Exit -eq 0) -and ($r.Out -notmatch 'another phone') -and ($r.Calls -match '(?m)^push ') -and ($m[[string]$k.Port] -eq ('tcp:' + $k.Port))) 'safety'
+    Stop-Spawned
+    # 5) stop_android.cmd：PGPU_FIXED_PORTS=1 なら android\port.txt の口は外さず、PGPU_PORT の口だけ外す。対照：無ければ両方外す
+    $x = Get-FreePort
+    $k = New-AndroidKit 'fixed-stop' $idle $true @(@{ Port = $x; Target = 'tcp:50060' })
+    [IO.File]::WriteAllText((Join-Path $k.Kit 'android\port.txt'), "gpu=$x`r`n", [Text.Encoding]::ASCII)
+    $r = Invoke-KitCmd $k 'android\stop_android.cmd' '' $fixed
+    $m = Get-FwdMap $k.State
+    Check 'stop_android.cmd・PGPU_FIXED_PORTS=1：PGPU_PORT の口だけ外し、android\port.txt の口は外さない' (($r.Exit -eq 0) -and (-not $m.ContainsKey([string]$k.Port)) -and ($m[[string]$x] -eq 'tcp:50060')) 'safety'
+    Stop-Spawned
+    $k = New-AndroidKit 'fixed-stop-control' $idle $true @(@{ Port = $x; Target = 'tcp:50060' })
+    [IO.File]::WriteAllText((Join-Path $k.Kit 'android\port.txt'), "gpu=$x`r`n", [Text.Encoding]::ASCII)
+    $r = Invoke-KitCmd $k 'android\stop_android.cmd' '' @{}
+    Check '対照：PGPU_FIXED_PORTS が無いと、stop_android.cmd は android\port.txt の口も外す' (($r.Exit -eq 0) -and ((Get-FwdMap $k.State).Count -eq 0)) 'safety'
+}
+
+# =====================================================================
 $scenarios = [ordered]@{
+    'speed-usb3'        = { param($m) Scn-SpeedUsb3 $m }
+    'speed-limit'       = { param($m) Scn-SpeedLimit $m }
+    'speed-usb2'        = { param($m) Scn-SpeedUsb2 $m }
+    'speed-lang'        = { param($m) Scn-SpeedLang $m }
+    'speed-unknown'     = { param($m) Scn-SpeedUnknown $m }
+    'speed-nc'          = { param($m) Scn-SpeedNc $m }
+    'speed-stop'        = { param($m) Scn-SpeedStop $m }
+    'speed-hide'        = { param($m) Scn-SpeedHide $m }
+    'game-mode'         = { param($m) Scn-GameMode $m }
+    'android-fixed-ports' = { param($m) Scn-AndroidFixedPorts $m }
     'log-ok'            = { param($m) Scn-LogOk $m }
     'log-lang'          = { param($m) Scn-LogLang $m }
     'log-stop'          = { param($m) Scn-LogStop $m }

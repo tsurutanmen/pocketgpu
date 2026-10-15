@@ -9,13 +9,13 @@ echo Stopping the receiver on the phone ...
 "%ADB%" shell "kill $(pidof pgpu_server) 2>/dev/null; rm -f /data/local/tmp/pgpu_server; true" >nul 2>&1
 "%ADB%" forward --remove tcp:%PGPU_PORT% >nul 2>&1
 rem The port saved in android\port.txt (the one start_android.cmd used) is closed too, even if PGPU_PORT is set to something else in this window.
-if exist "%~dp0port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0port.txt") do if /i "%%A"=="gpu" "%ADB%" forward --remove tcp:%%B >nul 2>&1
+if not defined PGPU_FIXED_PORTS if exist "%~dp0port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0port.txt") do if /i "%%A"=="gpu" "%ADB%" forward --remove tcp:%%B >nul 2>&1
 echo Stopped. The receiver is removed from the phone; its log stays at /data/local/tmp/pgpu_server.log.
 if "%PGPU_NOPAUSE%"=="" pause
 exit /b 0
 :nodev
 if defined ADB_OK "%ADB%" forward --remove tcp:%PGPU_PORT% >nul 2>&1
-if defined ADB_OK if exist "%~dp0port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0port.txt") do if /i "%%A"=="gpu" "%ADB%" forward --remove tcp:%%B >nul 2>&1
+if defined ADB_OK if not defined PGPU_FIXED_PORTS if exist "%~dp0port.txt" for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0port.txt") do if /i "%%A"=="gpu" "%ADB%" forward --remove tcp:%%B >nul 2>&1
 echo The receiver on the phone was not stopped. Connect the phone and run this file again, or restart the phone.
 if "%PGPU_NOPAUSE%"=="" pause
 exit /b 1

@@ -16,8 +16,9 @@ This repository has only the scripts that install, check and repair a PocketGPU 
 - `Fix-PocketGPU.cmd`: finds problems and fixes the ones it can
 - `Update-PocketGPU.cmd`: downloads only the files that changed
 - `Run-on-iPhone-GPU.cmd`: starts a game or app on the phone GPU
-- Android scripts in `kit/android/`: `start_android.cmd` and `stop_android.cmd` for the GPU receiver, `android_app.cmd` for the PocketGPU app (camera, microphone, speaker and GPU)
+- Android scripts in `kit/android/`: `start_android.cmd` and `stop_android.cmd` for the GPU receiver, `android_app.cmd` for the PocketGPU app (camera, microphone, speaker and GPU), `_gamemode.cmd` (the first two call it: it asks Android for the performance game mode for the PocketGPU app)
 - `Send-Android-Log.cmd`: one double-click collects the receiver log, the crash log (PocketGPU only unless you answer y), the app log and the phone and kit info into one zip. It leaves out the PC user name, the PC name, the adb serial number and e-mail addresses, and it never reads the phone number, IMEI or accounts
+- `Test-Android-Speed.cmd`: measures the USB speed of an Android phone through adb: the speed the phone and the PC agree on, MB/s in both directions and the round trip in ms. It writes one text file. It installs nothing on the phone and needs no root. It leaves out the PC user name, the PC name, the adb serial number and e-mail addresses, and it never reads the phone number, IMEI or accounts
 - Tests in `tests/`
 
 Not in here: the GPU driver (`iphone_icd.dll`), the iPhone and Android apps, the webcam and audio tools, and `PocketGPU.exe`.
@@ -95,6 +96,19 @@ The 0.1.4 app does not need port 50060 on the phone to be free. If the version c
 
 The Android cmd files in `android\` check the port before they use it. If it is reserved, or another program uses it, `tools\pgpu_port.ps1` picks a free port outside the reserved ranges (47300 and up for the GPU, 47400 for the webcam, 47500 for the audio), prints one line such as `Port 50300 is reserved by Windows, so port 47300 is used instead`, and saves the port in `android\port.txt`. `pocketgpu_android.cmd`, `check_android.cmd`, `android_app.cmd`, `stop_android.cmd` and `tools\run.ps1` read that file, so they use the same port. The order is: the variable (`PGPU_PORT`, `PGPU_CAM_PORT`, `PGPU_AUDIO_PORT`), then `android\port.txt`, then the default. Delete `android\port.txt` to forget the saved ports. `Fix-PocketGPU.cmd` finds a port inside a reserved range, asks, and does the same. It never changes the Windows reservation.
 
+### Several Android phones: PGPU_FIXED_PORTS
+
+To use several phones at the same time, set `PGPU_FIXED_PORTS=1`, `ANDROID_SERIAL` (the adb serial number of the phone) and a different `PGPU_PORT` for each phone (`PGPU_CAM_PORT` and `PGPU_AUDIO_PORT` too, if the app is used) in the window where you start the cmd files. Then `android\port.txt` is neither read nor written, and the ports are not changed. The cmd files use exactly the numbers you set.
+
+- If `ANDROID_SERIAL` or `PGPU_PORT` is not set, the cmd file stops with an error.
+- If the PC port is used by another program, `start_android.cmd` stops. It does not pick another port.
+- If the PC port already goes to another phone, `start_android.cmd` stops. It does not take the port over.
+- `stop_android.cmd` removes only the `adb forward` of `PGPU_PORT`. It does not read `android\port.txt`.
+
+### Game mode
+
+After the receiver is running, `start_android.cmd` and `android_app.cmd` ask Android for the performance game mode for the PocketGPU app (`adb shell cmd game mode performance com.tsurutanmen.pocketgpu`, then `cmd game set --mode performance` if that fails). If the app is not installed, or the phone refuses (Android 11 and older have no `cmd game`), the cmd file prints one line about it and goes on. Set `PGPU_NOGAMEMODE=1` to skip it.
+
 ## Linux: fix.sh
 
 For the Linux kit (CachyOS, Arch, Linux Mint, Ubuntu, Debian, Fedora, SteamOS). It is the Linux version of `Fix-PocketGPU.cmd`. The file is `linux/fix.sh`.
@@ -157,6 +171,7 @@ PocketGPU は、スマホを Windows の PC の 2 枚目の GPU・ウェブカ�
 - `Update-PocketGPU.cmd`：変わったファイルだけをダウンロードします
 - `Run-on-iPhone-GPU.cmd`：ゲームやアプリを iPhone の GPU で起動します
 - `Send-Android-Log.cmd`：ダブルクリック 1 回で、受け手の記録・Android の落ちた記録（既定は PocketGPU の分だけ。y と答えたときだけ全部）・アプリの記録・スマートフォンとキットの情報を、1 つの zip にまとめます。PC のユーザー名・PC 名・adb のシリアル番号・メールアドレスは伏せます。電話番号・IMEI・アカウントは読みません
+- `Test-Android-Speed.cmd`：Android の USB の速さを adb で測ります。スマートフォンと PC が取り決めた USB の速さ・両方向の MB/s・往復の ms を、1 つの txt に書きます。スマートフォンには何も入れず、root も要りません。PC のユーザー名・PC 名・adb のシリアル番号・メールアドレスは伏せます。電話番号・IMEI・アカウントは読みません。【仮文】USB 2 と出たときは、USB 3 のポートと USB 3 のケーブルでつなぎ直すと速くなるかもしれません
 
 直らないときは、`pocketgpu-fix-summary.txt` の中身を Discord か Issue に貼ってください。合言葉・ユーザー名・PC の名前・フォルダの場所は入っていません。
 
@@ -165,6 +180,19 @@ PocketGPU は、スマホを Windows の PC の 2 枚目の GPU・ウェブカ�
 `adb forward` は、この PC の口（GPU は 50300、ウェブカメラは 50064、音声は 50063）で待ちます。Hyper-V や WSL のために Windows が口の範囲を予約している PC があり（`netsh int ipv4 show excludedportrange protocol=tcp` で見えます）、範囲の中の口では adb が待てません。PC で待つのは Android の部分だけです。iPhone は Apple のサービスにつなぐだけで、PC では何も待ちません。
 
 `android\` の cmd は、使う前に口をチェックします。予約されている口や、ほかのプログラムが使っている口なら、`tools\pgpu_port.ps1` が、予約の範囲の外の空いている口（GPU は 47300、ウェブカメラは 47400、音声は 47500 から順）を選び、`ポート 50300 は Windows に予約されているので、47300 を使います` のような 1 行を出して、`android\port.txt` に覚えます。`pocketgpu_android.cmd`・`check_android.cmd`・`android_app.cmd`・`stop_android.cmd`・`tools\run.ps1` はそのファイルを読むので、同じ口を使います。決める順番は、環境変数（`PGPU_PORT`・`PGPU_CAM_PORT`・`PGPU_AUDIO_PORT`）、`android\port.txt`、既定の順です。覚えた口を消すには、`android\port.txt` を削除してください。`Fix-PocketGPU.cmd` は、予約の範囲に入っている口を見つけて、聞いてから、同じように直します。Windows の予約の設定は変えません。
+
+### Android：何台かを同時に使う（PGPU_FIXED_PORTS）
+
+何台かを同時に使うときは、cmd を起動する窓で、`PGPU_FIXED_PORTS=1`・`ANDROID_SERIAL`（その端末の adb のシリアル番号）・台ごとに違う `PGPU_PORT`（アプリを使うなら `PGPU_CAM_PORT` と `PGPU_AUDIO_PORT` も）を決めます。すると `android\port.txt` は読まず、書かず、口を変えません。cmd は決めた数をそのまま使います。
+
+- `ANDROID_SERIAL` か `PGPU_PORT` が決まっていないと、cmd はエラーを出して止まります
+- PC の口をほかのプログラムが使っているとき、`start_android.cmd` は止まります。別の口は選びません
+- PC の口がもう別の端末に向いているとき、`start_android.cmd` は止まります。口は奪いません
+- `stop_android.cmd` は `PGPU_PORT` の `adb forward` だけを外します。`android\port.txt` は読みません
+
+### Android：ゲームモード
+
+受け手が動いたあと、`start_android.cmd` と `android_app.cmd` は、PocketGPU アプリに「performance」のゲームモードを頼みます（`adb shell cmd game mode performance com.tsurutanmen.pocketgpu`。失敗したら `cmd game set --mode performance`）。アプリが入っていないとき、スマートフォンが断るとき（Android 11 以前には `cmd game` がありません）は、1 行だけ出して先へ進みます。頼みたくないときは `PGPU_NOGAMEMODE=1` にします。
 
 ### Linux：fix.sh
 

@@ -22,6 +22,16 @@
 //   crash=行|行      adb logcat -d -b crash の中身
 //   applog=行|行     adb logcat -d -s iphone-rpc-vk の中身
 //   adb version は「Installed as 場所」の行を出す（偽の adb.exe の置き場所）
+// Test-Android-Speed.cmd と _gamemode.cmd の試験用：
+//   marketname=Fake Phone Pro   ro.product.marketname
+//   udc=super-speed  udcmax=super-speed-plus  udcstate=configured   /sys/class/udc/*/current_speed・maximum_speed・state の答え（noudc=1 なら cat が失敗する）
+//   limit_to=40  limit_from=60   PC→端末・端末→PC の速さの上限（MB/s。空なら止めない）
+//   rtt_ms=2     端末の nc -e cat が 1 バイトを返すまでの待ち（ミリ秒）
+//   nonc=1       nc が無い（not found。ncerr=文 を足すと、その文を出す）    nonos=1  nc が -s を断る    noe=1  nc が -e を断る（usage を出して終わる）
+//   noclose=1    端末の nc が、全部受けても接続を閉じない
+//   gamemode=ok|fail1|fail|nogame|errtext   cmd game mode performance の答え（ok 何も出さず成功・fail1 mode の形だけ失敗・fail 両方失敗・nogame cmd game が無い・errtext 終わりのコード 0 で Error: を出す）
+//   端末の nc のふり：adb shell "nc -l …" は、状態に ncport・ncmode（sink|source|echo）を書いて、つながり終わる（ncdone=1）まで動き続ける。adb forward がつなぐと、その形で答える
+//   fwdserial=番号   adb forward --list の各行に出す端末の番号（既定は serial。別の端末が口を持っているふり。PGPU_FIXED_PORTS の試験用）
 // 環境変数 FAKE_ADB_LOG に書くと、呼ばれた adb の引数を 1 行ずつそのファイルに足す。
 // adb forward のふり：口を開けて待つ「adb.exe __serve 口 状態ファイル」を別に起こす。つながると、先と状態に応じて答える：
 //   tcp:番号（GPU）             キットの受け手が動いていれば GPU のあいさつに答える。先が 50060 なら、アプリの受け手が 50060 で動いていれば答える
@@ -132,6 +142,70 @@ public static class FakeAdb
 
     static int Shell(string cmd, Dictionary<string, string> s, string st)
     {
+        if (cmd.StartsWith("getprop ro.product.marketname")) { Line(Get(s, "marketname")); return 0; }
+        if (cmd.StartsWith("cat /sys/class/udc/"))
+        {
+            string f = cmd.Substring(cmd.LastIndexOf('/') + 1);
+            if (Get(s, "noudc") == "1") { Console.Error.WriteLine("cat: /sys/class/udc/*/" + f + ": No such file or directory"); return 1; }
+            if (f == "current_speed") Line(Or(Get(s, "udc"), "high-speed"));
+            else if (f == "maximum_speed") Line(Or(Get(s, "udcmax"), "super-speed"));
+            else if (f == "state") Line(Or(Get(s, "udcstate"), "configured"));
+            return 0;
+        }
+        if (cmd.StartsWith("cat /proc/net/tcp"))
+        {
+            Line("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode");
+            Line("   0: 0100007F:D431 00000000:0000 0A 00000000:00000000 00:00000000 00000000  2000        0 1111 1 0000000000000000 100 0 0 10 0");
+            string np = Get(s, "ncport");
+            if (np != "" && Get(s, "ncdone") != "1")
+                Line("   1: 0100007F:" + int.Parse(np).ToString("X4") + " 00000000:0000 0A 00000000:00000000 00:00000000 00000000  2000        0 2222 1 0000000000000000 100 0 0 10 0");
+            return 0;
+        }
+        if (cmd.Contains("pidof nc")) return 0;
+        if (cmd.StartsWith("cmd game "))
+        {
+            string gm = Get(s, "gamemode");
+            bool modeForm = cmd.StartsWith("cmd game mode ");
+            if (gm == "nogame") { Console.Error.WriteLine("cmd: Can't find service: game"); return 20; }
+            if (gm == "fail" || (gm == "fail1" && modeForm)) { Console.Error.WriteLine("Exception occurred while executing 'game': java.lang.IllegalArgumentException: unknown option"); return 255; }
+            if (gm == "errtext") { Line("Error: package is not a game"); return 0; }
+            s["gm_set"] = modeForm ? "mode" : "set";
+            Save(st, s);
+            return 0;
+        }
+        if (cmd.Contains("nc -l "))
+        {
+            if (Get(s, "nonc") == "1") { Console.Error.WriteLine(Or(Get(s, "ncerr"), "/system/bin/sh: nc: inaccessible or not found")); return 127; }
+            if (Get(s, "nonos") == "1" && cmd.Contains(" -s ")) { Console.Error.WriteLine("nc: Bad address"); return 1; }
+            string mode;
+            long nbytes = 0;
+            if (cmd.Contains("mkfifo")) mode = "echo";
+            else if (cmd.Contains(" -e cat"))
+            {
+                if (Get(s, "noe") == "1") { Console.Error.WriteLine("usage: nc [-46ELlntUu] [-pPORT] [-sADDR] [-wSECS] [-qSECS] [-WSIZE] [-f FILE | IPADDR PORT | -e COMMAND...]"); return 1; }
+                mode = "echo";
+            }
+            else if (cmd.StartsWith("head -c "))
+            {
+                mode = "source";
+                var hm = System.Text.RegularExpressions.Regex.Match(cmd, @"head -c (\d+) ");
+                nbytes = hm.Success ? long.Parse(hm.Groups[1].Value) : 0;
+            }
+            else mode = "sink";
+            var pm = System.Text.RegularExpressions.Regex.Match(cmd, @" -p (\d+)");
+            if (!pm.Success) return 1;
+            s["ncport"] = pm.Groups[1].Value; s["ncmode"] = mode; s["ncbytes"] = nbytes.ToString(); s["ncdone"] = "0";
+            Save(st, s);
+            // つながり終わるまで待つ（本物の adb shell が nc の終わりまで戻らないのと同じ）。25 秒で諦める
+            var until = DateTime.Now.AddSeconds(25);
+            while (DateTime.Now < until)
+            {
+                Thread.Sleep(50);
+                try { if (Get(Load(st), "ncdone") == "1") break; } catch (IOException) { }
+            }
+            var s2 = Load(st); s2["ncport"] = ""; s2["ncmode"] = ""; s2["ncdone"] = "0"; Save(st, s2);
+            return 0;
+        }
         if (cmd.StartsWith("getprop ro.product.cpu.abi")) { Line("arm64-v8a"); return 0; }
         if (cmd.StartsWith("getprop ro.product.model")) { Line("FakePhone"); return 0; }
         if (cmd.StartsWith("getprop ro.product.manufacturer")) { Line(Or(Get(s, "maker"), "FakeMaker")); return 0; }
@@ -245,7 +319,7 @@ public static class FakeAdb
         var fw = LoadFwds(s);
         if (a.Count >= 2 && a[1] == "--list")
         {
-            foreach (var f in fw) Line((serial == "" ? "FAKE" : serial) + " tcp:" + f.Port + " " + f.Target);
+            foreach (var f in fw) Line(Or(Get(s, "fwdserial"), serial == "" ? "FAKE" : serial) + " tcp:" + f.Port + " " + f.Target);
             return 0;
         }
         if (a.Count >= 3 && a[1] == "--remove")
@@ -307,6 +381,46 @@ public static class FakeAdb
         return ver >= min;
     }
 
+    static double Lim(Dictionary<string, string> s, string k) { double v; return double.TryParse(Get(s, k), out v) && v > 0 ? v : 0; }
+    static void NcHandle(TcpClient c, string st, Dictionary<string, string> s)
+    {
+        string mode = Get(s, "ncmode");
+        var ns = c.GetStream();
+        var sw = Stopwatch.StartNew();
+        long total = 0;
+        var buf = new byte[65536];
+        if (mode == "sink")
+        {
+            double lim = Lim(s, "limit_to");
+            int k;
+            while ((k = ns.Read(buf, 0, buf.Length)) > 0)
+            {
+                total += k;
+                if (lim > 0) { double want = total / (lim * 1048576.0) * 1000.0; double have = sw.Elapsed.TotalMilliseconds; if (want > have) Thread.Sleep((int)(want - have)); }
+            }
+        }
+        else if (mode == "source")
+        {
+            double lim = Lim(s, "limit_from");
+            long n = long.Parse(Get(s, "ncbytes"));
+            while (total < n)
+            {
+                int k = (int)Math.Min(buf.Length, n - total);
+                ns.Write(buf, 0, k);
+                total += k;
+                if (lim > 0) { double want = total / (lim * 1048576.0) * 1000.0; double have = sw.Elapsed.TotalMilliseconds; if (want > have) Thread.Sleep((int)(want - have)); }
+            }
+        }
+        else
+        {
+            int rtt = (int)Lim(s, "rtt_ms");
+            var one = new byte[1];
+            while (ns.Read(one, 0, 1) > 0) { if (rtt > 0) { var w = Stopwatch.StartNew(); while (w.Elapsed.TotalMilliseconds < rtt) Thread.SpinWait(50); } ns.Write(one, 0, 1); }
+        }
+        var d = Load(st); d["ncdone"] = "1"; Save(st, d);
+        if (Get(s, "noclose") == "1") Thread.Sleep(4000);   // nc が接続を閉じない形。PC が先に切ったあとも、ここで握ったまま
+    }
+
     static void Handle(TcpClient c, string st, int port)
     {
         try
@@ -330,6 +444,9 @@ public static class FakeAdb
                 while (c.GetStream().Read(hold, 0, 1) > 0) { }
                 return;
             }
+            // 端末の nc のふり（Test-Android-Speed.cmd）。待っている nc が無ければ、つないですぐ切る
+            string ncp = Get(s, "ncport");
+            if (target.StartsWith("tcp:") && Get(s, "ncmode") != "" && ncp != "" && target == "tcp:" + ncp) { NcHandle(c, st, s); return; }
             // GPU：先が 50060 か localabstract:pocketgpu-gpu ならアプリの受け手、それ以外はキットの受け手。動いていなければ、本物の adb と同じように、つないですぐ切る
             string appPort = Get(s, "appport") == "" ? "50060" : Get(s, "appport");
             if (target == "tcp:50060") { if (Get(s, "apprecv") != "1" || appPort != "50060") { c.Close(); return; } }

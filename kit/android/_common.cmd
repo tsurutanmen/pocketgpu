@@ -6,8 +6,12 @@ rem The ports on this PC are chosen in this order: the variable (set PGPU_PORT=.
 rem If the PC port is reserved by Windows (see: netsh int ipv4 show excludedportrange protocol=tcp) or used by another program, tools\pgpu_port.ps1
 rem   picks a free port outside the reserved ranges (47300, 47400, 47500 and up), prints one line about it, and saves it in android\port.txt.
 rem   This happens when the caller sets PGPU_PICK=gpu or PGPU_PICK=gpu,cam,audio before calling this file. To forget the saved ports: delete android\port.txt.
+rem Several phones at the same time: set PGPU_FIXED_PORTS=1, ANDROID_SERIAL=the-serial and PGPU_PORT=a-different-port-for-each-phone (PGPU_CAM_PORT and PGPU_AUDIO_PORT too, if the app is used).
+rem   Then android\port.txt is neither read nor written, and the ports are never changed behind your back. Every file of this kit uses exactly the numbers you set.
 set "ADB_OK="
-call :load_ports
+if defined PGPU_FIXED_PORTS goto fixed_check
+:fixed_back
+if not defined PGPU_FIXED_PORTS call :load_ports
 if "%PGPU_PORT%"=="" set PGPU_PORT=50300
 if "%PGPU_CAM_PORT%"=="" set PGPU_CAM_PORT=50064
 if "%PGPU_AUDIO_PORT%"=="" set PGPU_AUDIO_PORT=50063
@@ -82,10 +86,22 @@ echo ERROR: the device "%ANDROID_SERIAL%" is not ready. Run   "%ADB%" devices   
 exit /b 1
 
 :pick_ports
+rem With PGPU_FIXED_PORTS the numbers are the caller's choice: nothing is checked here and nothing is saved.
+if defined PGPU_FIXED_PORTS exit /b 0
 rem Check the ports on this PC and save the ones that had to change. The result is read back from android\port.txt.
 if exist "%~dp0..\tools\pgpu_port.ps1" "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\tools\pgpu_port.ps1" -PgpuPick "%PGPU_PICK%" <nul
 call :load_ports force
 exit /b 0
+
+:fixed_check
+rem PGPU_FIXED_PORTS needs the phone and the PC port to be chosen by the caller, so that two phones can never share a port by accident.
+if "%ANDROID_SERIAL%"=="" goto fixed_bad
+if "%PGPU_PORT%"=="" goto fixed_bad
+goto fixed_back
+:fixed_bad
+echo.
+echo ERROR: PGPU_FIXED_PORTS is set, so ANDROID_SERIAL and PGPU_PORT must be set too (a different PGPU_PORT for each phone).
+exit /b 1
 
 rem Read android\port.txt (lines like gpu=47300). Without "force" a variable that is already set wins; with "force" the file wins.
 :load_ports
