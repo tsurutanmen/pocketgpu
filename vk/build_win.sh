@@ -49,7 +49,9 @@ for w in $WHAT; do
         echo "道具：stackdump・vklist・subwin（x86 も）"
         ;;
     tests)
-        for t in tri tri13 vecadd pushdesc copydesc copyimg extlist; do $CC $VKH tests/$t.c -o "$OUT/$t.exe" $VKLIB; done
+        for t in tri tri13 vecadd pushdesc copydesc copyimg extlist nullrec; do $CC $VKH tests/$t.c -o "$OUT/$t.exe" $VKLIB; done
+        # 落ちたときの手がかりの書き出しの試験（server.c を取り込む。crash34）
+        $CC -Wall -Wno-unused-parameter $VKH tests/rpdump.c -o "$OUT/rpdump.exe" -lws2_32 -lole32 -loleaut32 -lwindowscodecs -luuid -ldbghelp
         for t in d3d11tri d3d11cube d3d11event; do $CC -Wall -Wno-unused-parameter tests/$t.c -o "$OUT/d3d11/$t.exe" -ld3d11 -ldxguid -luuid -luser32 -lgdi32; done
         # DirectX 9・10 の小さな試験（tests/d3d9tri.c・d3d10tri.c）。横に DXVK の d3d9.dll か d3d10core.dll・d3d11.dll・dxgi.dll を置くとドライバ越し。32 ビット版は x86 に出す（Need for Speed Carbon のような 32 ビットのゲームの代わり）
         mkdir -p "$OUT/dx910/x64" "$OUT/dx910/x86"

@@ -393,7 +393,10 @@ static int g_fmt3;                     // VkFormatProperties3 を答えられる
 // aux：バッファならつないだメモリの番号。list：descriptor set なら中のバッファの番号の並び
 typedef struct { uint64_t *ids; uint32_t n, cap; } idlist;
 typedef struct { uint64_t id, h; uint32_t kind; void *map; uint64_t size; uint64_t aux; idlist *list;
-                 uint8_t *last; uint64_t dev; uint64_t mark, use_msg; uint64_t gwb, gwsz; } ent; // last：ドライバが持っているはずの中身。VR_MEM_READ_DELTA で使う
+                 uint8_t *last; uint64_t dev; uint64_t mark, use_msg; uint64_t gwb, gwsz; uint32_t fl; void *dyn; } ent; // last：ドライバが持っているはずの中身。VR_MEM_READ_DELTA で使う
+                                                    // dyn：descriptor set の dynamic な buffer descriptor の表（dynlist・crash34）
+                                                    // fl：EF_BOUND（buffer・image をメモリに結べた）。buffer の size は作った大きさ（0 は分からない）。crash34
+#define EF_BOUND 1u
                                                     // dev：持ち主の装置（装置ならそれ自身）
                                                     // gwb・gwsz：書き込みを GPU で写すときの、メモリ全体に重ねた buffer とその大きさ（gw_*）
                                                     // mark：記録中の command buffer に足し済みの印（cbinfo の serial）・use_msg：これを使う最後の submit の番号（set とメモリ）
@@ -411,6 +414,9 @@ static void idlist_free(idlist **l) {
 }
 static ent *g_tab;
 static size_t g_cap, g_cnt;
+typedef struct { uint32_t binding, elem, type; uint64_t buf, off, range, bsize; } dynd; // bsize：書いたときの buffer の大きさ（0 は分からない）
+typedef struct { uint32_t n, cap; dynd *e; } dynlist;
+static void free_dyn(void *p) { dynlist *d = p; if (d) { free(d->e); free(d); } }
 
 enum { K_DEVICE = 1, K_QUEUE, K_BUFFER, K_MEMORY, K_SHADER, K_DSL, K_PLAYOUT, K_PIPELINE, K_DPOOL, K_DSET, K_CPOOL, K_CB, K_FENCE, K_SEM,
        K_IMAGE, K_VIEW, K_RPASS, K_FB, K_SAMPLER, K_QPOOL, K_BVIEW, K_ACCEL }; // K_ACCEL：acceleration structure（aux は buffer の番号）
@@ -441,8 +447,8 @@ static void put(uint64_t id, uint64_t h, uint32_t kind) {
     size_t s = slot(id);
     while (g_tab[s].id && g_tab[s].id != id) s = (s + 1) & (g_cap - 1);
     if (!g_tab[s].id) g_cnt++;
-    if (g_tab[s].id == id) { idlist_free(&g_tab[s].list); free(g_tab[s].last); }
-    g_tab[s] = (ent) { id, h, kind, NULL, 0, 0, NULL, NULL, kind == K_DEVICE ? h : g_last_dev, 0, 0, 0, 0 };
+    if (g_tab[s].id == id) { idlist_free(&g_tab[s].list); free(g_tab[s].last); free_dyn(g_tab[s].dyn); }
+    g_tab[s] = (ent) { id, h, kind, NULL, 0, 0, NULL, NULL, kind == K_DEVICE ? h : g_last_dev, 0, 0, 0, 0, 0, NULL };
 }
 
 static ent *find(uint64_t id) {
@@ -465,6 +471,8 @@ static void del(uint64_t id) {
     if (!g_tab[s].id) return;
     free(g_tab[s].last);
     g_tab[s].last = NULL;
+    free_dyn(g_tab[s].dyn);
+    g_tab[s].dyn = NULL;
     g_tab[s].id = 0;
     g_cnt--;
     for (size_t j = (s + 1) & (g_cap - 1); g_tab[j].id; j = (j + 1) & (g_cap - 1)) {
@@ -2301,6 +2309,378 @@ static void use_accel(cbinfo *ci, uint64_t id) {
     if (e && e->kind == K_ACCEL) use_buffer(ci, e->aux);
 }
 
+// ---- 落ちたときの手がかり：記録の再生で、いま処理している vkCmd と、直前の数個（crash34） ----
+// 前は「命令 34（RECORD_COMMAND_BUFFER）で落ちた」としか分からず、記録の中のどの vkCmd かが分からなかった
+// （10/14 BerBP の Adreno 750・FNaF Doom 2 で SIGSEGV）。命令を 1 つ読むたびに、下の表（グローバルな変数）に数個の数を書くだけ。
+// 落ちたときの合図の受け手（Android の and_crash・PC の crash_handler）が、この表を記録に書く。
+// 合図の受け手の中で呼ぶので、malloc も printf も使わず、決まった文字列と数だけを write で出す。
+#define RP_RING 16
+typedef struct { uint32_t op, idx, at, rec; uint64_t a, b, c; } rp_ent;
+typedef struct {
+    uint32_t phase;      // 0 再生していない・1 reset と begin・2 命令の再生・3 end
+    uint32_t rec;        // 何回目の記録か
+    uint64_t cid;        // command buffer の番号
+    uint32_t len;        // 命令の並びの長さ（バイト）
+    uint32_t n;          // この記録の中で読んだ命令の数
+    uint32_t head;       // ring の次の書き込み先
+    uint32_t pad;
+    uint64_t gfx_pipe, cmp_pipe; // 最後につないだ pipeline の番号
+    rp_ent ring[RP_RING];
+} rp_state;
+static volatile rp_state g_rp;
+// 「空の handle」の守りで飛ばした数（種類ごとに 1 回だけ記録に書く）
+static volatile uint64_t g_rpg_total;
+// 守りを切る（調べ用）：VKR_RP_GUARD=0 で、空の handle も今までどおり vkCmd に渡す
+static int rp_guard_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("VKR_RP_GUARD"); v = !(e && *e == '0'); }
+    return v;
+}
+
+static const char *rp_cmd_name(uint32_t op) {
+    switch (op) {
+    case VR_CMD_BIND_PIPELINE: return "BIND_PIPELINE";
+    case VR_CMD_BIND_DESCRIPTOR_SETS: return "BIND_DESCRIPTOR_SETS";
+    case VR_CMD_PUSH_CONSTANTS: return "PUSH_CONSTANTS";
+    case VR_CMD_DISPATCH: return "DISPATCH";
+    case VR_CMD_DISPATCH_BASE: return "DISPATCH_BASE";
+    case VR_CMD_COPY_BUFFER: return "COPY_BUFFER";
+    case VR_CMD_FILL_BUFFER: return "FILL_BUFFER";
+    case VR_CMD_UPDATE_BUFFER: return "UPDATE_BUFFER";
+    case VR_CMD_PIPELINE_BARRIER: return "PIPELINE_BARRIER";
+    case VR_CMD_DISPATCH_INDIRECT: return "DISPATCH_INDIRECT";
+    case VR_CMD_RESET_QUERY_POOL: return "RESET_QUERY_POOL";
+    case VR_CMD_BEGIN_RENDER_PASS: return "BEGIN_RENDER_PASS";
+    case VR_CMD_END_RENDER_PASS: return "END_RENDER_PASS";
+    case VR_CMD_NEXT_SUBPASS: return "NEXT_SUBPASS";
+    case VR_CMD_DRAW: return "DRAW";
+    case VR_CMD_DRAW_INDEXED: return "DRAW_INDEXED";
+    case VR_CMD_BIND_VERTEX_BUFFERS: return "BIND_VERTEX_BUFFERS";
+    case VR_CMD_BIND_INDEX_BUFFER: return "BIND_INDEX_BUFFER";
+    case VR_CMD_SET_VIEWPORT: return "SET_VIEWPORT";
+    case VR_CMD_SET_SCISSOR: return "SET_SCISSOR";
+    case VR_CMD_COPY_IMAGE_TO_BUFFER: return "COPY_IMAGE_TO_BUFFER";
+    case VR_CMD_COPY_BUFFER_TO_IMAGE: return "COPY_BUFFER_TO_IMAGE";
+    case VR_CMD_PIPELINE_BARRIER2: return "PIPELINE_BARRIER2";
+    case VR_CMD_CLEAR_COLOR_IMAGE: return "CLEAR_COLOR_IMAGE";
+    case VR_CMD_DRAW_INDIRECT: return "DRAW_INDIRECT";
+    case VR_CMD_DRAW_INDEXED_INDIRECT: return "DRAW_INDEXED_INDIRECT";
+    case VR_CMD_COPY_IMAGE: return "COPY_IMAGE";
+    case VR_CMD_BLIT_IMAGE: return "BLIT_IMAGE";
+    case VR_CMD_BEGIN_RENDERING: return "BEGIN_RENDERING";
+    case VR_CMD_END_RENDERING: return "END_RENDERING";
+    case VR_CMD_BARRIER_SYNC2: return "BARRIER_SYNC2";
+    case VR_CMD_SET_DYNAMIC: return "SET_DYNAMIC";
+    case VR_CMD_BIND_VERTEX_BUFFERS2: return "BIND_VERTEX_BUFFERS2";
+    case VR_CMD_CLEAR_ATTACHMENTS: return "CLEAR_ATTACHMENTS";
+    case VR_CMD_CLEAR_DEPTH_STENCIL_IMAGE: return "CLEAR_DEPTH_STENCIL_IMAGE";
+    case VR_CMD_RESOLVE_IMAGE: return "RESOLVE_IMAGE";
+    case VR_CMD_BEGIN_QUERY: return "BEGIN_QUERY";
+    case VR_CMD_END_QUERY: return "END_QUERY";
+    case VR_CMD_WRITE_TIMESTAMP: return "WRITE_TIMESTAMP";
+    case VR_CMD_COPY_QUERY_RESULTS: return "COPY_QUERY_RESULTS";
+    case VR_CMD_BUILD_ACCEL: return "BUILD_ACCEL";
+    case VR_CMD_COPY_ACCEL: return "COPY_ACCEL";
+    case VR_CMD_WRITE_ACCEL_PROPS: return "WRITE_ACCEL_PROPS";
+    case 1000: return "UPDATE_DESCRIPTOR_SETS";
+    default: return "?";
+    }
+}
+
+// 1 つ読むたびに呼ぶ。at は命令の番号を読んだ後の位置
+#define RP_BEGIN(opv, atv) do { \
+        uint32_t h_ = g_rp.head++ & (RP_RING - 1); \
+        g_rp.ring[h_].op = (opv); g_rp.ring[h_].idx = g_rp.n++; g_rp.ring[h_].at = (uint32_t) (atv); g_rp.ring[h_].rec = g_rp.rec; \
+        g_rp.ring[h_].a = 0; g_rp.ring[h_].b = 0; g_rp.ring[h_].c = 0; \
+        g_rp_cur = &g_rp.ring[h_]; } while (0)
+static volatile rp_ent *g_rp_cur;
+// 落ちたときに見る数を、いま処理している命令に足す（番号・大きさなど。命令ごとに意味は違う）
+#define RP_AB(av, bv) do { g_rp_cur->a = (uint64_t) (av); g_rp_cur->b = (uint64_t) (bv); } while (0)
+#define RP_C(cv) do { g_rp_cur->c = (uint64_t) (cv); } while (0)
+
+// ---- 合図の受け手の中で使える、数と文字列の組み立て（malloc・printf を使わない） ----
+typedef struct { char b[400]; int n; } rp_line;
+static void rpl_s(rp_line *l, const char *s) { while (*s && l->n < (int) sizeof l->b - 1) l->b[l->n++] = *s++; }
+static void rpl_u(rp_line *l, uint64_t v) {
+    char t[24];
+    int k = 0;
+    do { t[k++] = (char) ('0' + v % 10); v /= 10; } while (v && k < 23);
+    while (k && l->n < (int) sizeof l->b - 1) l->b[l->n++] = t[--k];
+}
+static void rpl_x(rp_line *l, uint64_t v) {
+    char t[20];
+    int k = 0;
+    do { t[k++] = "0123456789abcdef"[v & 15]; v >>= 4; } while (v && k < 19);
+    rpl_s(l, "0x");
+    while (k && l->n < (int) sizeof l->b - 1) l->b[l->n++] = t[--k];
+}
+static void rp_emit(rp_line *l) {
+    if (l->n <= 0) return;
+    l->b[l->n++] = '\n';
+#if defined(__ANDROID__)
+    ssize_t w = write(1, l->b, (size_t) l->n);
+    (void) w;
+    l->b[l->n - 1] = 0;
+    __android_log_write(ANDROID_LOG_ERROR, "iphone-rpc-vk", l->b);
+#elif defined(_WIN32)
+    fwrite(l->b, 1, (size_t) l->n, stderr);
+#else
+    ssize_t w = write(2, l->b, (size_t) l->n);
+    (void) w;
+#endif
+    l->n = 0;
+}
+
+// maps（/proc/self/maps の写し）の中で pc を含む行を探して、名前と、ファイルの中の位置を書く
+static void __attribute__((unused)) rp_where_maps(const char *tag, uint64_t pc, const char *maps, int len) {
+    rp_line l = { .n = 0 };
+    rpl_s(&l, tag);
+    rpl_x(&l, pc);
+    for (int i = 0; i < len;) {
+        // 1 行：開始-終わり 権限 位置 dev inode 名前
+        const char *p = maps + i;
+        int j = i;
+        while (j < len && maps[j] != '\n') j++;
+        uint64_t lo = 0, hi = 0, off = 0;
+        int k = 0;
+        while (k < j - i && ((p[k] >= '0' && p[k] <= '9') || (p[k] >= 'a' && p[k] <= 'f'))) { lo = lo * 16 + (uint64_t) (p[k] <= '9' ? p[k] - '0' : p[k] - 'a' + 10); k++; }
+        if (k < j - i && p[k] == '-') k++;
+        while (k < j - i && ((p[k] >= '0' && p[k] <= '9') || (p[k] >= 'a' && p[k] <= 'f'))) { hi = hi * 16 + (uint64_t) (p[k] <= '9' ? p[k] - '0' : p[k] - 'a' + 10); k++; }
+        if (pc >= lo && pc < hi) {
+            while (k < j - i && p[k] == ' ') k++;
+            while (k < j - i && p[k] != ' ') k++;            // 権限
+            while (k < j - i && p[k] == ' ') k++;
+            while (k < j - i && p[k] != ' ') { off = off * 16 + (uint64_t) (p[k] <= '9' ? p[k] - '0' : p[k] - 'a' + 10); k++; } // 位置
+            for (int f = 0; f < 2; f++) { while (k < j - i && p[k] == ' ') k++; while (k < j - i && p[k] != ' ') k++; } // dev・inode
+            while (k < j - i && p[k] == ' ') k++;
+            rpl_s(&l, " in ");
+            char nm[200];
+            int q = 0;
+            while (k < j - i && q < (int) sizeof nm - 1) nm[q++] = p[k++];
+            nm[q] = 0;
+            rpl_s(&l, q ? nm : "[anonymous]");
+            rpl_s(&l, " +");
+            rpl_x(&l, pc - lo + off);
+            rp_emit(&l);
+            return;
+        }
+        i = j + 1;
+    }
+    rpl_s(&l, " (not found in maps)");
+    rp_emit(&l);
+}
+// 落ちたときの手がかりを記録に書く。命令 34（RECORD_COMMAND_BUFFER）の最中か、記録の再生の途中のときだけ書く
+static void __attribute__((unused)) rp_dump_crash(void) {
+    int en = g_lang_en > 0;
+    if (g_cur_op != VR_RECORD_COMMAND_BUFFER && !g_rp.phase) return;
+    rp_line l = { .n = 0 };
+    static const char *const ph_en[] = { "not replaying", "vkResetCommandBuffer/vkBeginCommandBuffer", "replaying commands", "vkEndCommandBuffer" };
+    static const char *const ph_ja[] = { "再生していない", "vkResetCommandBuffer・vkBeginCommandBuffer", "命令の再生", "vkEndCommandBuffer" };
+    uint32_t ph = g_rp.phase < 4 ? g_rp.phase : 0;
+    rpl_s(&l, en ? "Crash site (recording replay): phase " : "落ちた場所（記録の再生）：段階 ");
+    rpl_s(&l, en ? ph_en[ph] : ph_ja[ph]);
+    rpl_s(&l, en ? ", command buffer " : "・command buffer ");
+    rpl_u(&l, g_rp.cid);
+    rpl_s(&l, en ? ", recording #" : "・記録の ");
+    rpl_u(&l, g_rp.rec);
+    rpl_s(&l, en ? ", stream " : " 回目・命令の並び ");
+    rpl_u(&l, g_rp.len);
+    rpl_s(&l, en ? " bytes, commands read so far " : " バイト・ここまでに読んだ命令 ");
+    rpl_u(&l, g_rp.n);
+    rpl_s(&l, en ? ", pipeline graphics " : " 個・pipeline 描く ");
+    rpl_u(&l, g_rp.gfx_pipe);
+    rpl_s(&l, en ? " compute " : " 計算 ");
+    rpl_u(&l, g_rp.cmp_pipe);
+    rpl_s(&l, en ? ", empty-handle guards so far " : "・空の handle の守りで飛ばした数 ");
+    rpl_u(&l, g_rpg_total);
+    rp_emit(&l);
+    uint32_t head = g_rp.head, shown = head < RP_RING ? head : RP_RING;
+    if (shown > 12) shown = 12; // 直前の 12 個まで
+    for (uint32_t i = 0; i < shown; i++) {
+        uint32_t k = (head - 1 - i) & (RP_RING - 1);
+        rpl_s(&l, i ? (en ? "  before: #" : "  直前：#") : (en ? "  now: #" : "  いま：#"));
+        rpl_u(&l, g_rp.ring[k].idx);
+        rpl_s(&l, " ");
+        rpl_s(&l, rp_cmd_name(g_rp.ring[k].op));
+        rpl_s(&l, " (op ");
+        rpl_u(&l, g_rp.ring[k].op);
+        rpl_s(&l, en ? ", offset " : "・位置 ");
+        rpl_u(&l, g_rp.ring[k].at);
+        rpl_s(&l, en ? ", recording " : "・記録 ");
+        rpl_u(&l, g_rp.ring[k].rec);
+        rpl_s(&l, ") a=");
+        rpl_u(&l, g_rp.ring[k].a);
+        // a・b は 10 進（記録に出る番号と同じ書き方）。上の桁と下の桁を詰めた物（最初の番号 << 32 | 個数など）は (上,下) も足す
+        rpl_s(&l, " b=");
+        rpl_u(&l, g_rp.ring[k].b);
+        if (g_rp.ring[k].b >> 32) { rpl_s(&l, " ("); rpl_u(&l, g_rp.ring[k].b >> 32); rpl_s(&l, ","); rpl_u(&l, g_rp.ring[k].b & 0xffffffffu); rpl_s(&l, ")"); }
+        if (g_rp.ring[k].c) { rpl_s(&l, " c="); rpl_u(&l, g_rp.ring[k].c >> 32); rpl_s(&l, ","); rpl_u(&l, g_rp.ring[k].c & 0xffffffffu); }
+        rp_emit(&l);
+    }
+}
+
+// ---- 空の handle を vkCmd に渡さない守り（crash34） ----
+// 返事を待たずに作った buffer・image が受け手で作れていなかった・メモリに結べなかった・消えた番号を使った、という記録を再生すると、
+// 空の handle が GPU のドライバに渡り、Adreno などは SIGSEGV で受け手ごと落ちる（PC では次の命令から全部 device lost になる）。
+// 渡す前に見つけて、その命令（バリアなら該当の 1 つ）を飛ばし、種類ごとに 1 回だけ記録に書く。絵が欠けるだけにする
+typedef struct { uint32_t op; const char *what; uint32_t why; uint64_t n; } rpg_kind;
+static rpg_kind g_rpg[64];
+static int g_rpg_nk;
+static void rp_guard(uint32_t op, const char *what, uint64_t id, uint32_t why) {
+    g_rpg_total++;
+    for (int i = 0; i < g_rpg_nk; i++)
+        if (g_rpg[i].op == op && !strcmp(g_rpg[i].what, what) && g_rpg[i].why == why) {
+            g_rpg[i].n++;
+            // 数が 10 倍になるたびに合計だけ 1 行足す
+            if (g_rpg[i].n == 100 || g_rpg[i].n == 10000 || g_rpg[i].n == 1000000)
+                vlog(JE("空の handle の守り：%s の %s は %llu 回になった", "Empty handle guard: %s with %s reached %llu times"), rp_cmd_name(op), what, (unsigned long long) g_rpg[i].n);
+            return;
+        }
+    if (g_rpg_nk < 64) g_rpg[g_rpg_nk++] = (rpg_kind) { op, what, why, 1 };
+    static const char *const why_ja[] = { "作れていないか、消えている", "メモリに結べていない", "範囲の外", "使えない値" };
+    static const char *const why_en[] = { "does not exist (not created, or destroyed)", "is not bound to memory", "is out of range", "is invalid" };
+    vlog(JE("空の handle の守り：%s は %s %llu を使うが、それは%s。この命令（の該当の部分）を飛ばす（種類ごとの最初の 1 回だけ書く・command buffer %llu・記録 %llu 回目・命令 %u 番目）",
+            "Empty handle guard: %s uses %s %llu, which %s. Skipping this command (or that part of it). Only the first of each kind is logged (command buffer %llu, recording #%llu, command #%u)"),
+         rp_cmd_name(op), what, (unsigned long long) id, JE(why_ja[why & 3], why_en[why & 3]),
+         (unsigned long long) g_rp.cid, (unsigned long long) g_rp.rec, (unsigned) g_rp.n);
+}
+
+// 番号 → buffer の本物。無い・メモリに結べていないときは 0（記録に書く）。守りを切っているときは、前と同じく表のとおり
+static VkBuffer rp_buf(uint32_t op, uint64_t id) {
+    ent *e = find(id);
+    if (!rp_guard_on()) return e && e->kind == K_BUFFER ? (VkBuffer) (uintptr_t) e->h : VK_NULL_HANDLE;
+    if (!e || e->kind != K_BUFFER) { rp_guard(op, "buffer", id, 0); return VK_NULL_HANDLE; }
+    if (!(e->fl & EF_BOUND)) { rp_guard(op, "buffer", id, 1); return VK_NULL_HANDLE; }
+    return (VkBuffer) (uintptr_t) e->h;
+}
+static VkImage rp_img(uint32_t op, uint64_t id) {
+    ent *e = find(id);
+    if (!rp_guard_on()) return e && e->kind == K_IMAGE ? (VkImage) (uintptr_t) e->h : VK_NULL_HANDLE;
+    if (!e || e->kind != K_IMAGE) { rp_guard(op, "image", id, 0); return VK_NULL_HANDLE; }
+    if (!(e->fl & EF_BOUND)) { rp_guard(op, "image", id, 1); return VK_NULL_HANDLE; }
+    return (VkImage) (uintptr_t) e->h;
+}
+// buffer の範囲 [off, off+size) が収まるか。大きさが分からない（0）ときは通す。size が VK_WHOLE_SIZE なら off が内側にあればよい
+static int rp_range_ok(uint32_t op, uint64_t id, uint64_t off, uint64_t size) {
+    if (!rp_guard_on()) return 1;
+    ent *e = find(id);
+    if (!e || e->kind != K_BUFFER || !e->size) return 1;
+    if (off > e->size || (size != VK_WHOLE_SIZE && size > e->size - off)) { rp_guard(op, "buffer range", id, 2); return 0; }
+    return 1;
+}
+// 守りに使う GPU の上限（最初の再生のときに 1 回読む）
+static struct { int ready; uint32_t max_push, max_sets, max_viewports, max_vbind, max_draw_ind, max_ubo_range, max_ssbo_range, max_dyn; uint64_t min_ubo_align, min_ssbo_align; int multi_draw; } g_rpl;
+static void rpl_init(void) {
+    if (g_rpl.ready) return;
+    VkPhysicalDeviceProperties p;
+    memset(&p, 0, sizeof p);
+    vkGetPhysicalDeviceProperties(g_pd, &p);
+    VkPhysicalDeviceFeatures f;
+    memset(&f, 0, sizeof f);
+    vkGetPhysicalDeviceFeatures(g_pd, &f);
+    g_rpl.max_push = p.limits.maxPushConstantsSize ? p.limits.maxPushConstantsSize : 128;
+    g_rpl.max_sets = p.limits.maxBoundDescriptorSets ? p.limits.maxBoundDescriptorSets : 4;
+    g_rpl.max_viewports = p.limits.maxViewports ? p.limits.maxViewports : 1;
+    g_rpl.max_vbind = p.limits.maxVertexInputBindings ? p.limits.maxVertexInputBindings : 16;
+    g_rpl.max_draw_ind = p.limits.maxDrawIndirectCount ? p.limits.maxDrawIndirectCount : 1;
+    g_rpl.multi_draw = f.multiDrawIndirect == VK_TRUE;
+    g_rpl.max_ubo_range = p.limits.maxUniformBufferRange ? p.limits.maxUniformBufferRange : 16384;
+    g_rpl.max_ssbo_range = p.limits.maxStorageBufferRange ? p.limits.maxStorageBufferRange : 128u << 20;
+    g_rpl.min_ubo_align = p.limits.minUniformBufferOffsetAlignment;
+    g_rpl.min_ssbo_align = p.limits.minStorageBufferOffsetAlignment;
+    g_rpl.max_dyn = p.limits.maxDescriptorSetUniformBuffersDynamic + p.limits.maxDescriptorSetStorageBuffersDynamic;
+    if (!g_rpl.max_dyn) g_rpl.max_dyn = 8;
+    g_rpl.ready = 1;
+}
+
+// descriptor set の dynamic な buffer descriptor を表に足す（同じ binding・要素は置き換える）。並びは binding・要素の昇順
+// （vkCmdBindDescriptorSets の dynamic offset は、set の順・binding の昇順・要素の昇順に対応する）
+static void rp_dyn_set(ent *se, uint32_t binding, uint32_t elem, uint32_t type, uint64_t buf, uint64_t off, uint64_t range) {
+    dynlist *d = se->dyn;
+    if (!d) d = se->dyn = calloc(1, sizeof *d);
+    if (!d) return;
+    ent *be = find(buf);
+    uint64_t bsize = be && be->kind == K_BUFFER ? be->size : 0;
+    uint32_t i = 0;
+    while (i < d->n && (d->e[i].binding < binding || (d->e[i].binding == binding && d->e[i].elem < elem))) i++;
+    if (i < d->n && d->e[i].binding == binding && d->e[i].elem == elem) { d->e[i] = (dynd) { binding, elem, type, buf, off, range, bsize }; return; }
+    if (d->n == d->cap) {
+        uint32_t nc = d->cap ? d->cap * 2 : 4;
+        dynd *ne = realloc(d->e, nc * sizeof *ne);
+        if (!ne) return;
+        d->e = ne;
+        d->cap = nc;
+    }
+    memmove(d->e + i + 1, d->e + i, (d->n - i) * sizeof *d->e);
+    d->e[i] = (dynd) { binding, elem, type, buf, off, range, bsize };
+    d->n++;
+}
+
+// buffer の descriptor を書くときに、GPU の上限を確かめる。uniform buffer の range が maxUniformBufferRange を超えるときは、上限に切り詰める
+// （仕様の外。GZDoom は数 MB の ring を指す。ドライバが上限で持つ表の外を読み書きする恐れがある）。位置の揃い・buffer の外へはみ出す物は、記録に書くだけ
+static void rp_desc_check(uint32_t type, uint64_t bid, VkDescriptorBufferInfo *bi) {
+    if (!rp_guard_on() || !bid) return;
+    int ubo = type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    int sbo = type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+    if (!ubo && !sbo) return;
+    rpl_init();
+    ent *be = find(bid);
+    uint64_t size = be && be->kind == K_BUFFER ? be->size : 0;
+    uint64_t lim = ubo ? g_rpl.max_ubo_range : g_rpl.max_ssbo_range;
+    uint64_t eff = bi->range == VK_WHOLE_SIZE ? (size > bi->offset ? size - bi->offset : 0) : bi->range;
+    static unsigned n_clamp, n_align, n_out;
+    if (eff > lim) {
+        if (++n_clamp <= 5 || (n_clamp & (n_clamp - 1)) == 0)
+            vlog(JE("descriptor の range が上限を超える：%s・buffer %llu（%llu バイト）・offset %llu・range %lld > %s %llu。上限に切り詰める（%u 回目）",
+                    "Descriptor range exceeds the limit: %s, buffer %llu (%llu bytes), offset %llu, range %lld > %s %llu. Clamping it (time %u)"),
+                 ubo ? "uniform" : "storage", (unsigned long long) bid, (unsigned long long) size, (unsigned long long) bi->offset,
+                 bi->range == VK_WHOLE_SIZE ? -1LL : (long long) bi->range, ubo ? "maxUniformBufferRange" : "maxStorageBufferRange", (unsigned long long) lim, n_clamp);
+        bi->range = lim;
+        eff = lim;
+    }
+    uint64_t al = ubo ? g_rpl.min_ubo_align : g_rpl.min_ssbo_align;
+    if (al && (bi->offset % al) && (++n_align <= 5 || (n_align & (n_align - 1)) == 0))
+        vlog(JE("descriptor の offset が揃っていない：%s・buffer %llu・offset %llu（揃いは %llu）（%u 回目）", "Descriptor offset is misaligned: %s, buffer %llu, offset %llu (alignment %llu) (time %u)"),
+             ubo ? "uniform" : "storage", (unsigned long long) bid, (unsigned long long) bi->offset, (unsigned long long) al, n_align);
+    if (size && (bi->offset > size || eff > size - bi->offset) && (++n_out <= 5 || (n_out & (n_out - 1)) == 0))
+        vlog(JE("descriptor の範囲が buffer の外：buffer %llu（%llu バイト）・offset %llu・range %llu（%u 回目）", "Descriptor range is outside the buffer: buffer %llu (%llu bytes), offset %llu, range %llu (time %u)"),
+             (unsigned long long) bid, (unsigned long long) size, (unsigned long long) bi->offset, (unsigned long long) eff, n_out);
+}
+
+// vkCmdBindDescriptorSets の dynamic offset を、つなぐ set の dynamic descriptor と照らす。外れていれば 1（記録に書く）。
+// 見るのは：個数が GPU の上限を超える・offset の揃い・offset を足した範囲が buffer の中に収まる・uniform の範囲が maxUniformBufferRange 以下。
+// 個数が set の表と合わないときは（表に載らない書き方の descriptor があるかもしれないので）調べず、記録に書くだけ
+static int rp_check_dyn(uint32_t op, const uint64_t *sids, uint32_t ns, const uint32_t *dyn, uint32_t nd) {
+    rpl_init();
+    if (nd > g_rpl.max_dyn) { rp_guard(op, "dynamic offset count", nd, 3); return 1; }
+    uint32_t expected = 0;
+    for (uint32_t s = 0; s < ns; s++) { ent *se = find(sids[s]); if (se && se->dyn) expected += ((dynlist *) se->dyn)->n; }
+    if (expected != nd) {
+        static unsigned nm;
+        if (++nm <= 4) vlog(JE("dynamic offset の数 %u が、set の表の dynamic descriptor の数 %u と合わない（照らさない・%u 回目）", "The number of dynamic offsets (%u) differs from the dynamic descriptors recorded for the sets (%u); not checking (time %u)"), nd, expected, nm);
+        return 0;
+    }
+    uint32_t di = 0;
+    for (uint32_t s = 0; s < ns; s++) {
+        ent *se = find(sids[s]);
+        dynlist *dl = se ? se->dyn : NULL;
+        for (uint32_t i = 0; dl && i < dl->n; i++) {
+            const dynd *e = &dl->e[i];
+            uint64_t o = dyn[di++];
+            int ubo = e->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            uint64_t al = ubo ? g_rpl.min_ubo_align : g_rpl.min_ssbo_align;
+            if (al && (o % al)) { rp_guard(op, "dynamic offset alignment", o, 3); return 1; }
+            if (!e->bsize) continue;
+            uint64_t base = e->off + o;
+            if (base > e->bsize) { rp_guard(op, "dynamic offset", o, 2); return 1; }
+            uint64_t eff = e->range == VK_WHOLE_SIZE ? e->bsize - base : e->range;
+            if (eff > e->bsize - base) { rp_guard(op, "dynamic offset range", o, 2); return 1; }
+            if (ubo && eff > g_rpl.max_ubo_range) { rp_guard(op, "dynamic uniform range", eff, 2); return 1; }
+        }
+    }
+    return 0;
+}
+
 // ---- command buffer に積まれた命令を実行する ----
 static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
     // 有効な描き方・計算の仕方がつながっていない draw と dispatch は飛ばす
@@ -2308,6 +2688,9 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
     int gfx = 0, cmp = 0;
     int rp_off = 0; // 始められなかった render pass の中（次の subpass・終わり・draw を飛ばす）
     uint32_t skipped = 0;
+    rpl_init();
+    uint32_t vb_bad = 0; // 空の handle で結べなかった頂点 buffer の slot の印（crash34）。この slot がある間、draw は飛ばす
+    int ib_bad = 0;      // 空の handle で結べなかった index buffer。index 付きの draw は飛ばす
     // 受け手に無い set（取れなかった・消えた番号）は MoltenVK に渡さない。MoltenVK は set を submit のときに読むので、
     // 空の set をつなぐと submit の中で落ちる（10/10 iPhone の bindDescriptorSets の 0x3c）。つながなかった番号を miss に覚え、
     // その番号を使うかもしれない pipeline の draw・dispatch も飛ばす（描くときにも set を読んで落ちるので）。[0] 描く・[1] 計算
@@ -2316,26 +2699,37 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
 #define SET_GATE() (gfx = gfx_pl && !(miss[0] & uses[0]), cmp = cmp_pl && !(miss[1] & uses[1]))
     while (r->at < r->n && !r->bad) {
         uint32_t op = vr_ru32(r);
+        RP_BEGIN(op, r->at);
+#ifdef VKR_TEST_CRASH
+        // 試験用（組むときに -DVKR_TEST_CRASH を付けたときだけ）：VKR_TEST_CRASH_REPLAY=n で、記録の n 番目（0 から）の命令でわざと落ちる。
+        // 落ちたときの書き出し（rp_dump_crash）を、本物の再生の途中で確かめる
+        { static int cn = -2; if (cn == -2) { const char *e = getenv("VKR_TEST_CRASH_REPLAY"); cn = e && *e ? atoi(e) : -1; } if (cn >= 0 && (int) g_rp.n == cn + 1) *(volatile int *) 0 = 1; }
+#endif
         switch (op) {
         case VR_CMD_BIND_PIPELINE: {
             uint32_t bp = vr_ru32(r);
             uint64_t pid = vr_ru64(r);
             VkPipeline pl = OBJ(VkPipeline, pid);
+            RP_AB(pid, bp);
             tracef(ci, "  pipeline %llu%s", (unsigned long long) pid, pl ? "" : JE("（無い）", " (missing)"));
             if (pl) vkCmdBindPipeline(cb, (VkPipelineBindPoint) bp, pl);
-            if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) { gfx_pl = pl != VK_NULL_HANDLE; uses[0] = pipe_set_mask(pid); }
-            else if (bp == VK_PIPELINE_BIND_POINT_COMPUTE) { cmp_pl = pl != VK_NULL_HANDLE; uses[1] = pipe_set_mask(pid); }
+            if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) { gfx_pl = pl != VK_NULL_HANDLE; uses[0] = pipe_set_mask(pid); g_rp.gfx_pipe = pid; }
+            else if (bp == VK_PIPELINE_BIND_POINT_COMPUTE) { cmp_pl = pl != VK_NULL_HANDLE; uses[1] = pipe_set_mask(pid); g_rp.cmp_pipe = pid; }
             SET_GATE();
         } break;
         case VR_CMD_BIND_DESCRIPTOR_SETS: {
             uint32_t bp = vr_ru32(r);
             VkPipelineLayout pl = OBJ(VkPipelineLayout, vr_ru64(r));
             uint32_t first = vr_ru32(r), n = vr_ru32(r);
+            RP_AB(0, ((uint64_t) first << 32) | n);
             VkDescriptorSet sets[32];
+            uint64_t sidv[32];
             uint32_t nmiss = 0;
             uint64_t miss_id = 0;
             for (uint32_t i = 0; i < n && i < 32; i++) {
                 uint64_t sid = vr_ru64(r);
+                sidv[i] = sid;
+                if (!i) RP_AB(sid, ((uint64_t) first << 32) | n);
                 sets[i] = OBJ(VkDescriptorSet, sid);
                 if (!sets[i] && !nmiss++) miss_id = sid;
                 if (dbg_on() && ci) {
@@ -2355,7 +2749,15 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             for (uint32_t i = 64; i < nd && !r->bad; i++) (void) vr_ru32(r);
             int k = bp == VK_PIPELINE_BIND_POINT_GRAPHICS ? 0 : bp == VK_PIPELINE_BIND_POINT_COMPUTE ? 1 : -1;
             uint32_t range = set_range_mask(first, n < 32 ? n : 32);
-            if (pl && !nmiss) {
+            // GPU の上限（maxBoundDescriptorSets）を超える番号は、ドライバの中の表の外を書く（crash34）
+            int over = rp_guard_on() && (!n || (uint64_t) first + (n < 32 ? n : 32) > g_rpl.max_sets);
+            if (nd) RP_C(((uint64_t) nd << 32) | dyn[0]);
+            // dynamic offset を、つなぐ set の descriptor と照らす（範囲の外・揃わない・上限超え）。外れていたら、つながずに、その番号を使う draw を飛ばす
+            int dynbad = !over && pl && !nmiss && nd && rp_guard_on() && rp_check_dyn(op, sidv, n < 32 ? n : 32, dyn, nd < 64 ? nd : 64);
+            if (over || dynbad) {
+                if (k >= 0) miss[k] |= range;
+                if (over) rp_guard(op, "descriptor set slots", first, 3);
+            } else if (pl && !nmiss) {
                 vkCmdBindDescriptorSets(cb, (VkPipelineBindPoint) bp, pl, first, n < 32 ? n : 32, sets, nd < 64 ? nd : 64, dyn);
                 if (k >= 0) miss[k] &= ~range;
             } else {
@@ -2372,40 +2774,49 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             VkPipelineLayout pl = OBJ(VkPipelineLayout, vr_ru64(r));
             uint32_t st = vr_ru32(r), off = vr_ru32(r), sz;
             const void *d = vr_rbytes(r, &sz);
+            RP_AB(off, sz);
             if (dbg_on() && d) {
                 char h[200] = "";
                 for (uint32_t i = 0; i < sz / 4 && i < 24; i++) snprintf(h + strlen(h), sizeof h - strlen(h), " %u", ((const uint32_t *) d)[i]);
                 tracef(ci, JE("  push %u バイト:%s", "  push %u bytes:%s"), sz, h);
             }
-            if (d && pl) vkCmdPushConstants(cb, pl, st, off, sz, d);
+            // 大きさ・位置は 4 の倍数で、GPU の上限（maxPushConstantsSize）に収まること。外れるとドライバが定数の置き場の外へ書く（crash34）
+            if (d && pl && rp_guard_on() && (!st || !sz || (off & 3) || (sz & 3) || (uint64_t) off + sz > g_rpl.max_push)) rp_guard(op, "push constants range", off, 3);
+            else if (d && pl) vkCmdPushConstants(cb, pl, st, off, sz, d);
             else if (d) vlog(JE("push constants の layout が無いので飛ばした", "Skipped: there is no layout for push constants"));
         } break;
         case VR_CMD_DISPATCH: {
             uint32_t x = vr_ru32(r), y = vr_ru32(r), z = vr_ru32(r);
+            RP_AB(x, ((uint64_t) y << 32) | z);
             tracef(ci, "  dispatch %u %u %u", x, y, z);
             if (!cmp) { skipped++; break; }
             vkCmdDispatch(cb, x, y, z);
         } break;
         case VR_CMD_DISPATCH_BASE: {
             uint32_t a = vr_ru32(r), b = vr_ru32(r), c = vr_ru32(r), x = vr_ru32(r), y = vr_ru32(r), z = vr_ru32(r);
+            RP_AB(x, ((uint64_t) y << 32) | z);
             if (!cmp) { skipped++; break; }
             vkCmdDispatchBase(cb, a, b, c, x, y, z);
         } break;
         case VR_CMD_DISPATCH_INDIRECT: {
             uint64_t bid = vr_ru64(r);
             use_buffer(ci, bid);
-            VkBuffer b = OBJ(VkBuffer, bid);
             uint64_t off = vr_ru64(r);
-            if (!cmp || !b) { skipped++; break; }
+            RP_AB(bid, off);
+            VkBuffer b = cmp ? rp_buf(op, bid) : VK_NULL_HANDLE;
+            if (!cmp || !b || !rp_range_ok(op, bid, off, 12)) { skipped++; break; }
             vkCmdDispatchIndirect(cb, b, off);
         } break;
         case VR_CMD_COPY_BUFFER: {
             uint64_t sid = vr_ru64(r), did = vr_ru64(r);
             use_buffer(ci, sid);
             use_buffer(ci, did);
-            VkBuffer src = OBJ(VkBuffer, sid), dst = OBJ(VkBuffer, did);
+            RP_AB(sid, did);
+            VkBuffer src = rp_buf(op, sid), dst = rp_buf(op, did);
             uint32_t n = vr_ru32(r);
+            if (n > (r->n - r->at) / 24) { r->bad = 1; break; } // 1 つ 24 バイト
             VkBufferCopy *rg = malloc(sizeof *rg * (n ? n : 1));
+            if (!rg) { r->bad = 1; break; }
             for (uint32_t i = 0; i < n; i++) { rg[i].srcOffset = vr_ru64(r); rg[i].dstOffset = vr_ru64(r); rg[i].size = vr_ru64(r); }
             if (dbg_on()) {
                 ent *se = find(sid), *de = find(did);
@@ -2414,78 +2825,107 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
                            (unsigned long long) (se ? se->size : 0), (unsigned long long) rg[i].srcOffset, (unsigned long long) did,
                            (unsigned long long) (de ? de->size : 0), (unsigned long long) rg[i].dstOffset, (unsigned long long) rg[i].size);
             }
-            vkCmdCopyBuffer(cb, src, dst, n, rg);
+            // buffer が空なら飛ばす。範囲が buffer に収まらない region は外す（外れたままだとドライバが buffer の外を読み書きする）
+            uint32_t nk = n;
+            if (rp_guard_on() && src && dst) {
+                nk = 0;
+                for (uint32_t i = 0; i < n; i++)
+                    if (rg[i].size && rp_range_ok(op, sid, rg[i].srcOffset, rg[i].size) && rp_range_ok(op, did, rg[i].dstOffset, rg[i].size)) rg[nk++] = rg[i];
+            }
+            if (src && dst && nk) vkCmdCopyBuffer(cb, src, dst, nk, rg);
+            else if (!rp_guard_on()) vkCmdCopyBuffer(cb, src, dst, n, rg);
             free(rg);
         } break;
         case VR_CMD_FILL_BUFFER: {
             uint64_t bid = vr_ru64(r);
             use_buffer(ci, bid);
-            VkBuffer b = OBJ(VkBuffer, bid);
+            VkBuffer b = rp_buf(op, bid);
             uint64_t off = vr_ru64(r), sz = vr_ru64(r);
+            uint32_t data = vr_ru32(r);
+            RP_AB(bid, off);
             tracef(ci, JE("  fill buffer %llu +%llu・%llu バイト", "  fill buffer %llu +%llu, %llu bytes"), (unsigned long long) bid, (unsigned long long) off, (unsigned long long) sz);
-            vkCmdFillBuffer(cb, b, off, sz, vr_ru32(r));
+            if (!rp_guard_on() || (b && !(off & 3) && (sz == VK_WHOLE_SIZE || (sz && !(sz & 3))) && rp_range_ok(op, bid, off, sz)))
+                vkCmdFillBuffer(cb, b, off, sz, data);
         } break;
         case VR_CMD_UPDATE_BUFFER: {
             uint64_t bid = vr_ru64(r);
             use_buffer(ci, bid);
-            VkBuffer b = OBJ(VkBuffer, bid);
+            VkBuffer b = rp_buf(op, bid);
             uint64_t off = vr_ru64(r);
             uint32_t sz;
             const void *d = vr_rbytes(r, &sz);
-            if (d) vkCmdUpdateBuffer(cb, b, off, sz, d);
+            RP_AB(bid, off);
+            if (d && (!rp_guard_on() || (b && sz && sz <= 65536 && !(sz & 3) && !(off & 3) && rp_range_ok(op, bid, off, sz)))) vkCmdUpdateBuffer(cb, b, off, sz, d);
         } break;
         case VR_CMD_PIPELINE_BARRIER: {
             uint32_t src = vr_ru32(r), dst = vr_ru32(r), dep = vr_ru32(r), nm = vr_ru32(r);
             VkMemoryBarrier mb[16];
-            for (uint32_t i = 0; i < nm && i < 16; i++) mb[i] = (VkMemoryBarrier) { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, vr_ru32(r), vr_ru32(r) };
+            for (uint32_t i = 0; i < nm && !r->bad; i++) {
+                uint32_t sa = vr_ru32(r), da = vr_ru32(r); // 全部読む（16 を超えた分も読み捨てて、並びをずらさない）
+                if (i < 16) mb[i] = (VkMemoryBarrier) { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, sa, da };
+            }
             uint32_t nb = vr_ru32(r);
             if (nb > r->n - r->at) { r->bad = 1; break; }
             VkBufferMemoryBarrier *bb = calloc(nb ? nb : 1, sizeof *bb);
+            uint32_t nbk = 0;
             for (uint32_t i = 0; i < nb; i++) {
-                bb[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-                bb[i].srcAccessMask = vr_ru32(r);
-                bb[i].dstAccessMask = vr_ru32(r);
-                bb[i].srcQueueFamilyIndex = vr_ru32(r);
-                bb[i].dstQueueFamilyIndex = vr_ru32(r);
-                bb[i].buffer = OBJ(VkBuffer, vr_ru64(r));
-                bb[i].offset = vr_ru64(r);
-                bb[i].size = vr_ru64(r);
+                VkBufferMemoryBarrier t = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+                t.srcAccessMask = vr_ru32(r);
+                t.dstAccessMask = vr_ru32(r);
+                t.srcQueueFamilyIndex = vr_ru32(r);
+                t.dstQueueFamilyIndex = vr_ru32(r);
+                uint64_t bid = vr_ru64(r);
+                t.buffer = rp_buf(op, bid);
+                t.offset = vr_ru64(r);
+                t.size = vr_ru64(r);
+                if (!rp_guard_on() || (t.buffer && rp_range_ok(op, bid, t.offset, t.size))) bb[nbk++] = t; // 空の buffer の barrier だけ外す
+                if (!i) RP_AB(bid, nb);
             }
-            vkCmdPipelineBarrier(cb, src, dst, dep, nm < 16 ? nm : 16, mb, nb, bb, 0, NULL);
+            vkCmdPipelineBarrier(cb, src, dst, dep, nm < 16 ? nm : 16, mb, nbk, bb, 0, NULL);
             free(bb);
         } break;
         case VR_CMD_PIPELINE_BARRIER2: {
             uint32_t src = vr_ru32(r), dst = vr_ru32(r), dep = vr_ru32(r), nm = vr_ru32(r);
             VkMemoryBarrier mb[16];
-            for (uint32_t i = 0; i < nm && i < 16; i++) mb[i] = (VkMemoryBarrier) { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, vr_ru32(r), vr_ru32(r) };
+            for (uint32_t i = 0; i < nm && !r->bad; i++) {
+                uint32_t sa = vr_ru32(r), da = vr_ru32(r);
+                if (i < 16) mb[i] = (VkMemoryBarrier) { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, sa, da };
+            }
             uint32_t nb = vr_ru32(r);
             if (nb > r->n - r->at) { r->bad = 1; break; }
             VkBufferMemoryBarrier *bb = calloc(nb ? nb : 1, sizeof *bb);
+            uint32_t nbk = 0;
             for (uint32_t i = 0; i < nb; i++) {
-                bb[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-                bb[i].srcAccessMask = vr_ru32(r);
-                bb[i].dstAccessMask = vr_ru32(r);
-                bb[i].srcQueueFamilyIndex = vr_ru32(r);
-                bb[i].dstQueueFamilyIndex = vr_ru32(r);
-                bb[i].buffer = OBJ(VkBuffer, vr_ru64(r));
-                bb[i].offset = vr_ru64(r);
-                bb[i].size = vr_ru64(r);
+                VkBufferMemoryBarrier t = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+                t.srcAccessMask = vr_ru32(r);
+                t.dstAccessMask = vr_ru32(r);
+                t.srcQueueFamilyIndex = vr_ru32(r);
+                t.dstQueueFamilyIndex = vr_ru32(r);
+                uint64_t bid = vr_ru64(r);
+                t.buffer = rp_buf(op, bid);
+                t.offset = vr_ru64(r);
+                t.size = vr_ru64(r);
+                if (!rp_guard_on() || (t.buffer && rp_range_ok(op, bid, t.offset, t.size))) bb[nbk++] = t;
             }
             uint32_t ni = vr_ru32(r);
             if (ni > r->n - r->at) { free(bb); r->bad = 1; break; }
             VkImageMemoryBarrier *ib = calloc(ni ? ni : 1, sizeof *ib);
+            uint32_t nik = 0;
             for (uint32_t i = 0; i < ni; i++) {
-                ib[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-                ib[i].srcAccessMask = vr_ru32(r);
-                ib[i].dstAccessMask = vr_ru32(r);
-                ib[i].oldLayout = (VkImageLayout) vr_ru32(r);
-                ib[i].newLayout = (VkImageLayout) vr_ru32(r);
-                ib[i].srcQueueFamilyIndex = vr_ru32(r);
-                ib[i].dstQueueFamilyIndex = vr_ru32(r);
-                ib[i].image = OBJ(VkImage, vr_ru64(r));
-                vr_rcopy(r, &ib[i].subresourceRange, sizeof ib[i].subresourceRange);
+                VkImageMemoryBarrier t = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+                t.srcAccessMask = vr_ru32(r);
+                t.dstAccessMask = vr_ru32(r);
+                t.oldLayout = (VkImageLayout) vr_ru32(r);
+                t.newLayout = (VkImageLayout) vr_ru32(r);
+                t.srcQueueFamilyIndex = vr_ru32(r);
+                t.dstQueueFamilyIndex = vr_ru32(r);
+                uint64_t iid = vr_ru64(r);
+                t.image = rp_img(op, iid);
+                vr_rcopy(r, &t.subresourceRange, sizeof t.subresourceRange);
+                if (!rp_guard_on() || t.image) ib[nik++] = t; // 空の image の barrier だけ外す
+                if (!i) RP_AB(iid, ((uint64_t) nb << 32) | ni);
             }
-            vkCmdPipelineBarrier(cb, src, dst, dep, nm < 16 ? nm : 16, mb, nb, bb, ni, ib);
+            vkCmdPipelineBarrier(cb, src, dst, dep, nm < 16 ? nm : 16, mb, nbk, bb, nik, ib);
             free(bb);
             free(ib);
         } break;
@@ -2494,6 +2934,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             bi.renderPass = OBJ(VkRenderPass, vr_ru64(r));
             uint64_t fid = vr_ru64(r);
             bi.framebuffer = OBJ(VkFramebuffer, fid);
+            RP_AB(fid, (uint64_t) (uintptr_t) bi.renderPass);
             vr_rcopy(r, &bi.renderArea, sizeof bi.renderArea);
             uint32_t nc = vr_ru32(r);
             if (nc > (r->n - r->at) / sizeof(VkClearValue)) { r->bad = 1; break; }
@@ -2529,62 +2970,119 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
         } break;
         case VR_CMD_DRAW: {
             uint32_t a = vr_ru32(r), b = vr_ru32(r), c = vr_ru32(r), d = vr_ru32(r);
-            if (!gfx || rp_off) { skipped++; break; }
+            RP_AB(a, g_rp.gfx_pipe);
+            if (!gfx || rp_off || vb_bad) { skipped++; break; }
             vkCmdDraw(cb, a, b, c, d);
         } break;
         case VR_CMD_DRAW_INDEXED: {
             uint32_t a = vr_ru32(r), b = vr_ru32(r), c = vr_ru32(r);
             int32_t d = (int32_t) vr_ru32(r);
             uint32_t e = vr_ru32(r);
-            if (!gfx || rp_off) { skipped++; break; }
+            RP_AB(a, g_rp.gfx_pipe);
+            if (!gfx || rp_off || vb_bad || ib_bad) { skipped++; break; }
             vkCmdDrawIndexed(cb, a, b, c, d, e);
         } break;
         case VR_CMD_DRAW_INDIRECT:
         case VR_CMD_DRAW_INDEXED_INDIRECT: {
             uint64_t bid = vr_ru64(r);
             use_buffer(ci, bid);
-            VkBuffer b = OBJ(VkBuffer, bid);
             uint64_t off = vr_ru64(r);
             uint32_t n = vr_ru32(r), stride = vr_ru32(r);
-            if (!gfx || !b || rp_off) { skipped++; break; }
-            if (op == VR_CMD_DRAW_INDIRECT) vkCmdDrawIndirect(cb, b, off, n, stride);
+            RP_AB(bid, g_rp.gfx_pipe);
+            int idx = op == VR_CMD_DRAW_INDEXED_INDIRECT;
+            int skip_it = !gfx || rp_off || vb_bad || (idx && ib_bad);
+            VkBuffer b = skip_it ? VK_NULL_HANDLE : rp_buf(op, bid);
+            if (!skip_it && rp_guard_on() && b) {
+                // multiDrawIndirect の無い GPU に 2 つ以上は頼めない。間隔・範囲・上限も確かめる（外れるとドライバが buffer の外を読む）
+                if (n > 1 && !g_rpl.multi_draw) n = 1;
+                uint64_t csz = idx ? 20 : 16;
+                if (!n || n > g_rpl.max_draw_ind || (n > 1 && ((stride & 3) || stride < csz)) || !rp_range_ok(op, bid, off, (uint64_t) (n - 1) * (n > 1 ? stride : 0) + csz)) {
+                    rp_guard(op, "indirect draw range", bid, 3);
+                    b = VK_NULL_HANDLE;
+                }
+            }
+            if (!b) { skipped++; break; }
+            if (!idx) vkCmdDrawIndirect(cb, b, off, n, stride);
             else vkCmdDrawIndexedIndirect(cb, b, off, n, stride);
         } break;
         case VR_CMD_BIND_VERTEX_BUFFERS: {
             uint32_t first = vr_ru32(r), n = vr_ru32(r);
             VkBuffer bs[32];
             VkDeviceSize offs[32];
-            for (uint32_t i = 0; i < n; i++) {
+            uint32_t nn = n < 32 ? n : 32, bad = 0, good = 0, nulls = 0;
+            for (uint32_t i = 0; i < n && !r->bad; i++) {
                 uint64_t bid = vr_ru64(r);
                 uint64_t off = vr_ru64(r);
                 use_buffer(ci, bid);
-                if (i < 32) { bs[i] = OBJ(VkBuffer, bid); offs[i] = off; }
-                if (i < 32 && !bid && !g_nulldesc_gpu) { bs[i] = dummy_vb(); offs[i] = 0; }
+                if (!i) RP_AB(bid, ((uint64_t) first << 32) | n);
+                if (i >= 32) continue;
+                uint32_t bit = first + i < 32 ? 1u << (first + i) : 0x80000000u;
+                offs[i] = off;
+                if (!bid) {
+                    // アプリが空を渡した（nullDescriptor の GPU では、そのまま渡してよい）
+                    bs[i] = VK_NULL_HANDLE;
+                    if (!g_nulldesc_gpu) { bs[i] = dummy_vb(); offs[i] = 0; }
+                    good |= bit;
+                } else {
+                    bs[i] = rp_buf(op, bid);
+                    if (rp_guard_on() && (!bs[i] || !rp_range_ok(op, bid, off, 0))) {
+                        // 作れていない・消えた・結べていない buffer。代わりを渡して、この slot を使う draw を飛ばす
+                        bs[i] = g_nulldesc_gpu ? VK_NULL_HANDLE : dummy_vb();
+                        offs[i] = 0;
+                        bad |= bit;
+                    } else good |= bit;
+                }
+                if (!bs[i] && !g_nulldesc_gpu) nulls++;
             }
-            vkCmdBindVertexBuffers(cb, first, n < 32 ? n : 32, bs, offs);
+            if (rp_guard_on() && !nn) rp_guard(op, "vertex buffer slots", first, 3); // 結ぶ物が無い
+            else if (rp_guard_on() && ((uint64_t) first + nn > g_rpl.max_vbind || nulls)) {
+                // slot の数が上限を超える・代わりも作れない：この命令は渡さず、後の draw も飛ばす
+                rp_guard(op, "vertex buffer slots", first, 3);
+                vb_bad |= set_range_mask(first, nn) | 0x80000000u;
+            } else {
+                vkCmdBindVertexBuffers(cb, first, nn, bs, offs);
+                vb_bad = (vb_bad & ~good) | bad;
+            }
         } break;
         case VR_CMD_BIND_INDEX_BUFFER: {
             uint64_t bid = vr_ru64(r);
             use_buffer(ci, bid);
             uint64_t off = vr_ru64(r);
-            vkCmdBindIndexBuffer(cb, OBJ(VkBuffer, bid), off, (VkIndexType) vr_ru32(r));
+            uint32_t itype = vr_ru32(r);
+            RP_AB(bid, off);
+            VkBuffer ib = rp_buf(op, bid);
+            if (!rp_guard_on()) vkCmdBindIndexBuffer(cb, ib, off, (VkIndexType) itype);
+            else if (ib && rp_range_ok(op, bid, off, 0) && (itype == VK_INDEX_TYPE_UINT16 || itype == VK_INDEX_TYPE_UINT32 || itype == 1000265000u)) {
+                vkCmdBindIndexBuffer(cb, ib, off, (VkIndexType) itype);
+                ib_bad = 0;
+            } else {
+                if (ib) rp_guard(op, "index buffer or type", bid, 3);
+                ib_bad = 1; // 結べなかったので、index 付きの draw は飛ばす
+            }
         } break;
         case VR_CMD_SET_VIEWPORT: {
             uint32_t first = vr_ru32(r), n = vr_ru32(r);
+            RP_AB(first, n);
             VkViewport v[16];
-            for (uint32_t i = 0; i < n; i++) { if (i < 16) vr_rcopy(r, &v[i], sizeof v[i]); else vr_take(r, sizeof v[0]); }
-            vkCmdSetViewport(cb, first, n < 16 ? n : 16, v);
+            for (uint32_t i = 0; i < n && !r->bad; i++) { if (i < 16) vr_rcopy(r, &v[i], sizeof v[i]); else vr_take(r, sizeof v[0]); }
+            uint32_t nn = n < 16 ? n : 16;
+            if (rp_guard_on() && (!nn || (uint64_t) first + nn > g_rpl.max_viewports)) rp_guard(op, "viewport slots", first, 3);
+            else vkCmdSetViewport(cb, first, nn, v);
         } break;
         case VR_CMD_SET_SCISSOR: {
             uint32_t first = vr_ru32(r), n = vr_ru32(r);
+            RP_AB(first, n);
             VkRect2D v[16];
-            for (uint32_t i = 0; i < n; i++) { if (i < 16) vr_rcopy(r, &v[i], sizeof v[i]); else vr_take(r, sizeof v[0]); }
-            vkCmdSetScissor(cb, first, n < 16 ? n : 16, v);
+            for (uint32_t i = 0; i < n && !r->bad; i++) { if (i < 16) vr_rcopy(r, &v[i], sizeof v[i]); else vr_take(r, sizeof v[0]); }
+            uint32_t nn = n < 16 ? n : 16;
+            if (rp_guard_on() && (!nn || (uint64_t) first + nn > g_rpl.max_viewports)) rp_guard(op, "scissor slots", first, 3);
+            else vkCmdSetScissor(cb, first, nn, v);
         } break;
         case VR_CMD_COPY_IMAGE_TO_BUFFER:
         case VR_CMD_COPY_BUFFER_TO_IMAGE: {
             uint64_t a = vr_ru64(r), b = vr_ru64(r);
             uint32_t layout = vr_ru32(r), n = vr_ru32(r);
+            RP_AB(a, b);
             if (n > r->n - r->at) { r->bad = 1; break; }
             VkBufferImageCopy *rg = calloc(n ? n : 1, sizeof *rg);
             for (uint32_t i = 0; i < n; i++) vr_rcopy(r, &rg[i], sizeof rg[i]);
@@ -2593,27 +3091,33 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
                 ent *ie = find(a);
                 if (ie && ci) use_buffer_mem(ci, ie->aux);
                 use_buffer(ci, b);
-                vkCmdCopyImageToBuffer(cb, OBJ(VkImage, a), (VkImageLayout) layout, OBJ(VkBuffer, b), n, rg);
+                VkImage im = rp_img(op, a);
+                VkBuffer bf = rp_buf(op, b);
+                if (!rp_guard_on() || (im && bf && n)) vkCmdCopyImageToBuffer(cb, im, (VkImageLayout) layout, bf, n, rg);
             } else {
                 // a = バッファ・b = 画像
                 ent *ie = find(b);
                 if (ie && ci) use_buffer_mem(ci, ie->aux);
                 use_buffer(ci, a);
-                vkCmdCopyBufferToImage(cb, OBJ(VkBuffer, a), OBJ(VkImage, b), (VkImageLayout) layout, n, rg);
+                VkBuffer bf = rp_buf(op, a);
+                VkImage im = rp_img(op, b);
+                if (!rp_guard_on() || (im && bf && n)) vkCmdCopyBufferToImage(cb, bf, im, (VkImageLayout) layout, n, rg);
             }
             free(rg);
         } break;
         case VR_CMD_CLEAR_COLOR_IMAGE: {
             uint64_t iid = vr_ru64(r);
             uint32_t layout = vr_ru32(r);
+            RP_AB(iid, layout);
             VkClearColorValue c;
             vr_rcopy(r, &c, sizeof c);
             uint32_t n = vr_ru32(r);
             VkImageSubresourceRange rg[16];
-            for (uint32_t i = 0; i < n; i++) { if (i < 16) vr_rcopy(r, &rg[i], sizeof rg[i]); else vr_take(r, sizeof rg[0]); }
+            for (uint32_t i = 0; i < n && !r->bad; i++) { if (i < 16) vr_rcopy(r, &rg[i], sizeof rg[i]); else vr_take(r, sizeof rg[0]); }
             ent *ie = find(iid);
             if (ie && ci) use_buffer_mem(ci, ie->aux);
-            vkCmdClearColorImage(cb, OBJ(VkImage, iid), (VkImageLayout) layout, &c, n < 16 ? n : 16, rg);
+            VkImage im = rp_img(op, iid);
+            if (!rp_guard_on() || (im && n)) vkCmdClearColorImage(cb, im, (VkImageLayout) layout, &c, n < 16 ? n : 16, rg);
         } break;
         case VR_CMD_COPY_IMAGE:
         case VR_CMD_BLIT_IMAGE: {
@@ -2621,20 +3125,23 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             uint32_t sl = vr_ru32(r);
             uint64_t did = vr_ru64(r);
             uint32_t dl = vr_ru32(r), n = vr_ru32(r);
+            RP_AB(sid, did);
             if (n > r->n - r->at) { r->bad = 1; break; }
             ent *se = find(sid), *de = find(did);
             if (se && ci) use_buffer_mem(ci, se->aux);
             if (de && ci) use_buffer_mem(ci, de->aux);
+            VkImage sim = rp_img(op, sid), dim = rp_img(op, did);
+            int okc = !rp_guard_on() || (sim && dim && n);
             if (op == VR_CMD_COPY_IMAGE) {
                 VkImageCopy *rg = calloc(n ? n : 1, sizeof *rg);
                 for (uint32_t i = 0; i < n; i++) vr_rcopy(r, &rg[i], sizeof rg[i]);
-                vkCmdCopyImage(cb, OBJ(VkImage, sid), (VkImageLayout) sl, OBJ(VkImage, did), (VkImageLayout) dl, n, rg);
+                if (okc) vkCmdCopyImage(cb, sim, (VkImageLayout) sl, dim, (VkImageLayout) dl, n, rg);
                 free(rg);
             } else {
                 VkImageBlit *rg = calloc(n ? n : 1, sizeof *rg);
                 for (uint32_t i = 0; i < n; i++) vr_rcopy(r, &rg[i], sizeof rg[i]);
                 uint32_t filter = vr_ru32(r);
-                vkCmdBlitImage(cb, OBJ(VkImage, sid), (VkImageLayout) sl, OBJ(VkImage, did), (VkImageLayout) dl, n, rg, (VkFilter) filter);
+                if (okc) vkCmdBlitImage(cb, sim, (VkImageLayout) sl, dim, (VkImageLayout) dl, n, rg, (VkFilter) filter);
                 free(rg);
             }
         } break;
@@ -2674,39 +3181,47 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             uint32_t nb = vr_ru32(r);
             if (nb > r->n - r->at) { free(mb); r->bad = 1; break; }
             VkBufferMemoryBarrier2 *bb = calloc(nb ? nb : 1, sizeof *bb);
+            uint32_t nbk = 0;
             for (uint32_t i = 0; i < nb; i++) {
-                bb[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
-                bb[i].srcStageMask = vr_ru64(r);
-                bb[i].srcAccessMask = vr_ru64(r);
-                bb[i].dstStageMask = vr_ru64(r);
-                bb[i].dstAccessMask = vr_ru64(r);
-                bb[i].srcQueueFamilyIndex = vr_ru32(r);
-                bb[i].dstQueueFamilyIndex = vr_ru32(r);
-                bb[i].buffer = OBJ(VkBuffer, vr_ru64(r));
-                bb[i].offset = vr_ru64(r);
-                bb[i].size = vr_ru64(r);
+                VkBufferMemoryBarrier2 t = { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
+                t.srcStageMask = vr_ru64(r);
+                t.srcAccessMask = vr_ru64(r);
+                t.dstStageMask = vr_ru64(r);
+                t.dstAccessMask = vr_ru64(r);
+                t.srcQueueFamilyIndex = vr_ru32(r);
+                t.dstQueueFamilyIndex = vr_ru32(r);
+                uint64_t bid = vr_ru64(r);
+                t.buffer = rp_buf(op, bid);
+                t.offset = vr_ru64(r);
+                t.size = vr_ru64(r);
+                if (!rp_guard_on() || (t.buffer && rp_range_ok(op, bid, t.offset, t.size))) bb[nbk++] = t; // 空の buffer の barrier だけ外す
+                if (!i) RP_AB(bid, nb);
             }
             uint32_t ni = vr_ru32(r);
             if (ni > r->n - r->at) { free(mb); free(bb); r->bad = 1; break; }
             VkImageMemoryBarrier2 *ib = calloc(ni ? ni : 1, sizeof *ib);
+            uint32_t nik = 0;
             for (uint32_t i = 0; i < ni; i++) {
-                ib[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-                ib[i].srcStageMask = vr_ru64(r);
-                ib[i].srcAccessMask = vr_ru64(r);
-                ib[i].dstStageMask = vr_ru64(r);
-                ib[i].dstAccessMask = vr_ru64(r);
-                ib[i].oldLayout = (VkImageLayout) vr_ru32(r);
-                ib[i].newLayout = (VkImageLayout) vr_ru32(r);
-                ib[i].srcQueueFamilyIndex = vr_ru32(r);
-                ib[i].dstQueueFamilyIndex = vr_ru32(r);
-                ib[i].image = OBJ(VkImage, vr_ru64(r));
-                vr_rcopy(r, &ib[i].subresourceRange, sizeof ib[i].subresourceRange);
+                VkImageMemoryBarrier2 t = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+                t.srcStageMask = vr_ru64(r);
+                t.srcAccessMask = vr_ru64(r);
+                t.dstStageMask = vr_ru64(r);
+                t.dstAccessMask = vr_ru64(r);
+                t.oldLayout = (VkImageLayout) vr_ru32(r);
+                t.newLayout = (VkImageLayout) vr_ru32(r);
+                t.srcQueueFamilyIndex = vr_ru32(r);
+                t.dstQueueFamilyIndex = vr_ru32(r);
+                uint64_t iid = vr_ru64(r);
+                t.image = rp_img(op, iid);
+                vr_rcopy(r, &t.subresourceRange, sizeof t.subresourceRange);
+                if (!rp_guard_on() || t.image) ib[nik++] = t; // 空の image の barrier だけ外す
+                if (!i) RP_AB(iid, ((uint64_t) nb << 32) | ni);
             }
             di.memoryBarrierCount = nm;
             di.pMemoryBarriers = mb;
-            di.bufferMemoryBarrierCount = nb;
+            di.bufferMemoryBarrierCount = nbk;
             di.pBufferMemoryBarriers = bb;
-            di.imageMemoryBarrierCount = ni;
+            di.imageMemoryBarrierCount = nik;
             di.pImageMemoryBarriers = ib;
             tracef(ci, JE("  barrier2 memory %u・buffer %u・image %u", "  barrier2 memory %u, buffer %u, image %u"), nm, nb, ni);
             if (!r->bad && vkCmdPipelineBarrier2) vkCmdPipelineBarrier2(cb, &di);
@@ -2716,6 +3231,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
         } break;
         case VR_CMD_SET_DYNAMIC: {
             uint32_t st = vr_ru32(r), n = vr_ru32(r);
+            RP_AB(st, n);
             uint32_t v[96];
             for (uint32_t i = 0; i < n && !r->bad; i++) { uint32_t x = vr_ru32(r); if (i < 96) v[i] = x; }
             if (!r->bad) set_dynamic(cb, st, n < 96 ? n : 96, v);
@@ -2724,14 +3240,37 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             uint32_t first = vr_ru32(r), n = vr_ru32(r), has_size = vr_ru32(r), has_stride = vr_ru32(r);
             VkBuffer bs[32];
             VkDeviceSize offs[32], sizes[32], strides[32];
+            uint32_t nn = n < 32 ? n : 32, bad = 0, good = 0, nulls = 0;
             for (uint32_t i = 0; i < n && !r->bad; i++) {
                 uint64_t bid = vr_ru64(r), off = vr_ru64(r), sz = vr_ru64(r), sd = vr_ru64(r);
                 use_buffer(ci, bid);
-                if (i < 32) { bs[i] = OBJ(VkBuffer, bid); offs[i] = off; sizes[i] = sz; strides[i] = sd; }
-                if (i < 32 && !bid && !g_nulldesc_gpu) { bs[i] = dummy_vb(); offs[i] = 0; sizes[i] = VK_WHOLE_SIZE; }
+                if (!i) RP_AB(bid, ((uint64_t) first << 32) | n);
+                if (i >= 32) continue;
+                uint32_t bit = first + i < 32 ? 1u << (first + i) : 0x80000000u;
+                bs[i] = OBJ(VkBuffer, bid); offs[i] = off; sizes[i] = sz; strides[i] = sd;
+                if (!bid) {
+                    if (!g_nulldesc_gpu) { bs[i] = dummy_vb(); offs[i] = 0; sizes[i] = VK_WHOLE_SIZE; }
+                    good |= bit;
+                } else {
+                    bs[i] = rp_buf(op, bid);
+                    if (rp_guard_on() && (!bs[i] || !rp_range_ok(op, bid, off, has_size ? sz : 0))) {
+                        bs[i] = g_nulldesc_gpu ? VK_NULL_HANDLE : dummy_vb();
+                        offs[i] = 0;
+                        sizes[i] = VK_WHOLE_SIZE;
+                        bad |= bit;
+                    } else good |= bit;
+                }
+                if (!bs[i] && !g_nulldesc_gpu) nulls++;
             }
-            if (!r->bad && vkCmdBindVertexBuffers2)
-                vkCmdBindVertexBuffers2(cb, first, n < 32 ? n : 32, bs, offs, has_size ? sizes : NULL, has_stride ? strides : NULL);
+            if (r->bad || !vkCmdBindVertexBuffers2) break;
+            if (rp_guard_on() && !nn) rp_guard(op, "vertex buffer slots", first, 3);
+            else if (rp_guard_on() && ((uint64_t) first + nn > g_rpl.max_vbind || nulls)) {
+                rp_guard(op, "vertex buffer slots", first, 3);
+                vb_bad |= set_range_mask(first, nn) | 0x80000000u;
+            } else {
+                vkCmdBindVertexBuffers2(cb, first, nn, bs, offs, has_size ? sizes : NULL, has_stride ? strides : NULL);
+                vb_bad = (vb_bad & ~good) | bad;
+            }
         } break;
         case VR_CMD_CLEAR_ATTACHMENTS: {
             uint32_t na = vr_ru32(r);
@@ -2742,32 +3281,38 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             if (nr > r->n - r->at) { free(ca); r->bad = 1; break; }
             VkClearRect *rc = calloc(nr ? nr : 1, sizeof *rc);
             for (uint32_t i = 0; i < nr; i++) vr_rcopy(r, &rc[i], sizeof rc[i]);
-            if (!r->bad) vkCmdClearAttachments(cb, na, ca, nr, rc);
+            RP_AB(na, nr);
+            // render pass を始められなかった中・個数が 0 のときは渡さない（render pass の外で呼ぶとドライバが落ちる。crash34）
+            if (!r->bad && (!rp_guard_on() || (!rp_off && na && nr))) vkCmdClearAttachments(cb, na, ca, nr, rc);
             free(ca);
             free(rc);
         } break;
         case VR_CMD_CLEAR_DEPTH_STENCIL_IMAGE: {
             uint64_t iid = vr_ru64(r);
             uint32_t layout = vr_ru32(r);
+            RP_AB(iid, layout);
             VkClearDepthStencilValue v;
             vr_rcopy(r, &v, sizeof v);
             uint32_t n = vr_ru32(r);
             VkImageSubresourceRange rg[16];
-            for (uint32_t i = 0; i < n; i++) { if (i < 16) vr_rcopy(r, &rg[i], sizeof rg[i]); else vr_take(r, sizeof rg[0]); }
+            for (uint32_t i = 0; i < n && !r->bad; i++) { if (i < 16) vr_rcopy(r, &rg[i], sizeof rg[i]); else vr_take(r, sizeof rg[0]); }
             use_image(ci, iid);
-            if (!r->bad) vkCmdClearDepthStencilImage(cb, OBJ(VkImage, iid), (VkImageLayout) layout, &v, n < 16 ? n : 16, rg);
+            VkImage im = rp_img(op, iid);
+            if (!r->bad && (!rp_guard_on() || (im && n))) vkCmdClearDepthStencilImage(cb, im, (VkImageLayout) layout, &v, n < 16 ? n : 16, rg);
         } break;
         case VR_CMD_RESOLVE_IMAGE: {
             uint64_t sid = vr_ru64(r);
             uint32_t sl = vr_ru32(r);
             uint64_t did = vr_ru64(r);
             uint32_t dl = vr_ru32(r), n = vr_ru32(r);
+            RP_AB(sid, did);
             if (n > r->n - r->at) { r->bad = 1; break; }
             VkImageResolve *rg = calloc(n ? n : 1, sizeof *rg);
             for (uint32_t i = 0; i < n; i++) vr_rcopy(r, &rg[i], sizeof rg[i]);
             use_image(ci, sid);
             use_image(ci, did);
-            if (!r->bad) vkCmdResolveImage(cb, OBJ(VkImage, sid), (VkImageLayout) sl, OBJ(VkImage, did), (VkImageLayout) dl, n, rg);
+            VkImage sim = rp_img(op, sid), dim = rp_img(op, did);
+            if (!r->bad && (!rp_guard_on() || (sim && dim && n))) vkCmdResolveImage(cb, sim, (VkImageLayout) sl, dim, (VkImageLayout) dl, n, rg);
             free(rg);
         } break;
         case VR_CMD_RESET_QUERY_POOL: {
@@ -2797,7 +3342,8 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             uint64_t bid = vr_ru64(r), off = vr_ru64(r), stride = vr_ru64(r);
             uint32_t flags = vr_ru32(r);
             use_buffer(ci, bid);
-            if (!r->bad && qp) vkCmdCopyQueryPoolResults(cb, qp, first, n, OBJ(VkBuffer, bid), off, stride, flags);
+            VkBuffer qb = qp ? rp_buf(op, bid) : VK_NULL_HANDLE;
+            if (!r->bad && qp && (qb || !rp_guard_on())) vkCmdCopyQueryPoolResults(cb, qp, first, n, qb, off, stride, flags);
         } break;
         case VR_CMD_BUILD_ACCEL: {
             uint32_t n = vr_ru32(r);
@@ -2872,7 +3418,7 @@ static void replay(VkCommandBuffer cb, vr_rd *r, cbinfo *ci) {
             r->bad = 1;
         }
     }
-    if (skipped) vlog(JE("描き方か計算の仕方がつながっていないので、draw・dispatch を %u 回飛ばした", "The pipeline is not bound, so %u draws/dispatches were skipped"), skipped);
+    if (skipped) vlog(JE("描き方か計算の仕方がつながっていない（または頂点・index・indirect の buffer が空）ので、draw・dispatch を %u 回飛ばした", "The pipeline is not bound (or a vertex, index or indirect buffer is empty), so %u draws/dispatches were skipped"), skipped);
 #undef SET_GATE
 }
 
@@ -4624,11 +5170,16 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         // 調べ用：VKR_TEST_MAX_BUFFER_MB=数 で、これより大きな buffer を作らずに「足りない」と答える（GPU の上限を超えた物の真似。devlost1015）
         static long long test_max_mb = -2;
         if (test_max_mb == -2) { const char *e = getenv("VKR_TEST_MAX_BUFFER_MB"); test_max_mb = e && *e ? atoll(e) : -1; }
-        VkResult res = test_max_mb >= 0 && bci.size > ((uint64_t) test_max_mb << 20) ? VK_ERROR_OUT_OF_DEVICE_MEMORY : vkCreateBuffer(d, &bci, NULL, &b);
+        // 調べ用：VKR_TEST_FAIL_NR=1 で、返事を待たない作り方（VR_CREATE_BUFFER_NR・VR_CREATE_IMAGE_NR）の物を作らずに握りつぶす（crash34。
+        // 受け手で作れなかったのにアプリは作れたと思っている「空の handle」を記録に混ぜる試験に使う）
+        static int test_fail_nr = -1;
+        if (test_fail_nr < 0) { const char *e = getenv("VKR_TEST_FAIL_NR"); test_fail_nr = e && *e == '1'; }
+        VkResult res = (test_max_mb >= 0 && bci.size > ((uint64_t) test_max_mb << 20)) || (test_fail_nr && op == VR_CREATE_BUFFER_NR) ? VK_ERROR_OUT_OF_DEVICE_MEMORY : vkCreateBuffer(d, &bci, NULL, &b);
         VkMemoryRequirements req;
         memset(&req, 0, sizeof req);
         if (res == VK_SUCCESS) {
             put(id, (uint64_t) b, K_BUFFER);
+            { ent *be = find(id); if (be) be->size = bci.size; } // 範囲を確かめるため（crash34）
             vkGetBufferMemoryRequirements(d, b, &req);
             req.memoryTypeBits = alias_bits(req.memoryTypeBits);
         }
@@ -4728,7 +5279,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         // buffer かメモリが作れていなかった（返事を待たずに作って失敗した・確保に失敗したのに結ぼうとした）。
         // 空の handle を GPU のドライバに渡すと受け手ごと落ち、PC では次の命令から全部 device lost になる
         if (!d || !b || !m) { bind_skip_log("buffer", bid, mid, !b, !m); return 1; }
-        vkBindBufferMemory(d, b, m, boff);
+        {
+            VkResult br = vkBindBufferMemory(d, b, m, boff);
+            if (br == VK_SUCCESS) { if (be) be->fl |= EF_BOUND; }
+            else vlog(JE("buffer %llu をメモリ %llu に結べなかった (%d)。この buffer を使う命令は飛ばす", "Could not bind buffer %llu to memory %llu (%d). Commands that use this buffer will be skipped"), (unsigned long long) bid, (unsigned long long) mid, (int) br);
+        }
         return 1;
     }
     case VR_MEM_WRITE: {
@@ -5482,6 +6037,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                 bi[k].offset = vr_ru64(r);
                 bi[k].range = vr_ru64(r);
                 if (se) idlist_add(&se->list, bid);
+                rp_desc_check(w.descriptorType, bid, &bi[k]); // 上限を超える range は切り詰める（crash34）
+                if (se && (w.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC))
+                    rp_dyn_set(se, w.dstBinding, w.dstArrayElement + k, w.descriptorType, bid, bi[k].offset, bi[k].range);
                 if (dbg_on()) {
                     ent *be = find(bid);
                     char t[160];
@@ -5570,17 +6128,29 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         if (!cb) return 1;
         drain_upto(last_with_cb(cid));
         double t0 = t_ms();
+        // 落ちたときの手がかり（crash34）：どの段階の、何番目の vkCmd かを、グローバルな変数に書くだけ
+        g_rp.cid = cid; g_rp.rec++; g_rp.len = n; g_rp.n = 0; g_rp.phase = 1;
         vkResetCommandBuffer(cb, 0);
         if (dbg_on()) trace_of(cid)->n = 0;
         VkCommandBufferBeginInfo bi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = flags };
-        vkBeginCommandBuffer(cb, &bi);
+        VkResult bgr = vkBeginCommandBuffer(cb, &bi);
         vr_rd sr = { stream, n, 0, 0 };
         cbinfo *ci = cbi(cid, 1);
         ci->n = 0;
         ci->serial = ++g_rec_serial;
         if (ci->mems) ci->mems->n = 0;
+        g_rp.phase = 2;
         replay(cb, &sr, ci);
-        vkEndCommandBuffer(cb);
+        g_rp.phase = 3;
+        VkResult edr = vkEndCommandBuffer(cb);
+        g_rp.phase = 0;
+        {
+            // begin・end が失敗したら、あとの submit が落ちる前に分かるよう 1 行書く。命令の並びが途中で壊れていたときも書く
+            static unsigned nfail;
+            if ((bgr != VK_SUCCESS || edr != VK_SUCCESS || sr.bad) && ++nfail <= 8)
+                vlog(JE("記録の再生で問題：command buffer %llu・begin %d・end %d・並びが壊れている %d（%u 回目）", "Problem replaying a recording: command buffer %llu, begin %d, end %d, broken stream %d (time %u)"),
+                     (unsigned long long) cid, (int) bgr, (int) edr, (int) sr.bad, nfail);
+        }
         g_st.record_ms += t_ms() - t0;
         g_st.records++;
         return 1;
@@ -5997,7 +6567,9 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkImage im;
         VkMemoryRequirements req;
         memset(&req, 0, sizeof req);
-        VkResult res = vkCreateImage(d, &ci, NULL, &im);
+        static int test_fail_nr_img = -1; // 調べ用（buffer と同じ VKR_TEST_FAIL_NR=1）
+        if (test_fail_nr_img < 0) { const char *e = getenv("VKR_TEST_FAIL_NR"); test_fail_nr_img = e && *e == '1'; }
+        VkResult res = test_fail_nr_img && op == VR_CREATE_IMAGE_NR ? VK_ERROR_OUT_OF_DEVICE_MEMORY : vkCreateImage(d, &ci, NULL, &im);
         if (res == VK_SUCCESS) {
             put(id, (uint64_t) im, K_IMAGE);
             vkGetImageMemoryRequirements(d, im, &req);
@@ -6042,7 +6614,11 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         VkImage bim = OBJ(VkImage, iid);
         VkDeviceMemory bm = OBJ(VkDeviceMemory, mid);
         if (!d || !bim || !bm) { bind_skip_log("image", iid, mid, !bim, !bm); return 1; } // 上の buffer と同じ
-        vkBindImageMemory(d, bim, bm, off);
+        {
+            VkResult br = vkBindImageMemory(d, bim, bm, off);
+            if (br == VK_SUCCESS) { if (ie) ie->fl |= EF_BOUND; }
+            else vlog(JE("image %llu をメモリ %llu に結べなかった (%d)。この image を使う命令は飛ばす", "Could not bind image %llu to memory %llu (%d). Commands that use this image will be skipped"), (unsigned long long) iid, (unsigned long long) mid, (int) br);
+        }
         return 1;
     }
     case VR_CREATE_IMAGE_VIEW: {
@@ -6057,6 +6633,13 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         vr_rcopy(r, &ci.components, sizeof ci.components);
         vr_rcopy(r, &ci.subresourceRange, sizeof ci.subresourceRange);
         VkImageView v;
+        if (!ci.image) {
+            // 元の image が作れていない（返事を待たずに作って失敗した物など）。空のまま GPU のドライバに渡すと、受け手ごと落ちる（crash34）
+            static unsigned nv;
+            if (++nv <= 8 || (nv & (nv - 1)) == 0)
+                vlog(JE("image view を作らない：元の image %llu が無い（%u 回目）", "Not creating the image view: image %llu does not exist (time %u)"), (unsigned long long) iid, nv);
+            return 1;
+        }
         VkResult res = vkCreateImageView(d, &ci, NULL, &v);
         if (res == VK_SUCCESS) {
             put(id, (uint64_t) v, K_VIEW);
@@ -6173,6 +6756,18 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
         ci.height = vr_ru32(r);
         ci.layers = vr_ru32(r);
         VkFramebuffer fb;
+        {
+            // 無い image view（作れていない・消えた）や render pass が混ざっていたら作らない（空の handle を渡すとドライバが落ちる。crash34）
+            uint32_t miss = 0;
+            for (uint32_t i = 0; i < ci.attachmentCount; i++) if (!v[i] && !(ci.flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT)) miss++;
+            if (miss || !ci.renderPass) {
+                static unsigned nf;
+                if (++nf <= 8 || (nf & (nf - 1)) == 0)
+                    vlog(JE("framebuffer を作らない：%s（%u 回目）", "Not creating the framebuffer: %s (time %u)"), ci.renderPass ? JE("image view が無い", "an image view is missing") : JE("render pass が無い", "the render pass is missing"), nf);
+                free(v);
+                return 1;
+            }
+        }
         VkResult res = vkCreateFramebuffer(d, &ci, NULL, &fb);
         if (res == VK_SUCCESS) {
             put(id, (uint64_t) fb, K_FB);
@@ -7433,6 +8028,7 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     static volatile LONG once;
     if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
     fprintf(stderr, JE("落ちた：例外 0x%08lx・命令 %u\n", "Crashed: exception 0x%08lx, command %u\n"), code, g_cur_op);
+    rp_dump_crash(); // 記録の再生の途中なら、いま処理していた vkCmd と直前の数個（crash34）
     where(JE("場所", "location"), ep->ExceptionRecord->ExceptionAddress);
     void *fr[40];
     USHORT n = RtlCaptureStackBackTrace(0, 40, fr, NULL);
@@ -7476,16 +8072,43 @@ static void *hs_ticker(void *p) {
 // Android の受け手が落ちたときに、記録（pgpu_server.log）の最後に、合図と処理していた命令を書く。
 // 前は何も書かずに消え、PC では次の命令から全部 device lost になるだけで、どこで落ちたか分からなかった（devlost1015）
 #include <signal.h>
+#include <fcntl.h>
+#include <ucontext.h>
 // 前の合図の受け手（Android の debuggerd・tombstone を書く物）。記録に書いたあと、これに渡して、logcat -b crash に出る backtrace を残す。
 // 前は signal() で debuggerd の受け手を置き換え、SIG_DFL にして raise していたので、Adreno や Mali のドライバの中で落ちても tombstone が出なかった
 static struct sigaction g_old_sa[NSIG];
-static void and_crash(int sig, siginfo_t *si, void *uc) {
+// 落ちた場所の番地が、どの .so の中かを /proc/self/maps から探して書く（Adreno のドライバの中か、受け手の中かが分かる）。
+// open・read だけを使い、malloc は使わない。maps が 512 KB を超えるときは前の方だけ見る。探す所は rp_where_maps（共通の所）
+static char g_maps_buf[1 << 19];
+static void and_where_pc(void *uc) {
+#if defined(__aarch64__)
+    if (!uc) return;
+    ucontext_t *u = (ucontext_t *) uc;
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) return;
+    int len = 0;
+    for (;;) {
+        ssize_t got = read(fd, g_maps_buf + len, sizeof g_maps_buf - (size_t) len);
+        if (got <= 0) break;
+        len += (int) got;
+        if (len >= (int) sizeof g_maps_buf) break;
+    }
+    close(fd);
+    rp_where_maps("  pc=", (uint64_t) u->uc_mcontext.pc, g_maps_buf, len);
+    rp_where_maps("  lr=", (uint64_t) u->uc_mcontext.regs[30], g_maps_buf, len);
+#else
     (void) uc;
+#endif
+}
+static void and_crash(int sig, siginfo_t *si, void *uc) {
     char line[200];
     int n = snprintf(line, sizeof line, lang_en() ? "Crashed: signal %d, command %u (code %d, address %p)\n" : "落ちた：合図 %d・命令 %u（code %d・アドレス %p）\n",
                      sig, g_cur_op, si ? si->si_code : 0, si ? si->si_addr : NULL);
     if (n > 0) { ssize_t w = write(1, line, (size_t) n); (void) w; }
     __android_log_print(ANDROID_LOG_ERROR, "iphone-rpc-vk", "%s", line);
+    // 記録の再生の途中なら、いま処理していた vkCmd と直前の数個（crash34）。落ちた場所がどの .so の中かも書く
+    rp_dump_crash();
+    and_where_pc(uc);
     // 前の受け手に戻す。自分で起こした合図（abort など。si_code が 0 以下）は出し直し、
     // 本物の落ち（アクセス違反など）は戻るだけでよい（同じ命令がもう一度落ち、前の受け手が受ける）
     if (sig > 0 && sig < NSIG) sigaction(sig, &g_old_sa[sig], NULL);
