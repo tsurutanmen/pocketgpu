@@ -3436,7 +3436,7 @@ struct CameraControlsView: View {
                     }
                 }
                 Text(c.front
-                     ? L("前面カメラのときは背面のライトを使います。iOS が許さないときは点きません。そのときは画面のライトを使ってください。",
+                     ? L("前面カメラのときは背面のライトが使用されます。iOS が許さないときは点きません。そのときは画面のライトを使ってください。",
                          "With the front camera, the back light is used. If iOS does not allow it, use the screen light instead.")
                      : L("PC と接続している間だけ点きます。", "The light is on only while the PC is connected.")).font(.footnote)
             }

@@ -1034,7 +1034,7 @@ struct PhotoTransferView: View {
                 }
                 Section {
                     Text(L("PC で photo_rx.exe を起動すると受け取ります。保存先は PC のピクチャの PocketGPU フォルダです。", "Run photo_rx.exe on the PC to receive. Files are saved in the PocketGPU folder in Pictures on the PC.")).font(.footnote)
-                    Text(L("送信中はこの画面を開いたままにしてください。ほかのアプリに切り替えると、少しあとで止まります。", "Keep this screen open while sending. If you switch to another app, sending stops after a short time.")).font(.footnote)
+                    Text(L("送信中はこの画面を開いたままにしてください。ほかのアプリに切り替えると、一定時間後に停止します。", "Keep this screen open while sending. If you switch to another app, sending stops after a short time.")).font(.footnote)
                     Button(L("ペアリングをリセット", "Reset pairing")) { askReset = true }
                 }
                 Section { BetaNote() }

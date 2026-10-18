@@ -500,7 +500,6 @@ struct ContentView: View {
                     LabeledContent(L("AI の機能", "AI features"), value: L("USB のポート 50057", "USB port 50057"))
                     LabeledContent(L("圧縮", "Compression"), value: L("USB のポート 50065", "USB port 50065"))
                     LabeledContent(L("録画", "Recording"), value: L("USB のポート 50060", "USB port 50060"))
-                    Text(L("どれも PC の PocketGPU アプリから使います。この iPhone で操作する必要はありません。", "All of these are used from the PocketGPU app on the PC. Nothing needs to be done on this iPhone.")).font(.footnote)
                 }
                 Section {
                     Picker(L("言語", "Language"), selection: $lang) {

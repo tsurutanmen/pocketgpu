@@ -1510,9 +1510,9 @@ struct MicSettingsView: View {
 
     private var inputNote: String {
         switch input {
-        case .auto: return L("有線イヤホンを挿している間は、そのマイクを使います。抜くと iPhone のマイクに戻ります。", "Uses the wired earphone mic while it is plugged in, and the iPhone mic after you unplug it.")
+        case .auto: return L("有線イヤホンを挿している間は、そのマイクが使用されます。抜くと iPhone のマイクに戻ります。", "Uses the wired earphone mic while it is plugged in, and the iPhone mic after you unplug it.")
         case .bluetooth: return L("Bluetooth のマイクを使う間は、音質が下がります。", "The sound quality is lower while the Bluetooth mic is in use.")
-        case .builtIn, .wired, .usb: return L("選んだデバイスが接続されていないときは、iPhone のマイクを使います。", "If the selected device is not connected, the iPhone mic is used.")
+        case .builtIn, .wired, .usb: return L("選んだデバイスが接続されていないときは、iPhone のマイクが使用されます。", "If the selected device is not connected, the iPhone mic is used.")
         }
     }
 
