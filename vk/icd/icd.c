@@ -173,6 +173,25 @@ static void lat_form_say(void) {
         lag, f->over[0] ? "・上書き " : "", f->over);
 }
 
+// このドライバの DLL を、プロセスが終わるまで外させない。
+// ローダーは最後の instance を壊すとこの DLL を FreeLibrary するが、外れたあとも次の 2 つはプロセスに残る：
+//   ・この DLL の中の関数の番地（ローダーが持つ入口の表と、dispatch の表）
+//   ・crash_handler（AddVectoredExceptionHandler で登録した物。外す入口が無い）
+// 前は「つながったとき」だけ留めていた。受け手につながらないと留まらないまま instance を壊し、
+// 終わる間際の例外（C++ の throw など）で外れた番地を呼んで 0xC0000005 になっていた、と見ている。
+// instance を作った時点で留める（DllMain の中ではローダーの錠を触らないよう、ここでは呼ばない）
+static void keep_self_loaded(void) {
+    static volatile LONG done;
+    if (InterlockedExchange(&done, 1)) return;
+#ifdef _WIN32
+    HMODULE self;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR) (void *) &keep_self_loaded, &self);
+#else
+    Dl_info di;
+    if (dladdr((void *) &keep_self_loaded, &di) && di.dli_fname) dlopen(di.dli_fname, RTLD_NOW | RTLD_NODELETE);
+#endif
+}
+
 // ---- 落ちたときに、どのプログラムのどこで落ちたかを書き出す（IPHONE_VK_LOG=1 のとき） ----
 #ifdef _WIN32
 static void where(const char *tag, void *addr) {
@@ -471,6 +490,10 @@ static struct {
     uint64_t q_nr_done;            // query を書いた submit がまだ終わっていないので、往復せずに「まだ」と答えた数
     uint64_t push_req, push_waits; // 押し出しを待つ間に念のため進み具合を聞いた数・押し出しを待った回数
     double push_wait_ms;
+    // 引き取り（GPU が書いた範囲の読み戻し）の往復。read_back_many 1 回が 1 往復（中に MEM_READ を何通か入れる）。
+    // 往復の数と、返事の頭が届くまで（RTT に近い）・頭から中身を読み終えるまでを分けて数える。
+    uint64_t rb_rounds, rb_reqs, rb_bytes;
+    double rb_head_ms, rb_body_ms;
     uint64_t wmsg[VR_OP_COUNT];    // 線に出た命令の数（まとめたあと。まとめる前の数は sends・calls）
     uint64_t spans;                // VR_MEM_WRITE_SPANS に入れた範囲の数
     uint64_t vframes;              // H.264 で受け取った中身のあるコマ
@@ -560,6 +583,13 @@ static void print_stats(void) {
     if (ls_on()) ls_print();
     if (g_lso_n[0] || g_lso_n[1]) fprintf(stderr, "  load_store_op_none：アプリが渡した NONE は LOAD %ld 個・STORE %ld 個（%s）\n", g_lso_n[0], g_lso_n[1], g_lso_fix ? "LOAD・STORE に直して送った" : "そのまま送った");
     fprintf(stderr, "  往復せずに済ませた待ち %llu\n", (unsigned long long) g_stat.skipped);
+    // 数えの形は prev/pertok.py・prev/batch.py が読む（引き取りの往復 N 回…：返事の頭まで X ms…・中身 Y ms）。
+    // 「引き取りの往復」は、fence を待ったときに GPU が書いた範囲を read_back_many で読み戻した回数（= 往復の回数）。
+    if (g_stat.rb_rounds)
+        fprintf(stderr, "  引き取りの往復 %llu 回（MEM_READ %llu 通・%llu バイト）：返事の頭まで %.1f ms（1 回 %.2f ms）・中身 %.1f ms（1 回 %.2f ms）\n",
+                (unsigned long long) g_stat.rb_rounds, (unsigned long long) g_stat.rb_reqs, (unsigned long long) g_stat.rb_bytes,
+                g_stat.rb_head_ms, g_stat.rb_head_ms / (double) g_stat.rb_rounds, g_stat.rb_body_ms,
+                g_stat.rb_body_ms / (double) g_stat.rb_rounds);
     if (g_stat.ext_in || g_stat.push_in)
         fprintf(stderr, "  返事の尾：尾 %llu（番号を進めた %llu）・押し出し %llu（進めた %llu）・押し出しを待った %llu 回 %.1f ms・念のため聞いた %llu・"
                         "query を往復せず「まだ」 %llu\n",
@@ -2243,14 +2273,7 @@ static int connect_locked(void) {
     warm_maybe_start(e && !strncmp(e, "link", 4) && (e[4] == 0 || e[4] == ':')); // muxwarm1015：IPHONE_VK_WARM のときだけ
     // つないだら、このドライバの DLL をプロセスが終わるまで外させない。最後の instance を壊すとローダーが DLL を外して読み直すが、
     // 外れるときにつながりを閉じないので古いつながりが残り、受け手（一度に 1 人の相手）が 2 本目のあいさつに答えず固まった（CTS で見つかった）
-#ifdef _WIN32
-    HMODULE self;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, (LPCWSTR) (void *) &connect_locked, &self);
-#else
-    // Linux のローダーも、最後の instance を壊すとこの .so を外す。RTLD_NODELETE で開き直して外れないようにする
-    Dl_info di;
-    if (dladdr((void *) &connect_locked, &di) && di.dli_fname) dlopen(di.dli_fname, RTLD_NOW | RTLD_NODELETE);
-#endif
+    keep_self_loaded();
     return 1;
 }
 
@@ -2898,6 +2921,20 @@ static int hello(void) {
         }
         free(b.p);
         free(out.p);
+    }
+    if (!g_hw.ok) {
+        // あいさつまで行かなかった（そもそもつながらない・返事が読めない）。
+        // 半端な socket を残すと、装置が無いのに後から rpc に入る道が残るので、ここで閉じて元に戻す。
+        // g_dead も戻す（装置を作る前なので「切れた」状態を持ち越さない）
+        AcquireSRWLockExclusive(&g_lock);
+        if (g_sock != VR_BAD_SOCK) {
+            closesocket(g_sock);
+            g_sock = VR_BAD_SOCK;
+        }
+        g_rxs.off = g_rxs.n = 0;
+        g_dead = 0;
+        ReleaseSRWLockExclusive(&g_lock);
+        say("受け手につながっていないので、装置は 0 台と答える");
     }
     ReleaseSRWLockExclusive(&g_hw_lock);
     return g_hw.ok;
@@ -4432,6 +4469,8 @@ static void read_back_many(rng *r, size_t n) {
     const uint64_t piece = 64u << 20;
     vr_buf b = { 0 };
     size_t nreq = 0;
+    int got_head = 0;
+    double t_head = 0;
     // アプリが書いた印を先に取っておく（引き取りで消えないように）
     for (size_t i = 0; i < n; i++) {
         struct mem *m = r[i].m;
@@ -4450,6 +4489,7 @@ static void read_back_many(rng *r, size_t n) {
             // アドレスで書かれうるメモリは、受け手がその書き手を知らないので、書いた submit の番号まで待ってもらう（古い受け手は末尾を読まない）
             if (op == VR_MEM_READ && r[i].m->wide && memw_upto_on()) vr_u64(&b, memw_upto(r[i].m, at, k));
             g_stat.calls[op]++;
+            g_stat.rb_bytes += k;
             put_msg_locked(op, &b);
             b.n = 0;
             nreq++;
@@ -4462,6 +4502,7 @@ static void read_back_many(rng *r, size_t n) {
             uint64_t k = r[i].off + r[i].len - at < piece ? r[i].off + r[i].len - at : piece;
             uint32_t h[2];
             if (!recv_head(h, VR_MEM_READ)) { ok = 0; break; }
+            if (!got_head) { got_head = 1; t_head = now_ms(); } // 最初の返事の頭が届くまで＝往復の待ち
             if ((int32_t) h[0] < 0) {
                 if (!g_dead) say("受け手が失敗を返した (%d)。この先は全部失敗にする", (int32_t) h[0]);
                 g_dead = 1;
@@ -4515,6 +4556,14 @@ static void read_back_many(rng *r, size_t n) {
             g_stat.bytes_in += 8 + h[1];
         }
     g_stat.wait_ms[VR_MEM_READ] += now_ms() - t0;
+    if (nreq) {
+        // 1 回の read_back_many が 1 往復。頭までの待ちと、頭から中身を読み終えるまでを分けて足す
+        double t1 = now_ms();
+        g_stat.rb_rounds++;
+        g_stat.rb_reqs += nreq;
+        g_stat.rb_head_ms += got_head ? t_head - t0 : t1 - t0;
+        g_stat.rb_body_ms += got_head ? t1 - t_head : 0.0;
+    }
     ReleaseSRWLockExclusive(&g_lock);
     free(b.p);
     (void) nreq;
@@ -4807,6 +4856,9 @@ static void complete(struct dev *d, struct queue *q, uint64_t upto) {
 // ---- インスタンスと装置の性質 ----
 static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *a, VkInstance *out) {
     (void) a;
+    // instance を作った時点で DLL を留める。つながっていないまま instance を壊しても、
+    // ローダーがこの DLL を外して、残った crash_handler や入口の番地が宙に浮かないようにする
+    keep_self_loaded();
     const VkApplicationInfo *ai = ci ? ci->pApplicationInfo : NULL;
     if (ai) say("アプリの名前：%s・エンジン：%s", ai->pApplicationName ? ai->pApplicationName : "(なし)", ai->pEngineName ? ai->pEngineName : "(なし)");
     if (ai && ai->pEngineName && !strcmp(ai->pEngineName, "ANGLE")) g_app_angle = 1;
@@ -4869,9 +4921,12 @@ static VkResult VKAPI_CALL enum_instance_version(uint32_t *v) {
 
 static VkResult VKAPI_CALL enum_phys(VkInstance inst, uint32_t *n, VkPhysicalDevice *out) {
     struct inst *i = (struct inst *) inst;
+    if (!n) return VK_ERROR_INITIALIZATION_FAILED;
     uint32_t have = hello() ? 1 : 0; // iPhone がいなければ 0 台
     if (!out) { *n = have; return VK_SUCCESS; }
     if (have && *n < 1) return VK_INCOMPLETE;
+    // 装置を 1 台と答えるのは、つながっていて instance の番地もあるときだけ（&i->pd を NULL から取らない）
+    if (have && !i) return VK_ERROR_INITIALIZATION_FAILED;
     if (have) out[0] = (VkPhysicalDevice) &i->pd;
     *n = have;
     return VK_SUCCESS;
@@ -5519,6 +5574,13 @@ static void VKAPI_CALL get_ext_sem(VkPhysicalDevice pd, const VkPhysicalDeviceEx
 static VkResult VKAPI_CALL create_device(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, const VkAllocationCallbacks *a, VkDevice *out) {
     say("装置を作る（create device）");
     (void) pd; (void) a;
+    if (!ci || !out) return VK_ERROR_INITIALIZATION_FAILED;
+    // 受け手につながっていなければ、装置は作らない（g_hw.real などが空のまま受け手へ命令を送らない）。
+    // きれいに失敗を返して、アプリ（DXVK）に止まってもらう
+    if (!g_hw.ok || g_sock == VR_BAD_SOCK || g_dead) {
+        say("受け手につながっていないので、装置を作らない");
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     struct dev *d = calloc(1, sizeof *d);
     if (!d) return VK_ERROR_OUT_OF_HOST_MEMORY;
     set_loader_magic_value(d);
@@ -12107,6 +12169,37 @@ static VkResult VKAPI_CALL reset_fences(VkDevice dv, uint32_t n, const VkFence *
     return VK_SUCCESS;
 }
 
+// 同じキューで待った fence をまとめ、キューごとに 1 回だけ引き取る。
+// complete は「そのキューの serial 番目までの submit が書いた範囲」を全部読むので、
+// vkWaitForFences に fence を何本も渡されたときに、MEM_READ の往復を fence の数だけ増やさずに済む。
+static void complete_fences(struct dev *d, uint32_t n, const VkFence *fs) {
+    struct queue *qs[16];
+    uint64_t up[16];
+    uint32_t nq = 0, overflow = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        struct fence *f = (struct fence *) fs[i];
+        if (!f->q) continue;
+        uint32_t k = 0;
+        while (k < nq && qs[k] != f->q) k++;
+        if (k == nq) {
+            if (nq == 16) { overflow = 1; continue; } // ふつう起きない（キューが 16 本を超えた）
+            qs[nq] = f->q;
+            up[nq] = f->serial;
+            nq++;
+        } else if (f->serial > up[k]) {
+            up[k] = f->serial;
+        }
+    }
+    if (overflow) { // 今までどおり 1 本ずつ（complete は同じ範囲を二度読まないので、重なっても害は無い）
+        for (uint32_t i = 0; i < n; i++) {
+            struct fence *f = (struct fence *) fs[i];
+            if (f->q) complete(d, f->q, f->serial);
+        }
+        return;
+    }
+    for (uint32_t k = 0; k < nq; k++) complete(d, qs[k], up[k]);
+}
+
 static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *fs, VkBool32 all, uint64_t timeout) {
     PIN_CALLER();
     // どれも submit に付けた fence で、終わるまで待つ呼び方なら、往復しない。
@@ -12151,7 +12244,7 @@ static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *f
         if (!progress_wait(need, ms)) return VK_TIMEOUT;
     }
     if (known) {
-        for (uint32_t i = 0; i < n; i++) complete((struct dev *) dv, ((struct fence *) fs[i])->q, ((struct fence *) fs[i])->serial);
+        complete_fences((struct dev *) dv, n, fs); // キューごとに 1 回にまとめて引き取る（往復を fence の数だけ増やさない）
         ((struct dev *) dv)->skipped_wait = 1;
         g_stat.skipped++;
         return lost_rc();
@@ -12165,12 +12258,13 @@ static VkResult VKAPI_CALL wait_fences(VkDevice dv, uint32_t n, const VkFence *f
     VkResult r = rpc_call(VR_WAIT_FOR_FENCES, &b, NULL);
     free(b.p);
     if (r == VK_SUCCESS) {
-        // fence が知らせたら、そのキューでそれより前に出した submit も終わっている
-        for (uint32_t i = 0; i < n; i++) {
+        // fence が知らせたら、そのキューでそれより前に出した submit も終わっている。
+        // all のときは、キューごとに 1 回にまとめて引き取る（fence の数だけ往復しない）
+        if (all) complete_fences((struct dev *) dv, n, fs);
+        else for (uint32_t i = 0; i < n; i++) {
             struct fence *f = (struct fence *) fs[i];
             if (!f->q) continue;
-            if (all) complete((struct dev *) dv, f->q, f->serial);
-            else if (n == 1) complete((struct dev *) dv, f->q, f->serial);
+            if (n == 1) complete((struct dev *) dv, f->q, f->serial);
             else {
                 // どれが知らせたか分からないので 1 つずつ尋ねる
                 vr_buf q = { 0 };

@@ -264,10 +264,16 @@ static int like_ios_no_vertex(VkFormat f) {
 }
 
 // iPhone のふりで隠す機能。10/7 の iPhone 17 Pro（MoltenVK 1.4.2）の DXVK の記録と比べて、iPhone に無かった物
+// sparse・pipeline statistics・inherited queries も iPhone 17 Pro は無い（10/14 の iphone_suite1015 で sw-texturesparseresidency と
+// sw-pipelinestatistics の両方のふりで「Selected GPU does not support ...」の前の飛ばしに落ちた）。ドライバ（icd.c の mask_features）
+// は DirectX の知らないアプリを飛ばすために連絡もなしに隠しているが、素の Vulkan のアプリが直接見る受け手の答えでも同じに隠す
 static void like_ios_mask(VkPhysicalDeviceFeatures *f) {
     if (!like_ios()) return;
     f->textureCompressionBC = f->geometryShader = f->shaderCullDistance = VK_FALSE;
     f->logicOp = f->shaderFloat64 = f->variableMultisampleRate = VK_FALSE;
+    f->sparseBinding = f->sparseResidencyBuffer = f->sparseResidencyImage2D = f->sparseResidencyImage3D = VK_FALSE;
+    f->sparseResidency2Samples = f->sparseResidency4Samples = f->sparseResidency8Samples = f->sparseResidency16Samples = VK_FALSE;
+    f->sparseResidencyAliased = f->pipelineStatisticsQuery = f->inheritedQueries = VK_FALSE;
 }
 
 // iPhone のふりで合わせる上限。10/7 の iPhone 17 Pro の vulkaninfo（iphone_runs/v0724）の値。
@@ -391,6 +397,21 @@ static void like_ios_rt_feats(VkBaseOutStructure *x) {
         f->rayTracingPipeline = f->rayTracingPipelineShaderGroupHandleCaptureReplay = f->rayTracingPipelineShaderGroupHandleCaptureReplayMixed = VK_FALSE;
         f->rayTracingPipelineTraceRaysIndirect = f->rayTraversalPrimitiveCulling = VK_FALSE;
     }
+}
+
+// iPhone のふり：多視点（multiview）で geometry shader を使う印。spec では geometryShader が無い装置では FALSE でなければならず、
+// iPhone の MoltenVK も断る。代役の GPU（RTX 3060・lavapipe）は持つので、答えでは 0 に直し、装置を作る頼みでは断るの印を返す。
+// 構造体の中の multiviewGeometryShader の位置：Vulkan11Features は multiview のあと 5 つ目・MultiviewFeatures は 1 つ目
+static int like_ios_mgs(VkBaseOutStructure *x, int clear) {
+    if (!like_ios() || !x) return 0;
+    uint32_t i;
+    if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES) i = 5;
+    else if (x->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES) i = 1;
+    else return 0;
+    VkBool32 *b = (VkBool32 *) ((uint8_t *) x + sizeof(VkBaseOutStructure));
+    int had = b[i] == VK_TRUE;
+    if (clear) b[i] = VK_FALSE;
+    return had;
 }
 static VkBuffer g_dummy_vb;
 static VkDeviceMemory g_dummy_mem;
@@ -6050,6 +6071,7 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
             vkGetPhysicalDeviceFeatures2(g_pd, &f2);
             like_ios_mask(&f2.features);
             for (uint32_t i = 0; i < n; i++) like_ios_rt_feats(blocks[i]);
+            for (uint32_t i = 0; i < n; i++) like_ios_mgs(blocks[i], 1);
             if (fake_divisor())
                 for (uint32_t i = 0; i < n; i++) {
                     VkBaseOutStructure *b = blocks[i];
@@ -6190,6 +6212,13 @@ static int handle(vr_sock s, uint32_t op, vr_rd *r) {
                         for (size_t k = 0; k < nw; k++)
                             if (rq[k] == VK_TRUE && hw[k] == VK_FALSE) missing = 1;
                     free(qb[i]);
+                }
+            }
+            if (like_ios()) {
+                // iPhone に持たない鎖の機能（multiview で geometry shader を使う印）。代役の GPU は許すので、ここで断るの印を入れる
+                for (uint32_t i = 0; i < nc && i < 32; i++) if (like_ios_mgs(blocks[i], 0)) {
+                    vlog(JE("iPhone のふり：multiview で geometry shader を使う印が 1 の装置は作らない", "Pretending to be an iPhone: refusing a device with multiviewGeometryShader enabled"));
+                    missing = 1;
                 }
             }
             if (missing) {
