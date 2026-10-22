@@ -39,3 +39,4 @@ jobs:
         with:
           name: dxvk-macos-win64
           path: out/
+          retention-days: 7

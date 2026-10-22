@@ -71,3 +71,4 @@ jobs:
             s/Media/Light Probes/uffizi_cross.dds
             s/Media/Light Probes/uffizi_cross32.DDS
             !s/**/obj/**
+          retention-days: 7

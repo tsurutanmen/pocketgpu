@@ -31,6 +31,7 @@ jobs:
         with:
           name: whisper-vk-win
           path: build/bin/Release/*.exe
+          retention-days: 7
 
   sd:
     runs-on: windows-2025
@@ -59,6 +60,7 @@ jobs:
         with:
           name: sd-vk-win
           path: build/bin/
+          retention-days: 7
 
   vulkaninfo:
     runs-on: windows-2025
@@ -78,3 +80,4 @@ jobs:
         with:
           name: vulkaninfo-win
           path: out/
+          retention-days: 7

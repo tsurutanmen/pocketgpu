@@ -31,6 +31,7 @@ jobs:
         with:
           name: llama-win
           path: build/bin/Release/*.exe
+          retention-days: 7
 
   whisper:
     runs-on: windows-2025
@@ -53,6 +54,7 @@ jobs:
         with:
           name: whisper-win-160
           path: build/bin/Release/*.exe
+          retention-days: 7
 
   sd:
     runs-on: windows-2025
@@ -75,3 +77,4 @@ jobs:
         with:
           name: sd-win
           path: build/bin/
+          retention-days: 7

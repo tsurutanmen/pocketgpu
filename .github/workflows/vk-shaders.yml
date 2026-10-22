@@ -30,3 +30,4 @@ jobs:
         with:
           name: vk-shaders
           path: out/
+          retention-days: 7

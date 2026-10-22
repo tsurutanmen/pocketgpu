@@ -99,3 +99,4 @@ jobs:
         with:
           name: RpcServer-ipa
           path: RpcServer.ipa
+          retention-days: 7

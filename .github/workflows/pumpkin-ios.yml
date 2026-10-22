@@ -74,3 +74,4 @@ jobs:
         with:
           name: pumpkin-ios
           path: out/
+          retention-days: 7

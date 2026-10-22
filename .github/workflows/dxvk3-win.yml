@@ -40,3 +40,4 @@ jobs:
         with:
           name: dxvk3-win64
           path: out/
+          retention-days: 7
