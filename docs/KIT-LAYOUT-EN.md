@@ -5,8 +5,8 @@ The contents of `kit/` go at the very top of the kit, keeping the exact same loc
 | This repository | Inside the kit | Contents |
 | --- | --- | --- |
 | `kit/Start-PocketGPU.cmd` | Same location | Entry point for automatic setup |
-| `kit/Setup-PocketGPU.cmd` | Same location | Entry point for installing everything and configuring it (View -> Listen and install -> iPhone app guide -> Final check) |
-| `kit/Run-on-iPhone-GPU.cmd` | Same location | Entry point for launching the app with a specified GPU |
+| `kit/Setup-PocketGPU.cmd` | Same location | Entry point for installing everything and configuring it (View -> Ask and install -> iPhone app guide -> Final check) |
+| `kit/Run-on-iPhone-GPU.cmd` | Same location | Entry point for launching apps using a iPhone as a GPU |
 | `kit/Update-PocketGPU.cmd` | Same location | Entry point for updates |
 | `kit/Fix-PocketGPU.cmd` | Same location | Entry point for automatic repair |
 | `kit/report.cmd`・`kit/report.ps1` | Same location | Summarizes the PC status into a single text file |
@@ -26,7 +26,7 @@ The contents of `kit/` go at the very top of the kit, keeping the exact same loc
 - `.ps1` files must be UTF-8 (with BOM), and `.cmd` files must be ASCII only. They can be fixed using `tests/Normalize-Files.ps1`.
 - Passphrases, personal signatures, `update.ini`, `kit.ini`, DLLs, EXEs, and IPAs are not included here.
 
-## Not in this repository (included in the kit)
+## Not in this repository 
 
 - `iphone_icd.dll`・`iphone_icd.json`・`x86\`・`vklist.exe`
 - `PocketGPU.exe`・`extras\` (camera, microphone, subtitle tools, and virtual camera)
