@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# 試験用の偽の pgpu-probe。本物（キットの bin/pgpu-probe）と同じ形の 1 行を返す。状態は FAKE_DIR の中のファイルで決める：
+#   mux        ok・missing・refused・denied（既定は ok）
+#   usb        Linux の USB に見えている iPhone の数（既定は 1）
+#   devices    usbmuxd に見えている機器。本物の「DEV <番号> <USB|Network> speed=… product=…」の行（無ければ USB の 1 台）
+#   paired     あればペアリング済み
+#   hello      ok・version・silent（既定は ok）。holders に書いた PID が 1 つでも生きていれば、答えない（timeout）
+#   loader     loader の答えの 1 行（既定は LOADER OK 1.3.275 …）
+#   brokers    「PID 合言葉」の行。broker で起こした偽の受け渡し役が書く
+# 本物の iPhone・usbmuxd・GPU は使わない。
+set -u
+D=${FAKE_DIR:?}
+alive() { [ -d "/proc/$1" ] && ! grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2> /dev/null; }
+mux=$(cat "$D/mux" 2> /dev/null || echo ok)
+hello_state() {
+    local p
+    if [ -f "$D/holders" ]; then
+        for p in $(cat "$D/holders"); do alive "$p" && { echo silent; return; }; done
+    fi
+    cat "$D/hello" 2> /dev/null || echo ok
+}
+case "${1:-}" in
+mux)
+    if [ "$mux" = ok ]; then echo "MUX OK /var/run/usbmuxd"; exit 0; fi
+    echo "MUX NG /var/run/usbmuxd $mux"
+    exit 1
+    ;;
+usb)
+    n=$(cat "$D/usb" 2> /dev/null || echo 1)
+    for i in $(seq 1 "$n"); do echo "USBDEV 05ac:12a8 480"; done
+    echo "USB $n"
+    [ "$n" -gt 0 ]
+    ;;
+devices)
+    [ "$mux" = ok ] || { echo "DEVICES NG /var/run/usbmuxd"; exit 1; }
+    if [ -f "$D/devices" ]; then cat "$D/devices"; n=$(grep -c '^DEV ' "$D/devices"); else echo "DEV 1 USB speed=480000000 product=4776"; n=1; fi
+    echo "DEVICES $n"
+    ;;
+pair)
+    [ "$mux" = ok ] || { echo "PAIR NG mux"; exit 1; }
+    if [ -f "$D/paired" ]; then echo "PAIR OK"; exit 0; fi
+    echo "PAIR NONE 2"
+    exit 1
+    ;;
+hello)
+    [ "$mux" = ok ] || { echo "HELLO NG mux -1"; exit 1; }
+    case "$(hello_state)" in
+    ok) echo "HELLO OK mem_mb=8192 name=Apple A17 Pro GPU (fake)" ;;
+    version) echo "HELLO NG result -9"; exit 1 ;;
+    silent) sleep 0.2; echo "HELLO NG timeout"; exit 1 ;;
+    *) echo "HELLO NG refused 3"; exit 1 ;;
+    esac
+    ;;
+loader)
+    l=$(cat "$D/loader" 2> /dev/null || echo "LOADER OK 1.3.275 /usr/lib/x86_64-linux-gnu/libvulkan.so.1")
+    echo "$l"
+    [ "${l#LOADER OK}" != "$l" ]
+    ;;
+vklist)
+    case "${IPHONE_VK:-usb}" in
+    127.0.0.1:*)
+        p=${IPHONE_VK#127.0.0.1:}
+        hex=$(printf '%04X' "$p")
+        if awk -v p="$hex" '$4 == "0A" && toupper(substr($2, length($2) - 3)) == p {f = 1} END {exit !f}' /proc/net/tcp /proc/net/tcp6 2> /dev/null; then
+            echo "GPU0: PocketGPU phone (Adreno 750, fake)  (vendor 0x5143, type 1, Vulkan 1.3, 7800 MiB)"
+        fi
+        ;;
+    *)
+        files="${VK_DRIVER_FILES:-}:${VK_ICD_FILENAMES:-}:${VK_ADD_DRIVER_FILES:-}"
+        if [ "${files#*iphone_icd}" != "$files" ] && [ "$mux" = ok ] && [ "$(hello_state)" = ok ]; then
+            echo "GPU0: Apple A17 Pro GPU (fake)  (vendor 0x106b, type 1, Vulkan 1.2, 8192 MiB)"
+        fi
+        ;;
+    esac
+    echo "GPU9: llvmpipe (LLVM 17, fake)  (vendor 0x10005, type 4, Vulkan 1.3, 2048 MiB)"
+    ;;
+ww) echo "WW OK" ;;
+broker)
+    # 偽の受け渡し役。止められるまで生きている
+    [ "${2:-}" = --quiet ] || echo "$$ ${PGPU_BROKER_TOKEN:-}" >> "$D/brokers"
+    trap 'exit 0' TERM INT HUP
+    while :; do sleep 1; done
+    ;;
+broker-check)
+    any=0
+    match=0
+    if [ -f "$D/brokers" ]; then
+        while read -r p tok; do
+            alive "$p" || continue
+            any=1
+            [ -n "${PGPU_BROKER_TOKEN:-}" ] && [ "$tok" = "$PGPU_BROKER_TOKEN" ] && match=1
+        done < "$D/brokers"
+    fi
+    name="pocketgpu-usbmuxd-$(id -u)"
+    if [ "$match" = 1 ]; then echo "BROKER OK @$name"; exit 0; fi
+    if [ "$any" = 0 ]; then echo "BROKER NONE @$name"; exit 1; fi
+    echo "BROKER NG @$name refused"
+    exit 1
+    ;;
+token) head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'; echo ;;
+*) echo "usage" >&2; exit 2 ;;
+esac

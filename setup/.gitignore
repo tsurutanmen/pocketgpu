@@ -1,0 +1,31 @@
+# Per-person files and secrets. Never commit these.
+update.ini
+kit.ini
+shortcuts.txt
+.env
+*.token
+
+# Logs and reports written by the tools
+pocketgpu-*-log.txt
+pocketgpu-fix-summary.txt
+pocketgpu-report.txt
+logs/
+
+# Backups made by the tools
+update-backup/
+fix-backup/
+
+# The core is not part of this repository (see README)
+*.dll
+*.exe
+*.ipa
+*.zip
+android/server_*
+extras/
+dxvk/
+x86/
+
+# Test work folder and Python caches
+tests/work/
+__pycache__/
+*.pyc
