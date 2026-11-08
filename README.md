@@ -14,6 +14,22 @@ Built with [Claude Code](https://claude.com/claude-code). Most of the code here 
 - Discord: https://discord.gg/F3Mk8DBxqQ
 - License: Apache-2.0 (`mc/pumpkin-ios` is GPL-3.0)
 
+## Screenshots
+
+The iPhone shows up as one more Vulkan GPU on the PC:
+
+![vklist lists the iPhone 17 Pro GPU next to the PC's own GPU](docs/img/gpu_list.png)
+
+| Unigine Heaven, DirectX 11 through DXVK | 0 A.D., Vulkan |
+| --- | --- |
+| ![Unigine Heaven drawn by the iPhone GPU](docs/img/heaven.png) | ![0 A.D. drawn by the iPhone GPU](docs/img/0ad.png) |
+
+## Try it
+
+1. Download `PocketGPU-*-windows.zip` from [Releases](https://github.com/tsurutanmen/pocketgpu/releases) and extract it.
+2. Install `RpcServer-*.ipa` on the iPhone with your own Apple ID (AltStore, Impactor, iloader or xtool), or `android/pocketgpu.apk` on an Android phone.
+3. Plug the phone into the PC and double-click `Setup-PocketGPU.cmd`. Then drop a game's `.exe` onto `Run-on-iPhone-GPU.cmd`.
+
 ## What you need to install
 
 These are not in this repository. They come from Apple, LunarG, Microsoft and others. The kit's `Setup-PocketGPU.cmd` checks them and offers to install them with winget.

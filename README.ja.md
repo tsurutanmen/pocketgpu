@@ -14,6 +14,22 @@ Windows と Linux の Vulkan ドライバとして動きます。DirectX と Ope
 - Discord：https://discord.gg/F3Mk8DBxqQ
 - ライセンス：Apache-2.0（`mc/pumpkin-ios` だけ GPL-3.0）
 
+## スクリーンショット
+
+iPhone が、PC の Vulkan の GPU の 1 つとして見えます。
+
+![vklist に、PC の GPU と並んで iPhone 17 Pro の GPU が出ている](docs/img/gpu_list.png)
+
+| Unigine Heaven（DirectX 11、DXVK 経由） | 0 A.D.（Vulkan） |
+| --- | --- |
+| ![iPhone の GPU で描いた Unigine Heaven](docs/img/heaven.png) | ![iPhone の GPU で描いた 0 A.D.](docs/img/0ad.png) |
+
+## 試し方
+
+1. [Releases](https://github.com/tsurutanmen/pocketgpu/releases) から `PocketGPU-*-windows.zip` を取ってきて、展開します。
+2. iPhone なら `RpcServer-*.ipa` を自分の Apple ID で入れます（AltStore、Impactor、iloader、xtool のどれか）。Android なら `android/pocketgpu.apk` を入れます。
+3. スマホを PC に挿して、`Setup-PocketGPU.cmd` をダブルクリックします。あとは、ゲームの `.exe` を `Run-on-iPhone-GPU.cmd` にドラッグします。
+
 ## 自分で入れる物
 
 このリポジトリには入っていません。Apple、LunarG、Microsoft などが配っている物です。キットの `Setup-PocketGPU.cmd` が、入っているかを調べて、winget で入れるかを聞きます。
