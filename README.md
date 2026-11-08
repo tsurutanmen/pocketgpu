@@ -10,6 +10,19 @@ It works as a Vulkan driver on Windows and Linux. DirectX and OpenGL apps run th
 - Discord: https://discord.gg/F3Mk8DBxqQ
 - License: Apache-2.0 (`mc/pumpkin-ios` is GPL-3.0)
 
+## What you need to install
+
+These are not in this repository. They come from Apple, LunarG, Microsoft and others. The kit's `Setup-PocketGPU.cmd` checks them and offers to install them with winget.
+
+| For | What | Where |
+| --- | --- | --- |
+| iPhone on Windows | Apple USB driver and Apple Mobile Device Service | [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) from the Microsoft Store, or [iTunes](https://www.apple.com/itunes/) |
+| Windows | Vulkan loader `vulkan-1.dll`, 64 and 32 bit | [Vulkan Runtime](https://vulkan.lunarg.com/sdk/home) from LunarG |
+| Windows | Visual C++ runtime | [vc_redist.x64.exe](https://aka.ms/vs/17/release/vc_redist.x64.exe) |
+| iPhone | A way to install the app with your own Apple ID | [AltStore](https://altstore.io), [Impactor](https://github.com/khcrysalis/Impactor/releases), [iloader](https://github.com/nab138/iloader/releases) or [xtool](https://github.com/xtool-org/xtool) |
+| Android | adb | [Android platform-tools](https://developer.android.com/tools/releases/platform-tools) |
+| iPhone on Linux | usbmuxd | Your distro's package |
+
 ## What is in here
 
 | Folder | What |
@@ -28,6 +41,7 @@ It works as a Vulkan driver on Windows and Linux. DirectX and OpenGL apps run th
 | `pc/audio` | Windows mic receiver |
 | `pc/livecap` | Live captions |
 | `pc/linux_media` | Linux webcam and mic receivers |
+| `pc/opengl` | OpenGL add-on pack: runs OpenGL apps through Mesa zink |
 | `win` | Scripts that run games and samples on the phone GPU for testing |
 | `mc` | Patches and glue to run the Pumpkin Minecraft server inside the iPhone app (optional) |
 | `patches` | Patches applied to llama.cpp and whisper.cpp |
@@ -76,4 +90,4 @@ It works as a Vulkan driver on Windows and Linux. DirectX and OpenGL apps run th
 | `vk/third_party/lz4` | BSD-2-Clause |
 | `vk/third_party/stb` | MIT or public domain |
 
-Not in this repository and fetched or built at build time: MoltenVK (Apache-2.0), llama.cpp (MIT), whisper.cpp (MIT), DXVK (zlib), Pumpkin (GPL-3.0).
+Not in this repository and fetched or built at build time: MoltenVK (Apache-2.0), llama.cpp (MIT), whisper.cpp (MIT), DXVK (zlib, the kit uses the dxvk-macOS async 1.10.3 build), vkd3d-proton 3.0.1 (LGPL-2.1, for the DirectX 12 tests), Mesa 26.2.4 from mesa-dist-win (MIT, for `pc/opengl`), Pumpkin (GPL-3.0).
