@@ -10,7 +10,7 @@ Windows と Linux の Vulkan ドライバとして動きます。DirectX と Ope
 
 [Claude Code](https://claude.com/claude-code) で作りました。コードのほとんどは Claude と一緒に書いています。
 
-- テスター向けのセットアップと修理のスクリプト：[tsurutanmen/pocketgpu-setup](https://github.com/tsurutanmen/pocketgpu-setup)
+- テスター向けのセットアップと修理のスクリプト：[`setup`](setup)（[tsurutanmen/pocketgpu-setup](https://github.com/tsurutanmen/pocketgpu-setup) にも同じ物）
 - Discord：https://discord.gg/F3Mk8DBxqQ
 - ライセンス：Apache-2.0（`mc/pumpkin-ios` だけ GPL-3.0）
 
@@ -50,6 +50,7 @@ Windows と Linux の Vulkan ドライバとして動きます。DirectX と Ope
 | `mc` | iPhone アプリの中で Pumpkin（マイクラのサーバー）を動かす部品（使うかは選べる） |
 | `patches` | llama.cpp と whisper.cpp に当てる修正 |
 | `ci`, `.github/workflows`, `codemagic.yaml` | 組み立てのスクリプト |
+| `setup` | キットを入れる・直すスクリプトと、その試験。tsurutanmen/pocketgpu-setup と同じ物 |
 | `server/kit-worker` | キットの配布、更新、テスターのログを受ける Cloudflare Worker |
 | `server/discord` | Discord の bot と、キットを配る道具、更新を出す道具 |
 | `docs` | 計画と試験のメモ（日本語） |
@@ -89,6 +90,7 @@ Windows と Linux の Vulkan ドライバとして動きます。DirectX と Ope
 | 部分 | ライセンス |
 | --- | --- |
 | 下の行以外の全部 | Apache-2.0（`LICENSE`） |
+| `setup` | MIT（`setup/LICENSE`） |
 | `mc/pumpkin-ios` | GPL-3.0（`mc/pumpkin-ios/LICENSE`）。`MINECRAFT=true` で組んだ iPhone アプリは Pumpkin を含むので、全体が GPL-3.0 になる |
 | `vk/third_party/bcdec` | MIT か Unlicense |
 | `vk/third_party/lz4` | BSD-2-Clause |

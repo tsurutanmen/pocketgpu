@@ -10,7 +10,7 @@ It works as a Vulkan driver on Windows and Linux. DirectX and OpenGL apps run th
 
 Built with [Claude Code](https://claude.com/claude-code). Most of the code here was written together with Claude.
 
-- Setup and repair scripts for testers: [tsurutanmen/pocketgpu-setup](https://github.com/tsurutanmen/pocketgpu-setup)
+- Setup and repair scripts for testers: [`setup`](setup) (also at [tsurutanmen/pocketgpu-setup](https://github.com/tsurutanmen/pocketgpu-setup))
 - Discord: https://discord.gg/F3Mk8DBxqQ
 - License: Apache-2.0 (`mc/pumpkin-ios` is GPL-3.0)
 
@@ -50,6 +50,7 @@ These are not in this repository. They come from Apple, LunarG, Microsoft and ot
 | `mc` | Patches and glue to run the Pumpkin Minecraft server inside the iPhone app (optional) |
 | `patches` | Patches applied to llama.cpp and whisper.cpp |
 | `ci`, `.github/workflows`, `codemagic.yaml` | Build scripts |
+| `setup` | Setup and repair scripts for the kits, with their tests. Same as tsurutanmen/pocketgpu-setup |
 | `server/kit-worker` | Cloudflare Worker for kit downloads, updates and tester logs |
 | `server/discord` | Discord bot and the scripts that hand out kits and publish updates |
 | `docs` | Plans and test notes (Japanese) |
@@ -89,6 +90,7 @@ These are not in this repository. They come from Apple, LunarG, Microsoft and ot
 | Part | License |
 | --- | --- |
 | Everything except the rows below | Apache-2.0 (`LICENSE`) |
+| `setup` | MIT (`setup/LICENSE`) |
 | `mc/pumpkin-ios` | GPL-3.0 (`mc/pumpkin-ios/LICENSE`). An iPhone app built with `MINECRAFT=true` links Pumpkin and is GPL-3.0 as a whole |
 | `vk/third_party/bcdec` | MIT or Unlicense |
 | `vk/third_party/lz4` | BSD-2-Clause |
