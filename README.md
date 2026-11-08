@@ -1,5 +1,7 @@
 # PocketGPU
 
+English | [日本語](README.ja.md)
+
 Thanks for reading this README. I'm Tsuruta.
 
 PocketGPU is for people who have a powerful phone but a PC without a graphics card. Connect the phone to the PC with a cable, and the phone does the GPU work for the PC.
