@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 0.1.6：Android のゲームモード（Android 12 から）の宣言。このアプリは絵を描かないので、解像度を下げる・コマ数を決める介入は受け付けない。
+     パフォーマンスだけ選べるようにして、バッテリーは選べなくする（バッテリーにすると GPU が遅くなるため） -->
+<game-mode-config xmlns:android="http://schemas.android.com/apk/res/android"
+    android:supportsBatteryGameMode="false"
+    android:supportsPerformanceGameMode="true"
+    android:allowGameDownscaling="false"
+    android:allowGameFpsOverride="false" />

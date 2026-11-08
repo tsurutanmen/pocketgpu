@@ -20,13 +20,22 @@ It works as a Vulkan driver on Windows and Linux. DirectX and OpenGL apps run th
 | `vk/tools` | Tools used while measuring and debugging |
 | `vk/third_party` | bcdec, lz4, stb_image |
 | `Sources` | iPhone app (PocketGPU) and the camera-only app (PocketCam) |
+| `android` | Android app (Java). It also carries the receiver from `vk/remote` |
 | `pc` | PC tools: kit builder, USB forwarding, iPhone log and status tools |
 | `pc/kit`, `pc/kit_linux` | Scripts that go into the Windows and Linux kits |
+| `pc/app` | Windows app `PocketGPU.exe` (C#, WPF) |
+| `pc/cam` | Windows webcam receiver, virtual camera and its installer |
+| `pc/audio` | Windows mic receiver |
+| `pc/livecap` | Live captions |
+| `pc/linux_media` | Linux webcam and mic receivers |
 | `win` | Scripts that run games and samples on the phone GPU for testing |
 | `mc` | Patches and glue to run the Pumpkin Minecraft server inside the iPhone app (optional) |
 | `patches` | Patches applied to llama.cpp and whisper.cpp |
 | `ci`, `.github/workflows`, `codemagic.yaml` | Build scripts |
+| `server/kit-worker` | Cloudflare Worker for kit downloads, updates and tester logs |
+| `server/discord` | Discord bot and the scripts that hand out kits and publish updates |
 | `docs` | Plans and test notes (Japanese) |
+| `docs/kit` | Install guide, FAQ and research notes for testers (Japanese and English) |
 
 ## Build
 
@@ -35,9 +44,14 @@ It works as a Vulkan driver on Windows and Linux. DirectX and OpenGL apps run th
 | Windows driver and tools | `vk/build_win.sh <out>` | zig (`zig cc`). No Visual Studio |
 | Linux driver (incl. WSL, Steam Deck) | `vk/build_linux.sh <out>` | gcc and the Vulkan headers |
 | Android receiver | `vk/build_android.sh <out>` | Android NDK. No Android Studio |
+| Android app (`.apk`) | `android/build_apk.sh` | Android SDK build-tools 35 and platform 34, JDK 17. No Gradle. Set `PGPU_SERVER_DIR` to the receiver built above |
 | iPhone app (unsigned `.ipa`) | `ci/build_ios.sh` | macOS and Xcode 26.3. Runs on Codemagic or the `ios.yml` workflow |
+| Windows app | `pc/app/build.cmd` | The C# compiler that comes with Windows (.NET Framework 4.8) |
+| Webcam, mic and captions for Windows | `pc/cam/build.sh`, `pc/audio/build.sh`, `pc/livecap/build.sh` | zig |
 | Pumpkin library for the iPhone app | `ci/build_pumpkin_ios.sh` | Rust. Only when `MINECRAFT=true` |
 | Windows kit for one tester | `python pc/make_kit.py <name>` | The driver and app built above. Set `PGKIT_UPDATE_URL` to your own update server |
+| Linux kit | `python pc/make_linux_kit.py <name>` | zig. Builds the Linux webcam and mic receivers too |
+| Update server | `npx wrangler deploy` in `server/kit-worker` | A Cloudflare account. Fill in the `YOUR-...` values in `wrangler.toml` |
 
 ## Testers
 

@@ -1,0 +1,34 @@
+<!-- チェック：Start-PocketGPU の 7 つの項目を順に見る。行は Code で作る（CheckRows に入れる） -->
+<StackPanel xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+            xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <TextBlock Style="{StaticResource H1}" Text="{DynamicResource s_nav_check}"/>
+  <TextBlock x:Name="CheckIntro" Style="{StaticResource Intro}"/>
+  <StackPanel Orientation="Horizontal" Margin="0,0,0,18">
+    <Button x:Name="CheckRun" Style="{StaticResource BtnPrimary}" Content="{DynamicResource s_check_again}"/>
+    <TextBlock x:Name="CheckWhen" Style="{StaticResource Foot}" Margin="16,0,0,0"/>
+  </StackPanel>
+  <Border Style="{StaticResource Card}">
+    <StackPanel x:Name="CheckRows"/>
+  </Border>
+  <StackPanel x:Name="CheckDone" Margin="0,18,0,0" Visibility="Collapsed">
+    <TextBlock Style="{StaticResource Sec}" Margin="2,0,0,8" Text="{DynamicResource s_check_ready}"/>
+    <Border Style="{StaticResource Card}">
+      <StackPanel>
+        <Border Style="{StaticResource Row}">
+          <DockPanel>
+            <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_play}"/>
+            <Button x:Name="CheckGoGpu" Style="{StaticResource BtnRow}" Content="{DynamicResource s_gpu_launch}"/>
+            <StackPanel VerticalAlignment="Center">
+              <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_check_ready_title}"/>
+              <TextBlock Style="{StaticResource RowSub}" Text="{DynamicResource s_check_ready_sub}"/>
+            </StackPanel>
+          </DockPanel>
+        </Border>
+      </StackPanel>
+    </Border>
+  </StackPanel>
+  <StackPanel Orientation="Horizontal" Margin="0,14,0,0">
+    <TextBlock Style="{StaticResource Foot}" Text="{DynamicResource s_check_foot}"/>
+    <Button x:Name="CheckCopy" Style="{StaticResource Link}" Margin="14,0,0,0" Content="{DynamicResource s_check_copy}"/>
+  </StackPanel>
+</StackPanel>

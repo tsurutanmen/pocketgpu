@@ -13,7 +13,7 @@
 # 入口は 3 つ：Start-PocketGPU.cmd（順に確かめて足りない物を案内する）と Run-on-iPhone-GPU.cmd（1 つのアプリを iPhone の GPU で起動する）と
 # Start-Mic-Camera.cmd（GPU を使わずに、iPhone をマイクとカメラにする）。
 # 中身は kit\tools\*.ps1（Windows PowerShell 5.1 だけで動く。Python は要らない）。tools\kit.ini に受け手との約束の版と、アプリの版を書く
-# PC アプリ PocketGPU.exe（work/pcapp2）はキットの一番上に置く。自分の横の iphone_icd.json・dxvk\・pocketgpu.cmd・tools\kit.ini を読み、道具は extras\ から探す
+# PC アプリ PocketGPU.exe（pc/app）はキットの一番上に置く。自分の横の iphone_icd.json・dxvk\・pocketgpu.cmd・tools\kit.ini を読み、道具は extras\ から探す
 # カメラ・マイク・字幕の道具と仮想カメラは extras\ にまとめる。PocketGPU.exe（横・tools\・extras\ を探す）と tools\miccam.ps1（extras\・camera\・一番上を探す）の
 # 両方が探す所で、仮想カメラの DLL は camera_setup.exe と同じフォルダに要る（PocketGPU.exe が camera_setup.exe の横から写すため）
 # 古い iPhone（iOS 15・16）用の PocketCam-*.ipa も、RpcServer の IPA と同じ印を足して入れる（カメラとマイクだけのアプリ。PC 側は Start-Mic-Camera.cmd）
@@ -34,16 +34,16 @@ DXVK_LICENSE = r'D:\iphone-rpc\vkbuild\dxvk3\LICENSE'
 IPA_DIR = os.environ.get('PGKIT_IPA_DIR', r'D:\iphone-rpc\ipa\serve')
 OUT = os.environ.get('PGKIT_OUT', r'D:\iphone-rpc\tester_kit')
 ANDROID_DIR = r'D:\iphone-rpc\androidbuild'   # app\vk\build_android.sh で組んだ受け手（server_aarch64 と server_x86_64）
-ANDROID_APK = r'D:\iphone-rpc\work\android_app\out\pocketgpu.apk'   # work\android_app\build_apk.sh で組んだ PocketGPU アプリ（Android）
+ANDROID_APK = os.environ.get('PGKIT_ANDROID_APK', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'android', 'out', 'pocketgpu.apk'))   # android\build_apk.sh で組んだ PocketGPU アプリ（Android）
 ANDROID_APK_MIN = (0, 1, 4)   # これより古い版のアプリはキットに入れない。0.1.2 からカメラとマイクの口が、0.1.4 から GPU の口も localabstract に変わった（android_app.cmd が版を見て向け方を選ぶ）。
                               # 0.1.3 までは端末の 50060 が使えないと GPU の受け手がすぐ終わった（10/14 テスターの Redmagic 9S Pro）。0.1.4 は次の番号と localabstract:pocketgpu-gpu でも待つ
 AAPT2 = r'D:\android-sdk\build-tools\35.0.0\aapt2.exe'   # APK の版を読む。無ければ版の確認だけ飛ばす
 PLACE = b'PGKIT-MARK:' + b'#' * 32
 PROTO_H = os.environ.get('PGKIT_PROTO_H', os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'vk', 'remote', 'proto.h'))
 # カメラ・マイク・字幕の道具と仮想カメラ（C で組んだ物。UCRT だけを使うので VC の部品は要らない）。KITBUILD\extras\ に置く → キットの extras\
-#   webcam_rx.exe・ipaudio.exe・camera_setup.exe・dshow_cam64.dll・dshow_cam32.dll は work/camset/out、livecap.exe は work/livecap
+#   webcam_rx.exe・camera_setup.exe・dshow_cam64.dll・dshow_cam32.dll は pc/cam、ipaudio.exe は pc/audio、livecap.exe は pc/livecap で組む
 MEDIA = ('webcam_rx.exe', 'ipaudio.exe', 'livecap.exe', 'camera_setup.exe', 'dshow_cam64.dll', 'dshow_cam32.dll')
-# PC アプリ。work/pcapp2 の build.cmd で組んだ out\PocketGPU.exe を KITBUILD の一番上に置く → キットの一番上
+# PC アプリ。pc/app の build.cmd で組んだ out\PocketGPU.exe を KITBUILD の一番上に置く → キットの一番上
 APP_EXE = 'PocketGPU.exe'
 # 更新を聞く先（Cloudflare の kit-worker）。試すときは PGKIT_UPDATE_URL で PC の中の wrangler dev に向ける
 UPDATE_URL = os.environ.get('PGKIT_UPDATE_URL', 'https://pocketgpu-kit.YOUR-SUBDOMAIN.workers.dev')

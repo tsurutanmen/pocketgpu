@@ -1,0 +1,147 @@
+<!-- 設定：言語・テーマ・使い方・保存先・マイクとスピーカー・道具の場所 -->
+<StackPanel xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+            xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <TextBlock Style="{StaticResource H1}" Text="{DynamicResource s_nav_settings}"/>
+
+  <Border Style="{StaticResource Card}">
+    <StackPanel>
+      <Border Style="{StaticResource Row}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_globe}"/>
+          <ComboBox x:Name="SetLang" Style="{StaticResource Select}"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_set_lang}"/>
+            <TextBlock Style="{StaticResource RowSub}" Text="{DynamicResource s_set_lang_sub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+      <Border Style="{StaticResource RowNext}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_theme}" Content="{StaticResource i_theme_fill}"/>
+          <ComboBox x:Name="SetTheme" Style="{StaticResource Select}"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_set_theme}"/>
+            <TextBlock Style="{StaticResource RowSub}" Text="{DynamicResource s_set_theme_sub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+      <Border Style="{StaticResource RowNext}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_vcam}"/>
+          <CheckBox x:Name="SetMediaOnly" Style="{StaticResource Switch}"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_mode_title}"/>
+            <TextBlock Style="{StaticResource RowSub}" Text="{DynamicResource s_mode_sub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+      <Border Style="{StaticResource RowNext}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_folder}"/>
+          <Button x:Name="SetDataOpen" Style="{StaticResource BtnRow}" Content="{DynamicResource s_open_folder}"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_set_data}"/>
+            <TextBlock x:Name="SetDataPath" Style="{StaticResource RowSub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+    </StackPanel>
+  </Border>
+
+  <!-- マイクとスピーカー：マイクとスピーカーの画面と同じ設定。どちらで変えても同じ値になる -->
+  <TextBlock Style="{StaticResource Sec}" Text="{DynamicResource s_nav_audio}"/>
+  <Border Style="{StaticResource Card}">
+    <StackPanel>
+      <Border Style="{StaticResource Row}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_mute}"/>
+          <CheckBox x:Name="SetMutePc" Style="{StaticResource Switch}"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_audio_mute_pc}"/>
+            <TextBlock x:Name="SetMutePcSub" Style="{StaticResource RowSub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+      <Border Style="{StaticResource RowNext}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_fps}"/>
+          <Border Style="{StaticResource SegBox}">
+            <StackPanel Orientation="Horizontal">
+              <RadioButton x:Name="SetDelay20" GroupName="sdelay" Style="{StaticResource SegItem}" Content="{DynamicResource s_delay_short}"/>
+              <RadioButton x:Name="SetDelay40" GroupName="sdelay" Style="{StaticResource SegItem}" Content="{DynamicResource s_delay_std}"/>
+              <RadioButton x:Name="SetDelay80" GroupName="sdelay" Style="{StaticResource SegItem}" Content="{DynamicResource s_delay_long}"/>
+            </StackPanel>
+          </Border>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_audio_delay}"/>
+            <TextBlock Style="{StaticResource RowSub}" Text="{DynamicResource s_audio_delay_sub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+      <Border Style="{StaticResource RowNext}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_headphones}"/>
+          <CheckBox x:Name="SetMon" Style="{StaticResource Switch}"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_audio_mon}"/>
+            <TextBlock x:Name="SetMonSub" Style="{StaticResource RowSub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+      <Border Style="{StaticResource RowNext}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_pc}"/>
+          <ComboBox x:Name="SetMonDev" Style="{StaticResource Select}" Width="260"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_audio_mon_dev}"/>
+            <TextBlock Style="{StaticResource RowSub}" Text="{DynamicResource s_audio_mon_dev_sub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+      <Border Style="{StaticResource RowNext}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_speaker}"/>
+          <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" Margin="16,0,0,0" VerticalAlignment="Center">
+            <TextBlock x:Name="SetMonVolText" Foreground="{DynamicResource Sub}" VerticalAlignment="Center" Margin="0,0,12,0" MinWidth="38" TextAlignment="Right"/>
+            <Slider x:Name="SetMonVol" Style="{StaticResource Slider}" Minimum="5" Maximum="100" TickFrequency="5"/>
+          </StackPanel>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_audio_mon_vol}"/>
+            <TextBlock Style="{StaticResource RowSub}" Text="{DynamicResource s_audio_mon_vol_sub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+    </StackPanel>
+  </Border>
+
+  <TextBlock Style="{StaticResource Sec}" Text="{DynamicResource s_set_tools}"/>
+  <Border Style="{StaticResource Card}">
+    <StackPanel x:Name="SetToolRows"/>
+  </Border>
+
+  <TextBlock Style="{StaticResource Sec}" Text="{DynamicResource s_set_about}"/>
+  <Border Style="{StaticResource Card}">
+    <StackPanel>
+      <Border Style="{StaticResource Row}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_info}"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock x:Name="SetVersion" Style="{StaticResource RowTitle}"/>
+            <TextBlock Style="{StaticResource RowSub}" Text="{DynamicResource s_set_about_sub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+      <!-- アップデート：キットの tools\update.ps1 でチェックし、Update-PocketGPU.cmd で更新する（PageUpdate.cs） -->
+      <Border Style="{StaticResource RowNext}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_update}"/>
+          <Button x:Name="SetUpdBtn" Style="{StaticResource BtnRow}" Content="{DynamicResource s_upd_check}"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_upd_title}"/>
+            <TextBlock x:Name="SetUpdSub" Style="{StaticResource RowSub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+    </StackPanel>
+  </Border>
+</StackPanel>

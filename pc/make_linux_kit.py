@@ -3,7 +3,7 @@
 #   python make_linux_kit.py --template フォルダ    印を入れないひな形のフォルダ（試験用。IPA・tar.gz・台帳は作らない）
 # ドライバ（libiphone_icd.so）と道具（pgpu-probe）は zig cc で glibc 2.31 に合わせて組む（Ubuntu 20.04・Steam Runtime sniper と同じ版）。
 # 32 ビットのゲーム用に i386 のドライバも組む（lib/i386。run-on-iphone-gpu.sh が両方の json を渡し、Vulkan のローダーが合う方を使う）。
-# カメラとマイクの道具（bin/webcam_rx・bin/ipaudio）も組む。元は PGKIT_MEDIA_SRC（無ければ横の pc\ か work\linux2kit\pc）。
+# カメラとマイクの道具（bin/webcam_rx・bin/ipaudio）も組む。元は PGKIT_MEDIA_SRC（無ければ横の linux_media\）。
 # 組んだあと、ELF の中を読んで、要る glibc の版が 2.31 以下か・要るライブラリが libc の仲間だけかを見る
 # （X・JPEG・FFmpeg・PipeWire・PulseAudio は動くときに dlopen）。
 # ドライバの「#」32 文字を、その人の印（名前＋乱数）に書き換える（Windows のキットと同じ印の場所・同じ作り方）。
@@ -46,7 +46,7 @@ VK_HEADERS = os.environ.get('VK_HEADERS') or next(
 TARGET = 'x86_64-linux-gnu.2.31'
 TARGET32 = 'x86-linux-gnu.2.31'
 MEDIA_SRC = os.environ.get('PGKIT_MEDIA_SRC') or next(
-    (p for p in (os.path.join(HERE, 'pc'), r'D:\iphone-rpc\work\linux2kit\pc') if os.path.exists(os.path.join(p, 'webcam_rx_linux.c'))), '')
+    (p for p in (os.path.join(HERE, 'linux_media'), os.path.join(HERE, 'pc')) if os.path.exists(os.path.join(p, 'webcam_rx_linux.c'))), '')
 GLIBC_MAX = (2, 31)
 NEEDED_OK = {'libc.so.6', 'libpthread.so.0', 'libdl.so.2', 'libm.so.6', 'ld-linux-x86-64.so.2', 'ld-linux.so.2', 'librt.so.1'}
 PLACE = b'PGKIT-MARK:' + b'#' * 32

@@ -1,0 +1,94 @@
+# PocketGPU FAQ and troubleshooting table (draft, 2026-10-10)
+# PocketGPU よくある質問と、動かないときの切り分け表（下書き・2026-10-10）
+
+Facts and steps only. Wording will be edited by Tsuruta.
+事実と手順だけです。言い回しは鶴田さんが直します。
+
+Source of every fact in this file: the project notes given by the iPhone RPC project session on 2026-10-10 (not a public page). Anything I added beyond those notes is marked **[unconfirmed / 未確認]**.
+この文書の事実はすべて、iPhone RPC のセッションから 2026-10-10 に渡されたメモが元です（公開のページではありません）。それ以外のことを足した所には **[未確認]** と付けています。
+
+---
+
+## English
+
+### Symptom → what to check → how to fix
+
+| Symptom | What to check | How to fix |
+|---|---|---|
+| The connection drops after streaming for a while over USB | Did it stream continuously for a long time? | **Restart the iPhone first.** This usually fixes it. Change the cable or the USB port only after that. |
+| The iPhone app froze after a drop | Is the app stuck on screen? | Swipe the app up to close it, then open it again. |
+| The GPU stops being used, or nothing is drawn | Is the iPhone app in front, with the screen on? | Keep the app in front and keep the screen on. If it goes to the background, the GPU cannot be used. |
+| `check.cmd` does not list the iPhone GPU | Check in this order: (1) iTunes from apple.com (not the Microsoft Store version) is installed; (2) Apple Mobile Device Service is running; (3) the USB connection is working; (4) the iPhone is unlocked; (5) the app is open on the iPhone | Fix the first item that fails, then run `check.cmd` again. |
+| The iPhone app stops opening after about a week | Did you install it with a free Apple ID? | A free Apple ID stops working after 7 days. Install the app again. |
+| A DirectX 11 game does not use the iPhone GPU | Are `d3d11.dll` and `dxgi.dll` from `dxvk` next to the game's `.exe`? Did you start the game with `pocketgpu.cmd`? | Copy the two files from `dxvk\x64` (64-bit game) or `dxvk\x32` (32-bit game) next to the `.exe`. Use `x64` or `x32` according to the game. |
+| The frame rate drops after some time | Is the iPhone hot? | The driver can lower the frame rate when the iPhone gets hot. Cooling with a fan is fine. Do not cool it suddenly, for example with an ice pack. |
+| Transfer is slow | Which iPhone do you have? | Only Pro models have fast USB 3. The non-Pro models use USB 2 and are slower. See `devices.md`. |
+| A game has anti-cheat | Does the game use Easy Anti-Cheat, BattlEye, VAC or Vanguard? | Do not use these games. Your account may be banned. |
+
+### Questions
+
+**Which games should I not use?**
+Games with anti-cheat, such as Easy Anti-Cheat, BattlEye, VAC and Vanguard. Your account may be banned.
+
+**Do I have to keep the app in front?**
+Yes. Keep the iPhone app in front with the screen on. The GPU cannot be used when it is in the background.
+
+**Do I need iTunes?**
+Yes, the version from apple.com (not the Microsoft Store version), so Windows can talk to the iPhone.
+
+**Why does the app stop opening after 7 days?**
+A free Apple ID signs the app for 7 days. Install it again.
+
+**Which iPhones are fast over USB?**
+Only the Pro models (USB 3). Non-Pro models use USB 2 and are slower. See `devices.md`.
+
+**Can the iPhone get too hot?**
+When it is hot, the driver may lower the frame rate. A fan is fine. Do not cool it suddenly, for example with an ice pack.
+
+**How do I send a report?**
+Two things: "Send diagnostics" in the iPhone app, and `report.cmd` on the PC.
+
+**Not covered here [unconfirmed]**: anything else, such as what to do if a specific game crashes, or how many apps a free Apple ID can install. Ask us and we will add it.
+
+---
+
+## 日本語
+
+### 症状 → 確かめること → 直し方
+
+| 症状 | 確かめること | 直し方 |
+|---|---|---|
+| USB で続けて流していると、つながりが切れる | 長い間、続けて流していたか | **まず iPhone を再起動する。** これで直ることが多い。ケーブルや口を替えるのは、そのあと。 |
+| つながりが切れたあと、iPhone のアプリが固まった | アプリの画面が動かなくなっているか | アプリを上にはじいて閉じ、開き直す。 |
+| GPU が使われない、何も描かれない | iPhone のアプリが前に出ていて、画面がついているか | アプリを前に出したまま、画面をつけたままにする。後ろに回ると GPU が使えない。 |
+| `check.cmd` に iPhone の GPU が出ない | 次の順に見る：(1) apple.com の iTunes（Microsoft Store 版ではないもの）が入っているか (2) Apple Mobile Device Service が動いているか (3) USB でつながっているか (4) iPhone のロックが外れているか (5) iPhone でアプリが開いているか | 引っかかった最初の所を直して、`check.cmd` をもう一度走らせる。 |
+| 1 週間ほどで iPhone のアプリが開けなくなった | 無料の Apple ID で入れたか | 無料の Apple ID は 7 日で開けなくなる。入れ直す。 |
+| DirectX 11 のゲームで iPhone の GPU が使われない | `dxvk` の `d3d11.dll` と `dxgi.dll` が、ゲームの `.exe` の横にあるか。`pocketgpu.cmd` で起動したか | `dxvk\x64`（64 ビットのゲーム）か `dxvk\x32`（32 ビットのゲーム）の 2 つを `.exe` の横に置く。ゲームに合わせて `x64` か `x32` を選ぶ。 |
+| しばらくするとコマ数が落ちる | iPhone が熱くなっているか | 熱くなると、ドライバがコマ数を落とすことがある。扇風機で冷やすのはよい。保冷剤のように急に冷やすのはよくない。 |
+| 転送が遅い | どの機種の iPhone か | USB 3 で速いのは Pro の機種だけ。無印の機種は USB 2 で遅い。`devices.md` を見る。 |
+| ゲームにズルの見張りが入っている | Easy Anti-Cheat、BattlEye、VAC、Vanguard などが入っているか | そのゲームは使わない。アカウントが止められるおそれがある。 |
+
+### 質問
+
+**使わない方がいいゲームは？**
+ズルの見張りが入ったゲームです。Easy Anti-Cheat、BattlEye、VAC、Vanguard など。アカウントが止められるおそれがあります。
+
+**アプリは前に出しておく必要がありますか？**
+あります。iPhone のアプリを前に出して、画面をつけたままにしてください。後ろに回ると GPU が使えません。
+
+**iTunes は要りますか？**
+要ります。apple.com 版のもの（Microsoft Store 版ではないもの）です。Windows が iPhone と話すのに使います。
+
+**なぜ 7 日でアプリが開けなくなるのですか？**
+無料の Apple ID は、アプリへの署名が 7 日で切れるからです。入れ直してください。
+
+**USB で速い iPhone は？**
+Pro の機種だけです（USB 3）。無印の機種は USB 2 で遅くなります。`devices.md` を見てください。
+
+**iPhone が熱くなっても大丈夫ですか？**
+熱くなると、ドライバがコマ数を落とすことがあります。扇風機で冷やすのはよいです。保冷剤のように急に冷やすのはよくありません。
+
+**報告はどうやって送りますか？**
+2 つあります。iPhone のアプリの「Send diagnostics」と、PC の `report.cmd` です。
+
+**ここに書いていないこと［未確認］**：特定のゲームが落ちたときの対処、無料の Apple ID で入れられるアプリの数など。聞いてもらえれば足します。

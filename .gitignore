@@ -8,3 +8,12 @@ Payload/
 MoltenVK/
 mvk.tar
 pumpkin/
+
+# 足したフォルダで組んだ物と試験用の鍵
+android/out/
+android/keys/
+pc/out/
+pc/app/out/
+pc/livecap/livecap.exe
+server/kit-worker/.wrangler/
+server/kit-worker/node_modules/

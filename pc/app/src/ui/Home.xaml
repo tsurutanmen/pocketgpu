@@ -1,0 +1,93 @@
+<!-- ホーム：接続の状態と、各機能の入り切り -->
+<StackPanel xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+            xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <TextBlock Style="{StaticResource H1}" Text="{DynamicResource s_nav_home}"/>
+
+  <Border Style="{StaticResource Card}">
+    <Border Style="{StaticResource Row}" MinHeight="72">
+      <DockPanel>
+        <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_phone}"/>
+        <Button x:Name="HomeCheck" Style="{StaticResource BtnRow}" Content="{DynamicResource s_home_check}"/>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock x:Name="HomeDevTitle" Style="{StaticResource RowTitle}" FontWeight="SemiBold"/>
+          <TextBlock x:Name="HomeDevSub" Style="{StaticResource RowSub}"/>
+          <!-- 温度（信号の色・度数）と電池の残り（BatteryPoll.cs） -->
+          <StackPanel x:Name="HomeDevStatsRow" Orientation="Horizontal" Margin="0,4,0,0" Visibility="Collapsed">
+            <Ellipse x:Name="HomeTempDot" Width="8" Height="8" Margin="0,1,7,0" VerticalAlignment="Center" Visibility="Collapsed"/>
+            <TextBlock x:Name="HomeDevStats" FontSize="12.5" Foreground="{DynamicResource Sub}" VerticalAlignment="Center"/>
+          </StackPanel>
+        </StackPanel>
+      </DockPanel>
+    </Border>
+  </Border>
+
+  <TextBlock Style="{StaticResource Sec}" Text="{DynamicResource s_home_features}"/>
+  <Border Style="{StaticResource Card}">
+    <StackPanel>
+      <Border x:Name="HomeRowGpu" Style="{StaticResource Row}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_gpu}"/>
+          <Button x:Name="HomeGpuLaunch" Style="{StaticResource BtnRow}" Content="{DynamicResource s_gpu_launch}"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_nav_gpu}"/>
+            <TextBlock x:Name="HomeGpuSub" Style="{StaticResource RowSub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+      <Border x:Name="HomeRowCamera" Style="{StaticResource RowNext}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_camera}"/>
+          <CheckBox x:Name="HomeCamSw" Style="{StaticResource Switch}"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_nav_camera}"/>
+            <TextBlock x:Name="HomeCamSub" Style="{StaticResource RowSub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+      <Border Style="{StaticResource RowNext}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_mic}"/>
+          <CheckBox x:Name="HomeAudioSw" Style="{StaticResource Switch}"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_nav_audio}"/>
+            <TextBlock x:Name="HomeAudioSub" Style="{StaticResource RowSub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+      <Border Style="{StaticResource RowNext}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_caption}"/>
+          <CheckBox x:Name="HomeCapSw" Style="{StaticResource Switch}"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_nav_caption}"/>
+            <TextBlock x:Name="HomeCapSub" Style="{StaticResource RowSub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+      <Border x:Name="HomeRowRecord" Style="{StaticResource RowNext}">
+        <DockPanel>
+          <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_rec}" Content="{StaticResource i_rec_fill}"/>
+          <CheckBox x:Name="HomeRecSw" Style="{StaticResource Switch}"/>
+          <StackPanel VerticalAlignment="Center">
+            <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_nav_record}"/>
+            <TextBlock x:Name="HomeRecSub" Style="{StaticResource RowSub}"/>
+          </StackPanel>
+        </DockPanel>
+      </Border>
+    </StackPanel>
+  </Border>
+
+  <TextBlock Style="{StaticResource Sec}" Text="{DynamicResource s_home_usage}"/>
+  <Border Style="{StaticResource Card}">
+    <Border Style="{StaticResource Row}">
+      <DockPanel>
+        <ContentControl Style="{StaticResource RowIco}" Tag="{StaticResource i_vcam}"/>
+        <CheckBox x:Name="HomeMediaOnly" Style="{StaticResource Switch}"/>
+        <StackPanel VerticalAlignment="Center">
+          <TextBlock Style="{StaticResource RowTitle}" Text="{DynamicResource s_mode_title}"/>
+          <TextBlock Style="{StaticResource RowSub}" Text="{DynamicResource s_mode_sub}"/>
+        </StackPanel>
+      </DockPanel>
+    </Border>
+  </Border>
+</StackPanel>

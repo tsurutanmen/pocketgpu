@@ -1,0 +1,75 @@
+<!-- 暗い色。案 B（pcapp_b の MainView.xaml）の色を、案 A の部品に当てはめた物。名前は ThemeLight.xaml と同じ。
+     B は墨と白だけで、強調の青を使わない。オンのスイッチと主なボタンは B のスイッチと同じ明るい灰色の地に墨の文字。 -->
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <!-- 地と文字 -->
+  <SolidColorBrush x:Key="Bg" Color="#0F1012"/>
+  <SolidColorBrush x:Key="CardBg" Color="#17181B"/>
+  <SolidColorBrush x:Key="Line" Color="#26282C"/>
+  <SolidColorBrush x:Key="Divider" Color="#26282C"/>
+  <SolidColorBrush x:Key="Ink" Color="#ECEDEF"/>
+  <SolidColorBrush x:Key="Sub" Color="#8E9198"/>
+  <SolidColorBrush x:Key="Faint" Color="#5E6168"/>
+  <SolidColorBrush x:Key="Accent" Color="#E3E4E7"/>
+  <SolidColorBrush x:Key="AccentText" Color="#17181B"/>
+  <SolidColorBrush x:Key="IconInk" Color="#C9CBD0"/>
+  <SolidColorBrush x:Key="Avatar" Color="#222428"/>
+
+  <!-- ボタン。上に重ねる色は透けた白 -->
+  <SolidColorBrush x:Key="BtnBg" Color="#222428"/>
+  <SolidColorBrush x:Key="BtnLine" Color="#33363B"/>
+  <SolidColorBrush x:Key="BtnHover" Color="#0FFFFFFF"/>
+  <SolidColorBrush x:Key="BtnPress" Color="#1AFFFFFF"/>
+  <SolidColorBrush x:Key="FocusLine" Color="#8E9198"/>
+
+  <!-- 左の一覧 -->
+  <SolidColorBrush x:Key="NavHover" Color="#1B1C20"/>
+  <SolidColorBrush x:Key="NavSel" Color="#222428"/>
+
+  <!-- 切り替えの組 -->
+  <SolidColorBrush x:Key="SegBg" Color="#222428"/>
+  <SolidColorBrush x:Key="SegLine" Color="#33363B"/>
+  <SolidColorBrush x:Key="SegText" Color="#B7BAC0"/>
+  <SolidColorBrush x:Key="SegHover" Color="#2A2C31"/>
+  <SolidColorBrush x:Key="SegSel" Color="#34373D"/>
+  <SolidColorBrush x:Key="SegSelLine" Color="#34373D"/>
+
+  <!-- オン・オフ -->
+  <SolidColorBrush x:Key="SwTrack" Color="#3A3C42"/>
+  <SolidColorBrush x:Key="SwLine" Color="#3A3C42"/>
+  <SolidColorBrush x:Key="SwKnob" Color="#9EA1A8"/>
+  <SolidColorBrush x:Key="SwHover" Color="#45484E"/>
+
+  <!-- 選ぶ（ComboBox）と、開いた一覧 -->
+  <SolidColorBrush x:Key="SelHover" Color="#2A2C31"/>
+  <SolidColorBrush x:Key="SelSel" Color="#34373D"/>
+  <SolidColorBrush x:Key="PopupBg" Color="#222428"/>
+  <SolidColorBrush x:Key="PopupLine" Color="#33363B"/>
+
+  <!-- 入力欄 -->
+  <SolidColorBrush x:Key="FieldBg" Color="#222428"/>
+  <SolidColorBrush x:Key="FieldLine" Color="#33363B"/>
+  <SolidColorBrush x:Key="FieldFocusBg" Color="#222428"/>
+  <SolidColorBrush x:Key="FieldFocusLine" Color="#8E9198"/>
+  <SolidColorBrush x:Key="Selection" Color="#8E9198"/>
+
+  <!-- つまみ（画質） -->
+  <SolidColorBrush x:Key="SliderRest" Color="#3A3C42"/>
+  <SolidColorBrush x:Key="ThumbBg" Color="#34373D"/>
+  <SolidColorBrush x:Key="ThumbLine" Color="#45484E"/>
+
+  <!-- スクロールバー -->
+  <SolidColorBrush x:Key="ScrollThumb" Color="#45484E"/>
+  <SolidColorBrush x:Key="ScrollThumbHover" Color="#5E6168"/>
+
+  <!-- カメラのプレビュー -->
+  <SolidColorBrush x:Key="PreviewBg" Color="#1E1F22"/>
+  <SolidColorBrush x:Key="PreviewText" Color="#C8FFFFFF"/>
+  <SolidColorBrush x:Key="PreviewLabel" Color="#BFFFFFFF"/>
+
+  <!-- iPhone の温度の信号（ThemeLight.xaml と同じ名前） -->
+  <SolidColorBrush x:Key="SigOk" Color="#6CCB5F"/>
+  <SolidColorBrush x:Key="SigWarm" Color="#F5D547"/>
+  <SolidColorBrush x:Key="SigHot" Color="#F1707A"/>
+  <SolidColorBrush x:Key="SigHotText" Color="#FF8F96"/>
+</ResourceDictionary>

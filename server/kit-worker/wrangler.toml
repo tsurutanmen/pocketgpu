@@ -1,0 +1,32 @@
+name = "pocketgpu-kit"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+[vars]
+DISCORD_PUBLIC_KEY = "YOUR-DISCORD-APP-PUBLIC-KEY"
+TESTER_ROLE_ID = "YOUR-TESTER-ROLE-ID"
+KIT_CHANNEL_ID = "YOUR-KIT-CHANNEL-ID"
+
+# KV の番号は wrangler kv namespace create KITS で作ってから書く
+[[kv_namespaces]]
+binding = "KITS"
+id = "YOUR-KV-NAMESPACE-ID"
+
+# /kit の割り当て（10/13）。SQLite の Durable Object なので無料の枠で足りる。
+# 初めて deploy するとき、この migrations で KitAllocator が作られる（別に作る手順は要らない）
+[[durable_objects.bindings]]
+name = "ALLOC"
+class_name = "KitAllocator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["KitAllocator"]
+
+# テスターのログ（10/13）。保存と回数の上限は SQLite の Durable Object（無料の枠）
+[[durable_objects.bindings]]
+name = "LOGS"
+class_name = "LogStore"
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["LogStore"]

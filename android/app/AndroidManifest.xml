@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- PocketGPU の Android 版。カメラ・マイク・スピーカーを PC に貸し、GPU の受信アプリも起動する。iPhone 版と同じ約束（50063・50064・50060） -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.tsurutanmen.pocketgpu">
+
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.vulkan.version" android:required="false" />
+
+    <!-- extractNativeLibs：GPU の受信アプリ（lib/<abi>/libpgpu_server.so）を実行ファイルとして起動するため、端末の中に取り出しておく -->
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@android:style/Theme.DeviceDefault.DayNight"
+        android:allowBackup="false"
+        android:appCategory="game"
+        android:isGame="true"
+        android:extractNativeLibs="true">
+
+        <!-- 0.1.6：ゲームとして名乗る（appCategory は Android 8＝API 26 から・isGame はそれより古い印）。
+             ゲームモードの宣言は res/xml/game_mode_config.xml（Android 12 から） -->
+        <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="@string/settings_title"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize" />
+
+        <!-- 0.1.2：画面のライトと、画面を暗くする（どちらもアプリが前にいるときだけ出す） -->
+        <activity
+            android:name=".ScreenLightActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize" />
+
+        <activity
+            android:name=".DimActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize" />
+
+        <service
+            android:name=".BridgeService"
+            android:exported="false"
+            android:foregroundServiceType="camera|microphone|mediaPlayback|specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Runs the Vulkan GPU receiver for a PC connected over USB" />
+        </service>
+    </application>
+</manifest>
