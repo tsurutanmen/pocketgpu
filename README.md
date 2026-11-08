@@ -1,0 +1,65 @@
+# PocketGPU
+
+Thanks for reading this README. I'm Tsuruta.
+
+PocketGPU is for people who have a powerful phone but a PC without a graphics card. Connect the phone to the PC with a cable, and the phone does the GPU work for the PC.
+
+It works as a Vulkan driver on Windows and Linux. DirectX and OpenGL apps run through DXVK, vkd3d and zink. The phone side runs on iPhone and Android.
+
+- Setup and repair scripts for testers: [tsurutanmen/pocketgpu-setup](https://github.com/tsurutanmen/pocketgpu-setup)
+- Discord: https://discord.gg/F3Mk8DBxqQ
+- License: Apache-2.0 (`mc/pumpkin-ios` is GPL-3.0)
+
+## What is in here
+
+| Folder | What |
+| --- | --- |
+| `vk/icd` | Vulkan driver (ICD) for the PC. It sends Vulkan calls to the phone |
+| `vk/remote` | The receiver that runs the calls on the phone GPU (`server.c`, also built for Android) |
+| `vk/tests` | Small Vulkan, D3D9/10/11/12 test programs |
+| `vk/tools` | Tools used while measuring and debugging |
+| `vk/third_party` | bcdec, lz4, stb_image |
+| `Sources` | iPhone app (PocketGPU) and the camera-only app (PocketCam) |
+| `pc` | PC tools: kit builder, USB forwarding, iPhone log and status tools |
+| `pc/kit`, `pc/kit_linux` | Scripts that go into the Windows and Linux kits |
+| `win` | Scripts that run games and samples on the phone GPU for testing |
+| `mc` | Patches and glue to run the Pumpkin Minecraft server inside the iPhone app (optional) |
+| `patches` | Patches applied to llama.cpp and whisper.cpp |
+| `ci`, `.github/workflows`, `codemagic.yaml` | Build scripts |
+| `docs` | Plans and test notes (Japanese) |
+
+## Build
+
+| Target | Command | Needs |
+| --- | --- | --- |
+| Windows driver and tools | `vk/build_win.sh <out>` | zig (`zig cc`). No Visual Studio |
+| Linux driver (incl. WSL, Steam Deck) | `vk/build_linux.sh <out>` | gcc and the Vulkan headers |
+| Android receiver | `vk/build_android.sh <out>` | Android NDK. No Android Studio |
+| iPhone app (unsigned `.ipa`) | `ci/build_ios.sh` | macOS and Xcode 26.3. Runs on Codemagic or the `ios.yml` workflow |
+| Pumpkin library for the iPhone app | `ci/build_pumpkin_ios.sh` | Rust. Only when `MINECRAFT=true` |
+| Windows kit for one tester | `python pc/make_kit.py <name>` | The driver and app built above. Set `PGKIT_UPDATE_URL` to your own update server |
+
+## Testers
+
+- Toasty~ (`bl7ck_ic3`)
+- BerBP (`berbp_but_now_its_benny`)
+- Brewmasters (`brewmaegger_s2`)
+- Josetruco1425 (`josetruco1425`)
+- PabloC557 (`remythemice557`)
+- ぴとん345 (`piton345`)
+- Aurora (`tranzide`)
+- 시유 (`seeu0001`)
+- StarBite (`iwannabitestars`)
+- Hi (`balzer0699`)
+
+## License
+
+| Part | License |
+| --- | --- |
+| Everything except the rows below | Apache-2.0 (`LICENSE`) |
+| `mc/pumpkin-ios` | GPL-3.0 (`mc/pumpkin-ios/LICENSE`). An iPhone app built with `MINECRAFT=true` links Pumpkin and is GPL-3.0 as a whole |
+| `vk/third_party/bcdec` | MIT or Unlicense |
+| `vk/third_party/lz4` | BSD-2-Clause |
+| `vk/third_party/stb` | MIT or public domain |
+
+Not in this repository and fetched or built at build time: MoltenVK (Apache-2.0), llama.cpp (MIT), whisper.cpp (MIT), DXVK (zlib), Pumpkin (GPL-3.0).
