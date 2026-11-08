@@ -6,6 +6,8 @@ PocketGPU is for people who have a powerful phone but a PC without a graphics ca
 
 It works as a Vulkan driver on Windows and Linux. DirectX and OpenGL apps run through DXVK, vkd3d and zink. The phone side runs on iPhone and Android.
 
+Built with [Claude Code](https://claude.com/claude-code). Most of the code here was written together with Claude.
+
 - Setup and repair scripts for testers: [tsurutanmen/pocketgpu-setup](https://github.com/tsurutanmen/pocketgpu-setup)
 - Discord: https://discord.gg/F3Mk8DBxqQ
 - License: Apache-2.0 (`mc/pumpkin-ios` is GPL-3.0)
